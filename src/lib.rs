@@ -42,12 +42,20 @@ type F32x4 = m128;
 type F64x2 = m128d;
 
 /// 运行时检测 LASX（cpucfg 读 CPUCFG2 bit7）
+/// 验证钩子：环境变量 LOONGSCI_FORCE_LSX=1 强制降级到 LSX 路径
+/// （模拟 LSX-only CPU——如 3A5000/3A6000；本机 3B6000 含 LASX，
+/// 用钩子让代码真实执行 LSX intrinsic 分支验证数值/性能，诚实标注非无-LASX 真机）
 static HAS_LASX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn has_lasx() -> bool {
-    *HAS_LASX.get_or_init(|| unsafe {
-        let mut cfg2: u32;
-        std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
-        (cfg2 & (1 << 7)) != 0
+    *HAS_LASX.get_or_init(|| {
+        if std::env::var("LOONGSCI_FORCE_LSX").map(|v| v == "1").unwrap_or(false) {
+            return false; // 强制 LSX 降级（验证/测试钩子）
+        }
+        unsafe {
+            let mut cfg2: u32;
+            std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
+            (cfg2 & (1 << 7)) != 0
+        }
     })
 }
 
