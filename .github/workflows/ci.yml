@@ -36,15 +36,5 @@ jobs:
         run: |
           rustup run nightly cargo check -Zbuild-std --target loongarch64-unknown-linux-gnu
 
-  # 3. 真机测试（self-hosted LoongArch runner——龙芯机器注册：
-  #    需在仓库 Settings → Actions → Runners 注册，标签含 loongarch64）
-  loongarch-test:
-    name: Test (LoongArch64 hardware)
-    runs-on: [self-hosted, loongarch64]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      - name: cargo build --release
-        run: cargo build --release
-      - name: cargo test --release
-        run: cargo test --release
+  # 真机测试（LoongArch64 硬件）不在 GitHub 执行——官方 runner 无 loongarch64 二进制。
+  # 真机编译 + 测试由自建 Git Panel CI 覆盖（http://192.168.1.29，龙芯真机，push 自动触发）。
