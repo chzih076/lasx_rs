@@ -1,6 +1,11 @@
 //! LASX 256 位向量引擎（Rust 版，llama.cpp 风格内核）
 //! 通过 Dart FFI 调用，提供 8×float32 / 4×float64 FMA 加速。
 #![feature(stdarch_loongarch)]
+// SIMD intrinsics 固有：裸 i8 向量 ↔ 类型化向量（F32x8/F64x4 等）的 transmute，
+// 目标类型由辅助函数签名约束，显式标注为样板噪音。
+#![allow(clippy::missing_transmute_annotations)]
+// extern "C" FFI 函数按约定解引用传入裸指针（调用方保证有效），非 unsafe fn 语义
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::arch::loongarch64::*;
 
@@ -106,8 +111,8 @@ pub extern "C" fn lasx_dot(a: *const f32, b: *const f32, n: i32) -> f32 {
             }
             let mut tmp = [0f32; 4];
             unsafe { st4_f32(tmp.as_mut_ptr(), acc) };
-            for k in 0..4 {
-                acc_d += tmp[k] as f64;
+            for &v in &tmp {
+                acc_d += v as f64;
             }
             acc = unsafe { zero4_f32() };
         }
@@ -119,11 +124,11 @@ pub extern "C" fn lasx_dot(a: *const f32, b: *const f32, n: i32) -> f32 {
         }
         let mut tmp = [0f32; 4];
         unsafe { st4_f32(tmp.as_mut_ptr(), acc) };
-        for k in 0..4 {
-            acc_d += tmp[k] as f64;
+        for &v in &tmp {
+            acc_d += v as f64;
         }
-        for j in i..n {
-            acc_d += (a[j] * b[j]) as f64;
+        for (&av, &bv) in a[i..n].iter().zip(&b[i..n]) {
+            acc_d += (av * bv) as f64;
         }
         return acc_d as f32;
     }
@@ -140,8 +145,8 @@ pub extern "C" fn lasx_dot(a: *const f32, b: *const f32, n: i32) -> f32 {
         }
         let mut tmp = [0f32; 8];
         unsafe { st_f32(tmp.as_mut_ptr(), acc) };
-        for k in 0..8 {
-            acc_d += tmp[k] as f64;
+        for &v in &tmp {
+            acc_d += v as f64;
         }
         acc = unsafe { zero_f32() };
     }
@@ -153,8 +158,8 @@ pub extern "C" fn lasx_dot(a: *const f32, b: *const f32, n: i32) -> f32 {
     }
     let mut tmp = [0f32; 8];
     unsafe { st_f32(tmp.as_mut_ptr(), acc) };
-    for k in 0..8 {
-        acc_d += tmp[k] as f64;
+    for &v in &tmp {
+        acc_d += v as f64;
     }
     for j in i..n {
         acc_d += (a[j] * b[j]) as f64;
@@ -190,8 +195,8 @@ pub extern "C" fn lasx_matmul(m: i32, k: i32, n: i32, a: *const f32, b: *const f
             let mut tmp = [0f32; 8];
             unsafe { st_f32(tmp.as_mut_ptr(), acc) };
             let mut s = 0f32;
-            for q in 0..8 {
-                s += tmp[q];
+            for &v in &tmp {
+                s += v;
             }
             for q in p..k {
                 s += a_row[q] * b_row[q];
@@ -236,8 +241,8 @@ pub extern "C" fn lasx_sum(x: *const f32, n: i32) -> f32 {
         }
         let mut tmp = [0f32; 8];
         unsafe { st_f32(tmp.as_mut_ptr(), acc) };
-        for k in 0..8 {
-            acc_d += tmp[k] as f64;
+        for &v in &tmp {
+            acc_d += v as f64;
         }
         acc = unsafe { zero_f32() };
     }
@@ -247,11 +252,11 @@ pub extern "C" fn lasx_sum(x: *const f32, n: i32) -> f32 {
     }
     let mut tmp = [0f32; 8];
     unsafe { st_f32(tmp.as_mut_ptr(), acc) };
-    for k in 0..8 {
-        acc_d += tmp[k] as f64;
+    for &v in &tmp {
+        acc_d += v as f64;
     }
-    for j in i..n {
-        acc_d += x[j] as f64;
+    for &v in &x[i..n] {
+        acc_d += v as f64;
     }
     acc_d as f32
 }
@@ -273,8 +278,8 @@ pub extern "C" fn lasx_dot_f64(a: *const f64, b: *const f64, n: i32) -> f64 {
     let mut tmp = [0f64; 4];
     unsafe { st_f64(tmp.as_mut_ptr(), acc) };
     let mut s = 0f64;
-    for k in 0..4 {
-        s += tmp[k];
+    for &v in &tmp {
+        s += v;
     }
     for j in i..n {
         s += a[j] * b[j];
@@ -300,16 +305,16 @@ pub extern "C" fn lasx_dot_i8(a: *const i8, b: *const i8, n: i32) -> i32 {
     let mut s_acc: i64 = 0;
     let mut i = 0;
     while i + 32 <= n {
-        let va = unsafe { lasx_xvld(a.as_ptr().add(i) as *const i8, 0) };
-        let vb = unsafe { lasx_xvld(b.as_ptr().add(i) as *const i8, 0) };
+        let va = unsafe { lasx_xvld(a.as_ptr().add(i), 0) };
+        let vb = unsafe { lasx_xvld(b.as_ptr().add(i), 0) };
         let lo16 = unsafe { lasx_xvmulwev_h_b(va, vb) };
         let hi16 = unsafe { lasx_xvmulwod_h_b(va, vb) };
         let sum16 = unsafe { lasx_xvadd_h(lo16, hi16) };
         // 每 32 字节落内存，用 int64 累加避免溢出
         let mut tmp = [0i16; 16];
         unsafe { lasx_xvst(sum16, tmp.as_mut_ptr() as *mut i8, 0) };
-        for k in 0..16 {
-            s_acc += tmp[k] as i64;
+        for &v in &tmp {
+            s_acc += v as i64;
         }
         i += 32;
     }
@@ -350,8 +355,8 @@ pub extern "C" fn lasx_dot_q4(
         let mut tmp = [0i16; 16];
         unsafe { lasx_xvst(sall, tmp.as_mut_ptr() as *mut i8, 0) };
         let mut dot: i64 = 0;
-        for k in 0..16 {
-            dot += tmp[k] as i64;
+        for &v in &tmp {
+            dot += v as i64;
         }
         let sc = sa[b / 32] * sb[b / 32];
         acc += (sc as f64) * (dot as f64);
@@ -403,8 +408,8 @@ pub extern "C" fn lasx_matmul_f64(
             let mut tmp = [0f64; 4];
             unsafe { st_f64(tmp.as_mut_ptr(), acc) };
             let mut s = 0f64;
-            for q in 0..4 {
-                s += tmp[q];
+            for &v in &tmp {
+                s += v;
             }
             for q in p..k {
                 s += a_row[q] * b_row[q];
@@ -554,6 +559,7 @@ pub extern "C" fn lasx_ballistic_step(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn euler_step(
     x: &mut f32,
     y: &mut f32,
@@ -919,354 +925,10 @@ pub extern "C" fn lasx_j2_accel_batch(
     }
 }
 
-// ==================== 批量内核数值测试（标量对照，<1e-9） ====================
-#[cfg(test)]
-mod batch_tests {
-    use super::*;
-
-    fn scalar_norm3(x: &[f64], y: &[f64], z: &[f64]) -> Vec<f64> {
-        (0..x.len())
-            .map(|i| (x[i] * x[i] + y[i] * y[i] + z[i] * z[i]).sqrt())
-            .collect()
-    }
-    fn scalar_add_scaled(a: &[f64], b: &[f64], s: f64) -> Vec<f64> {
-        a.iter().zip(b).map(|(&x, &y)| x + s * y).collect()
-    }
-    fn scalar_j2(
-        rx: &[f64],
-        ry: &[f64],
-        rz: &[f64],
-        mu: f64,
-        j2: f64,
-        re: f64,
-    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        let n = rx.len();
-        let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-        let j2k = 1.5 * j2 * mu * re * re;
-        for i in 0..n {
-            let rm = (rx[i] * rx[i] + ry[i] * ry[i] + rz[i] * rz[i]).sqrt();
-            let rm3 = rm * rm * rm;
-            let rm5 = rm3 * rm * rm;
-            let zr2 = (rz[i] / rm) * (rz[i] / rm);
-            let k = j2k / rm5;
-            ax[i] = -mu * rx[i] / rm3 + k * rx[i] * (5.0 * zr2 - 1.0);
-            ay[i] = -mu * ry[i] / rm3 + k * ry[i] * (5.0 * zr2 - 1.0);
-            az[i] = -mu * rz[i] / rm3 + k * rz[i] * (5.0 * zr2 - 3.0);
-        }
-        (ax, ay, az)
-    }
-
-    // 伪随机轨道状态（LEO/GEO/椭圆/高轨），避免巧合
-    fn states(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        let mut x = Vec::with_capacity(n);
-        let mut y = Vec::with_capacity(n);
-        let mut z = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = 6.8e6 + (i as f64) * 1.7e6; // 500km .. 12万 km
-            let e = 0.05 + 0.3 * (i as f64) / n as f64;
-            let th = (i as f64) * 2.39996;
-            let r = a * (1.0 - e * e) / (1.0 + e * (th * 1.7).cos());
-            let ph = (i as f64) * 1.131;
-            x.push(r * th.cos() * ph.cos());
-            y.push(r * th.sin() * ph.cos());
-            z.push(r * ph.sin());
-        }
-        (x, y, z)
-    }
-
-    /// 相对误差（|a−b| / max(1,|b|)），对 ~1e7 量级轨道状态用相对度量
-    fn rel_err(a: f64, b: f64) -> f64 {
-        (a - b).abs() / b.abs().max(1.0)
-    }
-
-    #[test]
-    fn test_norm3_batch_matches_scalar() {
-        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 16, 33] {
-            let (x, y, z) = states(n);
-            let mut out = vec![0.0; n];
-            unsafe {
-                lasx_norm3_batch(
-                    x.as_ptr(),
-                    y.as_ptr(),
-                    z.as_ptr(),
-                    out.as_mut_ptr(),
-                    n as i32,
-                )
-            };
-            let want = scalar_norm3(&x, &y, &z);
-            for i in 0..n {
-                assert!(
-                    rel_err(out[i], want[i]) < 1e-9,
-                    "n={n} i={i}: {} vs {}",
-                    out[i],
-                    want[i]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_vec3_add_scaled_batch_matches_scalar() {
-        let (x, y, z) = states(37);
-        let (b, c, d) = states(37);
-        for s in [0.0, 0.5, 2.0, -1.3, 1.0] {
-            let (mut ox, mut oy, mut oz) = (vec![0.0; 37], vec![0.0; 37], vec![0.0; 37]);
-            unsafe {
-                lasx_vec3_add_scaled_batch(
-                    x.as_ptr(),
-                    y.as_ptr(),
-                    z.as_ptr(),
-                    b.as_ptr(),
-                    c.as_ptr(),
-                    d.as_ptr(),
-                    s,
-                    ox.as_mut_ptr(),
-                    oy.as_mut_ptr(),
-                    oz.as_mut_ptr(),
-                    37,
-                );
-            }
-            let wx = scalar_add_scaled(&x, &b, s);
-            let wy = scalar_add_scaled(&y, &c, s);
-            let wz = scalar_add_scaled(&z, &d, s);
-            for i in 0..37 {
-                assert!(
-                    rel_err(ox[i], wx[i]) < 1e-9
-                        && rel_err(oy[i], wy[i]) < 1e-9
-                        && rel_err(oz[i], wz[i]) < 1e-9,
-                    "s={s} i={i}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_rk4_j2_step_batch_matches_scalar() {
-        // 批量单步 RK4 vs 逐星标量（同公式），多步累积后仍 <1e-9
-        let mu = 3.986004418e14;
-        let j2 = 1.08262668e-3;
-        let re = 6.378137e6;
-        for n in [1usize, 2, 3, 4, 5, 7, 8, 17] {
-            let (x, y, z) = states(n);
-            // 速度
-            let vx: Vec<f64> = (0..n).map(|i| 100.0 * (i as f64) + 500.0).collect();
-            let vy: Vec<f64> = (0..n).map(|i| 7700.0 * (1.0 + 0.01 * (i as f64))).collect();
-            let vz: Vec<f64> = (0..n).map(|i| 20.0 * (i as f64) as f64).collect();
-            let (mut bx, mut by, mut bz) = (x.clone(), y.clone(), z.clone());
-            let (mut bvx, mut bvy, mut bvz) = (vx.clone(), vy.clone(), vz.clone());
-            // 参考：逐星标量 50 步
-            let (mut sx, mut sy, mut sz) = (x.clone(), y.clone(), z.clone());
-            let (mut svx, mut svy, mut svz) = (vx.clone(), vy.clone(), vz.clone());
-            let dt = 10.0;
-            for _ in 0..50 {
-                unsafe {
-                    lasx_rk4_j2_step_batch(
-                        bx.as_mut_ptr(),
-                        by.as_mut_ptr(),
-                        bz.as_mut_ptr(),
-                        bvx.as_mut_ptr(),
-                        bvy.as_mut_ptr(),
-                        bvz.as_mut_ptr(),
-                        mu,
-                        j2,
-                        re,
-                        dt,
-                        n as i32,
-                    );
-                }
-                for i in 0..n {
-                    rk4_j2_step_scalar(
-                        &mut sx[i],
-                        &mut sy[i],
-                        &mut sz[i],
-                        &mut svx[i],
-                        &mut svy[i],
-                        &mut svz[i],
-                        mu,
-                        j2,
-                        re,
-                        dt,
-                    );
-                }
-            }
-            for i in 0..n {
-                assert!(
-                    rel_err(bx[i], sx[i]) < 1e-9 && rel_err(bvx[i], svx[i]) < 1e-9,
-                    "n={n} i={i}: batch r {} vs scalar {}",
-                    bx[i],
-                    sx[i]
-                );
-                assert!(rel_err(by[i], sy[i]) < 1e-9 && rel_err(bvy[i], svy[i]) < 1e-9);
-                assert!(rel_err(bz[i], sz[i]) < 1e-9 && rel_err(bvz[i], svz[i]) < 1e-9);
-            }
-        }
-    }
-
-    #[test]
-    fn test_j2_accel_batch_matches_scalar() {
-        for n in [0usize, 1, 2, 4, 9, 20] {
-            let (x, y, z) = states(n);
-            let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-            unsafe {
-                lasx_j2_accel_batch(
-                    x.as_ptr(),
-                    y.as_ptr(),
-                    z.as_ptr(),
-                    3.986004418e14,
-                    1.08262668e-3,
-                    6.378137e6,
-                    ax.as_mut_ptr(),
-                    ay.as_mut_ptr(),
-                    az.as_mut_ptr(),
-                    n as i32,
-                );
-            }
-            let (wx, wy, wz) = scalar_j2(&x, &y, &z, 3.986004418e14, 1.08262668e-3, 6.378137e6);
-            for i in 0..n {
-                assert!(
-                    rel_err(ax[i], wx[i]) < 1e-9
-                        && rel_err(ay[i], wy[i]) < 1e-9
-                        && rel_err(az[i], wz[i]) < 1e-9,
-                    "n={n} i={i}: ({},{},{}) vs ({},{},{})",
-                    ax[i],
-                    ay[i],
-                    az[i],
-                    wx[i],
-                    wy[i],
-                    wz[i]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_rk4_j2_step_scalar_fma_vs_plain_reference() {
-        // 标量尾循环 FMA 版（f64::mul_add）vs 分离 mul+add 参考（原版公式）：
-        // 单步 FMA 融合舍入差 ≤1 ulp，50 步累积后相对差仍 <1e-9（物理等价）。
-        let mu = 3.986004418e14;
-        let j2 = 1.08262668e-3;
-        let re = 6.378137e6;
-        let (x, y, z) = states(9);
-        // 分离 mul+add 参考实现（与旧版 rk4_j2_step_scalar 同式）
-        fn step_plain(
-            rx: &mut f64,
-            ry: &mut f64,
-            rz: &mut f64,
-            vx: &mut f64,
-            vy: &mut f64,
-            vz: &mut f64,
-            mu: f64,
-            j2: f64,
-            re: f64,
-            h: f64,
-        ) {
-            let j2k = 1.5 * j2 * mu * re * re;
-            let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
-                let rm = (x * x + y * y + z * z).sqrt();
-                let rm3 = rm * rm * rm;
-                let rm5 = rm3 * rm * rm;
-                let zr2 = (z / rm) * (z / rm);
-                let k = j2k / rm5;
-                [
-                    -mu * x / rm3 + k * x * (5.0 * zr2 - 1.0),
-                    -mu * y / rm3 + k * y * (5.0 * zr2 - 1.0),
-                    -mu * z / rm3 + k * z * (5.0 * zr2 - 3.0),
-                ]
-            };
-            let (x0, y0, z0, vx0, vy0, vz0) = (*rx, *ry, *rz, *vx, *vy, *vz);
-            let k1 = accel(x0, y0, z0);
-            let r2 = (x0 + 0.5 * h * vx0, y0 + 0.5 * h * vy0, z0 + 0.5 * h * vz0);
-            let v2 = (
-                vx0 + 0.5 * h * k1[0],
-                vy0 + 0.5 * h * k1[1],
-                vz0 + 0.5 * h * k1[2],
-            );
-            let k2 = accel(r2.0, r2.1, r2.2);
-            let r3 = (
-                x0 + 0.5 * h * v2.0,
-                y0 + 0.5 * h * v2.1,
-                z0 + 0.5 * h * v2.2,
-            );
-            let v3 = (
-                vx0 + 0.5 * h * k2[0],
-                vy0 + 0.5 * h * k2[1],
-                vz0 + 0.5 * h * k2[2],
-            );
-            let k3 = accel(r3.0, r3.1, r3.2);
-            let r4 = (x0 + h * v3.0, y0 + h * v3.1, z0 + h * v3.2);
-            let v4 = (vx0 + h * k3[0], vy0 + h * k3[1], vz0 + h * k3[2]);
-            let k4 = accel(r4.0, r4.1, r4.2);
-            let l = (
-                vx0 + 2.0 * v2.0 + 2.0 * v3.0 + v4.0,
-                vy0 + 2.0 * v2.1 + 2.0 * v3.1 + v4.1,
-                vz0 + 2.0 * v2.2 + 2.0 * v3.2 + v4.2,
-            );
-            let k = (
-                k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0],
-                k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1],
-                k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2],
-            );
-            *rx = x0 + (h / 6.0) * l.0;
-            *ry = y0 + (h / 6.0) * l.1;
-            *rz = z0 + (h / 6.0) * l.2;
-            *vx = vx0 + (h / 6.0) * k.0;
-            *vy = vy0 + (h / 6.0) * k.1;
-            *vz = vz0 + (h / 6.0) * k.2;
-        }
-        let (mut fx, mut fy, mut fz) = (x.clone(), y.clone(), z.clone());
-        let (mut fvx, mut fvy, mut fvz) = (vec![0.0; 9], vec![0.0; 9], vec![0.0; 9]);
-        for i in 0..9 {
-            fvx[i] = 500.0 + 100.0 * i as f64;
-            fvy[i] = 7700.0 * (1.0 + 0.01 * i as f64);
-            fvz[i] = 20.0 * i as f64;
-        }
-        let (mut px, mut py, mut pz) = (x.clone(), y.clone(), z.clone());
-        let (mut pvx, mut pvy, mut pvz) = (fvx.clone(), fvy.clone(), fvz.clone());
-        let dt = 10.0;
-        for _ in 0..50 {
-            for i in 0..9 {
-                rk4_j2_step_scalar(
-                    &mut fx[i],
-                    &mut fy[i],
-                    &mut fz[i],
-                    &mut fvx[i],
-                    &mut fvy[i],
-                    &mut fvz[i],
-                    mu,
-                    j2,
-                    re,
-                    dt,
-                );
-                step_plain(
-                    &mut px[i],
-                    &mut py[i],
-                    &mut pz[i],
-                    &mut pvx[i],
-                    &mut pvy[i],
-                    &mut pvz[i],
-                    mu,
-                    j2,
-                    re,
-                    dt,
-                );
-            }
-        }
-        for i in 0..9 {
-            assert!(
-                rel_err(fx[i], px[i]) < 1e-9 && rel_err(fvx[i], pvx[i]) < 1e-9,
-                "i={i}: FMA r {} vs plain {}",
-                fx[i],
-                px[i]
-            );
-            assert!(rel_err(fy[i], py[i]) < 1e-9 && rel_err(fvy[i], pvy[i]) < 1e-9);
-            assert!(rel_err(fz[i], pz[i]) < 1e-9 && rel_err(fvz[i], pvz[i]) < 1e-9);
-        }
-    }
-}
-
 /// 单步 RK4 的 J2 加速度（向量 lane 版本，4 样本并行）：
 /// a = −μ·r/|r|³ + J2 项（公式同 `lasx_j2_accel_batch`；vmu 已取负）
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn j2_accel_vec(
     vx: m256d,
     vy: m256d,
@@ -1298,6 +960,7 @@ unsafe fn j2_accel_vec(
 /// 标量单步 RK4（J2 力模型，供非 LASX 兜底/尾数；与 loong-sci `propagate_orbit` 同式）。
 /// FMA 版：组合算术与加速度末项用 `f64::mul_add`（单指令 `fmadd.d`，LA664），与
 /// LASX 向量路径 `j2_accel_vec`/内核组合算术逐位一致（物理等价 <1e-9）。
+#[allow(clippy::too_many_arguments)]
 fn rk4_j2_step_scalar(
     rx: &mut f64,
     ry: &mut f64,
@@ -1523,6 +1186,346 @@ pub extern "C" fn lasx_rk4_j2_step_batch(
                 &mut rx[j], &mut ry[j], &mut rz[j], &mut vx[j], &mut vy[j], &mut vz[j], mu, j2, re,
                 dt,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{
+        lasx_j2_accel_batch, lasx_norm3_batch, lasx_rk4_j2_step_batch, lasx_vec3_add_scaled_batch,
+        rk4_j2_step_scalar,
+    };
+
+    fn scalar_norm3(x: &[f64], y: &[f64], z: &[f64]) -> Vec<f64> {
+        (0..x.len())
+            .map(|i| (x[i] * x[i] + y[i] * y[i] + z[i] * z[i]).sqrt())
+            .collect()
+    }
+    fn scalar_add_scaled(a: &[f64], b: &[f64], s: f64) -> Vec<f64> {
+        a.iter().zip(b).map(|(&x, &y)| x + s * y).collect()
+    }
+    fn scalar_j2(
+        rx: &[f64],
+        ry: &[f64],
+        rz: &[f64],
+        mu: f64,
+        j2: f64,
+        re: f64,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let n = rx.len();
+        let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        let j2k = 1.5 * j2 * mu * re * re;
+        for i in 0..n {
+            let rm = (rx[i] * rx[i] + ry[i] * ry[i] + rz[i] * rz[i]).sqrt();
+            let rm3 = rm * rm * rm;
+            let rm5 = rm3 * rm * rm;
+            let zr2 = (rz[i] / rm) * (rz[i] / rm);
+            let k = j2k / rm5;
+            ax[i] = -mu * rx[i] / rm3 + k * rx[i] * (5.0 * zr2 - 1.0);
+            ay[i] = -mu * ry[i] / rm3 + k * ry[i] * (5.0 * zr2 - 1.0);
+            az[i] = -mu * rz[i] / rm3 + k * rz[i] * (5.0 * zr2 - 3.0);
+        }
+        (ax, ay, az)
+    }
+
+    // 伪随机轨道状态（LEO/GEO/椭圆/高轨），避免巧合
+    fn states(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut z = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = 6.8e6 + (i as f64) * 1.7e6; // 500km .. 12万 km
+            let e = 0.05 + 0.3 * (i as f64) / n as f64;
+            let th = (i as f64) * 2.39996;
+            let r = a * (1.0 - e * e) / (1.0 + e * (th * 1.7).cos());
+            let ph = (i as f64) * 1.131;
+            x.push(r * th.cos() * ph.cos());
+            y.push(r * th.sin() * ph.cos());
+            z.push(r * ph.sin());
+        }
+        (x, y, z)
+    }
+
+    /// 相对误差（|a−b| / max(1,|b|)），对 ~1e7 量级轨道状态用相对度量
+    fn rel_err(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs().max(1.0)
+    }
+
+    #[test]
+    fn test_norm3_batch_matches_scalar() {
+        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 16, 33] {
+            let (x, y, z) = states(n);
+            let mut out = vec![0.0; n];
+            lasx_norm3_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                out.as_mut_ptr(),
+                n as i32,
+            );
+            let want = scalar_norm3(&x, &y, &z);
+            for i in 0..n {
+                assert!(
+                    rel_err(out[i], want[i]) < 1e-9,
+                    "n={n} i={i}: {} vs {}",
+                    out[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vec3_add_scaled_batch_matches_scalar() {
+        let (x, y, z) = states(37);
+        let (b, c, d) = states(37);
+        for s in [0.0, 0.5, 2.0, -1.3, 1.0] {
+            let (mut ox, mut oy, mut oz) = (vec![0.0; 37], vec![0.0; 37], vec![0.0; 37]);
+            lasx_vec3_add_scaled_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                b.as_ptr(),
+                c.as_ptr(),
+                d.as_ptr(),
+                s,
+                ox.as_mut_ptr(),
+                oy.as_mut_ptr(),
+                oz.as_mut_ptr(),
+                37,
+            );
+            let wx = scalar_add_scaled(&x, &b, s);
+            let wy = scalar_add_scaled(&y, &c, s);
+            let wz = scalar_add_scaled(&z, &d, s);
+            for i in 0..37 {
+                assert!(
+                    rel_err(ox[i], wx[i]) < 1e-9
+                        && rel_err(oy[i], wy[i]) < 1e-9
+                        && rel_err(oz[i], wz[i]) < 1e-9,
+                    "s={s} i={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rk4_j2_step_batch_matches_scalar() {
+        // 批量单步 RK4 vs 逐星标量（同公式），多步累积后仍 <1e-9
+        let mu = 3.986004418e14;
+        let j2 = 1.08262668e-3;
+        let re = 6.378137e6;
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 17] {
+            let (x, y, z) = states(n);
+            // 速度
+            let vx: Vec<f64> = (0..n).map(|i| 100.0 * (i as f64) + 500.0).collect();
+            let vy: Vec<f64> = (0..n).map(|i| 7700.0 * (1.0 + 0.01 * (i as f64))).collect();
+            let vz: Vec<f64> = (0..n).map(|i| 20.0 * (i as f64)).collect();
+            let (mut bx, mut by, mut bz) = (x.clone(), y.clone(), z.clone());
+            let (mut bvx, mut bvy, mut bvz) = (vx.clone(), vy.clone(), vz.clone());
+            // 参考：逐星标量 50 步
+            let (mut sx, mut sy, mut sz) = (x.clone(), y.clone(), z.clone());
+            let (mut svx, mut svy, mut svz) = (vx.clone(), vy.clone(), vz.clone());
+            let dt = 10.0;
+            for _ in 0..50 {
+                lasx_rk4_j2_step_batch(
+                    bx.as_mut_ptr(),
+                    by.as_mut_ptr(),
+                    bz.as_mut_ptr(),
+                    bvx.as_mut_ptr(),
+                    bvy.as_mut_ptr(),
+                    bvz.as_mut_ptr(),
+                    mu,
+                    j2,
+                    re,
+                    dt,
+                    n as i32,
+                );
+                for i in 0..n {
+                    rk4_j2_step_scalar(
+                        &mut sx[i],
+                        &mut sy[i],
+                        &mut sz[i],
+                        &mut svx[i],
+                        &mut svy[i],
+                        &mut svz[i],
+                        mu,
+                        j2,
+                        re,
+                        dt,
+                    );
+                }
+            }
+            for i in 0..n {
+                assert!(
+                    rel_err(bx[i], sx[i]) < 1e-9 && rel_err(bvx[i], svx[i]) < 1e-9,
+                    "n={n} i={i}: batch r {} vs scalar {}",
+                    bx[i],
+                    sx[i]
+                );
+                assert!(rel_err(by[i], sy[i]) < 1e-9 && rel_err(bvy[i], svy[i]) < 1e-9);
+                assert!(rel_err(bz[i], sz[i]) < 1e-9 && rel_err(bvz[i], svz[i]) < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_j2_accel_batch_matches_scalar() {
+        for n in [0usize, 1, 2, 4, 9, 20] {
+            let (x, y, z) = states(n);
+            let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+            lasx_j2_accel_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                3.986004418e14,
+                1.08262668e-3,
+                6.378137e6,
+                ax.as_mut_ptr(),
+                ay.as_mut_ptr(),
+                az.as_mut_ptr(),
+                n as i32,
+            );
+            let (wx, wy, wz) = scalar_j2(&x, &y, &z, 3.986004418e14, 1.08262668e-3, 6.378137e6);
+            for i in 0..n {
+                assert!(
+                    rel_err(ax[i], wx[i]) < 1e-9
+                        && rel_err(ay[i], wy[i]) < 1e-9
+                        && rel_err(az[i], wz[i]) < 1e-9,
+                    "n={n} i={i}: ({},{},{}) vs ({},{},{})",
+                    ax[i],
+                    ay[i],
+                    az[i],
+                    wx[i],
+                    wy[i],
+                    wz[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rk4_j2_step_scalar_fma_vs_plain_reference() {
+        // 标量尾循环 FMA 版（f64::mul_add）vs 分离 mul+add 参考（原版公式）：
+        // 单步 FMA 融合舍入差 ≤1 ulp，50 步累积后相对差仍 <1e-9（物理等价）。
+        let mu = 3.986004418e14;
+        let j2 = 1.08262668e-3;
+        let re = 6.378137e6;
+        let (x, y, z) = states(9);
+        // 分离 mul+add 参考实现（与旧版 rk4_j2_step_scalar 同式）
+        #[allow(clippy::too_many_arguments)]
+        fn step_plain(
+            rx: &mut f64,
+            ry: &mut f64,
+            rz: &mut f64,
+            vx: &mut f64,
+            vy: &mut f64,
+            vz: &mut f64,
+            mu: f64,
+            j2: f64,
+            re: f64,
+            h: f64,
+        ) {
+            let j2k = 1.5 * j2 * mu * re * re;
+            let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
+                let rm = (x * x + y * y + z * z).sqrt();
+                let rm3 = rm * rm * rm;
+                let rm5 = rm3 * rm * rm;
+                let zr2 = (z / rm) * (z / rm);
+                let k = j2k / rm5;
+                [
+                    -mu * x / rm3 + k * x * (5.0 * zr2 - 1.0),
+                    -mu * y / rm3 + k * y * (5.0 * zr2 - 1.0),
+                    -mu * z / rm3 + k * z * (5.0 * zr2 - 3.0),
+                ]
+            };
+            let (x0, y0, z0, vx0, vy0, vz0) = (*rx, *ry, *rz, *vx, *vy, *vz);
+            let k1 = accel(x0, y0, z0);
+            let r2 = (x0 + 0.5 * h * vx0, y0 + 0.5 * h * vy0, z0 + 0.5 * h * vz0);
+            let v2 = (
+                vx0 + 0.5 * h * k1[0],
+                vy0 + 0.5 * h * k1[1],
+                vz0 + 0.5 * h * k1[2],
+            );
+            let k2 = accel(r2.0, r2.1, r2.2);
+            let r3 = (
+                x0 + 0.5 * h * v2.0,
+                y0 + 0.5 * h * v2.1,
+                z0 + 0.5 * h * v2.2,
+            );
+            let v3 = (
+                vx0 + 0.5 * h * k2[0],
+                vy0 + 0.5 * h * k2[1],
+                vz0 + 0.5 * h * k2[2],
+            );
+            let k3 = accel(r3.0, r3.1, r3.2);
+            let r4 = (x0 + h * v3.0, y0 + h * v3.1, z0 + h * v3.2);
+            let v4 = (vx0 + h * k3[0], vy0 + h * k3[1], vz0 + h * k3[2]);
+            let k4 = accel(r4.0, r4.1, r4.2);
+            let l = (
+                vx0 + 2.0 * v2.0 + 2.0 * v3.0 + v4.0,
+                vy0 + 2.0 * v2.1 + 2.0 * v3.1 + v4.1,
+                vz0 + 2.0 * v2.2 + 2.0 * v3.2 + v4.2,
+            );
+            let k = (
+                k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0],
+                k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1],
+                k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2],
+            );
+            *rx = x0 + (h / 6.0) * l.0;
+            *ry = y0 + (h / 6.0) * l.1;
+            *rz = z0 + (h / 6.0) * l.2;
+            *vx = vx0 + (h / 6.0) * k.0;
+            *vy = vy0 + (h / 6.0) * k.1;
+            *vz = vz0 + (h / 6.0) * k.2;
+        }
+        let (mut fx, mut fy, mut fz) = (x.clone(), y.clone(), z.clone());
+        let (mut fvx, mut fvy, mut fvz) = (vec![0.0; 9], vec![0.0; 9], vec![0.0; 9]);
+        for i in 0..9 {
+            fvx[i] = 500.0 + 100.0 * i as f64;
+            fvy[i] = 7700.0 * (1.0 + 0.01 * i as f64);
+            fvz[i] = 20.0 * i as f64;
+        }
+        let (mut px, mut py, mut pz) = (x.clone(), y.clone(), z.clone());
+        let (mut pvx, mut pvy, mut pvz) = (fvx.clone(), fvy.clone(), fvz.clone());
+        let dt = 10.0;
+        for _ in 0..50 {
+            for i in 0..9 {
+                rk4_j2_step_scalar(
+                    &mut fx[i],
+                    &mut fy[i],
+                    &mut fz[i],
+                    &mut fvx[i],
+                    &mut fvy[i],
+                    &mut fvz[i],
+                    mu,
+                    j2,
+                    re,
+                    dt,
+                );
+                step_plain(
+                    &mut px[i],
+                    &mut py[i],
+                    &mut pz[i],
+                    &mut pvx[i],
+                    &mut pvy[i],
+                    &mut pvz[i],
+                    mu,
+                    j2,
+                    re,
+                    dt,
+                );
+            }
+        }
+        for i in 0..9 {
+            assert!(
+                rel_err(fx[i], px[i]) < 1e-9 && rel_err(fvx[i], pvx[i]) < 1e-9,
+                "i={i}: FMA r {} vs plain {}",
+                fx[i],
+                px[i]
+            );
+            assert!(rel_err(fy[i], py[i]) < 1e-9 && rel_err(fvy[i], pvy[i]) < 1e-9);
+            assert!(rel_err(fz[i], pz[i]) < 1e-9 && rel_err(fvz[i], pvz[i]) < 1e-9);
         }
     }
 }
