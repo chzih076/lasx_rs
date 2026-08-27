@@ -41,22 +41,29 @@ fn splat_f32(x: f32) -> F32x8 {
 type F32x4 = m128;
 type F64x2 = m128d;
 
-/// 运行时检测 LASX（cpucfg 读 CPUCFG2 bit7）
-/// 验证钩子：环境变量 LOONGSCI_FORCE_LSX=1 强制降级到 LSX 路径
-/// （模拟 LSX-only CPU——如 3A5000/3A6000；本机 3B6000 含 LASX，
-/// 用钩子让代码真实执行 LSX intrinsic 分支验证数值/性能，诚实标注非无-LASX 真机）
-static HAS_LASX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+// 线程级强制 LSX 降级（验证/测试钩子）：仅影响调用线程的向量内核，避免进程级
+// 环境变量污染并发测试（旧机制 `LOONGSCI_FORCE_LSX` 在进程级 OnceLock 缓存，
+// 并发测试时会让其他依赖 LASX 黄金值的测试随机走 LSX 路径而失败）。
+thread_local! {
+    static FORCE_LSX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 强制当前线程的向量内核走 LSX 降级路径（模拟 LSX-only CPU——如 3A5000/3A6000；
+/// 本机 3B6000 含 LASX，用钩子让代码真实执行 LSX intrinsic 分支验证数值/性能，
+/// 诚实标注非无-LASX 真机）。仅本线程生效；测试结束时置回 false。
+pub fn lasx_force_lsx_thread(force: bool) {
+    FORCE_LSX.with(|c| c.set(force));
+}
+
+/// 硬件能力缓存（cpucfg 只读一次；LSX 强制为线程级，不缓存）
+static HW_HAS_LASX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn has_lasx() -> bool {
-    *HAS_LASX.get_or_init(|| {
-        if std::env::var("LOONGSCI_FORCE_LSX").map(|v| v == "1").unwrap_or(false) {
-            return false; // 强制 LSX 降级（验证/测试钩子）
-        }
-        unsafe {
-            let mut cfg2: u32;
-            std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
-            (cfg2 & (1 << 7)) != 0
-        }
-    })
+    let hw = *HW_HAS_LASX.get_or_init(|| unsafe {
+        let mut cfg2: u32;
+        std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
+        (cfg2 & (1 << 7)) != 0
+    });
+    hw && !FORCE_LSX.with(|c| c.get())
 }
 
 #[inline]
@@ -79,16 +86,6 @@ unsafe fn ld2_f64(p: *const f64) -> F64x2 {
 unsafe fn st2_f64(p: *mut f64, v: F64x2) {
     lsx_vst(std::mem::transmute(v), p as *mut i8, 0);
 }
-#[inline]
-unsafe fn zero2_f64() -> F64x2 {
-    std::mem::transmute(lsx_vldi(0))
-}
-#[inline]
-fn splat4_f32(x: f32) -> F32x4 {
-    let bits = x.to_bits() as i32;
-    unsafe { std::mem::transmute(lsx_vreplgr2vr_w(bits)) }
-}
-
 /// 点积（8×f32 FMA）
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_dot(a: *const f32, b: *const f32, n: i32) -> f32 {
@@ -300,7 +297,6 @@ pub extern "C" fn lasx_dot_i8(a: *const i8, b: *const i8, n: i32) -> i32 {
     let n = n as usize;
     let a = unsafe { std::slice::from_raw_parts(a, n) };
     let b = unsafe { std::slice::from_raw_parts(b, n) };
-    let mut acc: m256i = unsafe { lasx_xvldi(0) };
     let mut s_acc: i64 = 0;
     let mut i = 0;
     while i + 32 <= n {
@@ -439,7 +435,6 @@ pub extern "C" fn lasx_ballistic_step(
 
     if has_lasx() {
         let vdt = splat_f32(dt);
-        let vg = splat_f32(g);
         let mut i = 0;
         while i + 8 <= n {
             let vvx: m256 = unsafe { std::mem::transmute(lasx_xvld(vx.as_ptr().add(i) as *const i8, 0)) };
@@ -585,7 +580,8 @@ pub extern "C" fn lasx_norm3_batch(
             i += 4;
         }
         for j in i..n {
-            out[j] = (xs[j] * xs[j] + ys[j] * ys[j] + zs[j] * zs[j]).sqrt();
+            // 与向量路径同结合（x² + (y²+z²)），保证任一分块逐位一致
+            out[j] = (xs[j] * xs[j] + (ys[j] * ys[j] + zs[j] * zs[j])).sqrt();
         }
     } else {
         let mut i = 0;
@@ -604,7 +600,7 @@ pub extern "C" fn lasx_norm3_batch(
             i += 2;
         }
         for j in i..n {
-            out[j] = (xs[j] * xs[j] + ys[j] * ys[j] + zs[j] * zs[j]).sqrt();
+            out[j] = (xs[j] * xs[j] + (ys[j] * ys[j] + zs[j] * zs[j])).sqrt();
         }
     }
 }
@@ -648,9 +644,10 @@ pub extern "C" fn lasx_vec3_add_scaled_batch(
             i += 4;
         }
         for j in i..n {
-            ox[j] = ax[j] + s * bx[j];
-            oy[j] = ay[j] + s * by[j];
-            oz[j] = az[j] + s * bz[j];
+            // 与向量路径同式：单次 FMA（s·b + a），保证任一分块逐位一致
+            ox[j] = f64::mul_add(s, bx[j], ax[j]);
+            oy[j] = f64::mul_add(s, by[j], ay[j]);
+            oz[j] = f64::mul_add(s, bz[j], az[j]);
         }
     } else {
         let vs = splat2_f64(s);
@@ -670,9 +667,9 @@ pub extern "C" fn lasx_vec3_add_scaled_batch(
             i += 2;
         }
         for j in i..n {
-            ox[j] = ax[j] + s * bx[j];
-            oy[j] = ay[j] + s * by[j];
-            oz[j] = az[j] + s * bz[j];
+            ox[j] = f64::mul_add(s, bx[j], ax[j]);
+            oy[j] = f64::mul_add(s, by[j], ay[j]);
+            oz[j] = f64::mul_add(s, bz[j], az[j]);
         }
     }
 }
@@ -738,14 +735,17 @@ pub extern "C" fn lasx_j2_accel_batch(
             i += 4;
         }
         for j in i..n {
-            let rm = (rx[j] * rx[j] + ry[j] * ry[j] + rz[j] * rz[j]).sqrt();
-            let rm3 = rm * rm * rm;
-            let rm5 = rm3 * rm * rm;
-            let zr2 = (rz[j] / rm) * (rz[j] / rm);
+            // 与向量路径逐位同式（结合律/除式/末项 FMA 完全一致），保证任一分块逐位一致
+            let rm2 = rx[j] * rx[j] + (ry[j] * ry[j] + rz[j] * rz[j]);
+            let rm = rm2.sqrt();
+            let rm3 = rm * rm2;
+            let rm5 = rm3 * rm2;
+            let zr2 = (rz[j] * rz[j]) / rm2;
             let k = j2k / rm5;
-            ax[j] = -mu * rx[j] / rm3 + k * rx[j] * (5.0 * zr2 - 1.0);
-            ay[j] = -mu * ry[j] / rm3 + k * ry[j] * (5.0 * zr2 - 1.0);
-            az[j] = -mu * rz[j] / rm3 + k * rz[j] * (5.0 * zr2 - 3.0);
+            let vcen = -mu / rm3;
+            ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
+            ay[j] = f64::mul_add(k * ry[j], 5.0 * zr2 - 1.0, vcen * ry[j]);
+            az[j] = f64::mul_add(k * rz[j], 5.0 * zr2 - 3.0, vcen * rz[j]);
         }
     } else {
         let vs = splat2_f64(j2k);
@@ -780,14 +780,17 @@ pub extern "C" fn lasx_j2_accel_batch(
             i += 2;
         }
         for j in i..n {
-            let rm = (rx[j] * rx[j] + ry[j] * ry[j] + rz[j] * rz[j]).sqrt();
-            let rm3 = rm * rm * rm;
-            let rm5 = rm3 * rm * rm;
-            let zr2 = (rz[j] / rm) * (rz[j] / rm);
+            // 与 LSX 向量路径逐位同式（同结合/除式/末项 FMA）
+            let rm2 = rx[j] * rx[j] + (ry[j] * ry[j] + rz[j] * rz[j]);
+            let rm = rm2.sqrt();
+            let rm3 = rm * rm2;
+            let rm5 = rm3 * rm2;
+            let zr2 = (rz[j] * rz[j]) / rm2;
             let k = j2k / rm5;
-            ax[j] = -mu * rx[j] / rm3 + k * rx[j] * (5.0 * zr2 - 1.0);
-            ay[j] = -mu * ry[j] / rm3 + k * ry[j] * (5.0 * zr2 - 1.0);
-            az[j] = -mu * rz[j] / rm3 + k * rz[j] * (5.0 * zr2 - 3.0);
+            let vcen = -mu / rm3;
+            ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
+            ay[j] = f64::mul_add(k * ry[j], 5.0 * zr2 - 1.0, vcen * ry[j]);
+            az[j] = f64::mul_add(k * rz[j], 5.0 * zr2 - 3.0, vcen * rz[j]);
         }
     }
 }
@@ -933,6 +936,81 @@ mod batch_tests {
             }
         }
     }
+
+    #[test]
+    fn test_rk4_j2_step_scalar_fma_vs_plain_reference() {
+        // 标量尾循环 FMA 版（f64::mul_add）vs 分离 mul+add 参考（原版公式）：
+        // 单步 FMA 融合舍入差 ≤1 ulp，50 步累积后相对差仍 <1e-9（物理等价）。
+        let mu = 3.986004418e14;
+        let j2 = 1.08262668e-3;
+        let re = 6.378137e6;
+        let (x, y, z) = states(9);
+        // 分离 mul+add 参考实现（与旧版 rk4_j2_step_scalar 同式）
+        fn step_plain(rx: &mut f64, ry: &mut f64, rz: &mut f64, vx: &mut f64, vy: &mut f64, vz: &mut f64, mu: f64, j2: f64, re: f64, h: f64) {
+            let j2k = 1.5 * j2 * mu * re * re;
+            let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
+                let rm = (x * x + y * y + z * z).sqrt();
+                let rm3 = rm * rm * rm;
+                let rm5 = rm3 * rm * rm;
+                let zr2 = (z / rm) * (z / rm);
+                let k = j2k / rm5;
+                [
+                    -mu * x / rm3 + k * x * (5.0 * zr2 - 1.0),
+                    -mu * y / rm3 + k * y * (5.0 * zr2 - 1.0),
+                    -mu * z / rm3 + k * z * (5.0 * zr2 - 3.0),
+                ]
+            };
+            let (x0, y0, z0, vx0, vy0, vz0) = (*rx, *ry, *rz, *vx, *vy, *vz);
+            let k1 = accel(x0, y0, z0);
+            let r2 = (x0 + 0.5 * h * vx0, y0 + 0.5 * h * vy0, z0 + 0.5 * h * vz0);
+            let v2 = (vx0 + 0.5 * h * k1[0], vy0 + 0.5 * h * k1[1], vz0 + 0.5 * h * k1[2]);
+            let k2 = accel(r2.0, r2.1, r2.2);
+            let r3 = (x0 + 0.5 * h * v2.0, y0 + 0.5 * h * v2.1, z0 + 0.5 * h * v2.2);
+            let v3 = (vx0 + 0.5 * h * k2[0], vy0 + 0.5 * h * k2[1], vz0 + 0.5 * h * k2[2]);
+            let k3 = accel(r3.0, r3.1, r3.2);
+            let r4 = (x0 + h * v3.0, y0 + h * v3.1, z0 + h * v3.2);
+            let v4 = (vx0 + h * k3[0], vy0 + h * k3[1], vz0 + h * k3[2]);
+            let k4 = accel(r4.0, r4.1, r4.2);
+            let l = (
+                vx0 + 2.0 * v2.0 + 2.0 * v3.0 + v4.0,
+                vy0 + 2.0 * v2.1 + 2.0 * v3.1 + v4.1,
+                vz0 + 2.0 * v2.2 + 2.0 * v3.2 + v4.2,
+            );
+            let k = (
+                k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0],
+                k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1],
+                k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2],
+            );
+            *rx = x0 + (h / 6.0) * l.0;
+            *ry = y0 + (h / 6.0) * l.1;
+            *rz = z0 + (h / 6.0) * l.2;
+            *vx = vx0 + (h / 6.0) * k.0;
+            *vy = vy0 + (h / 6.0) * k.1;
+            *vz = vz0 + (h / 6.0) * k.2;
+        }
+        let (mut fx, mut fy, mut fz) = (x.clone(), y.clone(), z.clone());
+        let (mut fvx, mut fvy, mut fvz) = (vec![0.0; 9], vec![0.0; 9], vec![0.0; 9]);
+        for i in 0..9 {
+            fvx[i] = 500.0 + 100.0 * i as f64;
+            fvy[i] = 7700.0 * (1.0 + 0.01 * i as f64);
+            fvz[i] = 20.0 * i as f64;
+        }
+        let (mut px, mut py, mut pz) = (x.clone(), y.clone(), z.clone());
+        let (mut pvx, mut pvy, mut pvz) = (fvx.clone(), fvy.clone(), fvz.clone());
+        let dt = 10.0;
+        for _ in 0..50 {
+            for i in 0..9 {
+                rk4_j2_step_scalar(&mut fx[i], &mut fy[i], &mut fz[i], &mut fvx[i], &mut fvy[i], &mut fvz[i], mu, j2, re, dt);
+                step_plain(&mut px[i], &mut py[i], &mut pz[i], &mut pvx[i], &mut pvy[i], &mut pvz[i], mu, j2, re, dt);
+            }
+        }
+        for i in 0..9 {
+            assert!(rel_err(fx[i], px[i]) < 1e-9 && rel_err(fvx[i], pvx[i]) < 1e-9,
+                "i={i}: FMA r {} vs plain {}", fx[i], px[i]);
+            assert!(rel_err(fy[i], py[i]) < 1e-9 && rel_err(fvy[i], pvy[i]) < 1e-9);
+            assert!(rel_err(fz[i], pz[i]) < 1e-9 && rel_err(fvz[i], pvz[i]) < 1e-9);
+        }
+    }
 }
 
 /// 单步 RK4 的 J2 加速度（向量 lane 版本，4 样本并行）：
@@ -960,7 +1038,9 @@ unsafe fn j2_accel_vec(
     (ax, ay, az)
 }
 
-/// 标量单步 RK4（J2 力模型，供非 LASX 兜底/尾数；与 loong-sci `propagate_orbit` 同式）
+/// 标量单步 RK4（J2 力模型，供非 LASX 兜底/尾数；与 loong-sci `propagate_orbit` 同式）。
+/// FMA 版：组合算术与加速度末项用 `f64::mul_add`（单指令 `fmadd.d`，LA664），与
+/// LASX 向量路径 `j2_accel_vec`/内核组合算术逐位一致（物理等价 <1e-9）。
 fn rk4_j2_step_scalar(
     rx: &mut f64, ry: &mut f64, rz: &mut f64,
     vx: &mut f64, vy: &mut f64, vz: &mut f64,
@@ -968,44 +1048,50 @@ fn rk4_j2_step_scalar(
 ) {
     let j2k = 1.5 * j2 * mu * re * re;
     let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
-        let rm = (x * x + y * y + z * z).sqrt();
-        let rm3 = rm * rm * rm;
-        let rm5 = rm3 * rm * rm;
-        let zr2 = (z / rm) * (z / rm);
+        // 结合序与向量路径 `lasx_xvfadd_d(x·x, xvfadd_d(y·y, z·z))` 一致
+        let rm2 = x * x + (y * y + z * z);
+        let rm = rm2.sqrt();
+        let rm3 = rm * rm2;
+        let rm5 = rm3 * rm2;
+        let zr2 = (z * z) / rm2; // 与向量路径 `lasx_xvfdiv_d(xvfmul(z,z), rm2)` 一致
         let k = j2k / rm5;
+        let vcen = -mu / rm3;
+        // a = k·x·(5·zr2−1) + vcen·x（FMA 融合末加，与 `j2_accel_vec` 同式）
         [
-            -mu * x / rm3 + k * x * (5.0 * zr2 - 1.0),
-            -mu * y / rm3 + k * y * (5.0 * zr2 - 1.0),
-            -mu * z / rm3 + k * z * (5.0 * zr2 - 3.0),
+            f64::mul_add(k * x, 5.0 * zr2 - 1.0, vcen * x),
+            f64::mul_add(k * y, 5.0 * zr2 - 1.0, vcen * y),
+            f64::mul_add(k * z, 5.0 * zr2 - 3.0, vcen * z),
         ]
     };
     let (x0, y0, z0, vx0, vy0, vz0) = (*rx, *ry, *rz, *vx, *vy, *vz);
+    let hh = 0.5 * h;
+    let h6 = h / 6.0;
     let k1 = accel(x0, y0, z0);
-    let r2 = (x0 + 0.5 * h * vx0, y0 + 0.5 * h * vy0, z0 + 0.5 * h * vz0);
-    let v2 = (vx0 + 0.5 * h * k1[0], vy0 + 0.5 * h * k1[1], vz0 + 0.5 * h * k1[2]);
+    let r2 = (hh.mul_add(vx0, x0), hh.mul_add(vy0, y0), hh.mul_add(vz0, z0));
+    let v2 = (hh.mul_add(k1[0], vx0), hh.mul_add(k1[1], vy0), hh.mul_add(k1[2], vz0));
     let k2 = accel(r2.0, r2.1, r2.2);
-    let r3 = (x0 + 0.5 * h * v2.0, y0 + 0.5 * h * v2.1, z0 + 0.5 * h * v2.2);
-    let v3 = (vx0 + 0.5 * h * k2[0], vy0 + 0.5 * h * k2[1], vz0 + 0.5 * h * k2[2]);
+    let r3 = (hh.mul_add(v2.0, x0), hh.mul_add(v2.1, y0), hh.mul_add(v2.2, z0));
+    let v3 = (hh.mul_add(k2[0], vx0), hh.mul_add(k2[1], vy0), hh.mul_add(k2[2], vz0));
     let k3 = accel(r3.0, r3.1, r3.2);
-    let r4 = (x0 + h * v3.0, y0 + h * v3.1, z0 + h * v3.2);
-    let v4 = (vx0 + h * k3[0], vy0 + h * k3[1], vz0 + h * k3[2]);
+    let r4 = (h.mul_add(v3.0, x0), h.mul_add(v3.1, y0), h.mul_add(v3.2, z0));
+    let v4 = (h.mul_add(k3[0], vx0), h.mul_add(k3[1], vy0), h.mul_add(k3[2], vz0));
     let k4 = accel(r4.0, r4.1, r4.2);
     let l = (
-        vx0 + 2.0 * v2.0 + 2.0 * v3.0 + v4.0,
-        vy0 + 2.0 * v2.1 + 2.0 * v3.1 + v4.1,
-        vz0 + 2.0 * v2.2 + 2.0 * v3.2 + v4.2,
+        2.0_f64.mul_add(v2.0, vx0) + 2.0_f64.mul_add(v3.0, v4.0),
+        2.0_f64.mul_add(v2.1, vy0) + 2.0_f64.mul_add(v3.1, v4.1),
+        2.0_f64.mul_add(v2.2, vz0) + 2.0_f64.mul_add(v3.2, v4.2),
     );
     let k = (
-        k1[0] + 2.0 * k2[0] + 2.0 * k3[0] + k4[0],
-        k1[1] + 2.0 * k2[1] + 2.0 * k3[1] + k4[1],
-        k1[2] + 2.0 * k2[2] + 2.0 * k3[2] + k4[2],
+        2.0_f64.mul_add(k2[0], k1[0]) + 2.0_f64.mul_add(k3[0], k4[0]),
+        2.0_f64.mul_add(k2[1], k1[1]) + 2.0_f64.mul_add(k3[1], k4[1]),
+        2.0_f64.mul_add(k2[2], k1[2]) + 2.0_f64.mul_add(k3[2], k4[2]),
     );
-    *rx = x0 + (h / 6.0) * l.0;
-    *ry = y0 + (h / 6.0) * l.1;
-    *rz = z0 + (h / 6.0) * l.2;
-    *vx = vx0 + (h / 6.0) * k.0;
-    *vy = vy0 + (h / 6.0) * k.1;
-    *vz = vz0 + (h / 6.0) * k.2;
+    *rx = h6.mul_add(l.0, x0);
+    *ry = h6.mul_add(l.1, y0);
+    *rz = h6.mul_add(l.2, z0);
+    *vx = h6.mul_add(k.0, vx0);
+    *vy = h6.mul_add(k.1, vy0);
+    *vz = h6.mul_add(k.2, vz0);
 }
 
 /// 批量单步 RK4（中心项 + J2 力模型）：N 个轨道状态 [r(3),v(3)] 同时推进一步。
@@ -1117,3 +1203,4 @@ pub extern "C" fn lasx_rk4_j2_step_batch(
         }
     }
 }
+

@@ -2,6 +2,8 @@
 name = "lasx_rs"
 version = "0.1.0"
 edition = "2021"
+description = "lasx_rs 是为龙芯平台推出的向量库，支持调用龙芯架构里面的 LASX（256 位）与 LSX（128 位）向量指令集"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
