@@ -12,6 +12,13 @@
 - **零依赖**：纯 std + `stdarch_loongarch`（nightly）
 - **逐位确定**：向量化与标量结果一致（防回归测试守护）
 
+## 仓库
+
+| 平台 | 地址 |
+|---|---|
+| GitCode（主） | `git@gitcode.com:H076lik/lasx_rs.git` / <https://gitcode.com/H076lik/lasx_rs> |
+| GitHub（镜像） | `git@github.com:chzih076/lasx_rs.git` / <https://github.com/chzih076/lasx_rs> |
+
 ## 构建
 
 **依赖 nightly Rust（含 `stdarch_loongarch` 实验特性）**：
