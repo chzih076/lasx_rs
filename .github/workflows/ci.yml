@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 1. 代码格式检查（x86_64 runner 可跑：纯文本检查）
+  fmt:
+    name: Format (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with rustfmt
+        run: |
+          rustup toolchain install nightly --component rustfmt --profile minimal
+      - name: rustfmt --check
+        run: |
+          rustup run nightly cargo fmt --all -- --check
+
+  # 2. 交叉编译检查（loongarch64 target；cargo check 无需链接器，
+  #    验证源码在 loongarch64 nightly 下可编译——本库为 LoongArch 专用）
+  cross-check:
+    name: Cross-check (loongarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + loongarch64 target
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup target add loongarch64-unknown-linux-gnu
+      - name: cargo check --target loongarch64
+        run: |
+          rustup run nightly cargo check --target loongarch64-unknown-linux-gnu
+
+  # 3. 真机测试（self-hosted LoongArch runner——龙芯机器注册：
+  #    需在仓库 Settings → Actions → Runners 注册，标签含 loongarch64）
+  loongarch-test:
+    name: Test (LoongArch64 hardware)
+    runs-on: [self-hosted, loongarch64]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo build --release
+        run: cargo build --release
+      - name: cargo test --release
+        run: cargo test --release
