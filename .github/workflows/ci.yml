@@ -22,18 +22,19 @@ jobs:
 
   # 2. 交叉编译检查（loongarch64 target；cargo check 无需链接器，
   #    验证源码在 loongarch64 nightly 下可编译——本库为 LoongArch 专用）
+  #    用 -Zbuild-std 从源码构建 loongarch64 std（官方 nightly 分发不稳定/网络受限时可靠）
   cross-check:
     name: Cross-check (loongarch64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly + loongarch64 target
+      - name: Install nightly + rust-src + loongarch64 target
         run: |
-          rustup toolchain install nightly --profile minimal
-          rustup target add loongarch64-unknown-linux-gnu
-      - name: cargo check --target loongarch64
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add loongarch64-unknown-linux-gnu --toolchain nightly
+      - name: cargo check -Zbuild-std --target loongarch64
         run: |
-          rustup run nightly cargo check --target loongarch64-unknown-linux-gnu
+          rustup run nightly cargo check -Zbuild-std --target loongarch64-unknown-linux-gnu
 
   # 3. 真机测试（self-hosted LoongArch runner——龙芯机器注册：
   #    需在仓库 Settings → Actions → Runners 注册，标签含 loongarch64）
