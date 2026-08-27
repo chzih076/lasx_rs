@@ -47,6 +47,13 @@ final lib = DynamicLibrary.open('liblasx_rs.so');
 // 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
 ```
 
+## 文档
+
+- **[docs/manual.md](docs/manual.md)**：完整技术手册（中文）——架构与设计、
+  15 个 FFI 内核逐一详解、量化内核、批量物理内核、FFI 使用指南（C/Dart/Rust）、
+  性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
+- **[docs/README.md](docs/README.md)**：文档目录索引。
+
 ## 性能基准（Loongson-3B6000，LA664）
 
 | 内核 | 加速比 |

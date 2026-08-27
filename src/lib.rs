@@ -470,32 +470,34 @@ pub extern "C" fn lasx_ballistic_step(
             let vdvx = unsafe { lasx_xvfmul_s(vdrag, vvx) };
             let vdvy = unsafe { lasx_xvfmul_s(vdrag, vvy) };
             let vdvz = unsafe { lasx_xvfmul_s(vdrag, vvz) };
-            // 更新：vx += dvx*dt（符号：dvx 为负，直接用 dvx*dt）
-            // 注意：dvx = -drag*vx，更新 vx += dvx*dt（欧拉）
-            let vnx = unsafe { lasx_xvfmadd_s(vdvx, vdt, vvx) };
-            let vny = unsafe { lasx_xvfmadd_s(vdvy, vdt, vvy) };
-            let vnz = unsafe { lasx_xvfmadd_s(vdvz, vdt, vvz) };
-            // x += vx*dt（用旧 vx，欧拉）
-            let vnx_old = vvx;
-            let vny_old = vvy;
-            let vnz_old = vvz;
+            // 更新（对齐标量参考）：vx -= drag*vx*dt（欧拉；dvx = -drag*vx，用 xvfnmadd）
+            // vny 额外减 g*dt（重力项——旧实现缺失，阻力符号亦反）
+            let vdvx_dt = unsafe { lasx_xvfmul_s(vdvx, vdt) };
+            let vdvy_dt = unsafe { lasx_xvfmul_s(vdvy, vdt) };
+            let vdvz_dt = unsafe { lasx_xvfmul_s(vdvz, vdt) };
+            let vnx = unsafe { lasx_xvfsub_s(vvx, vdvx_dt) };
+            let vny_base = unsafe { lasx_xvfsub_s(vvy, vdvy_dt) };
+            let vnz = unsafe { lasx_xvfsub_s(vvz, vdvz_dt) };
+            let gv = splat_f32(g);
+            let vny = unsafe { lasx_xvfsub_s(vny_base, lasx_xvfmul_s(gv, vdt)) };
+            // x += vx*dt（用新速度 vx，与标量参考一致）
             let vnx_ = unsafe {
                 lasx_xvfmadd_s(
-                    vnx_old,
+                    vnx,
                     vdt,
                     std::mem::transmute(lasx_xvld(x.as_ptr().add(i) as *const i8, 0)),
                 )
             };
             let vny_ = unsafe {
                 lasx_xvfmadd_s(
-                    vny_old,
+                    vny,
                     vdt,
                     std::mem::transmute(lasx_xvld(y.as_ptr().add(i) as *const i8, 0)),
                 )
             };
             let vnz_ = unsafe {
                 lasx_xvfmadd_s(
-                    vnz_old,
+                    vnz,
                     vdt,
                     std::mem::transmute(lasx_xvld(z.as_ptr().add(i) as *const i8, 0)),
                 )
@@ -1193,8 +1195,8 @@ pub extern "C" fn lasx_rk4_j2_step_batch(
 #[cfg(test)]
 mod batch_tests {
     use super::{
-        lasx_j2_accel_batch, lasx_norm3_batch, lasx_rk4_j2_step_batch, lasx_vec3_add_scaled_batch,
-        rk4_j2_step_scalar,
+        lasx_ballistic_step, lasx_j2_accel_batch, lasx_norm3_batch, lasx_rk4_j2_step_batch,
+        lasx_vec3_add_scaled_batch, rk4_j2_step_scalar,
     };
 
     fn scalar_norm3(x: &[f64], y: &[f64], z: &[f64]) -> Vec<f64> {
@@ -1526,6 +1528,75 @@ mod batch_tests {
             );
             assert!(rel_err(fy[i], py[i]) < 1e-9 && rel_err(fvy[i], pvy[i]) < 1e-9);
             assert!(rel_err(fz[i], pz[i]) < 1e-9 && rel_err(fvz[i], pvz[i]) < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_ballistic_step_batch_matches_scalar() {
+        // 向量路径 vs 标量参考逐位/近位一致（修复阻力符号+重力+位置用新速度后）
+        let n = 64usize;
+        let x = vec![0.0f32; n];
+        let y = vec![0.0f32; n];
+        let z = vec![0.0f32; n];
+        let mut vx = vec![300.0f32; n];
+        let mut vy = vec![40.0f32; n];
+        let vz = vec![0.0f32; n];
+        for i in 0..n {
+            vx[i] = 300.0 + i as f32 * 10.0;
+            vy[i] = 40.0 - i as f32 * 2.0;
+        }
+        // 向量路径
+        let (mut xv, mut yv, mut zv) = (x.clone(), y.clone(), z.clone());
+        let (mut vxv, mut vyv, mut vzv) = (vx.clone(), vy.clone(), vz.clone());
+        let k = vec![1.0e-5f32; n];
+        lasx_ballistic_step(
+            xv.as_mut_ptr(),
+            yv.as_mut_ptr(),
+            zv.as_mut_ptr(),
+            vxv.as_mut_ptr(),
+            vyv.as_mut_ptr(),
+            vzv.as_mut_ptr(),
+            k.as_ptr(),
+            n as i32,
+            0.005,
+            9.81,
+        );
+        // 标量参考（同公式）
+        let mut xs = x.clone();
+        let mut ys = y.clone();
+        let mut zs = z.clone();
+        let mut vxs = vx.clone();
+        let mut vys = vy.clone();
+        let mut vzs = vz.clone();
+        for i in 0..n {
+            let v = (vxs[i] * vxs[i] + vys[i] * vys[i] + vzs[i] * vzs[i]).sqrt();
+            let drag = 1.0e-5 * v;
+            vxs[i] -= drag * vxs[i] * 0.005;
+            vys[i] -= (drag * vys[i] + 9.81) * 0.005;
+            vzs[i] -= drag * vzs[i] * 0.005;
+            xs[i] += vxs[i] * 0.005;
+            ys[i] += vys[i] * 0.005;
+            zs[i] += vzs[i] * 0.005;
+        }
+        for i in 0..n {
+            assert!(
+                (vxv[i] - vxs[i]).abs() < 1e-3,
+                "vx[{i}]: {} vs {}",
+                vxv[i],
+                vxs[i]
+            );
+            assert!(
+                (vyv[i] - vys[i]).abs() < 1e-3,
+                "vy[{i}]: {} vs {}",
+                vyv[i],
+                vys[i]
+            );
+            assert!(
+                (xv[i] - xs[i]).abs() < 1e-2,
+                "x[{i}]: {} vs {}",
+                xv[i],
+                xs[i]
+            );
         }
     }
 }
