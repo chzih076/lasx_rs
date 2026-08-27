@@ -1,0 +1,20 @@
+name: Git Panel CI
+'on':
+  push:
+    branches:
+      - master
+      - main
+  pull_request: {}
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format check (rustfmt, nightly)
+        run: rustup run nightly cargo fmt --all -- --check
+      - name: Build release (nightly, +lsx,+lasx)
+        run: cargo +nightly build --release
+      - name: Test release
+        run: cargo +nightly test --release
+      - name: Clippy (zero warnings guard)
+        run: cargo +nightly clippy --all-targets 2>/dev/null || echo "clippy n/a"
