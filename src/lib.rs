@@ -323,7 +323,11 @@ pub extern "C" fn lasx_dot_i8(a: *const i8, b: *const i8, n: i32) -> i32 {
 /// dot = Σ_g scale_a[g] * scale_b[g] * Σ_{64 nibble} (qa*qb)
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_dot_q4(
-    qa: *const u8, sa: *const f32, qb: *const u8, sb: *const f32, n_bytes: i32,
+    qa: *const u8,
+    sa: *const f32,
+    qb: *const u8,
+    sb: *const f32,
+    n_bytes: i32,
 ) -> f64 {
     let n = n_bytes as usize;
     let qa = unsafe { std::slice::from_raw_parts(qa, n) };
@@ -340,18 +344,8 @@ pub extern "C" fn lasx_dot_q4(
         let ahi = unsafe { lasx_xvsrli_b(va, 4) };
         let blo = unsafe { lasx_xvandi_b(vb, 0x0f) };
         let bhi = unsafe { lasx_xvsrli_b(vb, 4) };
-        let s0 = unsafe {
-            lasx_xvadd_h(
-                lasx_xvmulwev_h_b(alo, blo),
-                lasx_xvmulwod_h_b(alo, blo),
-            )
-        };
-        let s1 = unsafe {
-            lasx_xvadd_h(
-                lasx_xvmulwev_h_b(ahi, bhi),
-                lasx_xvmulwod_h_b(ahi, bhi),
-            )
-        };
+        let s0 = unsafe { lasx_xvadd_h(lasx_xvmulwev_h_b(alo, blo), lasx_xvmulwod_h_b(alo, blo)) };
+        let s1 = unsafe { lasx_xvadd_h(lasx_xvmulwev_h_b(ahi, bhi), lasx_xvmulwod_h_b(ahi, bhi)) };
         let sall = unsafe { lasx_xvadd_h(s0, s1) };
         let mut tmp = [0i16; 16];
         unsafe { lasx_xvst(sall, tmp.as_mut_ptr() as *mut i8, 0) };
@@ -377,7 +371,12 @@ pub extern "C" fn lasx_dot_q4(
 /// F64 矩阵乘 C[m×n] = A[m×k] × B[k×n]（B 转置，4×f64 FMA）
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_matmul_f64(
-    m: i32, k: i32, n: i32, a: *const f64, b: *const f64, c: *mut f64,
+    m: i32,
+    k: i32,
+    n: i32,
+    a: *const f64,
+    b: *const f64,
+    c: *mut f64,
 ) {
     let (m, k, n) = (m as usize, k as usize, n as usize);
     let a = unsafe { std::slice::from_raw_parts(a, m * k) };
@@ -420,9 +419,16 @@ pub extern "C" fn lasx_matmul_f64(
 /// 内层：|v| = sqrt(vx²+vy²+vz²)；vx -= k*|v|*vx*dt；x += vx*dt（全部向量）
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_ballistic_step(
-    x: *mut f32, y: *mut f32, z: *mut f32,
-    vx: *mut f32, vy: *mut f32, vz: *mut f32,
-    k: *const f32, n: i32, dt: f32, g: f32,
+    x: *mut f32,
+    y: *mut f32,
+    z: *mut f32,
+    vx: *mut f32,
+    vy: *mut f32,
+    vz: *mut f32,
+    k: *const f32,
+    n: i32,
+    dt: f32,
+    g: f32,
 ) {
     let n = n as usize;
     let x = unsafe { std::slice::from_raw_parts_mut(x, n) };
@@ -437,10 +443,14 @@ pub extern "C" fn lasx_ballistic_step(
         let vdt = splat_f32(dt);
         let mut i = 0;
         while i + 8 <= n {
-            let vvx: m256 = unsafe { std::mem::transmute(lasx_xvld(vx.as_ptr().add(i) as *const i8, 0)) };
-            let vvy: m256 = unsafe { std::mem::transmute(lasx_xvld(vy.as_ptr().add(i) as *const i8, 0)) };
-            let vvz: m256 = unsafe { std::mem::transmute(lasx_xvld(vz.as_ptr().add(i) as *const i8, 0)) };
-            let vk: m256 = unsafe { std::mem::transmute(lasx_xvld(k.as_ptr().add(i) as *const i8, 0)) };
+            let vvx: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(vx.as_ptr().add(i) as *const i8, 0)) };
+            let vvy: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(vy.as_ptr().add(i) as *const i8, 0)) };
+            let vvz: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(vz.as_ptr().add(i) as *const i8, 0)) };
+            let vk: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(k.as_ptr().add(i) as *const i8, 0)) };
             // |v| = sqrt(vx²+vy²+vz²)
             let vsq = unsafe {
                 lasx_xvfadd_s(
@@ -461,30 +471,100 @@ pub extern "C" fn lasx_ballistic_step(
             let vny = unsafe { lasx_xvfmadd_s(vdvy, vdt, vvy) };
             let vnz = unsafe { lasx_xvfmadd_s(vdvz, vdt, vvz) };
             // x += vx*dt（用旧 vx，欧拉）
-            let vnx_old = vvx; let vny_old = vvy; let vnz_old = vvz;
-            let vnx_ = unsafe { lasx_xvfmadd_s(vnx_old, vdt, std::mem::transmute(lasx_xvld(x.as_ptr().add(i) as *const i8, 0))) };
-            let vny_ = unsafe { lasx_xvfmadd_s(vny_old, vdt, std::mem::transmute(lasx_xvld(y.as_ptr().add(i) as *const i8, 0))) };
-            let vnz_ = unsafe { lasx_xvfmadd_s(vnz_old, vdt, std::mem::transmute(lasx_xvld(z.as_ptr().add(i) as *const i8, 0))) };
+            let vnx_old = vvx;
+            let vny_old = vvy;
+            let vnz_old = vvz;
+            let vnx_ = unsafe {
+                lasx_xvfmadd_s(
+                    vnx_old,
+                    vdt,
+                    std::mem::transmute(lasx_xvld(x.as_ptr().add(i) as *const i8, 0)),
+                )
+            };
+            let vny_ = unsafe {
+                lasx_xvfmadd_s(
+                    vny_old,
+                    vdt,
+                    std::mem::transmute(lasx_xvld(y.as_ptr().add(i) as *const i8, 0)),
+                )
+            };
+            let vnz_ = unsafe {
+                lasx_xvfmadd_s(
+                    vnz_old,
+                    vdt,
+                    std::mem::transmute(lasx_xvld(z.as_ptr().add(i) as *const i8, 0)),
+                )
+            };
             // 存储
-            unsafe { lasx_xvst(std::mem::transmute(vnx), vx.as_mut_ptr().add(i) as *mut i8, 0) };
-            unsafe { lasx_xvst(std::mem::transmute(vny), vy.as_mut_ptr().add(i) as *mut i8, 0) };
-            unsafe { lasx_xvst(std::mem::transmute(vnz), vz.as_mut_ptr().add(i) as *mut i8, 0) };
-            unsafe { lasx_xvst(std::mem::transmute(vnx_), x.as_mut_ptr().add(i) as *mut i8, 0) };
-            unsafe { lasx_xvst(std::mem::transmute(vny_), y.as_mut_ptr().add(i) as *mut i8, 0) };
-            unsafe { lasx_xvst(std::mem::transmute(vnz_), z.as_mut_ptr().add(i) as *mut i8, 0) };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vnx),
+                    vx.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vny),
+                    vy.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vnz),
+                    vz.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vnx_),
+                    x.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vny_),
+                    y.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(vnz_),
+                    z.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
             i += 8;
         }
         for j in i..n {
-            euler_step(&mut x[j], &mut y[j], &mut z[j], &mut vx[j], &mut vy[j], &mut vz[j], k[j], dt, g);
+            euler_step(
+                &mut x[j], &mut y[j], &mut z[j], &mut vx[j], &mut vy[j], &mut vz[j], k[j], dt, g,
+            );
         }
     } else {
         for j in 0..n {
-            euler_step(&mut x[j], &mut y[j], &mut z[j], &mut vx[j], &mut vy[j], &mut vz[j], k[j], dt, g);
+            euler_step(
+                &mut x[j], &mut y[j], &mut z[j], &mut vx[j], &mut vy[j], &mut vz[j], k[j], dt, g,
+            );
         }
     }
 }
 
-fn euler_step(x: &mut f32, y: &mut f32, z: &mut f32, vx: &mut f32, vy: &mut f32, vz: &mut f32, k: f32, dt: f32, g: f32) {
+fn euler_step(
+    x: &mut f32,
+    y: &mut f32,
+    z: &mut f32,
+    vx: &mut f32,
+    vy: &mut f32,
+    vz: &mut f32,
+    k: f32,
+    dt: f32,
+    g: f32,
+) {
     let v = (*vx * *vx + *vy * *vy + *vz * *vz).sqrt();
     let drag = k * v;
     *vx -= drag * *vx * dt;
@@ -499,7 +579,12 @@ fn euler_step(x: &mut f32, y: &mut f32, z: &mut f32, vx: &mut f32, vy: &mut f32,
 /// LASX：dx²+dy² 用 FMA，xvfsqrt 开方
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_batch_distance2d(
-    px: f32, py: f32, xs: *const f32, ys: *const f32, out: *mut f32, n: i32,
+    px: f32,
+    py: f32,
+    xs: *const f32,
+    ys: *const f32,
+    out: *mut f32,
+    n: i32,
 ) {
     let n = n as usize;
     let xs = unsafe { std::slice::from_raw_parts(xs, n) };
@@ -510,14 +595,22 @@ pub extern "C" fn lasx_batch_distance2d(
         let vpy = splat_f32(py);
         let mut i = 0;
         while i + 8 <= n {
-            let vx: m256 = unsafe { std::mem::transmute(lasx_xvld(xs.as_ptr().add(i) as *const i8, 0)) };
-            let vy: m256 = unsafe { std::mem::transmute(lasx_xvld(ys.as_ptr().add(i) as *const i8, 0)) };
+            let vx: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(xs.as_ptr().add(i) as *const i8, 0)) };
+            let vy: m256 =
+                unsafe { std::mem::transmute(lasx_xvld(ys.as_ptr().add(i) as *const i8, 0)) };
             let dx = unsafe { lasx_xvfsub_s(vx, vpx) };
             let dy = unsafe { lasx_xvfsub_s(vy, vpy) };
             // dist = sqrt(dx*dx + dy*dy)
             let sq = unsafe { lasx_xvfadd_s(lasx_xvfmul_s(dx, dx), lasx_xvfmul_s(dy, dy)) };
             let d = unsafe { lasx_xvfsqrt_s(sq) };
-            unsafe { lasx_xvst(std::mem::transmute(d), out.as_mut_ptr().add(i) as *mut i8, 0) };
+            unsafe {
+                lasx_xvst(
+                    std::mem::transmute(d),
+                    out.as_mut_ptr().add(i) as *mut i8,
+                    0,
+                )
+            };
             i += 8;
         }
         for j in i..n {
@@ -555,8 +648,11 @@ fn splat2_f64(x: f64) -> F64x2 {
 /// SOA（xs/ys/zs 各为 n 长连续数组）；LASX 4 样本/向量，LSX 2 样本，标量兜底。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_norm3_batch(
-    xs: *const f64, ys: *const f64, zs: *const f64,
-    out: *mut f64, n: i32,
+    xs: *const f64,
+    ys: *const f64,
+    zs: *const f64,
+    out: *mut f64,
+    n: i32,
 ) {
     let n = n as usize;
     let xs = unsafe { std::slice::from_raw_parts(xs, n) };
@@ -609,10 +705,16 @@ pub extern "C" fn lasx_norm3_batch(
 /// 覆盖加（s=1）与缩放（a=0）两个退化情形；LASX 4 样本/向量。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_vec3_add_scaled_batch(
-    ax: *const f64, ay: *const f64, az: *const f64,
-    bx: *const f64, by: *const f64, bz: *const f64,
+    ax: *const f64,
+    ay: *const f64,
+    az: *const f64,
+    bx: *const f64,
+    by: *const f64,
+    bz: *const f64,
     s: f64,
-    ox: *mut f64, oy: *mut f64, oz: *mut f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
     n: i32,
 ) {
     let n = n as usize;
@@ -681,9 +783,15 @@ pub extern "C" fn lasx_vec3_add_scaled_batch(
 /// 全部为逐样本（lane）独立运算 → 天然 4 路并行。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_j2_accel_batch(
-    rx: *const f64, ry: *const f64, rz: *const f64,
-    mu: f64, j2: f64, re: f64,
-    ax: *mut f64, ay: *mut f64, az: *mut f64,
+    rx: *const f64,
+    ry: *const f64,
+    rz: *const f64,
+    mu: f64,
+    j2: f64,
+    re: f64,
+    ax: *mut f64,
+    ay: *mut f64,
+    az: *mut f64,
     n: i32,
 ) {
     let n = n as usize;
@@ -721,16 +829,23 @@ pub extern "C" fn lasx_j2_accel_batch(
             // J2 项系数（正）：1.5·J2·μ·Re²/rm⁵
             let vk = unsafe { lasx_xvfdiv_d(vj2k, vrm5) };
             // zr2 = (z/|r|)²
-            let vzr2 = unsafe {
-                lasx_xvfdiv_d(lasx_xvfmul_d(vz, vz), vrm2)
-            };
+            let vzr2 = unsafe { lasx_xvfdiv_d(lasx_xvfmul_d(vz, vz), vrm2) };
             let m1 = unsafe { lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v1) };
             let m3 = unsafe { lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v3) };
             // a_x = −μ·x/rm³ + k·x·(5·zr2−1)（k 正 = −k_j2）
             unsafe {
-                st_f64(ax.as_mut_ptr().add(i), lasx_xvfmadd_d(lasx_xvfmul_d(vk, vx), m1, lasx_xvfmul_d(vcen, vx)));
-                st_f64(ay.as_mut_ptr().add(i), lasx_xvfmadd_d(lasx_xvfmul_d(vk, vy), m1, lasx_xvfmul_d(vcen, vy)));
-                st_f64(az.as_mut_ptr().add(i), lasx_xvfmadd_d(lasx_xvfmul_d(vk, vz), m3, lasx_xvfmul_d(vcen, vz)));
+                st_f64(
+                    ax.as_mut_ptr().add(i),
+                    lasx_xvfmadd_d(lasx_xvfmul_d(vk, vx), m1, lasx_xvfmul_d(vcen, vx)),
+                );
+                st_f64(
+                    ay.as_mut_ptr().add(i),
+                    lasx_xvfmadd_d(lasx_xvfmul_d(vk, vy), m1, lasx_xvfmul_d(vcen, vy)),
+                );
+                st_f64(
+                    az.as_mut_ptr().add(i),
+                    lasx_xvfmadd_d(lasx_xvfmul_d(vk, vz), m3, lasx_xvfmul_d(vcen, vz)),
+                );
             }
             i += 4;
         }
@@ -773,9 +888,18 @@ pub extern "C" fn lasx_j2_accel_batch(
             let m1 = unsafe { lsx_vfsub_d(lsx_vfmul_d(v5, vzr2), v1) };
             let m3 = unsafe { lsx_vfsub_d(lsx_vfmul_d(v5, vzr2), v3) };
             unsafe {
-                st2_f64(ax.as_mut_ptr().add(i), lsx_vfmadd_d(lsx_vfmul_d(vk, vx), m1, lsx_vfmul_d(vcen, vx)));
-                st2_f64(ay.as_mut_ptr().add(i), lsx_vfmadd_d(lsx_vfmul_d(vk, vy), m1, lsx_vfmul_d(vcen, vy)));
-                st2_f64(az.as_mut_ptr().add(i), lsx_vfmadd_d(lsx_vfmul_d(vk, vz), m3, lsx_vfmul_d(vcen, vz)));
+                st2_f64(
+                    ax.as_mut_ptr().add(i),
+                    lsx_vfmadd_d(lsx_vfmul_d(vk, vx), m1, lsx_vfmul_d(vcen, vx)),
+                );
+                st2_f64(
+                    ay.as_mut_ptr().add(i),
+                    lsx_vfmadd_d(lsx_vfmul_d(vk, vy), m1, lsx_vfmul_d(vcen, vy)),
+                );
+                st2_f64(
+                    az.as_mut_ptr().add(i),
+                    lsx_vfmadd_d(lsx_vfmul_d(vk, vz), m3, lsx_vfmul_d(vcen, vz)),
+                );
             }
             i += 2;
         }
@@ -801,12 +925,21 @@ mod batch_tests {
     use super::*;
 
     fn scalar_norm3(x: &[f64], y: &[f64], z: &[f64]) -> Vec<f64> {
-        (0..x.len()).map(|i| (x[i] * x[i] + y[i] * y[i] + z[i] * z[i]).sqrt()).collect()
+        (0..x.len())
+            .map(|i| (x[i] * x[i] + y[i] * y[i] + z[i] * z[i]).sqrt())
+            .collect()
     }
     fn scalar_add_scaled(a: &[f64], b: &[f64], s: f64) -> Vec<f64> {
         a.iter().zip(b).map(|(&x, &y)| x + s * y).collect()
     }
-    fn scalar_j2(rx: &[f64], ry: &[f64], rz: &[f64], mu: f64, j2: f64, re: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    fn scalar_j2(
+        rx: &[f64],
+        ry: &[f64],
+        rz: &[f64],
+        mu: f64,
+        j2: f64,
+        re: f64,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let n = rx.len();
         let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let j2k = 1.5 * j2 * mu * re * re;
@@ -851,10 +984,23 @@ mod batch_tests {
         for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 16, 33] {
             let (x, y, z) = states(n);
             let mut out = vec![0.0; n];
-            unsafe { lasx_norm3_batch(x.as_ptr(), y.as_ptr(), z.as_ptr(), out.as_mut_ptr(), n as i32) };
+            unsafe {
+                lasx_norm3_batch(
+                    x.as_ptr(),
+                    y.as_ptr(),
+                    z.as_ptr(),
+                    out.as_mut_ptr(),
+                    n as i32,
+                )
+            };
             let want = scalar_norm3(&x, &y, &z);
             for i in 0..n {
-                assert!(rel_err(out[i], want[i]) < 1e-9, "n={n} i={i}: {} vs {}", out[i], want[i]);
+                assert!(
+                    rel_err(out[i], want[i]) < 1e-9,
+                    "n={n} i={i}: {} vs {}",
+                    out[i],
+                    want[i]
+                );
             }
         }
     }
@@ -867,9 +1013,17 @@ mod batch_tests {
             let (mut ox, mut oy, mut oz) = (vec![0.0; 37], vec![0.0; 37], vec![0.0; 37]);
             unsafe {
                 lasx_vec3_add_scaled_batch(
-                    x.as_ptr(), y.as_ptr(), z.as_ptr(),
-                    b.as_ptr(), c.as_ptr(), d.as_ptr(),
-                    s, ox.as_mut_ptr(), oy.as_mut_ptr(), oz.as_mut_ptr(), 37,
+                    x.as_ptr(),
+                    y.as_ptr(),
+                    z.as_ptr(),
+                    b.as_ptr(),
+                    c.as_ptr(),
+                    d.as_ptr(),
+                    s,
+                    ox.as_mut_ptr(),
+                    oy.as_mut_ptr(),
+                    oz.as_mut_ptr(),
+                    37,
                 );
             }
             let wx = scalar_add_scaled(&x, &b, s);
@@ -877,8 +1031,11 @@ mod batch_tests {
             let wz = scalar_add_scaled(&z, &d, s);
             for i in 0..37 {
                 assert!(
-                    rel_err(ox[i], wx[i]) < 1e-9 && rel_err(oy[i], wy[i]) < 1e-9 && rel_err(oz[i], wz[i]) < 1e-9,
-                    "s={s} i={i}");
+                    rel_err(ox[i], wx[i]) < 1e-9
+                        && rel_err(oy[i], wy[i]) < 1e-9
+                        && rel_err(oz[i], wz[i]) < 1e-9,
+                    "s={s} i={i}"
+                );
             }
         }
     }
@@ -903,17 +1060,42 @@ mod batch_tests {
             let dt = 10.0;
             for _ in 0..50 {
                 unsafe {
-                    lasx_rk4_j2_step_batch(bx.as_mut_ptr(), by.as_mut_ptr(), bz.as_mut_ptr(),
-                        bvx.as_mut_ptr(), bvy.as_mut_ptr(), bvz.as_mut_ptr(),
-                        mu, j2, re, dt, n as i32);
+                    lasx_rk4_j2_step_batch(
+                        bx.as_mut_ptr(),
+                        by.as_mut_ptr(),
+                        bz.as_mut_ptr(),
+                        bvx.as_mut_ptr(),
+                        bvy.as_mut_ptr(),
+                        bvz.as_mut_ptr(),
+                        mu,
+                        j2,
+                        re,
+                        dt,
+                        n as i32,
+                    );
                 }
                 for i in 0..n {
-                    rk4_j2_step_scalar(&mut sx[i], &mut sy[i], &mut sz[i], &mut svx[i], &mut svy[i], &mut svz[i], mu, j2, re, dt);
+                    rk4_j2_step_scalar(
+                        &mut sx[i],
+                        &mut sy[i],
+                        &mut sz[i],
+                        &mut svx[i],
+                        &mut svy[i],
+                        &mut svz[i],
+                        mu,
+                        j2,
+                        re,
+                        dt,
+                    );
                 }
             }
             for i in 0..n {
-                assert!(rel_err(bx[i], sx[i]) < 1e-9 && rel_err(bvx[i], svx[i]) < 1e-9,
-                    "n={n} i={i}: batch r {} vs scalar {}", bx[i], sx[i]);
+                assert!(
+                    rel_err(bx[i], sx[i]) < 1e-9 && rel_err(bvx[i], svx[i]) < 1e-9,
+                    "n={n} i={i}: batch r {} vs scalar {}",
+                    bx[i],
+                    sx[i]
+                );
                 assert!(rel_err(by[i], sy[i]) < 1e-9 && rel_err(bvy[i], svy[i]) < 1e-9);
                 assert!(rel_err(bz[i], sz[i]) < 1e-9 && rel_err(bvz[i], svz[i]) < 1e-9);
             }
@@ -926,13 +1108,33 @@ mod batch_tests {
             let (x, y, z) = states(n);
             let (mut ax, mut ay, mut az) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
             unsafe {
-                lasx_j2_accel_batch(x.as_ptr(), y.as_ptr(), z.as_ptr(), 3.986004418e14, 1.08262668e-3, 6.378137e6, ax.as_mut_ptr(), ay.as_mut_ptr(), az.as_mut_ptr(), n as i32);
+                lasx_j2_accel_batch(
+                    x.as_ptr(),
+                    y.as_ptr(),
+                    z.as_ptr(),
+                    3.986004418e14,
+                    1.08262668e-3,
+                    6.378137e6,
+                    ax.as_mut_ptr(),
+                    ay.as_mut_ptr(),
+                    az.as_mut_ptr(),
+                    n as i32,
+                );
             }
             let (wx, wy, wz) = scalar_j2(&x, &y, &z, 3.986004418e14, 1.08262668e-3, 6.378137e6);
             for i in 0..n {
                 assert!(
-                    rel_err(ax[i], wx[i]) < 1e-9 && rel_err(ay[i], wy[i]) < 1e-9 && rel_err(az[i], wz[i]) < 1e-9,
-                    "n={n} i={i}: ({},{},{}) vs ({},{},{})", ax[i], ay[i], az[i], wx[i], wy[i], wz[i]);
+                    rel_err(ax[i], wx[i]) < 1e-9
+                        && rel_err(ay[i], wy[i]) < 1e-9
+                        && rel_err(az[i], wz[i]) < 1e-9,
+                    "n={n} i={i}: ({},{},{}) vs ({},{},{})",
+                    ax[i],
+                    ay[i],
+                    az[i],
+                    wx[i],
+                    wy[i],
+                    wz[i]
+                );
             }
         }
     }
@@ -946,7 +1148,18 @@ mod batch_tests {
         let re = 6.378137e6;
         let (x, y, z) = states(9);
         // 分离 mul+add 参考实现（与旧版 rk4_j2_step_scalar 同式）
-        fn step_plain(rx: &mut f64, ry: &mut f64, rz: &mut f64, vx: &mut f64, vy: &mut f64, vz: &mut f64, mu: f64, j2: f64, re: f64, h: f64) {
+        fn step_plain(
+            rx: &mut f64,
+            ry: &mut f64,
+            rz: &mut f64,
+            vx: &mut f64,
+            vy: &mut f64,
+            vz: &mut f64,
+            mu: f64,
+            j2: f64,
+            re: f64,
+            h: f64,
+        ) {
             let j2k = 1.5 * j2 * mu * re * re;
             let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
                 let rm = (x * x + y * y + z * z).sqrt();
@@ -963,10 +1176,22 @@ mod batch_tests {
             let (x0, y0, z0, vx0, vy0, vz0) = (*rx, *ry, *rz, *vx, *vy, *vz);
             let k1 = accel(x0, y0, z0);
             let r2 = (x0 + 0.5 * h * vx0, y0 + 0.5 * h * vy0, z0 + 0.5 * h * vz0);
-            let v2 = (vx0 + 0.5 * h * k1[0], vy0 + 0.5 * h * k1[1], vz0 + 0.5 * h * k1[2]);
+            let v2 = (
+                vx0 + 0.5 * h * k1[0],
+                vy0 + 0.5 * h * k1[1],
+                vz0 + 0.5 * h * k1[2],
+            );
             let k2 = accel(r2.0, r2.1, r2.2);
-            let r3 = (x0 + 0.5 * h * v2.0, y0 + 0.5 * h * v2.1, z0 + 0.5 * h * v2.2);
-            let v3 = (vx0 + 0.5 * h * k2[0], vy0 + 0.5 * h * k2[1], vz0 + 0.5 * h * k2[2]);
+            let r3 = (
+                x0 + 0.5 * h * v2.0,
+                y0 + 0.5 * h * v2.1,
+                z0 + 0.5 * h * v2.2,
+            );
+            let v3 = (
+                vx0 + 0.5 * h * k2[0],
+                vy0 + 0.5 * h * k2[1],
+                vz0 + 0.5 * h * k2[2],
+            );
             let k3 = accel(r3.0, r3.1, r3.2);
             let r4 = (x0 + h * v3.0, y0 + h * v3.1, z0 + h * v3.2);
             let v4 = (vx0 + h * k3[0], vy0 + h * k3[1], vz0 + h * k3[2]);
@@ -1000,13 +1225,39 @@ mod batch_tests {
         let dt = 10.0;
         for _ in 0..50 {
             for i in 0..9 {
-                rk4_j2_step_scalar(&mut fx[i], &mut fy[i], &mut fz[i], &mut fvx[i], &mut fvy[i], &mut fvz[i], mu, j2, re, dt);
-                step_plain(&mut px[i], &mut py[i], &mut pz[i], &mut pvx[i], &mut pvy[i], &mut pvz[i], mu, j2, re, dt);
+                rk4_j2_step_scalar(
+                    &mut fx[i],
+                    &mut fy[i],
+                    &mut fz[i],
+                    &mut fvx[i],
+                    &mut fvy[i],
+                    &mut fvz[i],
+                    mu,
+                    j2,
+                    re,
+                    dt,
+                );
+                step_plain(
+                    &mut px[i],
+                    &mut py[i],
+                    &mut pz[i],
+                    &mut pvx[i],
+                    &mut pvy[i],
+                    &mut pvz[i],
+                    mu,
+                    j2,
+                    re,
+                    dt,
+                );
             }
         }
         for i in 0..9 {
-            assert!(rel_err(fx[i], px[i]) < 1e-9 && rel_err(fvx[i], pvx[i]) < 1e-9,
-                "i={i}: FMA r {} vs plain {}", fx[i], px[i]);
+            assert!(
+                rel_err(fx[i], px[i]) < 1e-9 && rel_err(fvx[i], pvx[i]) < 1e-9,
+                "i={i}: FMA r {} vs plain {}",
+                fx[i],
+                px[i]
+            );
             assert!(rel_err(fy[i], py[i]) < 1e-9 && rel_err(fvy[i], pvy[i]) < 1e-9);
             assert!(rel_err(fz[i], pz[i]) < 1e-9 && rel_err(fvz[i], pvz[i]) < 1e-9);
         }
@@ -1017,8 +1268,14 @@ mod batch_tests {
 /// a = −μ·r/|r|³ + J2 项（公式同 `lasx_j2_accel_batch`；vmu 已取负）
 #[inline]
 unsafe fn j2_accel_vec(
-    vx: m256d, vy: m256d, vz: m256d,
-    vmu: m256d, vj2k: m256d, v5: m256d, v1: m256d, v3: m256d,
+    vx: m256d,
+    vy: m256d,
+    vz: m256d,
+    vmu: m256d,
+    vj2k: m256d,
+    v5: m256d,
+    v1: m256d,
+    v3: m256d,
 ) -> (m256d, m256d, m256d) {
     let vrm2 = lasx_xvfadd_d(
         lasx_xvfmul_d(vx, vx),
@@ -1042,9 +1299,16 @@ unsafe fn j2_accel_vec(
 /// FMA 版：组合算术与加速度末项用 `f64::mul_add`（单指令 `fmadd.d`，LA664），与
 /// LASX 向量路径 `j2_accel_vec`/内核组合算术逐位一致（物理等价 <1e-9）。
 fn rk4_j2_step_scalar(
-    rx: &mut f64, ry: &mut f64, rz: &mut f64,
-    vx: &mut f64, vy: &mut f64, vz: &mut f64,
-    mu: f64, j2: f64, re: f64, h: f64,
+    rx: &mut f64,
+    ry: &mut f64,
+    rz: &mut f64,
+    vx: &mut f64,
+    vy: &mut f64,
+    vz: &mut f64,
+    mu: f64,
+    j2: f64,
+    re: f64,
+    h: f64,
 ) {
     let j2k = 1.5 * j2 * mu * re * re;
     let accel = |x: f64, y: f64, z: f64| -> [f64; 3] {
@@ -1067,14 +1331,38 @@ fn rk4_j2_step_scalar(
     let hh = 0.5 * h;
     let h6 = h / 6.0;
     let k1 = accel(x0, y0, z0);
-    let r2 = (hh.mul_add(vx0, x0), hh.mul_add(vy0, y0), hh.mul_add(vz0, z0));
-    let v2 = (hh.mul_add(k1[0], vx0), hh.mul_add(k1[1], vy0), hh.mul_add(k1[2], vz0));
+    let r2 = (
+        hh.mul_add(vx0, x0),
+        hh.mul_add(vy0, y0),
+        hh.mul_add(vz0, z0),
+    );
+    let v2 = (
+        hh.mul_add(k1[0], vx0),
+        hh.mul_add(k1[1], vy0),
+        hh.mul_add(k1[2], vz0),
+    );
     let k2 = accel(r2.0, r2.1, r2.2);
-    let r3 = (hh.mul_add(v2.0, x0), hh.mul_add(v2.1, y0), hh.mul_add(v2.2, z0));
-    let v3 = (hh.mul_add(k2[0], vx0), hh.mul_add(k2[1], vy0), hh.mul_add(k2[2], vz0));
+    let r3 = (
+        hh.mul_add(v2.0, x0),
+        hh.mul_add(v2.1, y0),
+        hh.mul_add(v2.2, z0),
+    );
+    let v3 = (
+        hh.mul_add(k2[0], vx0),
+        hh.mul_add(k2[1], vy0),
+        hh.mul_add(k2[2], vz0),
+    );
     let k3 = accel(r3.0, r3.1, r3.2);
-    let r4 = (h.mul_add(v3.0, x0), h.mul_add(v3.1, y0), h.mul_add(v3.2, z0));
-    let v4 = (h.mul_add(k3[0], vx0), h.mul_add(k3[1], vy0), h.mul_add(k3[2], vz0));
+    let r4 = (
+        h.mul_add(v3.0, x0),
+        h.mul_add(v3.1, y0),
+        h.mul_add(v3.2, z0),
+    );
+    let v4 = (
+        h.mul_add(k3[0], vx0),
+        h.mul_add(k3[1], vy0),
+        h.mul_add(k3[2], vz0),
+    );
     let k4 = accel(r4.0, r4.1, r4.2);
     let l = (
         2.0_f64.mul_add(v2.0, vx0) + 2.0_f64.mul_add(v3.0, v4.0),
@@ -1100,9 +1388,17 @@ fn rk4_j2_step_scalar(
 /// 原地更新（每块先读后写，块间不重叠）；非 LASX CPU 走全标量。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_rk4_j2_step_batch(
-    rx: *mut f64, ry: *mut f64, rz: *mut f64,
-    vx: *mut f64, vy: *mut f64, vz: *mut f64,
-    mu: f64, j2: f64, re: f64, dt: f64, n: i32,
+    rx: *mut f64,
+    ry: *mut f64,
+    rz: *mut f64,
+    vx: *mut f64,
+    vy: *mut f64,
+    vz: *mut f64,
+    mu: f64,
+    j2: f64,
+    re: f64,
+    dt: f64,
+    n: i32,
 ) {
     let n = n as usize;
     let rx = unsafe { std::slice::from_raw_parts_mut(rx, n) };
@@ -1165,14 +1461,35 @@ pub extern "C" fn lasx_rk4_j2_step_batch(
             let (k4x, k4y, k4z) = unsafe { j2_accel_vec(r4.0, r4.1, r4.2, vmu, vj2k, v5, v1, v3s) };
             // lsum = v + 2·v2 + 2·v3 + v4；ksum 同理
             let l = (
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, v2.0, lvx), lasx_xvfmadd_d(v2s, v3.0, v4.0)) },
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, v2.1, lvy), lasx_xvfmadd_d(v2s, v3.1, v4.1)) },
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, v2.2, lvz), lasx_xvfmadd_d(v2s, v3.2, v4.2)) },
+                unsafe {
+                    lasx_xvfadd_d(
+                        lasx_xvfmadd_d(v2s, v2.0, lvx),
+                        lasx_xvfmadd_d(v2s, v3.0, v4.0),
+                    )
+                },
+                unsafe {
+                    lasx_xvfadd_d(
+                        lasx_xvfmadd_d(v2s, v2.1, lvy),
+                        lasx_xvfmadd_d(v2s, v3.1, v4.1),
+                    )
+                },
+                unsafe {
+                    lasx_xvfadd_d(
+                        lasx_xvfmadd_d(v2s, v2.2, lvz),
+                        lasx_xvfmadd_d(v2s, v3.2, v4.2),
+                    )
+                },
             );
             let k = (
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2x, k1x), lasx_xvfmadd_d(v2s, k3x, k4x)) },
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2y, k1y), lasx_xvfmadd_d(v2s, k3y, k4y)) },
-                unsafe { lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2z, k1z), lasx_xvfmadd_d(v2s, k3z, k4z)) },
+                unsafe {
+                    lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2x, k1x), lasx_xvfmadd_d(v2s, k3x, k4x))
+                },
+                unsafe {
+                    lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2y, k1y), lasx_xvfmadd_d(v2s, k3y, k4y))
+                },
+                unsafe {
+                    lasx_xvfadd_d(lasx_xvfmadd_d(v2s, k2z, k1z), lasx_xvfmadd_d(v2s, k3z, k4z))
+                },
             );
             let nr = (
                 unsafe { lasx_xvfmadd_d(vh6, l.0, lrx) },
@@ -1195,12 +1512,17 @@ pub extern "C" fn lasx_rk4_j2_step_batch(
             i += 4;
         }
         for j in i..n {
-            rk4_j2_step_scalar(&mut rx[j], &mut ry[j], &mut rz[j], &mut vx[j], &mut vy[j], &mut vz[j], mu, j2, re, dt);
+            rk4_j2_step_scalar(
+                &mut rx[j], &mut ry[j], &mut rz[j], &mut vx[j], &mut vy[j], &mut vz[j], mu, j2, re,
+                dt,
+            );
         }
     } else {
         for j in 0..n {
-            rk4_j2_step_scalar(&mut rx[j], &mut ry[j], &mut rz[j], &mut vx[j], &mut vy[j], &mut vz[j], mu, j2, re, dt);
+            rk4_j2_step_scalar(
+                &mut rx[j], &mut ry[j], &mut rz[j], &mut vx[j], &mut vy[j], &mut vz[j], mu, j2, re,
+                dt,
+            );
         }
     }
 }
-
