@@ -9,7 +9,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Format check (rustfmt, nightly)
         run: rustup run nightly cargo fmt --all -- --check
       - name: Build release (nightly, +lsx,+lasx)

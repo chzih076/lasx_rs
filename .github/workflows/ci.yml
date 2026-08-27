@@ -12,7 +12,7 @@ jobs:
     name: Format (rustfmt)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nightly with rustfmt
         run: |
           rustup toolchain install nightly --component rustfmt --profile minimal
@@ -27,7 +27,7 @@ jobs:
     name: Cross-check (loongarch64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nightly + rust-src + loongarch64 target
         run: |
           rustup toolchain install nightly --profile minimal --component rust-src
