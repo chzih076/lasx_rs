@@ -101,5 +101,6 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::ThreadScaling => suites::micro::thread_scaling(),
         Group::Align => suites::align::align(),
         Group::DispatchOverhead => suites::micro::dispatch_overhead(),
+        Group::Scenario => suites::scenario::run_all(),
     }
 }

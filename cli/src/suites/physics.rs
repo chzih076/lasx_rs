@@ -136,11 +136,14 @@ pub fn rk4(rows: &mut Vec<Row>) {
             single.step(true);
             let _ = black_box(single.rx[0]);
         });
-        let w = st.clone();
+        // 标量基线也必须在**计时闭包之外**准备缓冲：原先写成
+        // `timeit(|| { let mut s = w.clone(); s.step_scalar(); .. })`，
+        // 每次迭代都克隆 6 个 f64 数组（n=2^18 时 12.6 MB），把分配 + 拷贝的时间
+        // 算进了"标量内核"，而 LASX 列是原地步进——加速比因此被抬高。
+        let mut w = st.clone();
         let scalar = timeit(|| {
-            let mut s = w.clone();
-            s.step_scalar();
-            let _ = black_box(s.rx[0]);
+            w.step_scalar();
+            let _ = black_box(w.rx[0]);
         });
         row3(
             "lasx_rk4_j2_step_batch f64",

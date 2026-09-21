@@ -125,14 +125,14 @@ struct PoolShared {
 unsafe impl Sync for PoolShared {}
 unsafe impl Send for PoolShared {}
 
-struct SpinPool {
+pub struct SpinPool {
     shared: Arc<PoolShared>,
     handles: Vec<std::thread::JoinHandle<()>>,
     threads: usize,
 }
 
 impl SpinPool {
-    fn new(threads: usize) -> Self {
+    pub fn new(threads: usize) -> Self {
         let shared = Arc::new(PoolShared {
             epoch: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
@@ -200,8 +200,8 @@ impl SpinPool {
         }
     }
 
-    /// 把 `buf` 切块、派活，并自旋等到全部 worker 完成。
-    fn run(&self, buf: &mut Soa6) {
+    /// 把 `buf` 切块、派活，并等到全部 worker 完成。
+    pub fn run(&self, buf: &mut Soa6) {
         let n = buf.len();
         let chunk = n.div_ceil(self.threads).next_multiple_of(4).max(4);
         let mut off = 0usize;

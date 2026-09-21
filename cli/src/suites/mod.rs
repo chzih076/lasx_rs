@@ -7,3 +7,4 @@ pub mod micro;
 pub mod physics;
 pub mod quant;
 pub mod reduce;
+pub mod scenario;

@@ -121,7 +121,13 @@ try {
 cargo run -p lasx_bench --release              # 全部内核，约 2 分钟
 cargo run -p lasx_bench --release -- matmul    # 只跑组名含 matmul 的套件
 cargo run -p lasx_bench --release -- fma       # 纯寄存器 FMA 吞吐
+cargo run -p lasx_bench --release -- scenario  # 真实调用场景（多步传播/高频小调用/融合 vs 拼接）
 ```
+
+> **调用策略本身影响很大**（基准同时也是示例，`-- scenario` 给出实测）：
+> 多步传播时**复用常驻线程池**比每步新建线程端到端快 **2.1–2.3×**；
+> **用融合内核**（`lasx_rk4_j2_step_batch`）比用原语拼同一个 RK4 步快 **2.8×**；
+> 小数组高频调用每次有 10–25 ns 的固定开销；**别把分配/克隆放进热路径**。
 
 三种口径：**LASX**（原生 256 位）/ **强制 LSX**（线程级降级钩子）/ **标量**基线。
 

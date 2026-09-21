@@ -37,6 +37,8 @@ pub enum Group {
     Align,
     /// 每次调用的分派/探测开销。
     DispatchOverhead,
+    /// 真实调用场景（多步传播 / 高频小调用 / 融合 vs 拼接）。
+    Scenario,
 }
 
 impl Group {
@@ -59,6 +61,7 @@ impl Group {
         Group::ThreadScaling,
         Group::Align,
         Group::DispatchOverhead,
+        Group::Scenario,
     ];
 
     /// 组名，同时用作命令行过滤子串。
@@ -81,6 +84,7 @@ impl Group {
             Group::ThreadScaling => "mt",
             Group::Align => "align",
             Group::DispatchOverhead => "dispatch",
+            Group::Scenario => "scenario",
         }
     }
 
@@ -88,7 +92,11 @@ impl Group {
     pub fn is_tabular(self) -> bool {
         !matches!(
             self,
-            Group::FmaPeak | Group::ThreadScaling | Group::Align | Group::DispatchOverhead
+            Group::FmaPeak
+                | Group::ThreadScaling
+                | Group::Align
+                | Group::DispatchOverhead
+                | Group::Scenario
         )
     }
 
