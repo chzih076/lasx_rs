@@ -9,12 +9,14 @@ docs/
 ├── README.md        # 本文档：文档目录索引
 ├── manual.md        # 完整技术手册（主文档）
 ├── perf-report.md   # 性能实测报告与优化记录
-└── compression.md   # 无损压缩 / 带宽换算力：可行性测量与路线
+├── compression.md   # 无损压缩 / 带宽换算力：可行性测量与路线
+└── nn-ops.md        # 神经网络算子分析（以 llama.cpp/ggml 为参照）
 ```
 
 | 文档 | 内容 |
 |---|---|
 | [manual.md](manual.md) | **完整技术手册**（10 章）：架构与设计（LASX/LSX 双路径机制、SOA 布局、FFI 设计、源码组织）、15 个 FFI 内核逐一详解（C 签名/算法/向量化/精度/适用场景）、量化内核（q4/i8）、批量物理内核（J2/RK4/弹道）、FFI 使用指南（C/Dart/Rust/内存管理）、性能基准方法、测试与验证、构建与集成（nightly/CI/workspace）、Caveats 与限制、API 索引 |
+| [nn-ops.md](nn-ops.md) | **神经网络算子分析**：ggml 102 个算子全览、一次前向的算子配方、40+ 量化格式与块布局、**本机 LASX 实测**各算子带宽/GFLOP/s、缺口清单与建议批次 |
 | [compression.md](compression.md) | **无损压缩与带宽互换**：判定式（链路 vs 内核两种场景）、压缩比与解码速率实测、木桶模型下的算力余量、分阶段路线与反例登记 |
 | [perf-report.md](perf-report.md) | **性能实测报告**：三路口径（LASX/LSX/标量）逐内核数据、根因分析、优化前后对比、调用策略（常驻池 / 多核矩阵乘 / 脚本侧传播）、Rust API 层、方法学局限 |
 
@@ -28,6 +30,7 @@ docs/
 - 想**在脚本语言里调用**（含错误上抛）：见 manual.md §5.6/§5.7 与 [../yll/README.md](../yll/README.md)
 - 想了解**性能实测与优化历程**：见 [perf-report.md](perf-report.md)
 - 想了解**无损压缩/降带宽的可行性**：见 [compression.md](compression.md)
+- 想做**神经网络算子**：见 [nn-ops.md](nn-ops.md)（llama.cpp 实测与缺口）
 
 ## 与根 README 的关系
 

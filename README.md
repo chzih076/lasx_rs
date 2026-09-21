@@ -221,6 +221,8 @@ GFLOP/s（峰值的 66–72%）。
   22 个 FFI 内核逐一详解、量化内核、批量物理内核、批量姿态/几何内核、FFI 使用指南（C/Dart/Rust）、
   性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
 - **[docs/perf-report.md](docs/perf-report.md)**：性能实测报告与优化记录；
+- **[docs/nn-ops.md](docs/nn-ops.md)**：神经网络算子分析（llama.cpp/ggml 的 102 个算子、
+  量化块布局、**本机 LASX 实测**缺口清单：f16 GEMM 11× / softmax 7× / f16 GEMV 3.7×）；
 - **[docs/compression.md](docs/compression.md)**：无损压缩与「带宽换算力」的可行性
   测量（结论：快照 1.22×、轨迹 1.40×，且解码速率 0.37 GB/s 远低于内核消费
   3.3 GB/s，**不进内核热路径**）与后续路线；
