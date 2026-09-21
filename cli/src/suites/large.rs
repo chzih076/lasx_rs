@@ -23,8 +23,8 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// 锚点：`(单线程只读, 单线程拷贝, N 线程只读, N 线程拷贝)`，单位 GB/s。
-fn anchors(n: usize, threads: usize) -> (f64, f64, f64, f64, f64) {
+/// 锚点：`(单流只读, 双流只读, 单线程拷贝, 双流字节读, N 线程只读, N 线程拷贝, 6 流 3读3写)`，单位 GB/s。
+fn anchors(n: usize, threads: usize) -> (f64, f64, f64, f64, f64, f64, f64) {
     let src = AlignedBuf::<f64>::fill_with(n, |i| i as f64);
     let other = AlignedBuf::<f64>::fill_with(n, |i| (i % 7) as f64);
     let mut dst = AlignedBuf::<f64>::new(n);
@@ -65,8 +65,48 @@ fn anchors(n: usize, threads: usize) -> (f64, f64, f64, f64, f64) {
     });
     let r2 = (2.0 * read_bytes) / t.as_secs_f64() / 1e9;
 
+    // 单线程**双流字节读**：量化内核（dot_i8/dot_q4）的真实形态（每元素 1 字节，
+    // 两条流）。用 u64 异或折叠：每 8 字节一次载入、无依赖链，纯测访存。
+    // 数组字节数与量化内核一致（每流 n 字节）
+    let (ba, bb) = (vec![0xA5u8; n], vec![0x5Au8; n]);
+    let t = timeit(|| {
+        let mut x = 0u64;
+        for (ca, cb) in ba.as_chunks::<8>().0.iter().zip(bb.as_chunks::<8>().0) {
+            x ^= u64::from_le_bytes(*ca) ^ u64::from_le_bytes(*cb);
+        }
+        let _ = black_box(x);
+    });
+    let rb = (2.0 * n as f64) / t.as_secs_f64() / 1e9;
+
+    // 单线程**6 流**（3 读 3 写）：`j2_accel_batch` 这类"3 进 3 出"内核的真实形态。
+    // 一个循环体里同时碰 3 个源、3 个目的，测的是"多流 + 读写混合"的合成上限。
+    let (mut oa, mut ob, mut oc) = (
+        AlignedBuf::<f64>::new(n),
+        AlignedBuf::<f64>::new(n),
+        AlignedBuf::<f64>::new(n),
+    );
+    let t = timeit(|| {
+        let (s0, s1, s2) = (
+            src.as_chunks::<4>().0,
+            other.as_chunks::<4>().0,
+            src_mut.as_chunks::<4>().0,
+        );
+        let (d0, d1, d2) = (
+            oa.as_chunks_mut::<4>().0,
+            ob.as_chunks_mut::<4>().0,
+            oc.as_chunks_mut::<4>().0,
+        );
+        for i in 0..d0.len() {
+            d0[i].copy_from_slice(&s0[i]);
+            d1[i].copy_from_slice(&s1[i]);
+            d2[i].copy_from_slice(&s2[i]);
+        }
+        let _ = black_box(d0[0]);
+    });
+    let s6 = (6.0 * n as f64 * 8.0) / t.as_secs_f64() / 1e9;
+
     if threads <= 1 {
-        return (r1, r2, c1, r1, c1);
+        return (r1, r2, c1, rb, r1, c1, s6);
     }
     let mut pool = WorkerPool::new(threads);
     let t = timeit(|| {
@@ -85,7 +125,7 @@ fn anchors(n: usize, threads: usize) -> (f64, f64, f64, f64, f64) {
         let _ = black_box(*acc.lock().unwrap());
     });
     let rn = read_bytes / t.as_secs_f64() / 1e9;
-    (r1, r2, c1, rn, cn)
+    (r1, r2, c1, rb, rn, cn, s6)
 }
 
 /// 大集分析入口。
@@ -97,20 +137,22 @@ pub fn run() {
     println!();
     println!("### 锚点（同规模纯搬运实测）");
     println!();
-    println!("| 规模 | 单流只读 | 双流只读 | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 | 双流/单流 |");
-    println!("|---|---|---|---|---|---|---|");
+    println!("| 规模 | 单流只读 | 双流只读 | 双流字节读 | **6 流 3读3写** | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 | 字节/f64 |");
+    println!("|---|---|---|---|---|---|---|---|---|");
     let mut anchor = std::collections::HashMap::new();
     for &n in ns64.iter().chain(ns32.iter()) {
         let a = anchors(n, 12);
         anchor.insert(n, a);
         println!(
-            "| {n} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} GB/s | **{:.0}%** |",
+            "| {n} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | **{:.0}%** |",
             a.0,
             a.1,
-            a.2,
             a.3,
+            a.6,
+            a.2,
             a.4,
-            100.0 * a.1 / a.0
+            a.5,
+            100.0 * a.3 / a.1
         );
     }
     println!();
@@ -123,8 +165,19 @@ pub fn run() {
     let push = |kernel: &str, n: usize, bytes: f64, write_frac: f64, mt: bool, t: Duration| {
         let gbs = bytes / t.as_secs_f64() / 1e9;
         let a = anchor[&n];
-        // 锚点按内核的"流数"选：SOA 内核（6 流）用 6 流锚点，其余用单流/双流读
-        let (read, copy) = if mt { (a.3, a.4) } else { (a.0, a.2) };
+        // 锚点要同"footprint"：每元素 1 字节的内核（dot_i8/dot_q4）用同规模的**字节**双流读锚点，
+        // 否则会拿 8 倍 footprint 的 f64 锚点去比，口径不一致（本表早期版本就犯过这个错）。
+        let is_byte = kernel.starts_with("dot_i8") || kernel.starts_with("dot_q4");
+        let (read, copy) = if kernel.starts_with("j2_accel_batch") {
+            // "3 进 3 出"内核直接用同形态锚点，不再用"读+拷贝"内插
+            (a.6, a.6)
+        } else if is_byte {
+            (a.3, a.3)
+        } else if mt {
+            (a.4, a.5)
+        } else {
+            (a.0, a.2)
+        };
         let want = read + (copy - read) * write_frac.clamp(0.0, 1.0);
         println!(
             "| {kernel} | {n} | {:.1} | {gbs:.1} | {want:.1} | **{:.0}%** |",
