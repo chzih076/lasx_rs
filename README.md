@@ -218,6 +218,9 @@ GFLOP/s（峰值的 66–72%）。
   15 个 FFI 内核逐一详解、量化内核、批量物理内核、FFI 使用指南（C/Dart/Rust）、
   性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
 - **[docs/perf-report.md](docs/perf-report.md)**：性能实测报告与优化记录；
+- **[docs/compression.md](docs/compression.md)**：无损压缩与「带宽换算力」的可行性
+  测量（结论：快照 1.22×、轨迹 1.40×，且解码速率 0.37 GB/s 远低于内核消费
+  3.3 GB/s，**不进内核热路径**）与后续路线；
 - **[docs/README.md](docs/README.md)**：文档目录索引。
 
 ## 许可
