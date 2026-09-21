@@ -11,6 +11,8 @@
 - **LSX 128 位降级**：LSX-only CPU 自动走 128 位路径（线程级强制降级钩子用于验证/测试）
 - **零依赖**：纯 std + `stdarch_loongarch`（nightly）
 - **逐位确定**：向量化与标量结果一致（防回归测试守护）
+- **可选常驻线程池**（`lasx_rs::pool::WorkerPool`，Rust API）：多核铺开批量内核，
+  线程跨调用复用；小数据自动原地串行。**不新增任何 C ABI 符号**（走 `rlib`）
 
 ## 仓库
 
@@ -32,6 +34,7 @@ lasx_rs/
 │   │   ├── mod.rs        #   SimdPath enum：能力探测 + 路径分派
 │   │   ├── lasx.rs       #   LASX 256 位 load/store/splat 样板
 │   │   └── lsx.rs        #   LSX 128 位样板
+│   ├── pool.rs           # 可选常驻线程池（WorkerPool）：纯 Rust API，不导出符号
 │   ├── ops/              # 算子层：一个内核一个文件（含各自的 #[cfg(test)]）
 │   │   ├── dot.rs  sum.rs  axpy.rs  dot_f64.rs  dot_i8.rs  dot_q4.rs
 │   │   ├── matmul.rs  matmul_f64.rs
@@ -84,6 +87,23 @@ FFI 调用示例（Dart）：
 final lib = DynamicLibrary.open('liblasx_rs.so');
 // 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
 ```
+
+Rust 调用方要多核时用库内常驻池（**只走 rlib，不经过 C ABI**）：
+
+```rust
+use lasx_rs::aligned::AlignedVec;
+use lasx_rs::pool::WorkerPool;
+
+let pool = WorkerPool::new(12);            // 建一次，跨调用/跨步复用
+let mut x = AlignedVec::<f32>::fill_with(1 << 20, |i| i as f32);
+let mut y = AlignedVec::<f32>::fill_with(1 << 20, |_| 0.0);
+pool.for_each_chunks_mut([x.as_mut_slice(), y.as_mut_slice()], |[x, y]| {
+    let n = x.len() as i32;
+    lasx_rs::lasx_axpy(2.0, x.as_ptr(), y.as_mut_ptr(), n);
+});
+```
+
+完整可运行版本：`cargo run --release --example pool_axpy`（结果与串行逐位对照）。
 
 ## YouLiLong 原生扩展
 

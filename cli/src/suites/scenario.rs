@@ -11,15 +11,17 @@
 //! 3. [`fused_vs_composed`]：用融合内核 vs 用原语拼出同一个 RK4 步。
 
 use crate::data::{states, velocities, AlignedBuf, Soa6, J2, MU, RE};
-use crate::suites::micro::{rk4_parallel_scope, SpinPool};
+use crate::suites::micro::rk4_parallel_scope;
 use crate::timing::{fmt_t, timeit};
+use lasx_rs::pool::WorkerPool;
 use lasx_rs::*;
 use std::hint::black_box;
 
 /// 场景 1：多星 × 多步轨道传播。
 ///
 /// 关键对比是**线程池跨步复用**：单步基准里建池成本要靠重复取样摊掉，
-/// 而真实传播一跑几百步，池只建一次——这才是常驻池的用法。
+/// 而真实传播一跑几百步，池只建一次——这才是常驻池的用法。池来自库里
+/// （[`lasx_rs::pool::WorkerPool`]），不是基准私有实现。
 pub fn propagate() {
     let n = 1 << 16;
     let steps = 200usize;
@@ -45,11 +47,11 @@ pub fn propagate() {
     });
 
     // 池只建一次，跨 steps 步复用
-    let pool = SpinPool::new(threads);
+    let pool = WorkerPool::new(threads);
     let mut b3 = base.clone();
     let t_pool = timeit(|| {
         for _ in 0..steps {
-            pool.run(&mut b3);
+            b3.step_pooled(&pool);
         }
         let _ = black_box(b3.rx[0]);
     });
@@ -63,7 +65,7 @@ pub fn propagate() {
     for (name, t) in [
         ("单线程", t_single),
         ("12 线程 · 每步新建线程", t_scope),
-        ("12 线程 · 常驻自旋池（跨步复用）", t_pool),
+        ("12 线程 · 库内常驻池（跨步复用）", t_pool),
     ] {
         let per_step = t.as_secs_f64() / steps as f64;
         println!(

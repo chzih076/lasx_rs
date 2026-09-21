@@ -3,12 +3,10 @@
 use crate::data::{states, velocities, Soa6, J2, MU, RE};
 use crate::timing::{fmt_t, timeit};
 use lasx_rs::lasx_force_lsx_thread;
+use lasx_rs::pool::WorkerPool;
 use lasx_rs::*;
 use std::arch::loongarch64::*;
-use std::cell::UnsafeCell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// 一个 SOA 样本块：位置与速度各三分量。
@@ -69,184 +67,6 @@ pub fn rk4_parallel_scope(buf: &mut Soa6, threads: usize) {
     });
 }
 
-/* ==================== 常驻自旋工作线程池 ====================
-每次调用都新建线程的代价实测 ≈0.5 ms（24 线程），占 24 线程单步时间的一半以上。
-这里换成"原子代次 + 自旋等待"的常驻池：派活无系统调用、无互斥锁，主线程发布后
-自旋等 done 计数到齐。短任务 + 高频派活正是自旋优于阻塞式同步的场合。 */
-
-/// 一个 worker 的作业（裸指针，只有对应 worker 会读）。
-#[derive(Clone, Copy)]
-struct Rk4Job {
-    rx: *mut f64,
-    ry: *mut f64,
-    rz: *mut f64,
-    vx: *mut f64,
-    vy: *mut f64,
-    vz: *mut f64,
-    n: usize,
-}
-
-impl Rk4Job {
-    const NULL: Rk4Job = Rk4Job {
-        rx: std::ptr::null_mut(),
-        ry: std::ptr::null_mut(),
-        rz: std::ptr::null_mut(),
-        vx: std::ptr::null_mut(),
-        vy: std::ptr::null_mut(),
-        vz: std::ptr::null_mut(),
-        n: 0,
-    };
-}
-
-/// 自旋上限：超过就 park 睡到被唤醒。
-///
-/// 纯自旋在**不过订阅**时最快（派活全程无系统调用）。但线程数超过物理核时，一堆自旋
-/// 线程会把真正干活的线程挤掉——实测 24 线程（12 物理核 ×2 SMT）纯自旋慢 10 倍、
-/// 改成 `yield_now` 也仍慢 3 倍。故做成**自适应**：先自旋若干次，仍无任务就 park；
-/// 主线程发布后统一唤醒。这样不过订阅走无系统调用的快路径，过订阅退化为"睡着的线程"，
-/// 不会偷执行槽。
-const SPIN_LIMIT: u32 = 1024;
-
-struct PoolShared {
-    /// 主线程递增表示"新一批作业已就位"。
-    epoch: AtomicUsize,
-    /// 本轮已完成的 worker 数。
-    done: AtomicUsize,
-    /// 退出标志。
-    stop: AtomicBool,
-    jobs: Vec<UnsafeCell<Rk4Job>>,
-    /// 仅用于"自旋超限后 park / 发布后唤醒"，不保护数据。
-    park: Mutex<()>,
-    wake: Condvar,
-}
-
-// SAFETY: jobs[i] 只由第 i 个 worker 访问——主线程在递增 epoch 前写入，本轮不再触碰；
-// epoch/done/stop 都是原子量。故跨线程共享安全。
-unsafe impl Sync for PoolShared {}
-unsafe impl Send for PoolShared {}
-
-pub struct SpinPool {
-    shared: Arc<PoolShared>,
-    handles: Vec<std::thread::JoinHandle<()>>,
-    threads: usize,
-}
-
-impl SpinPool {
-    pub fn new(threads: usize) -> Self {
-        let shared = Arc::new(PoolShared {
-            epoch: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
-            stop: AtomicBool::new(false),
-            jobs: (0..threads)
-                .map(|_| UnsafeCell::new(Rk4Job::NULL))
-                .collect(),
-            park: Mutex::new(()),
-            wake: Condvar::new(),
-        });
-        let handles = (0..threads)
-            .map(|i| {
-                let sh = Arc::clone(&shared);
-                std::thread::spawn(move || {
-                    let mut seen = 0usize;
-                    loop {
-                        // 自适应等待：先自旋，超限就 park（过订阅时不再偷执行槽）
-                        let mut spins = 0u32;
-                        while sh.epoch.load(Ordering::Acquire) == seen {
-                            if sh.stop.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            spins += 1;
-                            if spins < SPIN_LIMIT {
-                                std::hint::spin_loop();
-                                continue;
-                            }
-                            let mut g = sh.park.lock().unwrap();
-                            while sh.epoch.load(Ordering::Acquire) == seen
-                                && !sh.stop.load(Ordering::Relaxed)
-                            {
-                                g = sh.wake.wait(g).unwrap();
-                            }
-                            break;
-                        }
-                        seen = sh.epoch.load(Ordering::Acquire);
-                        if sh.stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        // SAFETY: 本轮 jobs[i] 由本 worker 独占
-                        let job = unsafe { *sh.jobs[i].get() };
-                        lasx_force_lsx_thread(false);
-                        lasx_rk4_j2_step_batch(
-                            job.rx,
-                            job.ry,
-                            job.rz,
-                            job.vx,
-                            job.vy,
-                            job.vz,
-                            MU,
-                            J2,
-                            RE,
-                            10.0,
-                            job.n as i32,
-                        );
-                        sh.done.fetch_add(1, Ordering::Release);
-                    }
-                })
-            })
-            .collect();
-        SpinPool {
-            shared,
-            handles,
-            threads,
-        }
-    }
-
-    /// 把 `buf` 切块、派活，并等到全部 worker 完成。
-    pub fn run(&self, buf: &mut Soa6) {
-        let n = buf.len();
-        let chunk = n.div_ceil(self.threads).next_multiple_of(4).max(4);
-        let mut off = 0usize;
-        // 下标即 worker 编号（jobs[w] 必须与第 w 个 worker 对应），故用下标循环
-        #[allow(clippy::needless_range_loop)]
-        for w in 0..self.threads {
-            let len = chunk.min(n.saturating_sub(off));
-            // SAFETY: 各 worker 区间互不重叠；len=0 时 add(off) 仍是合法的一次过尾指针
-            let job = unsafe {
-                Rk4Job {
-                    rx: buf.rx.as_mut_ptr().add(off),
-                    ry: buf.ry.as_mut_ptr().add(off),
-                    rz: buf.rz.as_mut_ptr().add(off),
-                    vx: buf.vx.as_mut_ptr().add(off),
-                    vy: buf.vy.as_mut_ptr().add(off),
-                    vz: buf.vz.as_mut_ptr().add(off),
-                    n: len,
-                }
-            };
-            unsafe { *self.shared.jobs[w].get() = job };
-            off += len;
-        }
-        self.shared.done.store(0, Ordering::Relaxed);
-        {
-            let _g = self.shared.park.lock().unwrap();
-            self.shared.epoch.fetch_add(1, Ordering::Release);
-        }
-        self.shared.wake.notify_all();
-        while self.shared.done.load(Ordering::Acquire) < self.threads {
-            std::hint::spin_loop();
-        }
-    }
-}
-
-impl Drop for SpinPool {
-    fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.epoch.fetch_add(1, Ordering::Release); // 唤醒自旋中的 worker
-        self.shared.wake.notify_all(); // 以及已 park 的 worker
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
-    }
-}
-
 pub fn thread_scaling() {
     let n = 1 << 18;
     let (rx, ry, rz) = states(n);
@@ -265,9 +85,9 @@ pub fn thread_scaling() {
     println!("## 多线程扩展性：`lasx_rk4_j2_step_batch`（n = 2^18 = {n}，原地单步）");
     println!();
     println!("两种派活方式对比：**每次调用新建线程**（`std::thread::scope`）与");
-    println!("**常驻自旋池**（原子代次派活，worker 自旋等待，无锁无系统调用）。");
+    println!("**库内常驻池**（`lasx_rs::pool::WorkerPool`：原子代次派活，worker 自适应自旋/休眠，无系统调用）。");
     println!();
-    println!("| 线程数 | 每次新建线程 | 常驻自旋池 | 池相对 1 线程 | 池效率 |");
+    println!("| 线程数 | 每次新建线程 | 库内常驻池 | 池相对 1 线程 | 池效率 |");
     println!("|---|---|---|---|---|");
     println!("| 1 | — | {} | 1.00× | 100% |", fmt_t(t1));
 
@@ -276,12 +96,12 @@ pub fn thread_scaling() {
         let mut seq = base.clone();
         let mut par = base.clone();
         seq.step(false);
-        SpinPool::new(8).run(&mut par);
+        par.step_pooled(&WorkerPool::new(8));
         for k in 0..n {
             assert_eq!(
                 seq.rx[k].to_bits(),
                 par.rx[k].to_bits(),
-                "自旋池结果与单线程不一致 @ {k}"
+                "常驻池结果与单线程不一致 @ {k}"
             );
             assert_eq!(seq.vz[k].to_bits(), par.vz[k].to_bits(), "vz 不一致 @ {k}");
         }
@@ -294,10 +114,10 @@ pub fn thread_scaling() {
             let _ = black_box(b.rx[0]);
         });
         // 池要建一次、复用多次，才能把"建池成本"摊掉（这才是常驻池的用法）
-        let pool = SpinPool::new(th);
+        let pool = WorkerPool::new(th);
         let mut b2 = base.clone();
         let d_pool = timeit(|| {
-            pool.run(&mut b2);
+            b2.step_pooled(&pool);
             let _ = black_box(b2.rx[0]);
         });
         let sp = t1.as_secs_f64() / d_pool.as_secs_f64();
