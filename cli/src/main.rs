@@ -100,5 +100,6 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::FmaPeak => suites::micro::fma_peak(),
         Group::ThreadScaling => suites::micro::thread_scaling(),
         Group::Align => suites::align::align(),
+        Group::DispatchOverhead => suites::micro::dispatch_overhead(),
     }
 }

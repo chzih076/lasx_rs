@@ -54,22 +54,69 @@ pub struct HwCaps {
     pub lsx: bool,
 }
 
-static HW_CAPS: std::sync::OnceLock<HwCaps> = std::sync::OnceLock::new();
+impl HwCaps {
+    /// 打包成原子字节（bit0=LASX、bit1=LSX、bit7=已探测）。
+    #[inline]
+    fn to_bits(self) -> u8 {
+        (if self.lasx { BIT_LASX } else { 0 }) | (if self.lsx { BIT_LSX } else { 0 }) | BIT_DONE
+    }
+
+    #[inline]
+    fn from_bits(bits: u8) -> Self {
+        HwCaps {
+            lasx: bits & BIT_LASX != 0,
+            lsx: bits & BIT_LSX != 0,
+        }
+    }
+}
+
+const BIT_LASX: u8 = 0x01;
+const BIT_LSX: u8 = 0x02;
+/// 探测完成的哨兵位。有了它，"尚未探测"（0）与"探测结果是两者皆无"（仅 bit7）可区分。
+const BIT_DONE: u8 = 0x80;
+
+/// 能力探测结果打包进**一个原子字节**，写一次、之后只读。
+///
+/// 为什么不用 `OnceLock`：实测 `OnceLock::get_or_init` 每次取值约 **5 ns**，
+/// 而每次内核调用都要过这里——对 `lasx_dot` n=24（约 14 ns）这种小调用，
+/// 它一家就占了约 1/3。这里快路径只剩一条 `Relaxed` 原子读（约 0.5 ns）。
+///
+/// 发布用一次 `compare_exchange` 而非自旋：同一台机器上探测结果确定，
+/// 并发首调时谁先发布都一样，失败方直接采用已发布的值即可。
+static HW_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// 查询本机硬件能力。
+///
+/// 快路径（已探测）是一条 `Relaxed` 原子读；未探测时走 [`probe_hw_caps`]。
 #[inline]
 pub fn hardware() -> HwCaps {
-    *HW_CAPS.get_or_init(|| {
-        let mut cfg2: u32;
-        // SAFETY: cpucfg 是只读的 CPU 能力查询指令，读取 word 2 无副作用。
-        unsafe {
-            std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
-        }
-        HwCaps {
-            lasx: (cfg2 & (1 << 7)) != 0,
-            lsx: (cfg2 & (1 << 6)) != 0,
-        }
-    })
+    use std::sync::atomic::Ordering;
+    let bits = HW_BITS.load(Ordering::Relaxed);
+    if bits & BIT_DONE != 0 {
+        return HwCaps::from_bits(bits);
+    }
+    probe_hw_caps()
+}
+
+/// 首次调用时才走这里（`#[cold]`，不污染热路径的代码布局）。
+#[cold]
+fn probe_hw_caps() -> HwCaps {
+    use std::sync::atomic::Ordering;
+    let mut cfg2: u32;
+    // SAFETY: cpucfg 是只读的 CPU 能力查询指令，读取 word 2 无副作用。
+    unsafe {
+        std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
+    }
+    let caps = HwCaps {
+        lasx: (cfg2 & (1 << 7)) != 0,
+        lsx: (cfg2 & (1 << 6)) != 0,
+    };
+    let want = caps.to_bits();
+    match HW_BITS.compare_exchange(0, want, Ordering::Release, Ordering::Relaxed) {
+        Ok(_) => caps,
+        // 别的线程先发布了：结果与本次一致，直接用它的
+        Err(published) => HwCaps::from_bits(published),
+    }
 }
 
 thread_local! {

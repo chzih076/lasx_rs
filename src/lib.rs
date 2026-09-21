@@ -6,6 +6,7 @@
 //!
 //! | 模块 | 职责 |
 //! |---|---|
+//! | [`aligned`] | [`aligned::AlignedVec`]：保证 32 字节以上对齐的缓冲区（LASX 性能前提） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
 //! | `ops` | **算子层**：一个内核一个模块，入口按 `match SimdPath::detect()` 分派；接收切片 |
 //! | [`ffi`] | **C ABI 导出层**：15 个 `lasx_*` 符号，只做裸指针 → 切片，不含计算 |
@@ -34,6 +35,7 @@
 // extern "C" FFI 函数按约定解引用传入裸指针（调用方保证有效），非 unsafe fn 语义
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod aligned;
 pub mod arch;
 pub mod ffi;
 mod ops;

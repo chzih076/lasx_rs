@@ -35,6 +35,8 @@ pub enum Group {
     ThreadScaling,
     /// 缓冲区对齐对 LASX 的影响。
     Align,
+    /// 每次调用的分派/探测开销。
+    DispatchOverhead,
 }
 
 impl Group {
@@ -56,6 +58,7 @@ impl Group {
         Group::FmaPeak,
         Group::ThreadScaling,
         Group::Align,
+        Group::DispatchOverhead,
     ];
 
     /// 组名，同时用作命令行过滤子串。
@@ -77,12 +80,16 @@ impl Group {
             Group::FmaPeak => "fma",
             Group::ThreadScaling => "mt",
             Group::Align => "align",
+            Group::DispatchOverhead => "dispatch",
         }
     }
 
     /// 该组是否输出到结果表格（微基准自行打印，不写表）。
     pub fn is_tabular(self) -> bool {
-        !matches!(self, Group::FmaPeak | Group::ThreadScaling | Group::Align)
+        !matches!(
+            self,
+            Group::FmaPeak | Group::ThreadScaling | Group::Align | Group::DispatchOverhead
+        )
     }
 
     /// 是否被命令行过滤串选中（空串选中全部）。

@@ -220,3 +220,50 @@ pub fn spawn_overhead(threads: usize) -> Duration {
         });
     })
 }
+
+/// 分派开销：每次内核调用都要过的"全局状态"（能力探测缓存 + 线程级强制降级标志）。
+///
+/// 这两项历史上分别用 `OnceLock`（约 5 ns/次）与 TLS；改成"写一次的 relaxed 原子读"
+/// 后降到约 1 ns/次——对小规模内核（十几 ns）是实打实的比例提升。
+///
+/// lasx_rs 是**无状态**计算库，热路径上唯一的共享状态就是这两个；这里单独量它们，
+/// 用来判断值不值得换成自旋/无锁读。
+pub fn dispatch_overhead() {
+    use lasx_rs::arch::{hardware, SimdPath};
+
+    let n = 4_000_000usize;
+    let per = |f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            f(); // 被测值由各闭包内部 black_box，这里只需保证循环不被消除
+        }
+        t.elapsed().as_nanos() as f64 / n as f64
+    };
+
+    let empty = per(&mut || {
+        black_box(0u8);
+    });
+    let detect = per(&mut || {
+        black_box(SimdPath::detect());
+    });
+    let hw = per(&mut || {
+        black_box(hardware());
+    });
+
+    println!();
+    println!("## 分派开销（每次内核调用都要过的全局状态）");
+    println!();
+    println!("| 项 | ns/次 | 相对空循环 |");
+    println!("|---|---|---|");
+    println!("| 空循环基线 | {empty:.2} | 1.00× |");
+    println!(
+        "| `SimdPath::detect()`（原子读 + 线程级 TLS） | {detect:.2} | {:.1}× |",
+        detect / empty
+    );
+    println!(
+        "| `hardware()`（仅原子读） | {hw:.2} | {:.1}× |",
+        hw / empty
+    );
+    println!();
+    println!("> 参考：`lasx_dot` n=24 约 14 ns，n=4096 约 270 ns。");
+}
