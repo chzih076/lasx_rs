@@ -3,6 +3,7 @@
 pub mod align;
 pub mod attitude;
 pub mod batch;
+pub mod large;
 pub mod matmul;
 pub mod micro;
 pub mod physics;

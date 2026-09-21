@@ -16,45 +16,50 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     let mut acc1 = z;
     let mut acc2 = z;
     let mut acc3 = z;
+    /// 对**已经载入**的一对 32 字节向量做"乘 → 拓宽 → 累加"。
     #[inline(always)]
-    unsafe fn step(
-        a: *const i8,
-        b: *const i8,
-        i: usize,
-        z: m256i,
-        acc0: &mut m256i,
-        acc1: &mut m256i,
-        acc2: &mut m256i,
-        acc3: &mut m256i,
-    ) {
-        let va = lasx_xvld(a.add(i), 0);
-        let vb = lasx_xvld(b.add(i), 0);
+    unsafe fn step_pair(va: m256i, vb: m256i, z: m256i, acc0: &mut m256i, acc1: &mut m256i) {
         let lo16 = lasx_xvmulwev_h_b(va, vb);
         let hi16 = lasx_xvmulwod_h_b(va, vb);
         // 拓宽到 i32 再累加（不能链式用 xvaddwev/xvaddwod 当累加器）
         *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(lo16, z));
         *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(lo16, z));
-        *acc2 = lasx_xvadd_w(*acc2, lasx_xvaddwev_w_h(hi16, z));
-        *acc3 = lasx_xvadd_w(*acc3, lasx_xvaddwod_w_h(hi16, z));
+        *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(hi16, z));
+        *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(hi16, z));
     }
 
-    // 主循环：每 1024 字节（32 个向量）才落盘一次
+    // 主循环：每批次读出 128 字节（4 对向量）**先把 8 个载入都发出去**再算。
+    //
+    // 为什么这样改：每轮只发 2 个 32 B 载入时，DRAM 延迟（百纳秒量级）下在飞请求太少，
+    // 大集（工作集 >> L3）实测只有 5.8 GB/s（同规模纯读锚点 12 GB/s）；把 4 对载入
+    // 凑成一批，等于把 MLP 提高 4 倍。整数求和可结合，**结果逐位不变**。
+    // 每 1024 字节（8 批）落盘一次的节奏不变，i32 累加器上界 128×127² ≈ 2.1 M 仍安全。
     let mut tmp = [0i32; 8];
     while i + 1024 <= n {
-        for _ in 0..32 {
-            unsafe {
-                step(
-                    a.as_ptr(),
-                    b.as_ptr(),
-                    i,
-                    z,
-                    &mut acc0,
-                    &mut acc1,
-                    &mut acc2,
-                    &mut acc3,
+        for _ in 0..8 {
+            let (va0, vb0, va1, vb1) = unsafe {
+                (
+                    lasx_xvld(a.as_ptr().add(i), 0),
+                    lasx_xvld(b.as_ptr().add(i), 0),
+                    lasx_xvld(a.as_ptr().add(i + 32), 0),
+                    lasx_xvld(b.as_ptr().add(i + 32), 0),
                 )
             };
-            i += 32;
+            let (va2, vb2, va3, vb3) = unsafe {
+                (
+                    lasx_xvld(a.as_ptr().add(i + 64), 0),
+                    lasx_xvld(b.as_ptr().add(i + 64), 0),
+                    lasx_xvld(a.as_ptr().add(i + 96), 0),
+                    lasx_xvld(b.as_ptr().add(i + 96), 0),
+                )
+            };
+            unsafe {
+                step_pair(va0, vb0, z, &mut acc0, &mut acc1);
+                step_pair(va1, vb1, z, &mut acc2, &mut acc3);
+                step_pair(va2, vb2, z, &mut acc0, &mut acc1);
+                step_pair(va3, vb3, z, &mut acc2, &mut acc3);
+            }
+            i += 128;
         }
         // 合并成两条再落盘，减少一半 store 与标量加
         let s01 = unsafe { lasx_xvadd_w(acc0, acc1) };
@@ -80,16 +85,9 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     // 余下不足 1024 字节：按 32 字节块处理，收尾统一落盘
     while i + 32 <= n {
         unsafe {
-            step(
-                a.as_ptr(),
-                b.as_ptr(),
-                i,
-                z,
-                &mut acc0,
-                &mut acc1,
-                &mut acc2,
-                &mut acc3,
-            )
+            let va = lasx_xvld(a.as_ptr().add(i), 0);
+            let vb = lasx_xvld(b.as_ptr().add(i), 0);
+            step_pair(va, vb, z, &mut acc0, &mut acc1);
         };
         i += 32;
     }

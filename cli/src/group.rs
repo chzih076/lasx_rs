@@ -19,6 +19,7 @@ pub enum Group {
     Matmul,
     /// 批量 3 分量模长。
     Attitude,
+    Large,
     Norm3,
     /// 批量缩放加。
     Vec3,
@@ -53,6 +54,7 @@ impl Group {
         Group::DotQ4,
         Group::Matmul,
         Group::Attitude,
+        Group::Large,
         Group::Norm3,
         Group::Vec3,
         Group::Distance2d,
@@ -77,6 +79,7 @@ impl Group {
             Group::DotQ4 => "dot_q4",
             Group::Matmul => "matmul",
             Group::Attitude => "attitude",
+            Group::Large => "large",
             Group::Norm3 => "norm3",
             Group::Vec3 => "vec3",
             Group::Distance2d => "distance2d",

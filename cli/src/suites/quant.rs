@@ -7,7 +7,7 @@ use std::hint::black_box;
 
 /// int8 量化点积（LASX-only）。
 pub fn dot_i8(rows: &mut Vec<Row>) {
-    for &n in &[1usize << 16, 1 << 22] {
+    for &n in &[1usize << 16, 1 << 22, 1 << 25] {
         let mut rng = Lcg::new(0x9a17 ^ n as u64);
         let a = AlignedBuf::fill_with(n, |_| rng.i8());
         let b = AlignedBuf::fill_with(n, |_| rng.i8());
@@ -32,7 +32,7 @@ pub fn dot_i8(rows: &mut Vec<Row>) {
 
 /// Q4 量化点积（LASX-only）。
 pub fn dot_q4(rows: &mut Vec<Row>) {
-    for &n in &[1usize << 16, 1 << 22] {
+    for &n in &[1usize << 16, 1 << 22, 1 << 25] {
         let mut rng = Lcg::new(0x9a17 ^ n as u64);
         let qa = AlignedBuf::fill_with(n, |_| rng.u8());
         let qb = AlignedBuf::fill_with(n, |_| rng.u8());
