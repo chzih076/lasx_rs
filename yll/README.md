@@ -27,7 +27,8 @@ cp target/release/liblasx.so yll/
 | `distance2d(px, py, xs, ys)` | 各点到 `(px, py)` 的距离（f32）→ Array |
 | `vec3_add_scaled(ax, ay, az, bx, by, bz, s)` | `o = a + s·b` → `[ox, oy, oz]` |
 | `j2_accel(rx, ry, rz, mu, j2, re)` | 中心引力 + J2 摄动加速度 → `[ax, ay, az]` |
-| `rk4_step(rx, ry, rz, vx, vy, vz, mu, j2, re, dt)` | 批量 RK4 J2 单步 → `[rx, ry, rz, vx, vy, vz]` |
+| `rk4_step(rx, ry, rz, vx, vy, vz, mu, j2, re, dt)` | 批量 RK4 J2 单步（**单线程**）→ `[rx, ry, rz, vx, vy, vz]` |
+| `propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, steps)` | 批量 RK4 J2 多步传播（**多核常驻池**，数组只转换一次）→ 终态 `[rx, ry, rz, vx, vy, vz]` |
 
 常量：`VERSION`、`ALIGN`（LASX 建议的缓冲对齐字节数）。
 
@@ -38,6 +39,38 @@ a = [1.0, 2.0, 3.0, 4.0]
 print(lasx.dot(a, [1.0, 1.0, 1.0, 1.0]))   // 10
 print(lasx.norm3([3.0], [4.0], [0.0]))     // [5]
 ```
+
+## 多步传播：用 `propagate`，别在脚本里循环
+
+两者数值**逐位一致**（同样的内核、同样的每步顺序，池只改下标切分），差别只在调用策略：
+
+```youlilong
+// A) 脚本循环：单线程，而且**每一步**都要把 6 个数组在脚本值与 Rust 缓冲之间搬一遍
+cur = lasx.rk4_step(rx, ry, rz, vx, vy, vz, mu, j2, re, dt)
+for s in 1..200 {
+    cur = lasx.rk4_step(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], mu, j2, re, dt)
+}
+
+// B) 一次到位：常驻线程池多核，数组只转换一次
+final = lasx.propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, 200)
+```
+
+`yll/bench_propagate.yli` 的实测（n = 20000 星 × 200 步）：
+
+| 写法 | 总时间 | 每步 | 相对 |
+|---|---|---|---|
+| A 脚本循环 `rk4_step` | 5608.8 ms | 28.04 ms | 1× |
+| B `propagate` | 50.9 ms | 0.254 ms | **110×** |
+
+（重复测量在 **99–112×** 之间：A 列对机器负载很敏感，B 列基本不动。）
+
+这个 110× 远大于内核本身的多核加速（6.9×），因为 A 的每步里**内核只占约 0.6 ms**，
+其余 27 ms 全是"把 12 万个数值在脚本值与 Rust 缓冲之间来回搬"。结论：
+**脚本侧循环调用批量内核时，真正的代价不是内核，而是每次调用的数据搬运**——
+把循环放进库里（`propagate` 就是这么做的）比在脚本里优化循环有效得多——量级差别，不是调优。
+
+> 这个对照脚本要跑约 6 秒，**不进 CI**，手动执行：
+> `youli_long yll/bench_propagate.yli`
 
 ## 错误处理：一律上抛
 
@@ -70,7 +103,8 @@ try {
 - 参与同一运算的数组长度不一致；
 - `matmul` 的数组长度与声明的 `m/k/n` 不自洽；
 - `int8` 元素越界（不在 −128..=127）；
-- 物理常数非法（`mu <= 0`、`re <= 0`、`j2`/`dt` 为 NaN/无穷）；
+- 物理常数非法（`mu <= 0`、`re <= 0`、`j2`/`dt` 为非有限值）；
+- `propagate` 的 `steps < 0`，或位置与速度数组长度不一致；
 - 数组元素数超过 `1 << 28`。
 
 错误消息**具体到参数名与下标**（如 "参数 `x` 的第 1 个元素不是数值"），
@@ -84,8 +118,11 @@ try {
 - **对齐**：脚本数组进来后先拷贝进 32 字节以上对齐的缓冲（`AlignedVec`）再调内核。
   LASX 是 32 字节访存，未对齐会跨缓存行——实测 glibc `malloc`/Dart FFI 只有约一半
   落在 32 字节边界，所以这一步不是多余的。
-- **无锁**：扩展是纯函数（入参拷贝、无共享可变状态），解释器不给 GIL 也不影响它，
-  因此不需要任何锁。
+- **几乎没有共享状态**：除 `propagate` 外都是纯函数（入参拷贝进 `AlignedVec`、
+  无共享可变状态），解释器不给 GIL 也不影响它们。`propagate` 持有一个进程内常驻
+  线程池（跨调用复用才有多核收益），池的派活是独占的，故用 `Mutex` 串行化并发调用；
+  上一次调用若 panic，池会先让 worker 全部收工再续抛，状态仍干净，`Mutex` 中毒也不
+  影响继续使用。
 - **不泄漏**：字符串按"调用期间存活"借出（参考实现用 `CString::into_raw()` 每次调用
   泄漏一次），本扩展不回退到那种写法。
 
@@ -99,4 +136,5 @@ try {
 | `src/funcs.rs` | 各内核的对外函数（校验 + 调库 + 造返回值） |
 | `lib.ylh` | 接口声明（LSP/IDE 用） |
 | `youli.yaml` | 包配置（含 `native:` 段） |
-| `test_lasx.yli` | 端到端测试：成功路径 + 7 条错误上抛路径 |
+| `test_lasx.yli` | 端到端测试：成功路径 + 10 条错误上抛路径 |
+| `bench_propagate.yli` | 调用策略对照（脚本循环 vs `propagate`，手动跑，不进 CI） |

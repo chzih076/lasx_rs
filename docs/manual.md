@@ -174,9 +174,10 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 | `src/ops/*.rs` | **算子层**：一个内核一个文件，接收切片，`match SimdPath` 分派，自带测试 |
 | `src/ffi/*.rs` | **C ABI 导出层**：15 个 `#[unsafe(no_mangle)]` 符号 + 14 个 `_checked`，只做裸指针 → 切片 |
 | `src/pool.rs` | 可选常驻线程池（纯 Rust API，不导出符号，见 §5.8） |
+| `src/parallel.rs` | 多核调用策略层：`matmul_f32/f64`、`rk4_j2_step_batch`（见 §5.8） |
 | `cli/` | 独立 crate `lasx_bench`：性能基准 CLI（`Group` enum + `match` 分派） |
 | `yll/` | 独立 crate `lasx_yll`：YouLiLong 原生扩展，产出 `liblasx.so`（见 §5.7） |
-| `examples/` | 调用方示例（`cargo run --release --example pool_axpy`） |
+| `examples/` | 调用方示例（`pool_axpy`、`matmul_pooled`） |
 
 分层约定：算子只处理安全的切片，指针有效性与长度约定收敛在 `ffi`；新增内核 =
 在 `ops/` 加一个文件 + 在 `ffi/` 加一个薄包装。15 个导出符号名与语义保持不变，
@@ -734,6 +735,12 @@ C 层只能判**结构**（空指针、负长度、溢出、物理常数）；"�
 `lasx_*_checked` 再兜住结构性错误。脚本数组先拷贝进 32 字节以上对齐的
 `AlignedVec` 再调内核（LASX 对齐要求见 §5.5）。
 
+**多步传播用 `propagate` 而不是脚本里循环**：后者每步都要把 6 个数组在脚本值与
+Rust 缓冲之间搬一遍，实测 n=20000 星时每步 28.04 ms，其中内核只占约 0.6 ms——
+98% 是转换开销。`propagate` 持有一个进程内常驻池（`Mutex` 串行化并发调用），
+数组只转换一次、池跨步复用，同样 200 步只要 0.254 ms/步，**端到端约 100×**（99–112×），
+且与脚本循环的结果**逐位一致**（`yll/bench_propagate.yli`，手动跑，不进 CI）。
+
 构建与端到端测试：
 
 ```bash
@@ -742,19 +749,32 @@ cp target/release/liblasx.so yll/
 <YouLiLong>/target/release/youli_long yll/test_lasx.yli
 ```
 
-### 5.8 多核并行（`pool::WorkerPool`）
+### 5.8 多核并行（`pool::WorkerPool` + `parallel`）
 
 内核本身是单线程的（每个 `lasx_*` 只处理一段连续内存）。要把批量数据铺到多核，
-库里提供一个**可选的常驻线程池**：
+库里提供一个**可选的常驻线程池**，以及一层把常见负载的切分形状固定下来的
+**多核调用策略层**：
 
 ```rust
 use lasx_rs::pool::WorkerPool;
 
-let pool = WorkerPool::new(12);      // 建一次，长期持有
-// 单数组：切 12 段
+let mut pool = WorkerPool::new(12);   // 建一次，长期持有
+
+// 1) 单数组：按元素切 12 段
 pool.for_each_chunk_mut(x.as_mut_slice(), |chunk| { /* ... */ });
-// SOA 多数组：各数组同步切段，每段同一下标区间、互不重叠
+
+// 2) N 个等长数组（SOA）：同步切段，每段同一下标区间
 pool.for_each_chunks_mut([rx, ry, rz], |[rx, ry, rz]| { /* lasx_norm3_batch(...) */ });
+
+// 3) 行块：行宽可以不同（矩阵乘形状），row_gran 是内核的行粒度
+pool.for_each_row_block_mut(m, 4, [(&mut a, k), (&mut c, n)], |rows, [ab, cb]| {
+    lasx_rs::lasx_matmul(rows as i32, k as i32, n as i32, ab.as_ptr(), b, cb.as_mut_ptr());
+});
+
+// 常见负载直接用策略层（切分已经在里面做对了）
+lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
+lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt,
+                                     rx, ry, rz, vx, vy, vz);
 ```
 
 **它为什么是 Rust API 而不是 C ABI**：池的入参是「若干切片 + 一个闭包」，
@@ -767,17 +787,26 @@ C/Dart 调用方若要多核，用自己语言的线程/进程池，把切好的
 
 | 事项 | 取值 | 依据 |
 |---|---|---|
-| 低于该长度自动串行 | `MIN_PARALLEL_LEN = 4096` | 派活/唤醒开销超过收益 |
+| 低于该长度自动串行 | `MIN_PARALLEL_LEN = 4096`（各数组元素数之和） | 派活/唤醒开销超过收益 |
 | 等待策略 | 自旋 1024 次 → `Condvar` park | **纯自旋在过订阅时慢 10×**（24 逻辑核 /12 物理核，perf-report §12.2） |
-| 池相对单线程 | 12 线程 7.40×（单步）/ 6.88×（200 步传播） | 上限是内存带宽，不是派活 |
+| 派活方式 | `&mut self` 独占派活，仅一个原子代次发布 + `done` 计数 | 并发调用在编译期被拒绝，不是静默数据竞争 |
+| 每次调用分配 | **零**（作业槽是定长数组，只做指针算术） | 派活路径不该碰分配器 |
+| worker 里 panic | `catch_unwind` 拦下 → 主线程 `resume_unwind` 续抛 | 否则 `done` 永远到不齐，主线程永久自旋（比崩溃更糟） |
+| 池相对单线程 | 12 线程 7.40×（RK4 单步）/ 6.88×（200 步传播）/ 5.4×（256³ 矩阵乘） | 上限是内存带宽，不是派活 |
 | 相对「每步新建线程」 | 端到端 **2.1–2.3×** | 每次建/回收线程 ≈0.5 ms，池把它摊成 0 |
 
+**`row_gran` 不能省**：它声明内核一次处理几行，块大小会向上取整到它的倍数。
+`lasx_matmul` 按 4 行分块、尾块退化成单行（B 复用从 4 次掉到 1 次），256 行 12 线程
+若按默认切法会得到 22 行/块 = 5×4+2 行，**B 的流量凭空多 28%**；24 线程时更糟
+（11 行/块 = 2×4+3 行），实测加上行粒度后 196 µs → 151 µs。传 1 表示没有行结构。
+
 **数值一致性**：切块边界不影响结果——批量内核按元素独立计算，块内尾循环与单线程
-逐位一致；`pool` 的单测与 `cli` 的 `mt` 套件都做逐位对照。
+逐位一致；`pool`/`parallel` 的单测、`cli` 的 `mt`/`scenario` 套件都做逐位对照
+（`to_bits` 级）。矩阵乘的多核加速实测见 perf-report §14.6。
 
 > **池是要复用的**：把 `WorkerPool::new` 放进热路径等于退化成"每次新建线程"。
-> 正确形态是建一次、跨调用/跨步复用（示例见 `examples/pool_axpy.rs`，
-> 收益实测见 perf-report §13.3）。
+> 正确形态是建一次、跨调用/跨步复用（示例见 `examples/pool_axpy.rs`、
+> `examples/matmul_pooled.rs`，收益实测见 perf-report §13.3 / §14）。
 
 ---
 
@@ -785,14 +814,19 @@ C/Dart 调用方若要多核，用自己语言的线程/进程池，把切好的
 
 ### 6.1 已记录数据（来自 README，Loongson-3B6000，LA664）
 
-| 内核 | 加速比 |
-|---|---|
-| 批量点积（n≥8） | 2.4–2.8× |
-| 全阶引力批量 | 3.84× |
-| 24 线程批量传播 | ~18× |
+| 内核 | 规模 | LASX 计时 | 相对标量 |
+|---|---|---|---|
+| `lasx_dot` | n=4096 | 316 ns（现已 272 ns） | 17.6×（现已 20.6×） |
+| `lasx_sum` | n=64 Ki | 6.1 µs | 14.8× |
+| `lasx_dot_i8` | n=64 Ki | 7.9 µs | 1.35× |
+| `lasx_matmul` f32 | 256³ | 546 µs | 4.47× |
+| `lasx_matmul_f64` | 128³ | 134 µs | 4.65× |
 
-仓库内**没有**基准测试代码（无 `benches/`，无 criterion 依赖），上述为 README
-记录的实测结果。
+> 基准代码在**独立的 CLI crate**（`cli/`，零外部依赖，无 criterion）：
+> `cargo run -p lasx_bench --release [-- <组名>]`。
+> README 里曾出现的"24 线程 ~18×"**不可复现**，根因是内存带宽而非派活，
+> 见 perf-report §12.2；实测为 ~7×（RK4 单步）、6.9×（200 步传播）、
+> 5.4×@12 线程 / 8.5×@16 线程（256³ 矩阵乘，§14.6）。
 
 ### 6.2 复现建议（基于现有钩子，无新增依赖）
 
@@ -1091,9 +1125,14 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `pool::WorkerPool::new` | `pub fn new(threads: usize) -> Self` | 建常驻池（`threads` 至少 1）；建一次、跨调用复用 |
 | `pool::WorkerPool::auto` | `pub fn auto() -> Self` | 按 `available_parallelism()` 建池 |
 | `pool::WorkerPool::threads` | `pub fn threads(&self) -> usize` | 池内线程数 |
-| `pool::WorkerPool::for_each_chunk_mut` | `pub fn for_each_chunk_mut<T: Send, F: Fn(&mut [T]) + Sync>(&self, data: &mut [T], f: F)` | 单数组切段并行，返回前保证全部完成 |
-| `pool::WorkerPool::for_each_chunks_mut` | `pub fn for_each_chunks_mut<T: Send, const N: usize, F: Fn([&mut [T]; N]) + Sync>(&self, arrays: [&mut [T]; N], f: F)` | SOA 多数组同步切段（长度须一致，否则 panic） |
-| `pool::MIN_PARALLEL_LEN` | `pub const MIN_PARALLEL_LEN: usize = 4096` | 低于该长度自动原地串行 |
+| `pool::WorkerPool::for_each_chunk_mut` | `pub fn for_each_chunk_mut<T: Send, F: Fn(&mut [T]) + Sync>(&mut self, data: &mut [T], f: F)` | 单数组切段并行，返回前保证全部完成 |
+| `pool::WorkerPool::for_each_chunks_mut` | `pub fn for_each_chunks_mut<T: Send, const N: usize, F: Fn([&mut [T]; N]) + Sync>(&mut self, arrays: [&mut [T]; N], f: F)` | SOA 多数组同步切段（长度须一致，否则 panic） |
+| `pool::WorkerPool::for_each_row_block_mut` | `pub fn for_each_row_block_mut<T: Send, const N: usize, F: Fn(usize, [&mut [T]; N]) + Sync>(&mut self, rows: usize, row_gran: usize, arrays: [(&mut [T], usize); N], f: F)` | 按行块切分，行宽可不同；闭包首参为本块行数（矩阵乘形状，见 §5.8） |
+| `pool::MIN_PARALLEL_LEN` | `pub const MIN_PARALLEL_LEN: usize = 4096` | 低于该长度（各数组元素数之和）自动原地串行 |
+| `pool::MAX_ARRAYS` | `pub const MAX_ARRAYS: usize = 16` | 单次派活最多支持的数组个数 |
+| `parallel::matmul_f32` | `pub fn matmul_f32(&mut WorkerPool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32])` | 多核矩阵乘（行粒度 4），`B` 只读共享 |
+| `parallel::matmul_f64` | `pub fn matmul_f64(&mut WorkerPool, m, k, n, a: &mut [f64], b: &[f64], c: &mut [f64])` | 同上，f64 |
+| `parallel::rk4_j2_step_batch` | `pub fn rk4_j2_step_batch(&mut WorkerPool, mu, j2, re, dt, rx, ry, rz, vx, vy, vz: &mut [f64])` | 多核批量 RK4 J2 单步（6 数组一次派活） |
 | `aligned::AlignedVec::as_mut_slice` | `pub fn as_mut_slice(&mut self) -> &mut [T]` | 取对齐切片，直接喂给上面的池接口 |
 
 ### 10.3 内部辅助（私有，文档用途）
@@ -1110,7 +1149,7 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `rk4_j2_step_scalar` | RK4 J2 标量步（非 LASX 兜底 + 向量路径尾循环；FMA 版） |
 | `ops::testutil` | 测试共用夹具（`cfg(test)`，见 §7） |
 | `ffi::{reduce, matmul, quant, batch, physics, memory}` | 15 个 `lasx_*` 导出符号所在模块 |
-| `pool::{Shared, Slot, Thunk, worker_loop, thunk}` | 常驻池内部实现（原子代次发布 + 类型擦除入口，见 §5.8） |
+| `pool::{Shared, Slot, Thunk, worker_loop, thunk}` | 常驻池内部实现（原子代次发布 + 类型擦除入口 + panic 拦返，见 §5.8） |
 
 ---
 

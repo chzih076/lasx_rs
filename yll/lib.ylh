@@ -28,6 +28,9 @@ fn j2_accel(rx, ry, rz, mu, j2, re) {
 fn rk4_step(rx, ry, rz, vx, vy, vz, mu, j2, re, dt) {
     return nil
 }
+fn propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, steps) {
+    return nil
+}
 
 VERSION = "0.1.0"
 ALIGN = 32

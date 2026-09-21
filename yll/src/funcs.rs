@@ -8,6 +8,7 @@
 //! 兜住结构性问题（空指针、负长度、溢出）。
 
 use std::ffi::c_int;
+use std::sync::{Mutex, OnceLock};
 
 use lasx_rs::ffi::checked::{
     lasx_batch_distance2d_checked, lasx_dot_checked, lasx_dot_i8_checked,
@@ -20,6 +21,20 @@ use crate::convert::{
     push_f64_array, push_f64_arrays, read_f32, read_f64_soa, read_f64_soa_at, read_i8,
 };
 use crate::yll::{arg_f64, arg_int, error, yll_float, yll_int, YllContextC, YllValueWrapper};
+
+/// 进程内唯一的常驻线程池：建一次，跨调用/跨步复用。
+///
+/// 多步传播的收益几乎全在"池复用"上（每次新建线程要付约 0.5 ms/步，见
+/// `docs/perf-report.md` §13.3）。解释器不提供 GIL、可能并发调用本扩展，而池的派活
+/// 是**独占**的（`for_each_*` 取 `&mut self`），故用 `Mutex` 串行化两个脚本线程的调用。
+fn pool() -> std::sync::MutexGuard<'static, lasx_rs::pool::WorkerPool> {
+    static POOL: OnceLock<Mutex<lasx_rs::pool::WorkerPool>> = OnceLock::new();
+    // 中毒说明上一次调用在持锁时 panic（例如形状断言被绕过）；池在 panic 后状态是干净的
+    // （worker 已全部收工），故取回内部值继续用，而不是让整个扩展从此不可用。
+    POOL.get_or_init(|| Mutex::new(lasx_rs::pool::WorkerPool::auto()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// 统一收口：把 `Result` 里的错误消息变成解释器会抛出的错误值。
 ///
@@ -364,5 +379,78 @@ pub extern "C" fn fn_rk4_step(
         );
         ok_or!("rk4_step", st);
         Ok(push_f64_arrays(&[&p[0], &p[1], &p[2], &v[0], &v[1], &v[2]]))
+    })
+}
+
+/// `propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, steps) -> [rx, ry, rz, vx, vy, vz]`：
+/// 多星 × 多步 RK4 J2 传播（多核）。
+///
+/// 与 [`fn_rk4_step`] 的区别只在**调用策略**：这里是常驻线程池跑 `steps` 步、池跨步复用，
+/// 而 `rk4_step` 是单线程单步。同样的内核与线程数，端到端快约 2.1–2.3×（perf-report §13.3）。
+///
+/// 多步传播是**原地推进**的，脚本侧拿到的是终态；要逐步观察请用循环里的 `rk4_step`。
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn fn_propagate(
+    _ctx: *mut YllContextC,
+    argc: c_int,
+    argv: *mut *mut YllValueWrapper,
+) -> *mut YllValueWrapper {
+    guard(|| unsafe {
+        if argc < 11 {
+            return Err(
+                "propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, steps) 需要 11 个参数".into(),
+            );
+        }
+        let p = read_f64_soa(argv, ["rx", "ry", "rz"])?;
+        let v = read_f64_soa_at(argv, ["vx", "vy", "vz"], 3)?;
+        let mu = arg_f64(argv, 6, "mu")?;
+        let j2 = arg_f64(argv, 7, "j2")?;
+        let re = arg_f64(argv, 8, "re")?;
+        let dt = arg_f64(argv, 9, "dt")?;
+        let steps = arg_int(argv, 10, "steps")?;
+        if p[0].len() != v[0].len() {
+            return Err(format!(
+                "位置与速度长度不一致：{} vs {}",
+                p[0].len(),
+                v[0].len()
+            ));
+        }
+        if steps < 0 {
+            return Err(format!("steps 必须非负，得到 {steps}"));
+        }
+        for (name, val) in [("mu", mu), ("j2", j2), ("re", re), ("dt", dt)] {
+            if !val.is_finite() {
+                return Err(format!("{name} 必须是有限数，得到 {val}"));
+            }
+        }
+        if mu <= 0.0 || re <= 0.0 {
+            return Err(format!("mu 与 re 必须为正：mu={mu}, re={re}"));
+        }
+        // 0 步或空数组：直接原样返回，不进池（也避免建池）
+        if steps == 0 || p[0].is_empty() {
+            return Ok(push_f64_arrays(&[&p[0], &p[1], &p[2], &v[0], &v[1], &v[2]]));
+        }
+
+        // 解构出 6 个独立绑定：`p[0].as_mut_slice()` 这种索引写法过不了借用检查
+        let [mut px, mut py, mut pz] = p;
+        let [mut qx, mut qy, mut qz] = v;
+        let mut pool = pool();
+        for _ in 0..steps as usize {
+            lasx_rs::parallel::rk4_j2_step_batch(
+                &mut pool,
+                mu,
+                j2,
+                re,
+                dt,
+                px.as_mut_slice(),
+                py.as_mut_slice(),
+                pz.as_mut_slice(),
+                qx.as_mut_slice(),
+                qy.as_mut_slice(),
+                qz.as_mut_slice(),
+            );
+        }
+        Ok(push_f64_arrays(&[&px, &py, &pz, &qx, &qy, &qz]))
     })
 }

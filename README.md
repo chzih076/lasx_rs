@@ -11,8 +11,9 @@
 - **LSX 128 位降级**：LSX-only CPU 自动走 128 位路径（线程级强制降级钩子用于验证/测试）
 - **零依赖**：纯 std + `stdarch_loongarch`（nightly）
 - **逐位确定**：向量化与标量结果一致（防回归测试守护）
-- **可选常驻线程池**（`lasx_rs::pool::WorkerPool`，Rust API）：多核铺开批量内核，
-  线程跨调用复用；小数据自动原地串行。**不新增任何 C ABI 符号**（走 `rlib`）
+- **可选常驻线程池 + 多核调用策略层**（`lasx_rs::pool` / `lasx_rs::parallel`，Rust API）：
+  多核铺开批量内核、线程跨调用复用；小数据自动原地串行。矩阵乘 12 线程约 **5.4×**、
+  16 线程约 **8.5×**。**不新增任何 C ABI 符号**（走 `rlib`）
 
 ## 仓库
 
@@ -35,6 +36,7 @@ lasx_rs/
 │   │   ├── lasx.rs       #   LASX 256 位 load/store/splat 样板
 │   │   └── lsx.rs        #   LSX 128 位样板
 │   ├── pool.rs           # 可选常驻线程池（WorkerPool）：纯 Rust API，不导出符号
+│   ├── parallel.rs       # 把内核铺到池上的多核调用策略层（matmul / rk4 步）
 │   ├── ops/              # 算子层：一个内核一个文件（含各自的 #[cfg(test)]）
 │   │   ├── dot.rs  sum.rs  axpy.rs  dot_f64.rs  dot_i8.rs  dot_q4.rs
 │   │   ├── matmul.rs  matmul_f64.rs
@@ -43,6 +45,7 @@ lasx_rs/
 │   │   └── testutil.rs   #   测试共用夹具（仅 cfg(test)）
 │   └── ffi/              # C ABI 导出层：只做裸指针 → 切片，不含计算
 │       ├── reduce.rs  matmul.rs  quant.rs  batch.rs  physics.rs  memory.rs
+├── examples/             # 调用方示例：pool_axpy.rs、matmul_pooled.rs
 ├── cli/                  # 独立 crate `lasx_bench`：性能基准 CLI
 │   └── src/{main,group,timing,report,data,scalar_ref,suites/*}.rs
 └── yll/                  # 独立 crate `lasx_yll`：YouLiLong 原生扩展（产出 liblasx.so）
@@ -94,7 +97,7 @@ Rust 调用方要多核时用库内常驻池（**只走 rlib，不经过 C ABI**
 use lasx_rs::aligned::AlignedVec;
 use lasx_rs::pool::WorkerPool;
 
-let pool = WorkerPool::new(12);            // 建一次，跨调用/跨步复用
+let mut pool = WorkerPool::new(12);        // 建一次，跨调用/跨步复用
 let mut x = AlignedVec::<f32>::fill_with(1 << 20, |i| i as f32);
 let mut y = AlignedVec::<f32>::fill_with(1 << 20, |_| 0.0);
 pool.for_each_chunks_mut([x.as_mut_slice(), y.as_mut_slice()], |[x, y]| {
@@ -103,7 +106,19 @@ pool.for_each_chunks_mut([x.as_mut_slice(), y.as_mut_slice()], |[x, y]| {
 });
 ```
 
-完整可运行版本：`cargo run --release --example pool_axpy`（结果与串行逐位对照）。
+常见负载不用自己写切分——多核调用策略层已经把形状固定好了：
+
+```rust
+// 大矩阵乘：B 只读共享，A/C 按同一批行切块（行粒度 4 是内核的 4 行分块）
+lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
+// 多步轨道传播：把循环放进库里，池跨步复用
+for _ in 0..steps {
+    lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt, rx, ry, rz, vx, vy, vz);
+}
+```
+
+完整可运行版本：`cargo run --release --example pool_axpy`、
+`cargo run --release --example matmul_pooled`（都自带与单线程的逐位对照）。
 
 ## YouLiLong 原生扩展
 
@@ -121,6 +136,9 @@ use "./lasx"
 a = [1.0, 2.0, 3.0, 4.0]
 print(lasx.dot(a, [1.0, 1.0, 1.0, 1.0]))   // 10
 print(lasx.norm3([3.0], [4.0], [0.0]))     // [5]
+
+// 多星多步传播：多核 + 常驻池，数组只转换一次（比脚本里循环 call 单步快 110×）
+final = lasx.propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, 200)
 
 try {
     lasx.dot(a, [1.0])                     // 长度不一致
@@ -147,7 +165,9 @@ cargo run -p lasx_bench --release -- scenario  # 真实调用场景（多步传�
 > **调用策略本身影响很大**（基准同时也是示例，`-- scenario` 给出实测）：
 > 多步传播时**复用常驻线程池**比每步新建线程端到端快 **2.1–2.3×**；
 > **用融合内核**（`lasx_rk4_j2_step_batch`）比用原语拼同一个 RK4 步快 **2.8×**；
-> 小数组高频调用每次有 10–25 ns 的固定开销；**别把分配/克隆放进热路径**。
+> 小数组高频调用每次有 10–25 ns 的固定开销；**别把分配/克隆放进热路径**；
+> 脚本侧循环调用批量内核时，**每次调用的数据搬运**（而非内核）才是瓶颈——
+> YouLiLong 扩展里 `propagate` 比脚本循环快 **约 100×**（见 [yll/README](yll/README.md)）。
 
 三种口径：**LASX**（原生 256 位）/ **强制 LSX**（线程级降级钩子）/ **标量**基线。
 

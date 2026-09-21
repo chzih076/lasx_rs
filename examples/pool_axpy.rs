@@ -19,7 +19,7 @@ fn main() {
 
     // 注意：多数组接口要求 `&mut [T]`——池必须能把各块安全地**独占**交给不同线程，
     // 只读入参也得先 `as_mut_slice()`（这是"独占切分"的代价，也是它不需要 unsafe 的原因）。
-    let pool = WorkerPool::new(12);
+    let mut pool = WorkerPool::new(12);
     pool.for_each_chunks_mut([x.as_mut_slice(), y.as_mut_slice()], |[x, y]| {
         let m = x.len() as i32;
         lasx_rs::lasx_axpy(alpha, x.as_ptr(), y.as_mut_ptr(), m);

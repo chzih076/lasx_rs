@@ -1,0 +1,64 @@
+// lasx 原生扩展：多步传播的调用策略对比（**手动跑**，不在 CI 里）
+//
+//   cargo build --release -p lasx_yll && cp target/release/liblasx.so yll/
+//   <YouLiLong>/target/release/youli_long yll/bench_propagate.yli
+//
+// 对比两种写法：
+//   A) 脚本里循环调 `lasx.rk4_step`（单线程，**每步**都要把 6 个数组在脚本值与
+//      Rust 缓冲之间搬一遍）；
+//   B) 一次 `lasx.propagate`（常驻线程池多核，数组只转换一次）。
+//
+// 结论（n = 20000 星 × 200 步，dt = 10 s）：A ≈ 5.65 s，B ≈ 50 ms，**112×**。
+// 内核本身只占 A 的约 0.6 ms/步——98% 是每步的数组转换开销。也就是说，
+// **脚本侧循环调用批量内核时，真正的代价不是内核，而是每次调用的数据搬运**。
+
+use "./lasx"
+
+n = 20000
+steps = 200
+mu = 3.986004418e14
+j2 = 1.08262668e-3
+re = 6.378137e6
+dt = 10.0
+
+xs = []
+ys = []
+zs = []
+vxs = []
+vys = []
+vzs = []
+for i in 0..n {
+    push(xs, 7.0e6 + i * 100.0)
+    push(ys, 0.0)
+    push(zs, 0.0)
+    push(vxs, 0.0)
+    push(vys, 7.5e3)
+    push(vzs, 0.0)
+}
+print("[bench] n = " + n + " 星，" + steps + " 步，dt = " + dt + " s")
+
+// ---- A) 脚本循环，单线程，每步都转换一遍 ----
+t0 = now()
+cur = lasx.rk4_step(xs, ys, zs, vxs, vys, vzs, mu, j2, re, dt)
+for s in 1..steps {
+    cur = lasx.rk4_step(cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], mu, j2, re, dt)
+}
+t1 = now()
+ms_a = t1 - t0
+print("[bench] A) rk4_step 循环   : " + ms_a + " ms  （" + ms_a / steps + " ms/步）")
+
+// ---- B) 一次 propagate，多核，只转换一次 ----
+t2 = now()
+res = lasx.propagate(xs, ys, zs, vxs, vys, vzs, mu, j2, re, dt, steps)
+t3 = now()
+ms_b = t3 - t2
+print("[bench] B) propagate      : " + ms_b + " ms  （" + ms_b / steps + " ms/步）")
+print("[bench] 加速比            : " + ms_a / ms_b + "×")
+
+// 两条路径必须**逐位一致**：同样的内核、同样的每步顺序，池只改了下标切分
+assert res[0][0] == cur[0][0], "propagate 与 rk4_step 循环的 rx 不一致"
+assert res[1][123] == cur[1][123], "propagate 与 rk4_step 循环的 ry 不一致"
+assert res[2][n - 1] == cur[2][n - 1], "propagate 与 rk4_step 循环的 rz 不一致"
+assert res[3][7] == cur[3][7], "propagate 与 rk4_step 循环的 vx 不一致"
+assert res[5][n - 1] == cur[5][n - 1], "propagate 与 rk4_step 循环的 vz 不一致"
+print("[bench] 两条路径逐位一致 ✓")

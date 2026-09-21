@@ -10,7 +10,7 @@
 //! 2. [`hotloop`]：小数组高频调用——暴露"每次调用的固定开销"占比；
 //! 3. [`fused_vs_composed`]：用融合内核 vs 用原语拼出同一个 RK4 步。
 
-use crate::data::{states, velocities, AlignedBuf, Soa6, J2, MU, RE};
+use crate::data::{states, velocities, AlignedBuf, Lcg, Soa6, J2, MU, RE};
 use crate::suites::micro::rk4_parallel_scope;
 use crate::timing::{fmt_t, timeit};
 use lasx_rs::pool::WorkerPool;
@@ -47,11 +47,11 @@ pub fn propagate() {
     });
 
     // 池只建一次，跨 steps 步复用
-    let pool = WorkerPool::new(threads);
+    let mut pool = WorkerPool::new(threads);
     let mut b3 = base.clone();
     let t_pool = timeit(|| {
         for _ in 0..steps {
-            b3.step_pooled(&pool);
+            b3.step_pooled(&mut pool);
         }
         let _ = black_box(b3.rx[0]);
     });
@@ -302,9 +302,74 @@ impl Composed {
     }
 }
 
-/// 依次跑三个真实场景（各自打印自己的表）。
+/// 场景 4：大矩阵乘铺到多核。
+///
+/// `lasx_matmul` 本身是单线程的（一个内核只吃一段内存），把它铺到多核靠的是
+/// `lasx_rs::parallel::matmul_f32` —— 池的**按行块切分**接口：`A` 每行 `k` 个元素、
+/// `C` 每行 `n` 个元素，两者切在同一批行上，`B` 只读共享。
+///
+/// 这里逐位对照单线程结果：切行不影响任何输出元素的计算过程。
+pub fn parallel_matmul() {
+    let threads = 12usize;
+    let mut pool = WorkerPool::new(threads);
+
+    println!();
+    println!("## 真实场景 4：大矩阵乘铺到多核（`parallel::matmul_f32`，{threads} 线程）");
+    println!();
+    println!("| 规模 | 单线程 | {threads} 线程 | 加速比 | 单线程 GFLOP/s | 多核 GFLOP/s |");
+    println!("|---|---|---|---|---|---|");
+
+    for &(m, k, n) in &[
+        (64usize, 64usize, 64usize),
+        (128, 128, 128),
+        (256, 256, 256),
+        (512, 512, 512),
+    ] {
+        let mut rng = Lcg::new(0x5a5a_5a5a ^ m as u64);
+        let mut a = AlignedBuf::<f32>::fill_with(m * k, |_| rng.f32());
+        let b = AlignedBuf::<f32>::fill_with(k * n, |_| rng.f32());
+        let mut c1 = AlignedBuf::<f32>::new(m * n);
+        let mut c2 = AlignedBuf::<f32>::new(m * n);
+
+        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        let t1 = timeit(|| {
+            lasx_rs::lasx_matmul(mi, ki, ni, a.as_ptr(), b.as_ptr(), c1.as_mut_ptr());
+            let _ = black_box(c1[0]);
+        });
+        let t2 = timeit(|| {
+            lasx_rs::parallel::matmul_f32(
+                &mut pool,
+                m,
+                k,
+                n,
+                a.as_mut_slice(),
+                b.as_slice(),
+                c2.as_mut_slice(),
+            );
+            let _ = black_box(c2[0]);
+        });
+
+        assert_eq!(c1.as_slice(), c2.as_slice(), "{m}³ 池化结果与单线程不一致");
+
+        let flop = 2.0 * (m as f64) * (k as f64) * (n as f64);
+        println!(
+            "| {m}³ | {} | {} | **{:.2}×** | {:.1} | **{:.1}** |",
+            fmt_t(t1),
+            fmt_t(t2),
+            t1.as_secs_f64() / t2.as_secs_f64(),
+            flop / t1.as_secs_f64() / 1e9,
+            flop / t2.as_secs_f64() / 1e9
+        );
+    }
+    println!();
+    println!();
+    println!("> 加速比到不了 12×：这是 B 的流量在压共享缓存，不是派活。lasx_matmul 一次算 4 行 × 32 列，每个 4 行块都要重读整个 B，故 B 流量 = (m/4)·k·n·4 字节（256³ = 16 MB/次调用）。parallel::matmul_f32 已把块大小取整到行粒度 4 的倍数，避免退化的尾块再多送 28% 流量；线程数也不是越多越好——cargo run --release --example matmul_pooled 的扫描显示本机 16 线程 ≈ 8.5×、12 线程 ≈ 4.4–5.4×（本机有后台负载）、24 线程反而退化。小规模（64³ ≈ 8 µs）则受派活开销限制。");
+}
+
+/// 依次跑四个真实场景（各自打印自己的表）。
 pub fn run_all() {
     propagate();
     hotloop();
     fused_vs_composed();
+    parallel_matmul();
 }

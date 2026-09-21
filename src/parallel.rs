@@ -1,0 +1,323 @@
+//! 把库内核铺到多核的**调用策略层**。
+//!
+//! 这里每个函数都只是 [`WorkerPool`] 上面几行调用样板。它们存在的意义不是"多一层封装"，
+//! 而是**把正确的切分方式固定下来**——让每个调用方自己推导"按行切"该怎么切，很容易
+//! 切错：矩阵乘的 `A` 每行 `k` 个元素、`C` 每行 `n` 个元素，只有切在**同一批行**上
+//! 结果才对；SOA 物理内核的 6 个数组必须切在同一个下标区间。
+//!
+//! 收益（实测，见 `docs/perf-report.md` §13.3 / §14）：
+//!
+//! | 负载 | 单线程 | 12 线程 | 倍数 |
+//! |---|---|---|---|
+//! | RK4 J2 多星传播（每步） | 1.77 ms | 257 µs | **6.9×** |
+//! | f32 矩阵乘 256³ | 546 µs | 见 `scenario` 套件 | — |
+//!
+//! 前提是**池要复用**：把 `WorkerPool::new` 放进热路径等于退化成"每次新建线程"，
+//! 那就把 2.1–2.3× 的收益赔回去了。
+//!
+//! 数值一致性：这些函数只把**行/下标区间**分给不同线程，每个输出元素的计算过程与
+//! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
+
+use crate::pool::WorkerPool;
+
+/// 多核 `C[m×n] = A[m×k] · B[k×n]`（行主序，`B` 只读共享）。
+///
+/// `B` 是只读的，闭包以 `&` 捕获即可——池的按行块接口正是为这种形状准备的。
+///
+/// # Panics
+/// 数组长度与 `m/k/n` 不符时 panic。
+pub fn matmul_f32(
+    pool: &mut WorkerPool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &mut [f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    assert_eq!(
+        a.len(),
+        m.checked_mul(k).expect("m×k 溢出"),
+        "A 的长度应为 m×k"
+    );
+    assert_eq!(
+        b.len(),
+        k.checked_mul(n).expect("k×n 溢出"),
+        "B 的长度应为 k×n"
+    );
+    assert_eq!(
+        c.len(),
+        m.checked_mul(n).expect("m×n 溢出"),
+        "C 的长度应为 m×n"
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0); // 空内积：结果是全零矩阵（内核的 k 循环走 0 次，不会写 C）
+        return;
+    }
+    let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
+                // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
+    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+        crate::lasx_matmul(
+            rows as i32,
+            k as i32,
+            n as i32,
+            ab.as_ptr(),
+            bs.as_ptr(),
+            cb.as_mut_ptr(),
+        );
+    });
+}
+
+/// 多核 f64 版 [`matmul_f32`]。
+///
+/// # Panics
+/// 数组长度与 `m/k/n` 不符时 panic。
+pub fn matmul_f64(
+    pool: &mut WorkerPool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &mut [f64],
+    b: &[f64],
+    c: &mut [f64],
+) {
+    assert_eq!(
+        a.len(),
+        m.checked_mul(k).expect("m×k 溢出"),
+        "A 的长度应为 m×k"
+    );
+    assert_eq!(
+        b.len(),
+        k.checked_mul(n).expect("k×n 溢出"),
+        "B 的长度应为 k×n"
+    );
+    assert_eq!(
+        c.len(),
+        m.checked_mul(n).expect("m×n 溢出"),
+        "C 的长度应为 m×n"
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        c.fill(0.0);
+        return;
+    }
+    let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
+                // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
+    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+        crate::lasx_matmul_f64(
+            rows as i32,
+            k as i32,
+            n as i32,
+            ab.as_ptr(),
+            bs.as_ptr(),
+            cb.as_mut_ptr(),
+        );
+    });
+}
+
+/// 多核批量 RK4 J2 单步（6 个 SOA 数组一次派活）。
+///
+/// 对应单线程的 `lasx_rk4_j2_step_batch`，数值**逐位一致**；多步传播时把池建在循环外面，
+/// 每步调用本函数即可（这正是 §13.3 场景 1 里 6.9× 的用法）。
+///
+/// # 线程级降级钩子对它无效
+/// 池的 worker 是复用的，其线程本地状态与调用线程无关，故本函数在每块开头显式
+/// `lasx_force_lsx_thread(false)`——池化路径固定走自动分派（LASX）。
+/// 要逐位比对 LSX 路径，请用单线程的 `lasx_rk4_j2_step_batch`。
+///
+/// # Panics
+/// 6 个数组长度不一致时 panic。
+#[allow(clippy::too_many_arguments)]
+pub fn rk4_j2_step_batch(
+    pool: &mut WorkerPool,
+    mu: f64,
+    j2: f64,
+    re: f64,
+    dt: f64,
+    rx: &mut [f64],
+    ry: &mut [f64],
+    rz: &mut [f64],
+    vx: &mut [f64],
+    vy: &mut [f64],
+    vz: &mut [f64],
+) {
+    let n = rx.len();
+    assert_eq!(ry.len(), n, "6 个分量数组必须等长（ry）");
+    assert_eq!(rz.len(), n, "6 个分量数组必须等长（rz）");
+    assert_eq!(vx.len(), n, "6 个分量数组必须等长（vx）");
+    assert_eq!(vy.len(), n, "6 个分量数组必须等长（vy）");
+    assert_eq!(vz.len(), n, "6 个分量数组必须等长（vz）");
+    if n == 0 {
+        return;
+    }
+    pool.for_each_chunks_mut([rx, ry, rz, vx, vy, vz], |[rx, ry, rz, vx, vy, vz]| {
+        let m = rx.len() as i32;
+        crate::lasx_force_lsx_thread(false);
+        crate::lasx_rk4_j2_step_batch(
+            rx.as_mut_ptr(),
+            ry.as_mut_ptr(),
+            rz.as_mut_ptr(),
+            vx.as_mut_ptr(),
+            vy.as_mut_ptr(),
+            vz.as_mut_ptr(),
+            mu,
+            j2,
+            re,
+            dt,
+            m,
+        );
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aligned::AlignedVec;
+
+    /// 池化矩阵乘必须与单线程**逐位一致**，并覆盖行尾补齐（m 不是线程数整数倍）。
+    #[test]
+    fn test_matmul_f32_matches_serial_bit_for_bit() {
+        let mut pool = WorkerPool::new(7);
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (13, 5, 3),
+            (64, 64, 64),
+            (129, 33, 17),
+            (256, 96, 40),
+        ] {
+            let (mut a, b) = (
+                AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.25),
+                AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.5),
+            );
+            let mut want = AlignedVec::<f32>::new(m * n);
+            let mut got = AlignedVec::<f32>::new(m * n);
+            crate::lasx_matmul(
+                m as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                b.as_ptr(),
+                want.as_mut_ptr(),
+            );
+            matmul_f32(
+                &mut pool,
+                m,
+                k,
+                n,
+                a.as_mut_slice(),
+                b.as_slice(),
+                got.as_mut_slice(),
+            );
+            assert_eq!(
+                want.as_slice(),
+                got.as_slice(),
+                "{m}×{k}×{n} 与单线程不一致"
+            );
+        }
+    }
+
+    /// f64 版同上。
+    #[test]
+    fn test_matmul_f64_matches_serial_bit_for_bit() {
+        let mut pool = WorkerPool::new(5);
+        let (m, k, n) = (100usize, 48usize, 37usize);
+        let (mut a, b) = (
+            AlignedVec::<f64>::fill_with(m * k, |i| ((i % 29) as f64 - 14.0) * 0.125),
+            AlignedVec::<f64>::fill_with(k * n, |i| ((i % 31) as f64 - 15.0) * 0.0625),
+        );
+        let mut want = AlignedVec::<f64>::new(m * n);
+        let mut got = AlignedVec::<f64>::new(m * n);
+        crate::lasx_matmul_f64(
+            m as i32,
+            k as i32,
+            n as i32,
+            a.as_ptr(),
+            b.as_ptr(),
+            want.as_mut_ptr(),
+        );
+        matmul_f64(
+            &mut pool,
+            m,
+            k,
+            n,
+            a.as_mut_slice(),
+            b.as_slice(),
+            got.as_mut_slice(),
+        );
+        assert_eq!(want.as_slice(), got.as_slice(), "f64 矩阵乘与单线程不一致");
+    }
+
+    /// 池化 RK4 步必须与单线程逐位一致（切块边界不得影响结果）。
+    #[test]
+    fn test_rk4_pooled_matches_serial_bit_for_bit() {
+        let mut pool = WorkerPool::new(6);
+        let n = 20_000usize;
+        let make = || {
+            (
+                AlignedVec::<f64>::fill_with(n, |i| 7.0e6 + (i % 97) as f64 * 1.0e3),
+                AlignedVec::<f64>::fill_with(n, |i| (i % 89) as f64 * 1.0e3 - 4.0e4),
+                AlignedVec::<f64>::fill_with(n, |i| (i % 71) as f64 * 1.0e3 - 3.0e4),
+                AlignedVec::<f64>::fill_with(n, |i| (i % 53) as f64 * 2.0 - 50.0),
+                AlignedVec::<f64>::fill_with(n, |i| (i % 43) as f64 * 1.5 - 30.0),
+                AlignedVec::<f64>::fill_with(n, |i| (i % 37) as f64 * 1.25 - 20.0),
+            )
+        };
+        let (mu, j2, re, dt) = (3.986_004_418e14, 1.082_626_68e-3, 6.378_137e6, 10.0);
+
+        let (mut rx, mut ry, mut rz, mut vx, mut vy, mut vz) = make();
+        for _ in 0..3 {
+            crate::lasx_rk4_j2_step_batch(
+                rx.as_mut_ptr(),
+                ry.as_mut_ptr(),
+                rz.as_mut_ptr(),
+                vx.as_mut_ptr(),
+                vy.as_mut_ptr(),
+                vz.as_mut_ptr(),
+                mu,
+                j2,
+                re,
+                dt,
+                n as i32,
+            );
+        }
+
+        let (mut px, mut py, mut pz, mut qx, mut qy, mut qz) = make();
+        for _ in 0..3 {
+            rk4_j2_step_batch(
+                &mut pool,
+                mu,
+                j2,
+                re,
+                dt,
+                px.as_mut_slice(),
+                py.as_mut_slice(),
+                pz.as_mut_slice(),
+                qx.as_mut_slice(),
+                qy.as_mut_slice(),
+                qz.as_mut_slice(),
+            );
+        }
+
+        for i in 0..n {
+            assert_eq!(rx[i].to_bits(), px[i].to_bits(), "rx 不一致 @ {i}");
+            assert_eq!(vz[i].to_bits(), qz[i].to_bits(), "vz 不一致 @ {i}");
+        }
+    }
+
+    /// 空内积（k = 0）与零维不应 panic。
+    #[test]
+    fn test_degenerate_shapes() {
+        let mut pool = WorkerPool::new(3);
+        let mut a = vec![1.0f32; 0];
+        let b = vec![1.0f32; 0];
+        let mut c = vec![1.0f32; 4];
+        matmul_f32(&mut pool, 2, 0, 2, &mut a, &b, &mut c);
+        assert_eq!(c, vec![0.0f32; 4], "k=0 时结果应为全零");
+        matmul_f32(&mut pool, 0, 0, 0, &mut [], &[], &mut []);
+    }
+}

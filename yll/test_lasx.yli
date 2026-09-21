@@ -67,6 +67,44 @@ st = lasx.rk4_step([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14,
 assert st[0][0] != 7.0e6, "rk4_step 应当改变位置"
 assert st[1][0] > 0.0, "rk4_step 应当沿 y 前进"
 
+// propagate：多核多步传播。steps=1 时必须与单线程 rk4_step **逐位一致**——
+// 切块只分下标区间，不改任何元素的计算过程。
+p1 = lasx.propagate([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0, 1)
+assert p1[0][0] == st[0][0], "propagate(steps=1) 的 rx 应与 rk4_step 逐位一致"
+assert p1[1][0] == st[1][0], "propagate(steps=1) 的 ry 应与 rk4_step 逐位一致"
+assert p1[3][0] == st[3][0], "propagate(steps=1) 的 vx 应与 rk4_step 逐位一致"
+
+// 多步：推进 200 步后仍是有限值，且位置确实变了（不该出现 NaN）
+p2 = lasx.propagate([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0, 200)
+print("lasx.propagate(200 步) -> rx = " + p2[0][0])
+rx200 = p2[0][0]
+assert rx200 == rx200, "propagate 不应产生 NaN"
+assert rx200 > -1.0e9 && rx200 < 1.0e9, "propagate 结果应有限"
+assert rx200 != 7.0e6, "propagate 应当改变位置"
+
+// 批量：n = 5000 星（6 个数组共 30000 元素，超过库的并行下限 → 真的走多线程路径）
+n = 5000
+xs = []
+ys = []
+zs = []
+vxs = []
+vys = []
+vzs = []
+for i in 0..n {
+    push(xs, 7.0e6 + i * 100.0)
+    push(ys, 0.0)
+    push(zs, 0.0)
+    push(vxs, 0.0)
+    push(vys, 7.5e3)
+    push(vzs, 0.0)
+}
+p3 = lasx.propagate(xs, ys, zs, vxs, vys, vzs, 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0, 10)
+assert len(p3) == 6, "propagate 应返回 6 个数组"
+assert len(p3[0]) == n, "propagate 应返回同样长度的数组"
+assert p3[1][0] > 0.0, "批量 propagate 应当沿 y 前进"
+assert p3[0][0] == p3[0][0], "批量 propagate 不应产生 NaN"
+print("lasx.propagate(5000 星 × 10 步) -> ry[0] = " + p3[1][0])
+
 // ---------------- 错误上抛路径 ----------------
 
 // 1) 数组长度不一致
@@ -129,7 +167,37 @@ try {
 }
 assert caught, "int8 越界应当抛错"
 
-// 7) finally 仍然执行
+// 7) propagate: steps 为负
+caught = false
+try {
+    lasx.propagate([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0, -1)
+} catch (e) {
+    caught = true
+    print("捕获(steps<0): " + e)
+}
+assert caught, "steps<0 应当抛错"
+
+// 8) propagate: 位置与速度长度不一致
+caught = false
+try {
+    lasx.propagate([7.0e6], [0.0], [0.0], [0.0], [7.5e3, 1.0], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0, 1)
+} catch (e) {
+    caught = true
+    print("捕获(位置/速度长度不一致): " + e)
+}
+assert caught, "位置与速度长度不一致应当抛错"
+
+// 9) propagate: dt 非有限（脚本里用溢出造 inf；0.0/0.0 会先被解释器判为除零）
+caught = false
+try {
+    lasx.propagate([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 9.0e307 * 10.0, 1)
+} catch (e) {
+    caught = true
+    print("捕获(dt 为 inf): " + e)
+}
+assert caught, "非有限 dt 应当抛错"
+
+// 10) finally 仍然执行
 cleaned = false
 try {
     lasx.sum(a)

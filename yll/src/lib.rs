@@ -23,8 +23,9 @@
 //! - 对外函数签名固定为 `YllValueWrapper* f(YllContextC*, int, YllValueWrapper**)`；
 //! - **所有校验失败都返回 `yll_error(...)`**，解释器会抛成可 `try/catch` 的运行时错误
 //!   ——不静默返回 0、不吞掉错误；
-//! - 解释器不提供 GIL，函数可能被多线程并发调用；本扩展是纯函数（无共享可变状态），
-//!   因此不需要加锁。
+//! - 解释器不提供 GIL，函数可能被多线程并发调用；除 `propagate` 外都是纯函数
+//!   （无共享可变状态）。`propagate` 持有一个进程内常驻线程池，用 `Mutex` 串行化
+//!   并发调用——池的派活本身是独占的。
 
 #![allow(non_camel_case_types)]
 
@@ -142,6 +143,14 @@ pub extern "C" fn yll_init_lasx() -> *mut YllModuleDefC {
             6,
             6,
             "j2_accel(rx, ry, rz, mu, j2, re) -> [ax, ay, az]：中心引力 + J2 摄动加速度",
+        );
+        add(
+            module,
+            "propagate",
+            funcs::fn_propagate,
+            11,
+            11,
+            "propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, steps) -> [rx, ry, rz, vx, vy, vz]：多星多步 RK4 J2 传播（多核，常驻线程池跨步复用）",
         );
         add(
             module,

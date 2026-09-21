@@ -126,36 +126,22 @@ impl Soa6 {
         lasx_force_lsx_thread(false);
     }
 
-    /// 用常驻池推进一步：6 个分量数组同步切块，池内线程跨调用复用。
+    /// 用常驻池推进一步（转调库里的多核调用策略层，见 `lasx_rs::parallel`）。
     ///
     /// 与 [`Soa6::step`] 数值逐位一致（内核按元素独立计算，块边界不影响结果）。
-    pub fn step_pooled(&mut self, pool: &WorkerPool) {
-        pool.for_each_chunks_mut(
-            [
-                self.rx.as_mut_slice(),
-                self.ry.as_mut_slice(),
-                self.rz.as_mut_slice(),
-                self.vx.as_mut_slice(),
-                self.vy.as_mut_slice(),
-                self.vz.as_mut_slice(),
-            ],
-            |[rx, ry, rz, vx, vy, vz]| {
-                let m = rx.len() as i32;
-                lasx_force_lsx_thread(false);
-                lasx_rk4_j2_step_batch(
-                    rx.as_mut_ptr(),
-                    ry.as_mut_ptr(),
-                    rz.as_mut_ptr(),
-                    vx.as_mut_ptr(),
-                    vy.as_mut_ptr(),
-                    vz.as_mut_ptr(),
-                    MU,
-                    J2,
-                    RE,
-                    10.0,
-                    m,
-                );
-            },
+    pub fn step_pooled(&mut self, pool: &mut WorkerPool) {
+        lasx_rs::parallel::rk4_j2_step_batch(
+            pool,
+            MU,
+            J2,
+            RE,
+            10.0,
+            self.rx.as_mut_slice(),
+            self.ry.as_mut_slice(),
+            self.rz.as_mut_slice(),
+            self.vx.as_mut_slice(),
+            self.vy.as_mut_slice(),
+            self.vz.as_mut_slice(),
         );
     }
 
