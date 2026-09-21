@@ -1,3 +1,4 @@
+use crate::data::AlignedBuf;
 use crate::data::Lcg;
 use crate::report::{row3, Row};
 use crate::scalar_ref::*;
@@ -12,9 +13,9 @@ pub fn matmul(rows: &mut Vec<Row>) {
         (256, 256, 256),
     ] {
         let mut rng = Lcg::new((m * 1000 + k * 10 + n) as u64);
-        let a: Vec<f32> = (0..m * k).map(|_| rng.f32()).collect();
-        let b: Vec<f32> = (0..k * n).map(|_| rng.f32()).collect();
-        let mut c = vec![0f32; m * n];
+        let a = AlignedBuf::fill_with(m * k, |_| rng.f32());
+        let b = AlignedBuf::fill_with(k * n, |_| rng.f32());
+        let mut c = AlignedBuf::new(m * n);
         let tag = format!("{m}×{k}×{n}");
         let lasx = time_mode(Mode::Lasx, || {
             lasx_matmul(
@@ -45,9 +46,9 @@ pub fn matmul(rows: &mut Vec<Row>) {
 
     for &(m, k, n) in &[(64usize, 64usize, 64usize), (128, 128, 128)] {
         let mut rng = Lcg::new((m * 7 + k * 13 + n) as u64);
-        let a: Vec<f64> = (0..m * k).map(|_| rng.f64()).collect();
-        let b: Vec<f64> = (0..k * n).map(|_| rng.f64()).collect();
-        let mut c = vec![0f64; m * n];
+        let a = AlignedBuf::fill_with(m * k, |_| rng.f64());
+        let b = AlignedBuf::fill_with(k * n, |_| rng.f64());
+        let mut c = AlignedBuf::new(m * n);
         let tag = format!("{m}×{k}×{n}");
         let lasx = time_mode(Mode::Lasx, || {
             lasx_matmul_f64(

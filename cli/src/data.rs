@@ -175,21 +175,48 @@ impl<T: Copy + Default> AlignedBuf<T> {
         b
     }
 
-    /// 分配并用闭包填充。
-    pub fn fill_with(len: usize, mut f: impl FnMut() -> T) -> Self {
+    /// 分配并用 `f(i)` 填充（下标从 0 起，形状与 `(0..len).map(f)` 一致）。
+    pub fn fill_with(len: usize, mut f: impl FnMut(usize) -> T) -> Self {
         let mut b = Self::new(len);
-        for x in b.as_mut_slice() {
-            *x = f();
+        for (i, x) in AlignedBuf::as_mut_slice(&mut b).iter_mut().enumerate() {
+            *x = f(i);
         }
         b
     }
+}
 
+impl<T> AlignedBuf<T> {
+    /// 底层切片视图。
     pub fn as_slice(&self) -> &[T] {
         &self.buf[self.off..self.off + self.len]
     }
 
+    /// 底层可变切片视图。
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         &mut self.buf[self.off..self.off + self.len]
+    }
+
+    /// 首地址（保证 64 字节对齐）。
+    pub fn as_ptr(&self) -> *const T {
+        AlignedBuf::as_slice(self).as_ptr()
+    }
+
+    /// 可写首地址（保证 64 字节对齐）。
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        AlignedBuf::as_mut_slice(self).as_mut_ptr()
+    }
+}
+
+impl<T> std::ops::Deref for AlignedBuf<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        AlignedBuf::as_slice(self)
+    }
+}
+
+impl<T> std::ops::DerefMut for AlignedBuf<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        AlignedBuf::as_mut_slice(self)
     }
 }
 

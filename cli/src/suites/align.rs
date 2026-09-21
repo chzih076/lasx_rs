@@ -20,8 +20,8 @@ pub fn align() {
 
     for &n in &[1024usize, 2048, 4096, 8192, 1 << 16] {
         let mut rng = Lcg::new(0xa116 ^ n as u64);
-        let a = AlignedBuf::fill_with(n, || rng.f32());
-        let b = AlignedBuf::fill_with(n, || rng.f32());
+        let a = AlignedBuf::fill_with(n, |_| rng.f32());
+        let b = AlignedBuf::fill_with(n, |_| rng.f32());
         let al = a.as_slice();
         let bl = b.as_slice();
         let len = (n - 1) as i32;
@@ -42,8 +42,8 @@ pub fn align() {
 
     for &n in &[4096usize, 1 << 16] {
         let mut rng = Lcg::new(0xb227 ^ n as u64);
-        let a = AlignedBuf::fill_with(n, || rng.f64());
-        let b = AlignedBuf::fill_with(n, || rng.f64());
+        let a = AlignedBuf::fill_with(n, |_| rng.f64());
+        let b = AlignedBuf::fill_with(n, |_| rng.f64());
         let al = a.as_slice();
         let bl = b.as_slice();
         let len = (n - 1) as i32;

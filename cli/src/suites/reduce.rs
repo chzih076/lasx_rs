@@ -1,4 +1,4 @@
-use crate::data::Lcg;
+use crate::data::{AlignedBuf, Lcg};
 use crate::report::{row3, Row};
 use crate::scalar_ref::*;
 use crate::timing::{time_mode, timeit, Mode};
@@ -8,8 +8,8 @@ use std::hint::black_box;
 pub fn dot(rows: &mut Vec<Row>) {
     for &n in &[8usize, 16, 24, 32, 48, 64, 256, 4096, 1 << 16, 1 << 20] {
         let mut rng = Lcg::new(n as u64);
-        let a: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
-        let b: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+        let a = AlignedBuf::fill_with(n, |_| rng.f32());
+        let b = AlignedBuf::fill_with(n, |_| rng.f32());
         let lasx = time_mode(Mode::Lasx, || {
             let _ = black_box(lasx_dot(a.as_ptr(), b.as_ptr(), n as i32));
         });
@@ -35,7 +35,7 @@ pub fn dot(rows: &mut Vec<Row>) {
 pub fn sum(rows: &mut Vec<Row>) {
     for &n in &[1usize << 16, 1 << 22] {
         let mut rng = Lcg::new(0x5eed ^ n as u64);
-        let x: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+        let x = AlignedBuf::fill_with(n, |_| rng.f32());
         let lasx = time_mode(Mode::Lasx, || {
             let _ = black_box(lasx_sum(x.as_ptr(), n as i32));
         });
@@ -58,8 +58,8 @@ pub fn sum(rows: &mut Vec<Row>) {
 pub fn axpy(rows: &mut Vec<Row>) {
     for &n in &[1usize << 16, 1 << 22] {
         let mut rng = Lcg::new(0xa9_1e ^ n as u64);
-        let x: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
-        let mut y: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+        let x = AlignedBuf::fill_with(n, |_| rng.f32());
+        let mut y = AlignedBuf::fill_with(n, |_| rng.f32());
         let lasx = time_mode(Mode::Lasx, || {
             lasx_axpy(0.5, x.as_ptr(), y.as_mut_ptr(), n as i32);
             let _ = black_box(y[0]);
@@ -85,8 +85,8 @@ pub fn axpy(rows: &mut Vec<Row>) {
 pub fn dot_f64(rows: &mut Vec<Row>) {
     for &n in &[1usize << 15, 1 << 21] {
         let mut rng = Lcg::new(0xd07f64 ^ n as u64);
-        let a: Vec<f64> = (0..n).map(|_| rng.f64()).collect();
-        let b: Vec<f64> = (0..n).map(|_| rng.f64()).collect();
+        let a = AlignedBuf::fill_with(n, |_| rng.f64());
+        let b = AlignedBuf::fill_with(n, |_| rng.f64());
         let lasx = time_mode(Mode::Lasx, || {
             let _ = black_box(lasx_dot_f64(a.as_ptr(), b.as_ptr(), n as i32));
         });

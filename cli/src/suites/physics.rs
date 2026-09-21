@@ -1,4 +1,4 @@
-use crate::data::{states, velocities, Soa6, J2, MU, RE};
+use crate::data::{states, velocities, AlignedBuf, Soa6, J2, MU, RE};
 use crate::report::{row3, Row};
 use crate::scalar_ref::*;
 use crate::timing::{time_mode, timeit, Mode};
@@ -58,17 +58,17 @@ pub fn j2(rows: &mut Vec<Row>) {
 
 pub fn ballistic(rows: &mut Vec<Row>) {
     for &n in &[1usize << 16, 1 << 20] {
-        let zero = vec![0f32; n];
+        let zero = AlignedBuf::new(n);
         let mut x = zero.clone();
         let mut y = zero.clone();
         let mut z = zero.clone();
-        let vx: Vec<f32> = (0..n).map(|i| 300.0 + i as f32 * 10.0).collect();
-        let vy: Vec<f32> = (0..n).map(|i| 40.0 - i as f32 * 2.0).collect();
+        let vx = AlignedBuf::fill_with(n, |i| 300.0 + i as f32 * 10.0);
+        let vy = AlignedBuf::fill_with(n, |i| 40.0 - i as f32 * 2.0);
         let vz = zero.clone();
         let mut vxw = vx.clone();
         let mut vyw = vy.clone();
         let mut vzw = vz.clone();
-        let k = vec![1e-5f32; n];
+        let k = AlignedBuf::new(n);
         let lasx = time_mode(Mode::Lasx, || {
             lasx_ballistic_step(
                 x.as_mut_ptr(),

@@ -8,8 +8,8 @@ use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};
 use std::arch::loongarch64::*;
 
-/// 低于该规模改走标量（实测交叉点约 n=16）。
-const SMALL_N: usize = 16;
+/// 低于该规模改走标量（实测交叉点约 n=20，取 24 留余量）。
+const SMALL_N: usize = 24;
 
 /// 算子入口：极小规模走标量，否则解析向量路径后分派。
 ///
