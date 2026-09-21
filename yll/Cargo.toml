@@ -1,0 +1,15 @@
+[package]
+name = "lasx_yll"
+version = "0.1.0"
+edition = "2021"
+description = "lasx_rs 的 YouLiLong 原生扩展：龙芯 LASX(256 位)/LSX(128 位) 向量内核"
+license = "MIT"
+publish = false
+
+[lib]
+# 产出 liblasx.so —— 脚本侧 `use "./lasx"` 加载，模块名 `lasx`
+name = "lasx"
+crate-type = ["cdylib"]
+
+[dependencies]
+lasx_rs = { path = ".." }

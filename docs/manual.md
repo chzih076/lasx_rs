@@ -687,6 +687,57 @@ LASX 的 `xvld/xvst` 是 **32 字节**访问：起始地址只要不落在 32 �
 > （实测 `lasx_dot` n=4096：未对齐 LASX 412 ns vs LSX 665 ns）。
 > 若无法控制调用方缓冲区，建议把它当成"顺带的额外收益"，而不是前提。
 
+### 5.6 错误上报（`lasx_*_checked`）
+
+原 15 个 `lasx_*` 符号沿用 C 惯例：**不做校验，调用方保证指针/长度合法，误用即 UB**，
+零开销。需要把错误**上抛**给上层时改用对应的 `lasx_*_checked`——多一个末尾的
+`int *status` 出参，先校验再执行；失败时写入状态码并返回安全中性值
+（数值型 `0.0`/`0`，`void` 型只写状态），**不触碰输出缓冲**：
+
+```c
+int st;
+float d = lasx_dot_checked(a, b, n, &st);
+if (st != LASX_OK) { /* 处理 */ }
+```
+
+| 码 | 名称 | 含义 |
+|---|---|---|
+| 0 | `Ok` | 成功 |
+| 1 | `NullPointer` | 指针为空且长度非 0 |
+| 2 | `NegativeLength` | 长度参数为负 |
+| 3 | `BadShape` | 形状/长度自洽性不成立 |
+| 4 | `SizeOverflow` | 尺寸相乘溢出 |
+| 5 | `NonPositiveConstant` | `mu <= 0` 或 `re <= 0` |
+| 6 | `NonFiniteConstant` | `j2`/`dt` 为 NaN 或无穷 |
+
+`status` 可以传 `NULL`（不关心原因）——校验仍会执行，只是原因被丢弃。
+`LasxStatus::message()` 给中文原因，`LasxStatus::from_i32()` 供绑定层还原枚举。
+
+C 层只能判**结构**（空指针、负长度、溢出、物理常数）；"数组真实长度是否与声明的
+形状一致"只有知道长度的上层判得了——`BadShape` 主要给语言绑定用（见 §5.7）。
+
+导出符号数：15（原始）→ **29**（+14 个 checked），原始 15 个签名与语义不变。
+
+### 5.7 YouLiLong 原生扩展（`yll/`）
+
+`yll/` 是本仓库内的独立 crate（`lasx_yll`，产出 `liblasx.so`），按 YouLiLong
+《C-C++原生扩展开发指南》的约定接入：入口 `yll_init_lasx`，函数签名为
+`YllValueWrapper* f(YllContextC*, int, YllValueWrapper**)`，**所有校验失败返回
+`yll_error(...)`**，解释器抛成脚本可 `try/catch` 的运行时错误。
+
+校验分两层：扩展层判"是不是数组、元素是不是数值、数组长度与 `matmul` 声明的
+`m/k/n` 是否自洽、`int8` 是否越界"，给出具体到参数名与下标的消息；库的
+`lasx_*_checked` 再兜住结构性错误。脚本数组先拷贝进 32 字节以上对齐的
+`AlignedVec` 再调内核（LASX 对齐要求见 §5.5）。
+
+构建与端到端测试：
+
+```bash
+cargo build --release -p lasx_yll
+cp target/release/liblasx.so yll/
+<YouLiLong>/target/release/youli_long yll/test_lasx.yli
+```
+
 ---
 
 ## 6. 性能基准方法
@@ -980,6 +1031,16 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `lasx_vec3_add_scaled_batch` | `void lasx_vec3_add_scaled_batch(const double*, const double*, const double*, const double*, const double*, const double*, double, double*, double*, double*, int)` | 批量 `o = a + s·b`；LASX+LSX 双路径 |
 | `lasx_j2_accel_batch` | `void lasx_j2_accel_batch(const double*, const double*, const double*, double, double, double, double*, double*, double*, int)` | 批量 J2 引力加速度；LASX+LSX 双路径 |
 | `lasx_rk4_j2_step_batch` | `void lasx_rk4_j2_step_batch(double*, double*, double*, double*, double*, double*, double, double, double, double, int)` | 批量 RK4 J2 步（4 样本并行，寄存器内完成）；LASX + 标量降级 |
+
+### 10.1b 带错误通道的变体（`_checked`，各多一个 `int *status` 出参）
+
+`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、`lasx_axpy_checked`、
+`lasx_matmul_checked`、`lasx_matmul_f64_checked`、`lasx_dot_i8_checked`、
+`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、`lasx_vec3_add_scaled_batch_checked`、
+`lasx_batch_distance2d_checked`、`lasx_ballistic_step_checked`、
+`lasx_j2_accel_batch_checked`、`lasx_rk4_j2_step_batch_checked`。
+
+状态码与用法见 §5.6；其中 `BadShape` 只有知道数组真实长度的上层才会产生（§5.7）。
 
 ### 10.2 Rust 侧公开辅助
 

@@ -1,0 +1,33 @@
+// lasx.ylh —— lasx 原生扩展的接口声明（供 LSP/IDE 使用）
+// 实际实现为 Rust 原生扩展（liblasx.so），由 lasx_rs 的 yll/ crate 构建。
+
+fn dot(a, b) {
+    return 0.0
+}
+fn sum(x) {
+    return 0.0
+}
+fn dot_i8(a, b) {
+    return 0
+}
+fn matmul(a, b, m, k, n) {
+    return nil
+}
+fn norm3(xs, ys, zs) {
+    return nil
+}
+fn distance2d(px, py, xs, ys) {
+    return nil
+}
+fn vec3_add_scaled(ax, ay, az, bx, by, bz, s) {
+    return nil
+}
+fn j2_accel(rx, ry, rz, mu, j2, re) {
+    return nil
+}
+fn rk4_step(rx, ry, rz, vx, vy, vz, mu, j2, re, dt) {
+    return nil
+}
+
+VERSION = "0.1.0"
+ALIGN = 32

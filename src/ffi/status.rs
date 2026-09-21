@@ -52,6 +52,22 @@ impl LasxStatus {
         matches!(self, LasxStatus::Ok)
     }
 
+    /// 由 C 侧写回的整数还原状态码；未知值返回 `None`。
+    ///
+    /// 供上层（如语言绑定）把 `int *status` 翻回枚举再映射成本语言的错误。
+    pub fn from_i32(v: i32) -> Option<LasxStatus> {
+        Some(match v {
+            0 => LasxStatus::Ok,
+            1 => LasxStatus::NullPointer,
+            2 => LasxStatus::NegativeLength,
+            3 => LasxStatus::BadShape,
+            4 => LasxStatus::SizeOverflow,
+            5 => LasxStatus::NonPositiveConstant,
+            6 => LasxStatus::NonFiniteConstant,
+            _ => return None,
+        })
+    }
+
     /// 写入出参（`NULL` 表示调用方不关心）。
     #[inline]
     pub(crate) fn write(self, out: *mut i32) {
@@ -154,6 +170,23 @@ mod tests {
             assert!(!s.is_ok());
             assert!(!s.message().is_empty());
         }
+    }
+
+    #[test]
+    fn test_from_i32_roundtrip() {
+        for s in [
+            LasxStatus::Ok,
+            LasxStatus::NullPointer,
+            LasxStatus::NegativeLength,
+            LasxStatus::BadShape,
+            LasxStatus::SizeOverflow,
+            LasxStatus::NonPositiveConstant,
+            LasxStatus::NonFiniteConstant,
+        ] {
+            assert_eq!(LasxStatus::from_i32(s as i32), Some(s));
+        }
+        assert_eq!(LasxStatus::from_i32(99), None);
+        assert_eq!(LasxStatus::from_i32(-1), None);
     }
 
     #[test]

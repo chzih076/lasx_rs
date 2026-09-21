@@ -40,13 +40,17 @@ lasx_rs/
 │   │   └── testutil.rs   #   测试共用夹具（仅 cfg(test)）
 │   └── ffi/              # C ABI 导出层：只做裸指针 → 切片，不含计算
 │       ├── reduce.rs  matmul.rs  quant.rs  batch.rs  physics.rs  memory.rs
-└── cli/                  # 独立 crate `lasx_bench`：性能基准 CLI
-    └── src/{main,group,timing,report,data,scalar_ref,suites/*}.rs
+├── cli/                  # 独立 crate `lasx_bench`：性能基准 CLI
+│   └── src/{main,group,timing,report,data,scalar_ref,suites/*}.rs
+└── yll/                  # 独立 crate `lasx_yll`：YouLiLong 原生扩展（产出 liblasx.so）
+    └── src/{lib,yll,convert,funcs}.rs + lib.ylh / youli.yaml / test_lasx.yli
 ```
 
 分层约定：
 
 - **算子只接收切片**（`&[T]` / `&mut [T]`），裸指针解引用与长度约定收敛在 `ffi` 一层；
+- **两套 ABI**：原 15 个 `lasx_*` 零校验（误用即 UB）；另有 14 个 `lasx_*_checked`
+  带 `int *status` 出参，校验失败写入错误码并返回安全中性值——需要把错误上抛给上层时用它；
 - 支持降级的算子在入口用 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`；
 - LASX-only 的算子在模块文档里显式标注；
 - 15 个 C ABI 符号名与语义保持不变，历史调用方式（`lasx_rs::lasx_dot(..)`）继续可用。
@@ -80,6 +84,34 @@ FFI 调用示例（Dart）：
 final lib = DynamicLibrary.open('liblasx_rs.so');
 // 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
 ```
+
+## YouLiLong 原生扩展
+
+`yll/` 是把本库接进 [YouLiLong](../../) 语言的原生扩展，构建后产出 `liblasx.so`：
+
+```bash
+cargo build --release -p lasx_yll
+cp target/release/liblasx.so yll/
+<YouLiLong>/target/release/youli_long yll/test_lasx.yli   # 端到端测试
+```
+
+```youlilong
+use "./lasx"
+
+a = [1.0, 2.0, 3.0, 4.0]
+print(lasx.dot(a, [1.0, 1.0, 1.0, 1.0]))   // 10
+print(lasx.norm3([3.0], [4.0], [0.0]))     // [5]
+
+try {
+    lasx.dot(a, [1.0])                     // 长度不一致
+} catch (e) {
+    print(e)   // 无效操作: a 与 b 长度不一致：4 vs 1
+}
+```
+
+**所有调用错误都上抛**：参数不是数组、元素不是数值、长度/形状不自洽、int8 越界、
+物理常数非法——一律返回 `yll_error(...)`，解释器抛成可 `try/catch` 的运行时错误，
+不静默返回 0。详见 [yll/README.md](yll/README.md)。
 
 ## 性能基准
 

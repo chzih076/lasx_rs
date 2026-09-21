@@ -1,2 +1,5 @@
 /target
 target/
+
+# YLL 扩展的构建产物（由 cargo 生成后拷入包目录）
+yll/liblasx.so

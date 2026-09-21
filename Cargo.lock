@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "lasx_rs"
 version = "0.1.0"
+
+[[package]]
+name = "lasx_yll"
+version = "0.1.0"
+dependencies = [
+ "lasx_rs",
+]

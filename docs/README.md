@@ -23,6 +23,7 @@ docs/
 - 想在 **C / Dart / Rust** 中调用：见 manual.md 第 5 章
 - 想了解**精度/逐位确定**的边界：见 manual.md 第 7 章与第 9 章
 - 想**复现性能基准**：见 manual.md 第 6 章，或直接 `cargo run -p lasx_bench --release`
+- 想**在脚本语言里调用**（含错误上抛）：见 manual.md §5.6/§5.7 与 [../yll/README.md](../yll/README.md)
 - 想了解**性能实测与优化历程**：见 [perf-report.md](perf-report.md)
 
 ## 与根 README 的关系

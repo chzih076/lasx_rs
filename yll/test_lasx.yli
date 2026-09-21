@@ -1,0 +1,141 @@
+// lasx 原生扩展端到端测试：成功路径 + 错误上抛路径
+//
+// 运行（在 lasx_rs 仓库根）：
+//   cargo build --release -p lasx_yll
+//   cp target/release/liblasx.so yll/
+//   <YouLiLong>/target/release/youli_long yll/test_lasx.yli
+
+use "./lasx"
+
+print("[test] lasx 原生扩展加载成功")
+print("lasx.VERSION = " + lasx.VERSION)
+print("lasx.ALIGN = " + lasx.ALIGN)
+
+// ---------------- 成功路径 ----------------
+
+// dot / sum：注意本扩展的数值函数返回 Float，断言要写浮点字面量
+a = [1.0, 2.0, 3.0, 4.0]
+b = [1.0, 1.0, 1.0, 1.0]
+d = lasx.dot(a, b)
+print("lasx.dot([1,2,3,4], [1,1,1,1]) = " + d)
+assert d == 10.0, "dot 失败"
+
+s = lasx.sum(a)
+print("lasx.sum([1,2,3,4]) = " + s)
+assert s == 10.0, "sum 失败"
+
+// 整数也能作为数值输入
+d2 = lasx.dot([1, 2, 3], [1, 1, 1])
+assert d2 == 6.0, "dot 接受整数数组失败"
+
+// norm3：3-4-5 直角三角形
+ns = lasx.norm3([3.0, 0.0], [4.0, 0.0], [0.0, 5.0])
+print("lasx.norm3(...) = " + ns)
+assert ns[0] == 5.0, "norm3[0] 失败"
+assert ns[1] == 5.0, "norm3[1] 失败"
+
+// distance2d：到原点的距离
+ds = lasx.distance2d(0.0, 0.0, [3.0], [4.0])
+assert ds[0] == 5.0, "distance2d 失败"
+
+// matmul：2×2 单位阵 × [[1,2],[3,4]] = 原矩阵
+c = lasx.matmul([1.0, 0.0, 0.0, 1.0], [1.0, 2.0, 3.0, 4.0], 2, 2, 2)
+print("lasx.matmul(I, M) = " + c)
+assert c[0] == 1.0, "matmul[0] 失败"
+assert c[1] == 2.0, "matmul[1] 失败"
+assert c[2] == 3.0, "matmul[2] 失败"
+assert c[3] == 4.0, "matmul[3] 失败"
+
+// dot_i8：返回整数
+di = lasx.dot_i8([1, 2, 3], [4, 5, 6])
+print("lasx.dot_i8([1,2,3], [4,5,6]) = " + di)
+assert di == 32, "dot_i8 失败"
+
+// vec3_add_scaled：o = a + 2·b
+o = lasx.vec3_add_scaled([1.0], [2.0], [3.0], [10.0], [20.0], [30.0], 2.0)
+assert o[0][0] == 21.0, "vec3_add_scaled x 失败"
+assert o[1][0] == 42.0, "vec3_add_scaled y 失败"
+assert o[2][0] == 63.0, "vec3_add_scaled z 失败"
+
+// j2_accel：地球静止轨道附近应当得到指向地心的加速度（x 为负）
+acc = lasx.j2_accel([7.0e6], [0.0], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6)
+print("lasx.j2_accel -> ax = " + acc[0][0])
+assert acc[0][0] < 0.0, "j2_accel 加速度方向应为负"
+
+// rk4_step：推进一小步后位置应当变化，且结果有限
+st = lasx.rk4_step([7.0e6], [0.0], [0.0], [0.0], [7.5e3], [0.0], 3.986004418e14, 1.08262668e-3, 6.378137e6, 10.0)
+assert st[0][0] != 7.0e6, "rk4_step 应当改变位置"
+assert st[1][0] > 0.0, "rk4_step 应当沿 y 前进"
+
+// ---------------- 错误上抛路径 ----------------
+
+// 1) 数组长度不一致
+caught = false
+try {
+    lasx.dot(a, [1.0])
+} catch (e) {
+    caught = true
+    print("捕获(长度不一致): " + e)
+}
+assert caught, "长度不一致应当抛错"
+
+// 2) 参数不是数组
+caught = false
+try {
+    lasx.dot(1.0, a)
+} catch (e) {
+    caught = true
+    print("捕获(非数组): " + e)
+}
+assert caught, "非数组参数应当抛错"
+
+// 3) 数组元素不是数值
+caught = false
+try {
+    lasx.sum([1.0, "x"])
+} catch (e) {
+    caught = true
+    print("捕获(非数值元素): " + e)
+}
+assert caught, "非数值元素应当抛错"
+
+// 4) matmul 形状与数组长度不符
+caught = false
+try {
+    lasx.matmul([1.0, 0.0, 0.0, 1.0], [1.0, 2.0, 3.0, 4.0], 3, 3, 3)
+} catch (e) {
+    caught = true
+    print("捕获(形状不符): " + e)
+}
+assert caught, "形状不符应当抛错"
+
+// 5) 物理常数非法（mu <= 0）
+caught = false
+try {
+    lasx.j2_accel([7.0e6], [0.0], [0.0], 0.0, 1.08262668e-3, 6.378137e6)
+} catch (e) {
+    caught = true
+    print("捕获(mu<=0): " + e)
+}
+assert caught, "mu<=0 应当抛错"
+
+// 6) int8 越界
+caught = false
+try {
+    lasx.dot_i8([1, 200], [1, 1])
+} catch (e) {
+    caught = true
+    print("捕获(int8 越界): " + e)
+}
+assert caught, "int8 越界应当抛错"
+
+// 7) finally 仍然执行
+cleaned = false
+try {
+    lasx.sum(a)
+} finally {
+    cleaned = true
+}
+assert cleaned, "finally 应当执行"
+
+print("[test] 全部通过!")

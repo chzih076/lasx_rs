@@ -1,0 +1,11 @@
+name: lasx
+version: 0.1.0
+type: library
+description: "龙芯 LASX(256 位)/LSX(128 位) 向量内核 —— lasx_rs 的 YouLiLong 原生扩展"
+
+native:
+  src: "."
+  # 在 lasx_rs workspace 内构建，并把产物拷到包目录
+  build: "cargo build --release -p lasx_yll && cp ../target/release/liblasx.so ."
+  targets:
+    linux-loongarch64: "liblasx.so"
