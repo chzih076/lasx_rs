@@ -845,3 +845,59 @@ worker 侧只读自己的槽。闭包指针指向调用方栈上的 `F`，其存
 - `nm -D` 复核：导出符号仍为 15 + 14，**未新增**；
 - `cargo fmt --all --check`、`cargo clippy --workspace --release --all-targets` 零警告；
 - 远端 CI（fmt / build / test / clippy 四步）在推送上全绿。
+
+---
+
+## 15. Rust 原生 API 层（`lasx_rs::api`）
+
+### 15.1 之前的状况：库对 Rust 调用方不友好
+
+`ops/` 里的算子早就只吃切片（`dot(a: &[f32], b: &[f32]) -> f32`），但那层是
+`pub(crate)`；Rust 调用方唯一能用的是 crate 根重导出的 `extern "C"` 函数：
+
+```rust
+let d = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n as i32);   // 裸指针 + 长度
+```
+
+它们**零校验**（`n` 与实际缓冲区不符 = UB），`lib.rs` 甚至为此专门
+`allow(clippy::not_unsafe_ptr_arg_deref)`。对 C/Dart 这是合理的约定（少一层间接、
+错误在边界处一次性校验）；对 Rust 则是"内核是安全的，包装把它变危险了"。
+
+### 15.2 现在：`api` 层
+
+`src/api.rs` 把切片层公开出来，并补上三件 Rust 调用方需要的事：
+
+| 事项 | 取值 |
+|---|---|
+| 入参 | `&[T]` / `&mut [T]`，长度隐含，不需要 `n as i32` |
+| 出错 | `Result<T, api::Error>`，变体带算子名/参数名/期望值/实际值，实现 `Display + Error` |
+| 输出 | 需要输出缓冲的内核返回新分配的 `AlignedVec<T>`（32 字节对齐，见 §5.5 的对齐收益） |
+| 不会失败的操作 | 不套 `Result`（如 `sum`） |
+
+`api::Error` 的四个变体（`Shape` / `Overflow` / `NotFinite` / `NotPositive`）与
+`lasx_*_checked` 的校验规则**逐条对应**，包括判定顺序（常数先于形状）。
+
+### 15.3 安全不等于变慢
+
+同一批规模下 `lasx_dot`（裸指针）与 `api::dot`（切片 + 校验）的单次调用开销
+（`cli -- scenario`，场景 2 的第二张表）：
+
+| 内核 | n | C ABI | `api` | 差 |
+|---|---|---|---|---|
+| `dot` f32 | 64 | 17 ns | 13 ns | −4 ns |
+| `dot` f32 | 256 | 25 ns | 22 ns | −3 ns |
+| `dot` f32 | 4096 | 263 ns | 260 ns | −3 ns |
+
+差值是负的（同一段内核，`api` 是 `#[inline]` 的薄包装，校验被内联吸收），也就是
+**这层安全包装没有可测开销**——不值得为了"快"去用裸指针版本。真正会在热循环里
+付出代价的是**分配**：`api::matmul` / `api::norm3_batch` 每次返回新缓冲，
+那种场合应该用 `parallel` 的接口（缓冲由调用方持有）或 C ABI 的裸指针版本。
+
+### 15.4 验证
+
+- 测试 48 → **57**（`api` 9 项：与 C ABI 逐位一致、空/单元素、`Shape`/`Overflow`/
+  `NotFinite`/`NotPositive` 的变体与消息、`dot_q4` 的 scale 约定、输出对齐、
+  原地内核、`api` 与 `parallel` 逐位一致）；
+- `nm -D` 复核：仍是 15 + 14 个符号——`api` 只在 `rlib` 里，**没有新增导出符号**；
+- 文档测试 4 → 6；`cargo fmt --all --check` 与
+  `cargo clippy --workspace --release --all-targets` 零警告。

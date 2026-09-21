@@ -13,8 +13,8 @@ docs/
 
 | 文档 | 内容 |
 |---|---|
-| [manual.md](manual.md) | **完整技术手册**（10 章）：架构与设计（LASX/LSX 双路径机制、SOA 布局、FFI 设计、源码组织）、15 个 FFI 内核逐一详解（C 签名/算法/向量化/精度/适用场景）、量化内核（q4/i8）、批量物理内核（J2/RK4/弹道）、FFI 使用指南（C/Dart/Rust/内存管理）、性能基准方法、测试与验证（14 个测试）、构建与集成（nightly/CI/workspace）、Caveats 与限制、API 索引 |
-| [perf-report.md](perf-report.md) | **性能实测报告**：三路口径（LASX/LSX/标量）逐内核数据、根因分析、优化前后对比、方法学局限 |
+| [manual.md](manual.md) | **完整技术手册**（10 章）：架构与设计（LASX/LSX 双路径机制、SOA 布局、FFI 设计、源码组织）、15 个 FFI 内核逐一详解（C 签名/算法/向量化/精度/适用场景）、量化内核（q4/i8）、批量物理内核（J2/RK4/弹道）、FFI 使用指南（C/Dart/Rust/内存管理）、性能基准方法、测试与验证、构建与集成（nightly/CI/workspace）、Caveats 与限制、API 索引 |
+| [perf-report.md](perf-report.md) | **性能实测报告**：三路口径（LASX/LSX/标量）逐内核数据、根因分析、优化前后对比、调用策略（常驻池 / 多核矩阵乘 / 脚本侧传播）、Rust API 层、方法学局限 |
 
 ## 快速入口
 

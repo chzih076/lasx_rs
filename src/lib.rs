@@ -6,6 +6,7 @@
 //!
 //! | 模块 | 职责 |
 //! |---|---|
+//! | [`api`] | **Rust 原生 API**：切片进出、`Result` 上抛、输出是 [`aligned::AlignedVec`] |
 //! | [`aligned`] | [`aligned::AlignedVec`]：保证 32 字节以上对齐的缓冲区（LASX 性能前提） |
 //! | [`pool`] | [`pool::WorkerPool`]：可选常驻线程池，把批量内核铺到多核且跨调用复用线程 |
 //! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`rk4_j2_step_batch`） |
@@ -19,10 +20,22 @@
 //!
 //! # 快速上手
 //!
+//! Rust 调用方用 [`api`]（切片 + `Result`）：
+//!
+//! ```
+//! let a = [1.0f32, 2.0, 3.0, 4.0];
+//! let b = [1.0f32; 4];
+//! assert_eq!(lasx_rs::api::dot(&a, &b).unwrap(), 10.0);
+//! // 要输出的内核直接返回 32 字节对齐的缓冲
+//! let c = lasx_rs::api::matmul(2, 2, 2, &[1.0, 0.0, 0.0, 1.0], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+//! assert_eq!(&c[..], &[1.0, 2.0, 3.0, 4.0]);
+//! ```
+//!
+//! C / Dart 等 FFI 调用方用裸指针版本（[`ffi`]，或 crate 根的历史重导出）：
+//!
 //! ```no_run
 //! # let (a, b) = (vec![1.0f32, 2.0, 3.0, 4.0], vec![1.0f32; 4]);
 //! # let n = a.len() as i32;
-//! // 走 C ABI 导出层
 //! let d = lasx_rs::ffi::reduce::lasx_dot(a.as_ptr(), b.as_ptr(), n);
 //! // crate 根的重导出与历史 API 完全等价
 //! let d2 = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n);
@@ -38,6 +51,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod aligned;
+pub mod api;
 pub mod arch;
 pub mod ffi;
 mod ops;

@@ -172,6 +172,7 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 | `src/lib.rs` | crate 根：模块声明 + 历史 API 重导出（`lasx_rs::lasx_dot(..)` 仍可用） |
 | `src/arch/` | 能力探测 `SimdPath` + LASX/LSX 的 load/store/splat 样板 |
 | `src/ops/*.rs` | **算子层**：一个内核一个文件，接收切片，`match SimdPath` 分派，自带测试 |
+| `src/api.rs` | **Rust 原生 API**：切片进出、`Result` 上抛、输出对齐（不导出符号，见 §5.3） |
 | `src/ffi/*.rs` | **C ABI 导出层**：15 个 `#[unsafe(no_mangle)]` 符号 + 14 个 `_checked`，只做裸指针 → 切片 |
 | `src/pool.rs` | 可选常驻线程池（纯 Rust API，不导出符号，见 §5.8） |
 | `src/parallel.rs` | 多核调用策略层：`matmul_f32/f64`、`rk4_j2_step_batch`（见 §5.8） |
@@ -603,24 +604,55 @@ final lasxAlloc = lib.lookupFunction<
 
 ### 5.3 Rust 调用（rlib）
 
-直接 `use lasx_rs::*` 即可（函数为 safe 但接受裸指针）：
+Rust 调用方用 **`lasx_rs::api`**：切片进出、`Result` 上抛、需要输出的内核返回
+32 字节对齐的 `AlignedVec`（对齐为什么重要见 §5.5）。这一层与 C ABI 走的是
+**同一段内核**，实测没有可测开销（`cli -- scenario` 里 n=64/256/4096 的差值
+都在 ±5 ns 内，且方向为负，说明校验被内联吸收了）。
+
+```rust
+use lasx_rs::api;
+
+let a = [1.0f32, 2.0, 3.0, 4.0];
+let b = [1.0f32; 4];
+
+let d = api::dot(&a, &b)?;                    // Result<f32, api::Error>
+let s = api::sum(&a);                         // 不会失败的操作不套 Result
+let c = api::matmul(2, 2, 2, &a, &b)?;        // Result<AlignedVec<f32>, _>
+let out = api::norm3_batch(&xs, &ys, &zs)?;   // 输出已对齐
+
+// 原地内核
+api::axpy(2.0, &x, &mut y)?;
+api::rk4_j2_step_batch(&mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz, mu, j2, re, dt)?;
+```
+
+`api::Error` 有四个变体，都带算子名与参数名，实现 `Display + std::error::Error`，
+因此 `?` 与 `Box<dyn Error>` 可直接用：
+
+| 变体 | 触发条件 | 消息示例 |
+|---|---|---|
+| `Shape` | 长度/形状不符 | `matmul: 参数 b 的长度应为 k×n = 9，实际 4` |
+| `Overflow` | `m×k` 等乘积溢出 `usize` | `matmul: m×k 溢出` |
+| `NotFinite` | 常数是 NaN/±∞ | `rk4_j2_step_batch: 常数 dt 必须是有限数，得到 NaN` |
+| `NotPositive` | 要求为正的常数 ≤ 0 | `j2_accel_batch: 常数 mu 必须为正，得到 0` |
+
+**危险的那条路仍然存在**，只是要显式选它：`lasx_*` 系列的参数是裸指针，函数本身
+不是 `unsafe fn`（历史约定），因此**误用即 UB**——长度必须由调用方保证（见 §9.5）。
+已经自己校验过形状、要榨掉最后几 ns 的 Rust 代码，可以继续用：
 
 ```rust
 use lasx_rs::{lasx_dot, lasx_force_lsx_thread};
 
-let a: Vec<f32> = ...;
-let b: Vec<f32> = ...;
-let d = unsafe { lasx_dot(a.as_ptr(), b.as_ptr(), n) };
-// 正确写法是 .as_ptr()——函数签名是裸指针，不是 &Vec/slice。
+let d = lasx_dot(a.as_ptr(), b.as_ptr(), n as i32);
+// 正确写法是 .as_ptr() + 显式长度——签名是裸指针，不是切片。
 
 // 强制当前线程走 LSX 路径（验证/测试钩子，仅本线程生效）
 lasx_force_lsx_thread(true);
-let d_lsx = unsafe { lasx_dot(a.as_ptr(), b.as_ptr(), n) };
+let d_lsx = lasx_dot(a.as_ptr(), b.as_ptr(), n as i32);
 lasx_force_lsx_thread(false);
 ```
 
-> **README 纠正**：主 README 用法示例写作 `lasx_rs::lasx_dot(&a, &b, n)`，
-> 与真实签名（`*const f32`）不符，实际应传 `.as_ptr()`。
+> 三层各管一段：**Rust 用 `api`**；**多核用 `parallel` + `pool`**（§5.8）；
+> **C/Dart 用 `lasx_*` / `lasx_*_checked`**（§5.1/§5.2/§5.6）。
 
 ### 5.4 内存管理（lasx_alloc / 指针生命周期）
 
@@ -1086,6 +1118,24 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 ---
 
 ## 10. API 索引
+
+### 10.0 Rust 原生 API（`lasx_rs::api`，仅 rlib，不导出符号）
+
+| 函数 | 签名摘要 | 失败条件 |
+|---|---|---|
+| `api::sum` | `fn sum(x: &[f32]) -> f32` | 不会失败 |
+| `api::dot` / `dot_f64` | `fn dot(a: &[f32], b: &[f32]) -> Result<f32>` | 长度不一致 |
+| `api::dot_i8` | `fn dot_i8(a: &[i8], b: &[i8]) -> Result<i32>` | 长度不一致 |
+| `api::dot_q4` | `fn dot_q4(qa, sa, qb, sb) -> Result<f64>` | 长度不一致；scale 长度 < `ceil(n/32)` |
+| `api::axpy` | `fn axpy(alpha: f32, x: &[f32], y: &mut [f32]) -> Result<()>` | 长度不一致 |
+| `api::matmul` / `matmul_f64` | `fn matmul(m, k, n, a: &[T], b: &[T]) -> Result<AlignedVec<T>>` | 形状不符、乘积溢出 |
+| `api::norm3_batch` | `fn norm3_batch(xs, ys, zs: &[f64]) -> Result<AlignedVec<f64>>` | 三数组不等长 |
+| `api::batch_distance2d` | `fn batch_distance2d(px, py: f32, xs, ys: &[f32]) -> Result<AlignedVec<f32>>` | 两数组不等长 |
+| `api::vec3_add_scaled_batch` | `fn vec3_add_scaled_batch(ax, ay, az, bx, by, bz: &[f64], s: f64) -> Result<[AlignedVec<f64>; 3]>` | 六数组不等长 |
+| `api::j2_accel_batch` | `fn j2_accel_batch(rx, ry, rz: &[f64], mu, j2, re: f64) -> Result<[AlignedVec<f64>; 3]>` | 不等长；`mu/re <= 0`；`j2` 非有限 |
+| `api::ballistic_step` | `fn ballistic_step(x..vz: &mut [f32], k: &[f32], dt: f32, g: f32) -> Result<()>` | 七数组不等长 |
+| `api::rk4_j2_step_batch` | `fn rk4_j2_step_batch(rx..vz: &mut [f64], mu, j2, re, dt: f64) -> Result<()>` | 不等长；`mu/re <= 0`；`j2`/`dt` 非有限 |
+| `api::Error` | `enum { Shape, Overflow, NotFinite, NotPositive }`（`Display + Error`） | — |
 
 ### 10.1 导出的 FFI 内核（`extern "C"` + `#[unsafe(no_mangle)]`，cdylib 导出）
 

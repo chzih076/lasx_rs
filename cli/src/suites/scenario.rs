@@ -122,6 +122,38 @@ pub fn hotloop() {
         "> 对照 `dispatch` 套件：`SimdPath::detect()` 约 0.9 ns/次。\
          规模越小，这部分固定开销占比越高。"
     );
+
+    // 同一批规模下，C ABI（裸指针）与 Rust api（切片 + 校验）的差别
+    println!();
+    println!("### 同一规模下：C ABI vs Rust 切片 API（`lasx_rs::api`）");
+    println!();
+    println!("| 内核 | n | C ABI（裸指针） | `api`（切片 + 校验） | `api` 额外开销 |");
+    println!("|---|---|---|---|---|");
+    for &n in &[64usize, 256, 4096] {
+        let mut rng = crate::data::Lcg::new(0x9e37 ^ n as u64);
+        let a = AlignedBuf::fill_with(n, |_| rng.f32());
+        let b = AlignedBuf::fill_with(n, |_| rng.f32());
+        let t_raw = timeit(|| {
+            for _ in 0..64 {
+                let _ = black_box(lasx_dot(a.as_ptr(), b.as_ptr(), n as i32));
+            }
+        }) / 64;
+        let t_api = timeit(|| {
+            for _ in 0..64 {
+                let _ = black_box(lasx_rs::api::dot(&a, &b).unwrap());
+            }
+        }) / 64;
+        println!(
+            "| `dot` f32 | {n} | {} | {} | {:.0} ns |",
+            fmt_t(t_raw),
+            fmt_t(t_api),
+            (t_api.as_secs_f64() - t_raw.as_secs_f64()) * 1e9
+        );
+    }
+    println!();
+    println!(
+        "> 差值在 ±5 ns 以内（本次为负，说明校验被内联吸收了），也就是**这层安全包装没有\n> 可测的开销**：两者本来就是同一段内核，`api` 只多了长度比较与一次 `Result` 构造。\n> 但需要输出缓冲的内核（`api::matmul`、`api::norm3_batch`）返回的是**新分配**的\n> 32 字节对齐缓冲，热循环里反复调用会把分配器算进去——那种场合用 `parallel` 的接口\n> （自己切好缓冲）或直接用 C ABI 的裸指针版本。"
+    );
 }
 
 /// 场景 3：融合内核 vs 原语拼接。

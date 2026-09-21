@@ -9,6 +9,8 @@
 
 - **LASX 256 位**：`lasx_*` intrinsics 批量内核（axpy / dot / norm3 / 距离 / J2 加速度 / RK4 步）
 - **LSX 128 位降级**：LSX-only CPU 自动走 128 位路径（线程级强制降级钩子用于验证/测试）
+- **Rust 原生 API**（`lasx_rs::api`）：`&[T]` 进出、形状不符返回 `Err`、输出是 32 字节
+  对齐的 `AlignedVec`；与 C ABI 走同一段内核，**没有可测开销**
 - **零依赖**：纯 std + `stdarch_loongarch`（nightly）
 - **逐位确定**：向量化与标量结果一致（防回归测试守护）
 - **可选常驻线程池 + 多核调用策略层**（`lasx_rs::pool` / `lasx_rs::parallel`，Rust API）：
@@ -35,6 +37,7 @@ lasx_rs/
 │   │   ├── mod.rs        #   SimdPath enum：能力探测 + 路径分派
 │   │   ├── lasx.rs       #   LASX 256 位 load/store/splat 样板
 │   │   └── lsx.rs        #   LSX 128 位样板
+│   ├── api.rs            # Rust 原生 API：切片进出 + Result + 对齐输出（不导出符号）
 │   ├── pool.rs           # 可选常驻线程池（WorkerPool）：纯 Rust API，不导出符号
 │   ├── parallel.rs       # 把内核铺到池上的多核调用策略层（matmul / rk4 步）
 │   ├── ops/              # 算子层：一个内核一个文件（含各自的 #[cfg(test)]）
@@ -77,41 +80,56 @@ cargo build --workspace --release   # 连基准 CLI 一起构建
 
 ## 用法
 
+**Rust（推荐）**：切片进、`Result` 出、需要输出的内核直接返回 32 字节对齐的缓冲。
+
 ```rust
-// 作为依赖：crate-type 含 rlib + cdylib
-let out = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n);
-// 等价的显式路径（FFI 层）
-let out = lasx_rs::ffi::reduce::lasx_dot(a.as_ptr(), b.as_ptr(), n);
+use lasx_rs::api;
+
+let a = [1.0f32, 2.0, 3.0, 4.0];
+let b = [1.0f32; 4];
+
+let d = api::dot(&a, &b)?;                       // Result<f32, api::Error>
+let s = api::sum(&a);                            // 不会失败，直接返回 f32
+let c = api::matmul(2, 2, 2, &a, &b)?;           // Result<AlignedVec<f32>, _>
+let out = api::norm3_batch(&xs, &ys, &zs)?;      // 输出已对齐，无需自己 malloc
+
+// 原地内核取 &mut
+api::axpy(2.0, &x, &mut y)?;
+api::rk4_j2_step_batch(&mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz, mu, j2, re, dt)?;
 ```
 
-FFI 调用示例（Dart）：
+形状不符是 `Err`（带算子名、参数名、期望值与实际值，实现了 `std::error::Error`），
+**不是 UB**：
+
+```rust
+assert_eq!(
+    api::dot(&a, &b[..2]).unwrap_err().to_string(),
+    "dot: 参数 b 的长度应为 4，实际 2"
+);
+```
+
+**C / Dart 等 FFI 调用方**用裸指针版本（零校验，误用即 UB，但也是最快的）：
+
+```rust
+// crate 根的历史重导出与显式路径等价
+let out = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n);
+let out = lasx_rs::ffi::reduce::lasx_dot(a.as_ptr(), b.as_ptr(), n);
+```
 
 ```dart
 final lib = DynamicLibrary.open('liblasx_rs.so');
 // 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
 ```
 
-Rust 调用方要多核时用库内常驻池（**只走 rlib，不经过 C ABI**）：
+**要多核**时用库内常驻池（只走 `rlib`，不经过 C ABI）：
 
 ```rust
 use lasx_rs::aligned::AlignedVec;
 use lasx_rs::pool::WorkerPool;
 
 let mut pool = WorkerPool::new(12);        // 建一次，跨调用/跨步复用
-let mut x = AlignedVec::<f32>::fill_with(1 << 20, |i| i as f32);
-let mut y = AlignedVec::<f32>::fill_with(1 << 20, |_| 0.0);
-pool.for_each_chunks_mut([x.as_mut_slice(), y.as_mut_slice()], |[x, y]| {
-    let n = x.len() as i32;
-    lasx_rs::lasx_axpy(2.0, x.as_ptr(), y.as_mut_ptr(), n);
-});
-```
-
-常见负载不用自己写切分——多核调用策略层已经把形状固定好了：
-
-```rust
-// 大矩阵乘：B 只读共享，A/C 按同一批行切块（行粒度 4 是内核的 4 行分块）
+// 常见负载的切分形状已经固定好了
 lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
-// 多步轨道传播：把循环放进库里，池跨步复用
 for _ in 0..steps {
     lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt, rx, ry, rz, vx, vy, vz);
 }
