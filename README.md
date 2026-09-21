@@ -109,8 +109,11 @@ cargo run -p lasx_bench --release -- fma       # 纯寄存器 FMA 吞吐
 GFLOP/s（峰值的 66–72%）。
 
 > **对齐建议**：LASX 是 32 字节访存，调用方缓冲区若 32 字节对齐可再快约 1.1–1.56×
-> （L1 驻留规模上最明显）。`lasx_alloc` 已保证 32 字节对齐；
-> 量化对比见 `cargo run -p lasx_bench --release -- align`。
+> （L1 驻留规模上最明显）。**不要假设缓冲区天然对齐**——实测 glibc `malloc` 与
+> Dart FFI 的缓冲区只有约一半落在 32 字节边界上；用 `posix_memalign(&p, 32, n)` /
+> C11 `aligned_alloc(32, n)`，或本库的 `lasx_alloc`（已保证 32 字节对齐）。
+> 代码片段见 [manual.md §5.5](docs/manual.md)，量化对比见
+> `cargo run -p lasx_bench --release -- align`。
 完整数据、根因分析与优化前后对比见 **[docs/perf-report.md](docs/perf-report.md)**。
 
 ## 文档

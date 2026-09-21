@@ -619,24 +619,73 @@ lasx_force_lsx_thread(false);
 
 ### 5.4 内存管理（lasx_alloc / 指针生命周期）
 
-- `lasx_alloc(n)` 返回 `Vec::with_capacity(n)` 的裸指针，**未初始化**、库内无
-  释放导出；
-- 调用方释放（Rust 侧归还给 Vec）：
+- `lasx_alloc(n)` 用 `std::alloc::alloc` 按 `Layout::from_size_align(n*4, 32)` 分配，
+  因此返回的指针**保证 32 字节对齐**（旧版用 `Vec::with_capacity`，只有 4 字节对齐；
+  对齐为何重要见 §5.5）。内存**未初始化**，库内不导出 `lasx_free`；
+- `n == 0` 返回"对齐但不可解引用"的悬垂指针（非 null，与旧行为一致）；
+  `n < 0` 会因 layout 非法而 panic；
+- 调用方释放（Rust 侧，layout 必须与分配时一致）：
 
 ```rust
-// 归还由 lasx_alloc 分配的缓冲区（假设已写入 n 个 f32）
+// 归还由 lasx_alloc(n) 分配的缓冲区
 unsafe {
-    let v = Vec::from_raw_parts(ptr, n, n);
-    drop(v); // 释放
+    let layout = std::alloc::Layout::from_size_align(n as usize * 4, 32).unwrap();
+    std::alloc::dealloc(ptr as *mut u8, layout);
 }
 ```
 
-- Dart 侧同样需要归还：持有原始指针与容量，用 `malloc` 的 release 语义（或经
-  Dart 侧 `Vec.fromRawParts` 语义的辅助库）释放；**不释放则泄漏**；
+- Dart / C 侧同理：需要持有原始指针**与容量 `n`**（释放要还原同一个 layout），
+  或干脆改用自己语言的分配器（见 §5.5 的 `posix_memalign`）；**不释放则泄漏**；
 - **生命周期约定**：所有内核只在调用期间读取/写入传入缓冲区，不持有任何指针
   （无回调、无异步），因此调用方在函数返回后即可安全释放输入/输出缓冲；
-- `lasx_matmul` / `lasx_matmul_f64` 内部转置临时缓冲为函数内分配、函数内释放，
-  与调用方无关。
+- `lasx_matmul` / `lasx_matmul_f64` **不再分配临时缓冲**（v2 起改用列方向微内核，
+  去掉了 B 转置），全部原地计算。
+
+### 5.5 缓冲区对齐（只影响 LASX 性能，不影响正确性）
+
+LASX 的 `xvld/xvst` 是 **32 字节**访问：起始地址只要不落在 32 字节边界上，
+每次 32 字节的 load/store 就会**跨 64 字节缓存行**。同一份数据只改起始地址，
+实测 `lasx_dot` 在 L1 驻留规模上差 **1.09×–1.56×**（n=8192 时最大），
+数据超出 L1 后由 L2/L3 带宽主导、差距收敛（见 perf-report §11.3）。
+
+**不要假设"缓冲区应该是对齐的"**。在 Loongson-3B6000 + glibc 2.42 上实测：
+
+| 分配来源 | 实际对齐 |
+|---|---|
+| C `malloc(n)` | 时而 `addr % 64 = 32`（对齐）、时而 `16`（**不对齐**），随尺寸变化 |
+| Dart FFI + libc `malloc` | 同一尺寸连续 16 次：`[32,48,0,32,48,0,16,32,48,0,16,32,48,0,16,32]`，**仅 9/16 是 32 字节对齐** |
+| Rust `Vec<f32>` | 同样随分配尺寸变化（本机实测 n=4096 对齐、n=8192 不对齐） |
+| `posix_memalign(&p, 32, n)` / C11 `aligned_alloc(32, n)` | **稳定 32 字节对齐** |
+
+修法二选一：
+
+- **用自己的分配器拿对齐内存**（推荐：释放仍走自己的 `free`）：
+
+  ```c
+  float *a;
+  if (posix_memalign((void **)&a, 32, n * sizeof(float)) != 0) { /* OOM */ }
+  /* ... 用完 free(a); */
+  ```
+
+  Dart（只用 `dart:ffi`，不需要 `package:ffi`）：
+
+  ```dart
+  typedef _AlignedNative = Int32 Function(Pointer<Pointer<Void>>, IntPtr, IntPtr);
+  typedef _Aligned = int Function(Pointer<Pointer<Void>>, int, int);
+  final posixMemalign = DynamicLibrary.process()
+      .lookupFunction<_AlignedNative, _Aligned>('posix_memalign');
+
+  final slot = malloc(8).cast<Pointer<Void>>();
+  final rc = posixMemalign(slot, 32, n * 4);      // rc == 0 表示成功
+  final Pointer<Float> a = slot.value.cast<Float>();   // 保证 32 字节对齐
+  ```
+
+- **用本库的 `lasx_alloc`**：已保证 32 字节对齐；注意本库不导出 `lasx_free`，
+  归还方式见 §5.4。
+
+> 对齐**只影响性能**：未对齐时内核结果照样正确，而且仍明显快于 LSX 路径
+> （实测 `lasx_dot` n=4096：未对齐 LASX 412 ns vs LSX 665 ns）。
+> 若无法控制调用方缓冲区，建议把它当成"顺带的额外收益"，而不是前提。
 
 ---
 
@@ -921,7 +970,7 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `lasx_axpy` | `void lasx_axpy(float, const float*, float*, int)` | `y += a·x`；FMA；LASX-only |
 | `lasx_sum` | `float lasx_sum(const float*, int)` | f32 归约；64 元素分块 f64 落盘；LASX-only |
 | `lasx_dot_f64` | `double lasx_dot_f64(const double*, const double*, int)` | f64 点积（4×f64）；LASX-only |
-| `lasx_alloc` | `float* lasx_alloc(int)` | 分配未初始化 f32 缓冲（需外部释放） |
+| `lasx_alloc` | `float* lasx_alloc(int)` | 分配未初始化 f32 缓冲，**保证 32 字节对齐**（需外部释放，见 §5.4/§5.5） |
 | `lasx_dot_i8` | `int lasx_dot_i8(const int8_t*, const int8_t*, int)` | int8 点积（32×i8，i64 防溢出）；LASX-only |
 | `lasx_dot_q4` | `double lasx_dot_q4(const uint8_t*, const float*, const uint8_t*, const float*, int)` | Q4 量化点积（每 32 字节一组 scale）；LASX-only |
 | `lasx_matmul_f64` | `void lasx_matmul_f64(int m, int k, int n, const double*, const double*, double*)` | f64 矩阵乘（4×f64）；B 转置；LASX-only |
