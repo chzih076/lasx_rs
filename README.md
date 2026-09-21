@@ -100,10 +100,17 @@ cargo run -p lasx_bench --release -- fma       # 纯寄存器 FMA 吞吐
 | `lasx_dot` | n=4096 | 316 ns | 17.6× |
 | `lasx_sum` | n=64 Ki | 6.1 µs | 14.8× |
 | `lasx_dot_i8` | n=64 Ki | 7.9 µs | 1.35× |
-| `lasx_matmul` f32 | 64³ | 13.5 µs | 2.63× |
-| `lasx_matmul` f32 | 128³ | 119 µs | 2.06× |
+| `lasx_matmul` f32 | 64³ | **7.9 µs** | 4.46× |
+| `lasx_matmul` f32 | 128³ | **65.9 µs** | 3.73× |
+| `lasx_matmul` f32 | 256³ | **716 µs** | 6.65× |
+| `lasx_matmul_f64` | 128³ | **178 µs** | 3.99× |
 
-硬件 FMA 峰值实测 LASX 93.6 / LSX 46.8 GFLOP/s（2.00×）。
+硬件 FMA 峰值实测 LASX 93.6 / LSX 46.8 GFLOP/s（2.00×）；f32 matmul 达 46.9–66.3
+GFLOP/s（峰值的 50–71%）。
+
+> **对齐建议**：LASX 是 32 字节访存，调用方缓冲区若 32 字节对齐可再快约 1.2–1.38×
+> （L1 驻留规模上最明显）。`lasx_alloc` 已保证 32 字节对齐；
+> 量化对比见 `cargo run -p lasx_bench --release -- align`。
 完整数据、根因分析与优化前后对比见 **[docs/perf-report.md](docs/perf-report.md)**。
 
 ## 文档

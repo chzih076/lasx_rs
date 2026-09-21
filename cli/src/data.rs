@@ -140,3 +140,64 @@ impl Soa6 {
         );
     }
 }
+
+/// 64 字节对齐的缓冲区包装。
+///
+/// LASX 是 256 位访问：若起始地址不落在 32 字节边界上，32 字节的 load/store 会
+/// **跨 64 字节缓存行**，实测 `lasx_dot` 因此慢约 38%（n=4096：365 ns → 264 ns）。
+/// 普通 `Vec<T>` 只保证 `align_of::<T>()`（f32 为 4、f64 为 8），所以基准里显式
+/// 对齐，以免把"调用方缓冲区没对齐"的代价记到内核头上。
+///
+/// FFI 侧同理：C/Dart 调用者若想让 LASX 跑满，应传入 32 字节对齐的指针
+/// （本库的 `lasx_alloc` 已保证）。
+pub struct AlignedBuf<T> {
+    buf: Vec<T>,
+    off: usize,
+    len: usize,
+}
+
+impl<T: Copy + Default> AlignedBuf<T> {
+    const ALIGN: usize = 64;
+
+    /// 分配 `len` 个元素，保证首地址 64 字节对齐。
+    pub fn new(len: usize) -> Self {
+        let esz = std::mem::size_of::<T>().max(1);
+        let extra = Self::ALIGN / esz + 1;
+        let buf = vec![T::default(); len + extra];
+        let misalign = buf.as_ptr() as usize % Self::ALIGN;
+        let off = if misalign == 0 {
+            0
+        } else {
+            (Self::ALIGN - misalign).div_ceil(esz)
+        };
+        let b = AlignedBuf { buf, off, len };
+        debug_assert_eq!(b.as_slice().as_ptr() as usize % Self::ALIGN, 0);
+        b
+    }
+
+    /// 分配并用闭包填充。
+    pub fn fill_with(len: usize, mut f: impl FnMut() -> T) -> Self {
+        let mut b = Self::new(len);
+        for x in b.as_mut_slice() {
+            *x = f();
+        }
+        b
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.buf[self.off..self.off + self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.buf[self.off..self.off + self.len]
+    }
+}
+
+impl<T: Copy + Default> Clone for AlignedBuf<T> {
+    /// 克隆后**重新计算对齐偏移**——直接复用原 `off` 会因新分配地址不同而失准。
+    fn clone(&self) -> Self {
+        let mut b = Self::new(self.len);
+        b.as_mut_slice().copy_from_slice(self.as_slice());
+        b
+    }
+}

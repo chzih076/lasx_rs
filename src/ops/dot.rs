@@ -1,13 +1,30 @@
 //! `lasx_dot` —— f32 点积 `Σ a[i]·b[i]`（8×f32 FMA，f64 分块落盘抑制累加误差）。
 //!
 //! LASX 缺失时走 LSX 128 位路径。
+//!
+//! 规模小于 [`SMALL_N`] 时直接走标量：向量建立 + f64 落盘 + 最终归约的固定开销
+//! 在十几个元素上摊不薄（实测 n=8 时向量路径反而比标量慢 1.7×，n≥16 才反超）。
 use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};
 use std::arch::loongarch64::*;
 
-/// 算子入口：解析当前线程的向量路径后分派。
+/// 低于该规模改走标量（实测交叉点约 n=16）。
+const SMALL_N: usize = 16;
+
+/// 算子入口：极小规模走标量，否则解析向量路径后分派。
+///
+/// 极小规模用**单精度累加**（与向量路径的 f64 分块累加不同）：n<16 时 f32 舍入
+/// 误差量级只有 ~1e-6 绝对值，比向量路径多出来的转换 + f64 加法开销划算
+/// ——实测 n=8 时 f64 口径 10 ns、f32 口径 6 ns，而向量路径是 10 ns。
 #[inline]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() < SMALL_N {
+        let mut acc = 0f32;
+        for (&x, &y) in a.iter().zip(b) {
+            acc += x * y;
+        }
+        return acc;
+    }
     match SimdPath::detect() {
         SimdPath::Lasx => dot_lasx(a, b),
         SimdPath::Lsx => dot_lsx(a, b),

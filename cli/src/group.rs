@@ -33,6 +33,8 @@ pub enum Group {
     FmaPeak,
     /// 多线程扩展性（含线程创建开销）。
     ThreadScaling,
+    /// 缓冲区对齐对 LASX 的影响。
+    Align,
 }
 
 impl Group {
@@ -53,6 +55,7 @@ impl Group {
         Group::Rk4,
         Group::FmaPeak,
         Group::ThreadScaling,
+        Group::Align,
     ];
 
     /// 组名，同时用作命令行过滤子串。
@@ -73,12 +76,13 @@ impl Group {
             Group::Rk4 => "rk4",
             Group::FmaPeak => "fma",
             Group::ThreadScaling => "mt",
+            Group::Align => "align",
         }
     }
 
     /// 该组是否输出到结果表格（微基准自行打印，不写表）。
     pub fn is_tabular(self) -> bool {
-        !matches!(self, Group::FmaPeak | Group::ThreadScaling)
+        !matches!(self, Group::FmaPeak | Group::ThreadScaling | Group::Align)
     }
 
     /// 是否被命令行过滤串选中（空串选中全部）。

@@ -6,7 +6,7 @@ use lasx_rs::*;
 use std::hint::black_box;
 
 pub fn dot(rows: &mut Vec<Row>) {
-    for &n in &[8usize, 64, 256, 4096, 1 << 16, 1 << 20, 1 << 23] {
+    for &n in &[8usize, 16, 24, 32, 48, 64, 256, 4096, 1 << 16, 1 << 20] {
         let mut rng = Lcg::new(n as u64);
         let a: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
         let b: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
