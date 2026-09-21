@@ -13,7 +13,7 @@ use super::status::{
     LasxStatus,
 };
 
-/// 校验失败即写状态并提前返回。把 14 个包装里重复的样板收敛到一处。
+/// 校验失败即写状态并提前返回。把各包装里重复的样板收敛到一处。
 macro_rules! or_fail {
     // `void` 版：提前 `return`（写成 `return ();` 会被 clippy 判为多余）
     ($expr:expr, $status:expr, ()) => {
@@ -414,6 +414,280 @@ pub extern "C" fn lasx_rk4_j2_step_batch_checked(
     };
     LasxStatus::Ok.write(status);
     crate::ops::rk4_j2_step_batch::rk4_j2_step_batch(rx, ry, rz, vx, vy, vz, mu, j2, re, dt);
+}
+
+/* ==================== 姿态/几何批处理 ==================== */
+
+/// 带错误通道的批量叉积。
+/// C 签名：`void lasx_cross3_batch_checked(const double*, ..., double*, ..., int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_cross3_batch_checked(
+    ax: *const f64,
+    ay: *const f64,
+    az: *const f64,
+    bx: *const f64,
+    by: *const f64,
+    bz: *const f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    let (ax, ay, az, bx, by, bz) = unsafe {
+        (
+            or_fail!(checked_slice(ax, n), status, ()),
+            or_fail!(checked_slice(ay, n), status, ()),
+            or_fail!(checked_slice(az, n), status, ()),
+            or_fail!(checked_slice(bx, n), status, ()),
+            or_fail!(checked_slice(by, n), status, ()),
+            or_fail!(checked_slice(bz, n), status, ()),
+        )
+    };
+    let (ox, oy, oz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(ox, n), status, ()),
+            or_fail!(checked_slice_mut(oy, n), status, ()),
+            or_fail!(checked_slice_mut(oz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::cross3_batch::cross3_batch(ax, ay, az, bx, by, bz, ox, oy, oz);
+}
+
+/// 带错误通道的批量单位化。
+/// C 签名：`void lasx_unitize3_batch_checked(const double*, const double*, const double*, double*, double*, double*, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_unitize3_batch_checked(
+    x: *const f64,
+    y: *const f64,
+    z: *const f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    let (x, y, z) = unsafe {
+        (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice(y, n), status, ()),
+            or_fail!(checked_slice(z, n), status, ()),
+        )
+    };
+    let (ox, oy, oz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(ox, n), status, ()),
+            or_fail!(checked_slice_mut(oy, n), status, ()),
+            or_fail!(checked_slice_mut(oz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::unitize3_batch::unitize3_batch(x, y, z, ox, oy, oz);
+}
+
+/// 带错误通道的批量 `o = M·v`。
+/// C 签名：`void lasx_mat3_mul_vec3_batch_checked(const double *m0..m8, const double*, ..., double*, ..., int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_mat3_mul_vec3_batch_checked(
+    m0: *const f64,
+    m1: *const f64,
+    m2: *const f64,
+    m3: *const f64,
+    m4: *const f64,
+    m5: *const f64,
+    m6: *const f64,
+    m7: *const f64,
+    m8: *const f64,
+    x: *const f64,
+    y: *const f64,
+    z: *const f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    // 先逐个校验 9 个矩阵数组，再组装成切片数组（`or_fail!` 会直接 return）
+    let mp = [m0, m1, m2, m3, m4, m5, m6, m7, m8];
+    let mut m: [&[f64]; 9] = [&[]; 9];
+    for (k, p) in mp.iter().enumerate() {
+        // SAFETY: FFI 约定——每个矩阵数组各 n 个可读元素。
+        m[k] = unsafe { or_fail!(checked_slice(*p, n), status, ()) };
+    }
+    let (x, y, z) = unsafe {
+        (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice(y, n), status, ()),
+            or_fail!(checked_slice(z, n), status, ()),
+        )
+    };
+    let (ox, oy, oz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(ox, n), status, ()),
+            or_fail!(checked_slice_mut(oy, n), status, ()),
+            or_fail!(checked_slice_mut(oz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::mat3_mul_vec3_batch::mat3_mul_vec3_batch(m, x, y, z, ox, oy, oz);
+}
+
+/// 带错误通道的批量四元数单位化（原地）。
+/// C 签名：`void lasx_quat_normalize_batch_checked(double*, double*, double*, double*, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_quat_normalize_batch_checked(
+    qw: *mut f64,
+    qx: *mut f64,
+    qy: *mut f64,
+    qz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 见上。
+    let (qw, qx, qy, qz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(qw, n), status, ()),
+            or_fail!(checked_slice_mut(qx, n), status, ()),
+            or_fail!(checked_slice_mut(qy, n), status, ()),
+            or_fail!(checked_slice_mut(qz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::quat_normalize_batch::quat_normalize_batch(qw, qx, qy, qz);
+}
+
+/// 带错误通道的批量化四元数乘法。
+/// C 签名：`void lasx_quat_mul_batch_checked(const double *aw..az, const double *bw..bz, double *ow..oz, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_quat_mul_batch_checked(
+    aw: *const f64,
+    ax: *const f64,
+    ay: *const f64,
+    az: *const f64,
+    bw: *const f64,
+    bx: *const f64,
+    by: *const f64,
+    bz: *const f64,
+    ow: *mut f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 见上。
+    let (aw, ax, ay, az, bw, bx, by, bz) = unsafe {
+        (
+            or_fail!(checked_slice(aw, n), status, ()),
+            or_fail!(checked_slice(ax, n), status, ()),
+            or_fail!(checked_slice(ay, n), status, ()),
+            or_fail!(checked_slice(az, n), status, ()),
+            or_fail!(checked_slice(bw, n), status, ()),
+            or_fail!(checked_slice(bx, n), status, ()),
+            or_fail!(checked_slice(by, n), status, ()),
+            or_fail!(checked_slice(bz, n), status, ()),
+        )
+    };
+    let (ow, ox, oy, oz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(ow, n), status, ()),
+            or_fail!(checked_slice_mut(ox, n), status, ()),
+            or_fail!(checked_slice_mut(oy, n), status, ()),
+            or_fail!(checked_slice_mut(oz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::quat_mul_batch::quat_mul_batch(aw, ax, ay, az, bw, bx, by, bz, ow, ox, oy, oz);
+}
+
+/// 带错误通道的批量四元数旋转。
+/// C 签名：`void lasx_quat_rotate_batch_checked(const double *qw..qz, const double *vx..vz, double *ox..oz, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_quat_rotate_batch_checked(
+    qw: *const f64,
+    qx: *const f64,
+    qy: *const f64,
+    qz: *const f64,
+    vx: *const f64,
+    vy: *const f64,
+    vz: *const f64,
+    ox: *mut f64,
+    oy: *mut f64,
+    oz: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 见上。
+    let (qw, qx, qy, qz, vx, vy, vz) = unsafe {
+        (
+            or_fail!(checked_slice(qw, n), status, ()),
+            or_fail!(checked_slice(qx, n), status, ()),
+            or_fail!(checked_slice(qy, n), status, ()),
+            or_fail!(checked_slice(qz, n), status, ()),
+            or_fail!(checked_slice(vx, n), status, ()),
+            or_fail!(checked_slice(vy, n), status, ()),
+            or_fail!(checked_slice(vz, n), status, ()),
+        )
+    };
+    let (ox, oy, oz) = unsafe {
+        (
+            or_fail!(checked_slice_mut(ox, n), status, ()),
+            or_fail!(checked_slice_mut(oy, n), status, ()),
+            or_fail!(checked_slice_mut(oz, n), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::quat_rotate_batch::quat_rotate_batch(qw, qx, qy, qz, vx, vy, vz, ox, oy, oz);
+}
+
+/// 带错误通道的批量四元数 → DCM。
+/// C 签名：`void lasx_quat_to_dcm_batch_checked(const double *qw..qz, double *m0..m8, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_quat_to_dcm_batch_checked(
+    qw: *const f64,
+    qx: *const f64,
+    qy: *const f64,
+    qz: *const f64,
+    m0: *mut f64,
+    m1: *mut f64,
+    m2: *mut f64,
+    m3: *mut f64,
+    m4: *mut f64,
+    m5: *mut f64,
+    m6: *mut f64,
+    m7: *mut f64,
+    m8: *mut f64,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 见上。
+    let (qw, qx, qy, qz) = unsafe {
+        (
+            or_fail!(checked_slice(qw, n), status, ()),
+            or_fail!(checked_slice(qx, n), status, ()),
+            or_fail!(checked_slice(qy, n), status, ()),
+            or_fail!(checked_slice(qz, n), status, ()),
+        )
+    };
+    let mp = [m0, m1, m2, m3, m4, m5, m6, m7, m8];
+    let m: [&mut [f64]; 9] =
+        std::array::from_fn(|k| unsafe { std::slice::from_raw_parts_mut(mp[k], n) });
+    LasxStatus::Ok.write(status);
+    crate::ops::quat_to_dcm_batch::quat_to_dcm_batch(qw, qx, qy, qz, m);
 }
 
 #[cfg(test)]

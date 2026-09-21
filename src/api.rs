@@ -463,6 +463,190 @@ pub fn rk4_j2_step_batch(
     Ok(())
 }
 
+/* ==================== 批量姿态与几何（f64 SOA） ==================== */
+
+/// 批量三维叉积 `o = a × b`，返回 `[ox, oy, oz]`。
+///
+/// # Errors
+/// 六个数组长度不一致时返回 [`Error::Shape`]。
+pub fn cross3_batch(
+    ax: &[f64],
+    ay: &[f64],
+    az: &[f64],
+    bx: &[f64],
+    by: &[f64],
+    bz: &[f64],
+) -> Result<[AlignedVec<f64>; 3]> {
+    let n = expect_same_len(
+        "cross3_batch",
+        &[
+            ("ax", ax.len()),
+            ("ay", ay.len()),
+            ("az", az.len()),
+            ("bx", bx.len()),
+            ("by", by.len()),
+            ("bz", bz.len()),
+        ],
+    )?;
+    let (mut ox, mut oy, mut oz) = alloc3(n);
+    crate::ops::cross3_batch::cross3_batch(ax, ay, az, bx, by, bz, &mut ox, &mut oy, &mut oz);
+    Ok([ox, oy, oz])
+}
+
+/// 批量三维单位化 `o = v/|v|`（零向量 → `(0,0,0)`），返回 `[ox, oy, oz]`。
+///
+/// # Errors
+/// 三个数组长度不一致时返回 [`Error::Shape`]。
+pub fn unitize3_batch(x: &[f64], y: &[f64], z: &[f64]) -> Result<[AlignedVec<f64>; 3]> {
+    let n = expect_same_len(
+        "unitize3_batch",
+        &[("x", x.len()), ("y", y.len()), ("z", z.len())],
+    )?;
+    let (mut ox, mut oy, mut oz) = alloc3(n);
+    crate::ops::unitize3_batch::unitize3_batch(x, y, z, &mut ox, &mut oy, &mut oz);
+    Ok([ox, oy, oz])
+}
+
+/// 批量 `o = M·v`（`m` 为行主序 3×3），返回 `[ox, oy, oz]`。
+///
+/// # Errors
+/// 9 个矩阵数组与 `x`/`y`/`z` 长度不一致时返回 [`Error::Shape`]。
+pub fn mat3_mul_vec3_batch(
+    m: [&[f64]; 9],
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+) -> Result<[AlignedVec<f64>; 3]> {
+    let names: [&'static str; 12] = [
+        "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "x", "y", "z",
+    ];
+    let mut lens = [("", 0usize); 12];
+    for (k, name) in names.iter().enumerate() {
+        lens[k] = (
+            name,
+            if k < 9 {
+                m[k].len()
+            } else {
+                [x, y, z][k - 9].len()
+            },
+        );
+    }
+    let n = expect_same_len("mat3_mul_vec3_batch", &lens)?;
+    let (mut ox, mut oy, mut oz) = alloc3(n);
+    crate::ops::mat3_mul_vec3_batch::mat3_mul_vec3_batch(m, x, y, z, &mut ox, &mut oy, &mut oz);
+    Ok([ox, oy, oz])
+}
+
+/// 批量单位化四元数（标量在前），返回 `[qw, qx, qy, qz]`。
+///
+/// `|q| < 1e-15` 的样本输出单位四元数 `(1,0,0,0)`。
+///
+/// # Errors
+/// 四个数组长度不一致时返回 [`Error::Shape`]。
+pub fn quat_normalize_batch(
+    qw: &[f64],
+    qx: &[f64],
+    qy: &[f64],
+    qz: &[f64],
+) -> Result<[AlignedVec<f64>; 4]> {
+    let n = expect_same_len(
+        "quat_normalize_batch",
+        &[
+            ("qw", qw.len()),
+            ("qx", qx.len()),
+            ("qy", qy.len()),
+            ("qz", qz.len()),
+        ],
+    )?;
+    let mut q: [AlignedVec<f64>; 4] = std::array::from_fn(|_| AlignedVec::new(n));
+    q[0].as_mut_slice().copy_from_slice(qw);
+    q[1].as_mut_slice().copy_from_slice(qx);
+    q[2].as_mut_slice().copy_from_slice(qy);
+    q[3].as_mut_slice().copy_from_slice(qz);
+    {
+        let [qw, qx, qy, qz] = &mut q;
+        crate::ops::quat_normalize_batch::quat_normalize_batch(qw, qx, qy, qz);
+    }
+    Ok(q)
+}
+
+/// 批量化四元数乘法 `a ⊗ b`（Hamilton 积，标量在前），返回 `[ow, ox, oy, oz]`。
+///
+/// # Errors
+/// 八个数组长度不一致时返回 [`Error::Shape`]。
+pub fn quat_mul_batch(a: [&[f64]; 4], b: [&[f64]; 4]) -> Result<[AlignedVec<f64>; 4]> {
+    let names: [&'static str; 8] = ["aw", "ax", "ay", "az", "bw", "bx", "by", "bz"];
+    let mut lens = [("", 0usize); 8];
+    for (k, name) in names.iter().enumerate() {
+        lens[k] = (name, if k < 4 { a[k].len() } else { b[k - 4].len() });
+    }
+    let n = expect_same_len("quat_mul_batch", &lens)?;
+    let mut o: [AlignedVec<f64>; 4] = std::array::from_fn(|_| AlignedVec::new(n));
+    {
+        let [ow, ox, oy, oz] = &mut o;
+        crate::ops::quat_mul_batch::quat_mul_batch(
+            a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], ow, ox, oy, oz,
+        );
+    }
+    Ok(o)
+}
+
+/// 批量用四元数旋转向量（先单位化，再 `o = R(q)·v`），返回 `[ox, oy, oz]`。
+///
+/// # Errors
+/// 四元数与向量各数组长度不一致时返回 [`Error::Shape`]。
+pub fn quat_rotate_batch(q: [&[f64]; 4], v: [&[f64]; 3]) -> Result<[AlignedVec<f64>; 3]> {
+    let names: [&'static str; 7] = ["qw", "qx", "qy", "qz", "vx", "vy", "vz"];
+    let mut lens = [("", 0usize); 7];
+    for (k, name) in names.iter().enumerate() {
+        lens[k] = (name, if k < 4 { q[k].len() } else { v[k - 4].len() });
+    }
+    let n = expect_same_len("quat_rotate_batch", &lens)?;
+    let (mut ox, mut oy, mut oz) = alloc3(n);
+    crate::ops::quat_rotate_batch::quat_rotate_batch(
+        q[0], q[1], q[2], q[3], v[0], v[1], v[2], &mut ox, &mut oy, &mut oz,
+    );
+    Ok([ox, oy, oz])
+}
+
+/// 批量四元数 → 3×3 方向余弦阵（行主序），返回 `[m0..m8]`。
+///
+/// # Errors
+/// 四个分量数组长度不一致时返回 [`Error::Shape`]。
+pub fn quat_to_dcm_batch(q: [&[f64]; 4]) -> Result<[AlignedVec<f64>; 9]> {
+    let n = expect_same_len(
+        "quat_to_dcm_batch",
+        &[
+            ("qw", q[0].len()),
+            ("qx", q[1].len()),
+            ("qy", q[2].len()),
+            ("qz", q[3].len()),
+        ],
+    )?;
+    let mut m: [AlignedVec<f64>; 9] = std::array::from_fn(|_| AlignedVec::new(n));
+    {
+        let [m0, m1, m2, m3, m4, m5, m6, m7, m8] = &mut m;
+        let refs: [&mut [f64]; 9] = [
+            m0.as_mut_slice(),
+            m1.as_mut_slice(),
+            m2.as_mut_slice(),
+            m3.as_mut_slice(),
+            m4.as_mut_slice(),
+            m5.as_mut_slice(),
+            m6.as_mut_slice(),
+            m7.as_mut_slice(),
+            m8.as_mut_slice(),
+        ];
+        crate::ops::quat_to_dcm_batch::quat_to_dcm_batch(q[0], q[1], q[2], q[3], refs);
+    }
+    Ok(m)
+}
+
+/// 三个等长对齐缓冲。
+fn alloc3(n: usize) -> (AlignedVec<f64>, AlignedVec<f64>, AlignedVec<f64>) {
+    (AlignedVec::new(n), AlignedVec::new(n), AlignedVec::new(n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@
 ## 目录
 
 1. [架构与设计](#1-架构与设计)
-2. [内核详解（15 个 FFI 内核）](#2-内核详解15-个-ffi-内核)
+2. [内核详解（22 个 FFI 内核）](#2-内核详解22-个-ffi-内核)
 3. [量化内核（lasx_dot_q4 / lasx_dot_i8）](#3-量化内核lasx_dot_q4--lasx_dot_i8)
 4. [批量物理内核（j2_accel_batch / rk4_j2_step_batch / ballistic_step）](#4-批量物理内核j2_accel_batch--rk4_j2_step_batch--ballistic_step)
 5. [FFI 使用指南](#5-ffi-使用指南)
@@ -148,7 +148,7 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 
 ### 1.4 FFI 设计
 
-- **导出约定**：全部 15 个内核为 `pub extern "C"` + `#[unsafe(no_mangle)]`，
+- **导出约定**：全部 22 个内核为 `pub extern "C"` + `#[unsafe(no_mangle)]`，
   符号名即函数名（`lasx_*`），C ABI 可直接 `dlsym` 绑定；
 - **裸指针语义**：参数为 `*const` / `*mut` 裸指针，函数内部立即
   `std::slice::from_raw_parts` 转成切片再运算；源码顶部显式
@@ -173,7 +173,7 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 | `src/arch/` | 能力探测 `SimdPath` + LASX/LSX 的 load/store/splat 样板 |
 | `src/ops/*.rs` | **算子层**：一个内核一个文件，接收切片，`match SimdPath` 分派，自带测试 |
 | `src/api.rs` | **Rust 原生 API**：切片进出、`Result` 上抛、输出对齐（不导出符号，见 §5.3） |
-| `src/ffi/*.rs` | **C ABI 导出层**：15 个 `#[unsafe(no_mangle)]` 符号 + 14 个 `_checked`，只做裸指针 → 切片 |
+| `src/ffi/*.rs` | **C ABI 导出层**：22 个 `#[unsafe(no_mangle)]` 符号（历史 15 + 姿态/几何 7）+ 21 个 `_checked` |
 | `src/pool.rs` | 可选常驻线程池（纯 Rust API，不导出符号，见 §5.8） |
 | `src/parallel.rs` | 多核调用策略层：`matmul_f32/f64`、`rk4_j2_step_batch`（见 §5.8） |
 | `cli/` | 独立 crate `lasx_bench`：性能基准 CLI（`Group` enum + `match` 分派） |
@@ -181,10 +181,10 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 | `examples/` | 调用方示例（`pool_axpy`、`matmul_pooled`） |
 
 分层约定：算子只处理安全的切片，指针有效性与长度约定收敛在 `ffi`；新增内核 =
-在 `ops/` 加一个文件 + 在 `ffi/` 加一个薄包装。15 个导出符号名与语义保持不变，
+在 `ops/` 加一个文件 + 在 `ffi/` 加一个薄包装。历史 15 个导出符号名与语义保持不变，
 池与示例都不引入新符号。
 
-## 2. 内核详解（15 个 FFI 内核）
+## 2. 内核详解（22 个 FFI 内核）
 
 > 各内核"精度保证"一栏描述其与自身标量尾/测试参考的数值关系；"性能"一栏仅列出
 > README 中记录的实测数据，未记录者注明"README 无独立数据"。
@@ -389,6 +389,52 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 - **适用场景**：多星轨道批量传播（loong-sci `propagate_orbits_batch`）。
 
 ---
+
+### 2.16 批量姿态/几何内核（7 个，f64 SOA）
+
+这一组是**新增**的（历史 15 个符号一个没动），面向姿态动力学与向量几何的**批量**场景：
+loong-sci 里 `quat_rotate` 被调 15 处、`cross3`/几何换算散布在制导与姿态回路里，
+全都是逐点标量调用；批量化后按 SOA 一次算 N 个样本。
+
+| 内核 | 语义 | 输入 → 输出 |
+|---|---|---|
+| `lasx_cross3_batch` | `o = a × b` | 6 → 3 |
+| `lasx_unitize3_batch` | `o = v/\|v\|`（零向量 → `(0,0,0)`） | 3 → 3 |
+| `lasx_mat3_mul_vec3_batch` | `o = M·v`（`M` 行主序） | 9+3 → 3 |
+| `lasx_quat_normalize_batch` | 单位化四元数（**原地**） | 4 → 4 |
+| `lasx_quat_mul_batch` | Hamilton 积 `a⊗b` | 8 → 4 |
+| `lasx_quat_rotate_batch` | 先单位化，再 `o = R(q)·v`（体→惯） | 4+3 → 3 |
+| `lasx_quat_to_dcm_batch` | 四元数 → 3×3 方向余弦阵（行主序） | 4 → 9 |
+
+**约定（与 loong-sci `attitude`/`orbit` 的标量实现逐位一致）**：
+
+- 四元数**标量在前** `q = w + xi + yj + zk`，Hamilton 积 `i²=j²=k²=ijk=−1`；
+- 旋转矩阵按 Wertz Ch.12.2 构造，方向是**体坐标 → 惯性坐标**（惯性转体请先取共轭）；
+- `|q| < 1e-15` 视为退化 ⇒ 输出**单位四元数** `(1,0,0,0)`（不是 NaN）；
+- `lasx_unitize3_batch` 对零向量输出 `(0,0,0)`（这一条与"朴素标量公式给出 NaN"不同，
+  是与调用方的安全约定，三条路径同规则）；
+- 分量求和**结合次序固定**（如四元数乘法按左结合、`quat_rotate` 每行 `((r0·vx + r1·vy) + r2·vz)`），
+  LASX / LSX / 标量尾三条路径**逐位一致**；
+- 全部内核**允许输出与输入别名**（向量路径先取完本轮输入再写回），
+  `quat_to_dcm_batch` 与 `mat3_mul_vec3_batch` 因此能串起来用。
+
+**实测**（`cargo run -p lasx_bench --release -- attitude`，Loongson-3B6000）：
+
+| 内核 | n | LASX | 标量 | 倍数 |
+|---|---|---|---|---|
+| `lasx_cross3_batch` | 4096 | 6.4 µs | 41.2 µs | **6.41×** |
+| `lasx_unitize3_batch` | 4096 | 20.2 µs | 61.0 µs | **3.02×** |
+| `lasx_quat_rotate_batch` | 4096 | 53.2 µs | 165.8 µs | **3.11×** |
+| `lasx_cross3_batch` | 262144 | 853.5 µs | 3.50 ms | 4.11× |
+| `lasx_unitize3_batch` | 262144 | 1.31 ms | 4.12 ms | 3.16× |
+| `lasx_quat_rotate_batch` | 262144 | 4.37 ms | 11.82 ms | 2.70× |
+
+这组算子单元素算力/字节比很低（叉积 9 flop 读 48 B 写 24 B），大规模时受内存带宽限制，
+倍数会比小规模低一些——但即便 DRAM 流式也仍有 2.7–4.1×，因为标量循环的访存次数是
+向量路径的数倍。
+
+API 侧同样有三层：C ABI [`ffi::attitude`]、带错误通道的 `_checked`、
+以及 Rust 原生 [`crate::api`]（切片进出、返回 `[AlignedVec<f64>; N]`）。
 
 ## 3. 量化内核（lasx_dot_q4 / lasx_dot_i8）
 
@@ -753,7 +799,8 @@ if (st != LASX_OK) { /* 处理 */ }
 C 层只能判**结构**（空指针、负长度、溢出、物理常数）；"数组真实长度是否与声明的
 形状一致"只有知道长度的上层判得了——`BadShape` 主要给语言绑定用（见 §5.7）。
 
-导出符号数：15（原始）→ **29**（+14 个 checked），原始 15 个签名与语义不变。
+导出符号数：15（原始）→ 29（+14 checked）→ **43**（再 +7 姿态/几何与其 checked），
+原始 15 个签名与语义始终不变。
 
 ### 5.7 YouLiLong 原生扩展（`yll/`）
 
@@ -812,7 +859,7 @@ lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt,
 **它为什么是 Rust API 而不是 C ABI**：池的入参是「若干切片 + 一个闭包」，
 走 `extern "C"` 就得引入不透明句柄、C 函数指针与手工生命周期管理。
 本库同时产出 `rlib`，Rust 调用方直接 `use` 即可，**因此池不新增任何导出符号**
-（`nm -D` 仍是原 15 个 `lasx_*` + 14 个 `lasx_*_checked`）。
+（`nm -D`：原 15 个 `lasx_*` + 14 个 `lasx_*_checked` 一个没动，新增的是姿态/几何那 7 + 7）。
 C/Dart 调用方若要多核，用自己语言的线程/进程池，把切好的子区间分别喂给 `lasx_*`。
 
 设计要点与实测边界：
@@ -1136,6 +1183,13 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `api::ballistic_step` | `fn ballistic_step(x..vz: &mut [f32], k: &[f32], dt: f32, g: f32) -> Result<()>` | 七数组不等长 |
 | `api::rk4_j2_step_batch` | `fn rk4_j2_step_batch(rx..vz: &mut [f64], mu, j2, re, dt: f64) -> Result<()>` | 不等长；`mu/re <= 0`；`j2`/`dt` 非有限 |
 | `api::Error` | `enum { Shape, Overflow, NotFinite, NotPositive }`（`Display + Error`） | — |
+| `api::cross3_batch` | `fn cross3_batch(ax..bz: &[f64]) -> Result<[AlignedVec<f64>; 3]>` | 六数组不等长 |
+| `api::unitize3_batch` | `fn unitize3_batch(x, y, z: &[f64]) -> Result<[AlignedVec<f64>; 3]>` | 三数组不等长 |
+| `api::mat3_mul_vec3_batch` | `fn mat3_mul_vec3_batch(m: [&[f64]; 9], x, y, z: &[f64]) -> Result<[AlignedVec<f64>; 3]>` | 12 个数组不等长 |
+| `api::quat_normalize_batch` | `fn quat_normalize_batch(qw..qz: &[f64]) -> Result<[AlignedVec<f64>; 4]>` | 四数组不等长 |
+| `api::quat_mul_batch` | `fn quat_mul_batch(a: [&[f64]; 4], b: [&[f64]; 4]) -> Result<[AlignedVec<f64>; 4]>` | 八数组不等长 |
+| `api::quat_rotate_batch` | `fn quat_rotate_batch(q: [&[f64]; 4], v: [&[f64]; 3]) -> Result<[AlignedVec<f64>; 3]>` | 七数组不等长 |
+| `api::quat_to_dcm_batch` | `fn quat_to_dcm_batch(q: [&[f64]; 4]) -> Result<[AlignedVec<f64>; 9]>` | 四数组不等长 |
 
 ### 10.1 导出的 FFI 内核（`extern "C"` + `#[unsafe(no_mangle)]`，cdylib 导出）
 
@@ -1156,6 +1210,21 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 | `lasx_vec3_add_scaled_batch` | `void lasx_vec3_add_scaled_batch(const double*, const double*, const double*, const double*, const double*, const double*, double, double*, double*, double*, int)` | 批量 `o = a + s·b`；LASX+LSX 双路径 |
 | `lasx_j2_accel_batch` | `void lasx_j2_accel_batch(const double*, const double*, const double*, double, double, double, double*, double*, double*, int)` | 批量 J2 引力加速度；LASX+LSX 双路径 |
 | `lasx_rk4_j2_step_batch` | `void lasx_rk4_j2_step_batch(double*, double*, double*, double*, double*, double*, double, double, double, double, int)` | 批量 RK4 J2 步（4 样本并行，寄存器内完成）；LASX + 标量降级 |
+
+### 10.1c 批量姿态/几何（f64 SOA，`src/ffi/attitude.rs`）
+
+| 符号 | 签名摘要 |
+|---|---|
+| `lasx_cross3_batch` | `(ax, ay, az, bx, by, bz, ox, oy, oz, n)`：`o = a × b` |
+| `lasx_unitize3_batch` | `(x, y, z, ox, oy, oz, n)`：`o = v/\|v\|`，零向量 → 0 |
+| `lasx_mat3_mul_vec3_batch` | `(m0..m8, x, y, z, ox, oy, oz, n)`：`o = M·v`（M 行主序） |
+| `lasx_quat_normalize_batch` | `(qw, qx, qy, qz, n)`：**原地**单位化，`\|q\|<1e-15` → `(1,0,0,0)` |
+| `lasx_quat_mul_batch` | `(aw..az, bw..bz, ow..oz, n)`：Hamilton 积 |
+| `lasx_quat_rotate_batch` | `(qw..qz, vx, vy, vz, ox, oy, oz, n)`：先单位化再 `R(q)·v` |
+| `lasx_quat_to_dcm_batch` | `(qw..qz, m0..m8, n)`：四元数 → 3×3 DCM（行主序） |
+
+上表 7 个符号各有对应的 `_checked` 变体（末尾多一个 `int *status`），以及 [`crate::api`]
+里的安全 Rust 版本（`api::cross3_batch` 等，返回 `Result<[AlignedVec<f64>; N], Error>`）。
 
 ### 10.1b 带错误通道的变体（`_checked`，各多一个 `int *status` 出参）
 

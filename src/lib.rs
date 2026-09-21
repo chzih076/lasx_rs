@@ -12,7 +12,7 @@
 //! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`rk4_j2_step_batch`） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
 //! | `ops` | **算子层**：一个内核一个模块，入口按 `match SimdPath::detect()` 分派；接收切片 |
-//! | [`ffi`] | **C ABI 导出层**：15 个 `lasx_*` 符号，只做裸指针 → 切片，不含计算 |
+//! | [`ffi`] | **C ABI 导出层**：22 个 `lasx_*` 符号（历史 15 + 姿态/几何 7），只做裸指针 → 切片 |
 //!
 //! 分层的目的是让"算法"与"ABI 约定"互不干扰：算子只处理安全的切片，指针有效性与
 //! 长度约定收敛在 [`ffi`] 一层；新增内核时只需在 `ops` 下加一个文件、在 [`ffi`]
@@ -62,6 +62,10 @@ pub use arch::lasx_force_lsx_thread;
 
 // 历史 API 兼容：`lasx_*` 符号原先位于 crate 根，继续在此重导出，
 // 使既有的 `lasx_rs::lasx_dot(..)` 调用与文档无需改动。
+pub use ffi::attitude::{
+    lasx_cross3_batch, lasx_mat3_mul_vec3_batch, lasx_quat_mul_batch, lasx_quat_normalize_batch,
+    lasx_quat_rotate_batch, lasx_quat_to_dcm_batch, lasx_unitize3_batch,
+};
 pub use ffi::batch::{lasx_batch_distance2d, lasx_norm3_batch, lasx_vec3_add_scaled_batch};
 pub use ffi::matmul::{lasx_matmul, lasx_matmul_f64};
 pub use ffi::memory::lasx_alloc;

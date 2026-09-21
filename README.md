@@ -8,6 +8,8 @@
 ## 特性
 
 - **LASX 256 位**：`lasx_*` intrinsics 批量内核（axpy / dot / norm3 / 距离 / J2 加速度 / RK4 步）
+- **批量姿态/几何（7 个）**：叉积、单位化、3×3·向量、四元数单位化/乘法/旋转/DCM——
+  与 loong-sci `attitude`/`orbit` 的标量实现逐位一致，实测比标量快 **2.7–6.4×**
 - **LSX 128 位降级**：LSX-only CPU 自动走 128 位路径（线程级强制降级钩子用于验证/测试）
 - **Rust 原生 API**（`lasx_rs::api`）：`&[T]` 进出、形状不符返回 `Err`、输出是 32 字节
   对齐的 `AlignedVec`；与 C ABI 走同一段内核，**没有可测开销**
@@ -58,11 +60,12 @@ lasx_rs/
 分层约定：
 
 - **算子只接收切片**（`&[T]` / `&mut [T]`），裸指针解引用与长度约定收敛在 `ffi` 一层；
-- **两套 ABI**：原 15 个 `lasx_*` 零校验（误用即 UB）；另有 14 个 `lasx_*_checked`
+- **两套 ABI**：22 个 `lasx_*` 零校验（误用即 UB）；另有 21 个 `lasx_*_checked`
   带 `int *status` 出参，校验失败写入错误码并返回安全中性值——需要把错误上抛给上层时用它；
 - 支持降级的算子在入口用 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`；
 - LASX-only 的算子在模块文档里显式标注；
-- 15 个 C ABI 符号名与语义保持不变，历史调用方式（`lasx_rs::lasx_dot(..)`）继续可用。
+- 历史 15 个 C ABI 符号名与语义保持不变（`lasx_rs::lasx_dot(..)` 继续可用）；
+  姿态/几何批处理是**新增**的 7 个符号，不改动任何一个旧符号。
 
 ## 构建
 
@@ -215,7 +218,7 @@ GFLOP/s（峰值的 66–72%）。
 ## 文档
 
 - **[docs/manual.md](docs/manual.md)**：完整技术手册（中文）——架构与设计、
-  15 个 FFI 内核逐一详解、量化内核、批量物理内核、FFI 使用指南（C/Dart/Rust）、
+  22 个 FFI 内核逐一详解、量化内核、批量物理内核、批量姿态/几何内核、FFI 使用指南（C/Dart/Rust）、
   性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
 - **[docs/perf-report.md](docs/perf-report.md)**：性能实测报告与优化记录；
 - **[docs/compression.md](docs/compression.md)**：无损压缩与「带宽换算力」的可行性

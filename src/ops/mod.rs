@@ -17,16 +17,23 @@
 pub mod axpy;
 pub mod ballistic_step;
 pub mod batch_distance2d;
+pub mod cross3_batch;
 pub mod dot;
 pub mod dot_f64;
 pub mod dot_i8;
 pub mod dot_q4;
 pub mod j2_accel_batch;
+pub mod mat3_mul_vec3_batch;
 pub mod matmul;
 pub mod matmul_f64;
 pub mod norm3_batch;
+pub mod quat_mul_batch;
+pub mod quat_normalize_batch;
+pub mod quat_rotate_batch;
+pub mod quat_to_dcm_batch;
 pub mod rk4_j2_step_batch;
 pub mod sum;
+pub mod unitize3_batch;
 pub mod vec3_add_scaled_batch;
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! 这一层只做三件事——把裸指针 + 长度转成切片、调用 [`crate::ops`] 里的算子、
 //! 把结果原样返回。**不含任何计算逻辑**，这样 ABI 约定与算法演进互不干扰。
 //!
-//! 导出符号（15 个，名称与语义与历史版本保持兼容）：
+//! 导出符号（22 个：历史 15 个 + 批量姿态/几何 7 个，名称与语义与历史版本保持兼容）：
 //!
 //! | 模块 | 符号 |
 //! |---|---|
@@ -13,7 +13,8 @@
 //! | [`batch`] | `lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_batch_distance2d` |
 //! | [`physics`] | `lasx_ballistic_step`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch` |
 //! | [`memory`] | `lasx_alloc` |
-//! | [`checked`] | 14 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
+//! | [`attitude`] | 批量姿态/几何 7 个：叉积、单位化、3×3·向量、四元数四则/旋转/DCM |
+//! | [`checked`] | 21 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
 //! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助 |
 //!
 //! # 安全约定
@@ -29,6 +30,7 @@
 //!   指针/长度/形状/物理常数，失败时写入 [`status::LasxStatus`] 并返回安全中性值。
 //!   需要把错误**上抛**给上层（如脚本语言）时用它。
 
+pub mod attitude;
 pub mod batch;
 pub mod checked;
 pub mod matmul;
