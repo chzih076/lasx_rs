@@ -19,14 +19,47 @@
 | GitCode（主） | `git@gitcode.com:H076lik/lasx_rs.git` / <https://gitcode.com/H076lik/lasx_rs> |
 | GitHub（镜像） | `git@github.com:chzih076/lasx_rs.git` / <https://github.com/chzih076/lasx_rs> |
 
+## 代码结构
+
+按"算法 / ABI / 工具"三层切分，算子一个文件，方便定位与增量添加：
+
+```
+lasx_rs/
+├── Cargo.toml            # workspace 根 + lasx_rs 库（cdylib + rlib）
+├── src/
+│   ├── lib.rs            # crate 根：模块声明 + 历史 API 重导出
+│   ├── arch/             # 架构抽象层
+│   │   ├── mod.rs        #   SimdPath enum：能力探测 + 路径分派
+│   │   ├── lasx.rs       #   LASX 256 位 load/store/splat 样板
+│   │   └── lsx.rs        #   LSX 128 位样板
+│   ├── ops/              # 算子层：一个内核一个文件（含各自的 #[cfg(test)]）
+│   │   ├── dot.rs  sum.rs  axpy.rs  dot_f64.rs  dot_i8.rs  dot_q4.rs
+│   │   ├── matmul.rs  matmul_f64.rs
+│   │   ├── norm3_batch.rs  vec3_add_scaled_batch.rs  batch_distance2d.rs
+│   │   ├── ballistic_step.rs  j2_accel_batch.rs  rk4_j2_step_batch.rs
+│   │   └── testutil.rs   #   测试共用夹具（仅 cfg(test)）
+│   └── ffi/              # C ABI 导出层：只做裸指针 → 切片，不含计算
+│       ├── reduce.rs  matmul.rs  quant.rs  batch.rs  physics.rs  memory.rs
+└── cli/                  # 独立 crate `lasx_bench`：性能基准 CLI
+    └── src/{main,group,timing,report,data,scalar_ref,suites/*}.rs
+```
+
+分层约定：
+
+- **算子只接收切片**（`&[T]` / `&mut [T]`），裸指针解引用与长度约定收敛在 `ffi` 一层；
+- 支持降级的算子在入口用 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`；
+- LASX-only 的算子在模块文档里显式标注；
+- 15 个 C ABI 符号名与语义保持不变，历史调用方式（`lasx_rs::lasx_dot(..)`）继续可用。
+
 ## 构建
 
 **依赖 nightly Rust（含 `stdarch_loongarch` 实验特性）**：
 
 ```bash
-# .cargo/config.toml 已配置：rustflags = ["-C", "target-feature=+lsx,+lasx"]
-cargo build --release
-cargo test --release
+# .cargo/config.toml 已配置：rustflags = ["-C", "target-feature=+lasx"]
+cargo build --release          # 构建库（workspace 默认成员）
+cargo test --release           # 单元测试 + 文档测试
+cargo build --workspace --release   # 连基准 CLI 一起构建
 ```
 
 > **注意**：本库依赖**实验版本 rustc**（nightly + `#![feature(stdarch_loongarch)]`），
@@ -36,8 +69,9 @@ cargo test --release
 
 ```rust
 // 作为依赖：crate-type 含 rlib + cdylib
-let out = lasx_rs::lasx_dot(&a, &b, n);
-// 或 FFI：cdylib 导出 C ABI（extern "C" lasx_* 符号）
+let out = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n);
+// 等价的显式路径（FFI 层）
+let out = lasx_rs::ffi::reduce::lasx_dot(a.as_ptr(), b.as_ptr(), n);
 ```
 
 FFI 调用示例（Dart）：
@@ -47,20 +81,38 @@ final lib = DynamicLibrary.open('liblasx_rs.so');
 // 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
 ```
 
+## 性能基准
+
+基准是独立的 CLI crate，零外部依赖：
+
+```bash
+cargo run -p lasx_bench --release              # 全部内核，约 2 分钟
+cargo run -p lasx_bench --release -- matmul    # 只跑组名含 matmul 的套件
+cargo run -p lasx_bench --release -- fma       # 纯寄存器 FMA 吞吐
+```
+
+三种口径：**LASX**（原生 256 位）/ **强制 LSX**（线程级降级钩子）/ **标量**基线。
+
+实测结论（Loongson-3B6000 / LA664，优化后）：
+
+| 内核 | 规模 | LASX 计时 | 相对标量 |
+|---|---|---|---|
+| `lasx_dot` | n=4096 | 316 ns | 17.6× |
+| `lasx_sum` | n=64 Ki | 6.1 µs | 14.8× |
+| `lasx_dot_i8` | n=64 Ki | 7.9 µs | 1.35× |
+| `lasx_matmul` f32 | 64³ | 13.5 µs | 2.63× |
+| `lasx_matmul` f32 | 128³ | 119 µs | 2.06× |
+
+硬件 FMA 峰值实测 LASX 93.6 / LSX 46.8 GFLOP/s（2.00×）。
+完整数据、根因分析与优化前后对比见 **[docs/perf-report.md](docs/perf-report.md)**。
+
 ## 文档
 
 - **[docs/manual.md](docs/manual.md)**：完整技术手册（中文）——架构与设计、
   15 个 FFI 内核逐一详解、量化内核、批量物理内核、FFI 使用指南（C/Dart/Rust）、
   性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
+- **[docs/perf-report.md](docs/perf-report.md)**：性能实测报告与优化记录；
 - **[docs/README.md](docs/README.md)**：文档目录索引。
-
-## 性能基准（Loongson-3B6000，LA664）
-
-| 内核 | 加速比 |
-|---|---|
-| 批量点积（n≥8） | 2.4-2.8× |
-| 全阶引力批量 | 3.84× |
-| 24 线程批量传播 | ~18× |
 
 ## 许可
 

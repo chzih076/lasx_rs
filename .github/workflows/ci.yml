@@ -23,6 +23,7 @@ jobs:
   # 2. 交叉编译检查（loongarch64 target；cargo check 无需链接器，
   #    验证源码在 loongarch64 nightly 下可编译——本库为 LoongArch 专用）
   #    用 -Zbuild-std 从源码构建 loongarch64 std（官方 nightly 分发不稳定/网络受限时可靠）
+  #    --workspace：库（lasx_rs）+ 基准 CLI（lasx_bench）一起检查
   cross-check:
     name: Cross-check (loongarch64)
     runs-on: ubuntu-latest
@@ -34,7 +35,7 @@ jobs:
           rustup target add loongarch64-unknown-linux-gnu --toolchain nightly
       - name: cargo check -Zbuild-std --target loongarch64
         run: |
-          rustup run nightly cargo check -Zbuild-std --target loongarch64-unknown-linux-gnu
+          rustup run nightly cargo check --workspace -Zbuild-std --target loongarch64-unknown-linux-gnu
 
   # 真机测试（LoongArch64 硬件）不在 GitHub 执行——官方 runner 无 loongarch64 二进制。
-  # 真机编译 + 测试由自建 Git Panel CI 覆盖（http://192.168.1.29，龙芯真机，push 自动触发）。
+  # 真机编译 + 测试由自建 Git Panel CI 覆盖（http://192.168.1.64，龙芯真机，push 自动触发）。

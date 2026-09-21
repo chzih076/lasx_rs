@@ -1,0 +1,10 @@
+[package]
+name = "lasx_bench"
+version = "0.1.0"
+edition = "2021"
+description = "lasx_rs 性能基准 CLI（LASX/LSX/标量三路口径）"
+license = "MIT"
+publish = false
+
+[dependencies]
+lasx_rs = { path = ".." }

@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "lasx_bench"
+version = "0.1.0"
+dependencies = [
+ "lasx_rs",
+]
+
+[[package]]
 name = "lasx_rs"
 version = "0.1.0"

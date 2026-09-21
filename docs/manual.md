@@ -2,8 +2,10 @@
 
 > 龙芯（LoongArch）LASX 256 位 / LSX 128 位向量库 · 完整技术文档
 >
-> 本手册逐条对照 `src/lib.rs`（1601 行）撰写，忠实于源码，不增删任何行为描述。
-> 源码版本：`50088c6` 之上（ballistic 向量路径修复 + 新增对照测试 + 零警告清理）。
+> 本手册初版逐行对照**扁平版 `src/lib.rs`**（1601 行）撰写；源码其后按
+> "架构 / 算子 / FFI" 三层重组（见 [§1.5](#15-源码组织重构后)），文中行号引用不再对应，
+> 模块路径以 §1.5 为准。
+> 源码版本：`50088c6` 之上（ballistic 向量路径修复 + 对照测试 + 性能优化 v2 + 结构重构）。
 
 ---
 
@@ -39,24 +41,26 @@ crate 形态为 `cdylib + rlib`：`cdylib` 供 C / Dart 等经 `extern "C"` FFI 
 
 ### 1.2 LASX / LSX 双路径机制
 
-#### 硬件能力检测：`has_lasx()`
+#### 硬件能力检测：`SimdPath::detect()`
+
+重构后能力探测收敛到 `src/arch/mod.rs`，内核不再各自写 `if has_lasx()`：
 
 ```rust
-static HW_HAS_LASX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-fn has_lasx() -> bool {
-    let hw = *HW_HAS_LASX.get_or_init(|| unsafe {
-        let mut cfg2: u32;
-        std::arch::asm!("cpucfg {}, {}", out(reg) cfg2, in(reg) 2u32);
-        (cfg2 & (1 << 7)) != 0
-    });
-    hw && !FORCE_LSX.with(|c| c.get())
+pub enum SimdPath { Lasx, Lsx }
+
+impl SimdPath {
+    pub fn detect() -> Self {
+        if hardware().lasx && !forced_lsx() { SimdPath::Lasx } else { SimdPath::Lsx }
+    }
+    pub fn is_lasx(self) -> bool { matches!(self, SimdPath::Lasx) }
 }
 ```
 
-- 通过 LoongArch `cpucfg` 指令读取配置字 2（`CFG2`），检测 **bit 7（0x80）**
-  是否为 1，即硬件是否含 LASX；
-- 结果用 `OnceLock<bool>` 缓存，**进程级只探测一次**（cpucfg 只读一次）；
-- 每次调用 `has_lasx()` 还需与线程级 `FORCE_LSX` 标志求与——见下。
+- 通过 LoongArch `cpucfg` 指令读取配置字 2（`CFG2`）：**bit 7（0x80）= LASX**、
+  bit 6（0x40）= LSX，打包进 `HwCaps` 用 `OnceLock` 缓存，**进程级只探测一次**；
+- 探测结果与线程级 `FORCE_LSX` 一起决定本线程走哪条路径（见下）；
+- 各算子在入口 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`
+  （或 `_scalar`），而不是在函数体里嵌 `if/else`。
 
 #### 线程级强制降级钩子：`lasx_force_lsx_thread`
 
@@ -160,6 +164,19 @@ LASX 路径的标量尾与 LSX 路径的标量尾也都用同式，因此 LASX/L
 - **零依赖**：`Cargo.toml` 无任何 `[dependencies]`，仅 std + nightly 实验特性。
 
 ---
+
+### 1.5 源码组织（重构后）
+
+| 路径 | 职责 |
+|---|---|
+| `src/lib.rs` | crate 根：模块声明 + 历史 API 重导出（`lasx_rs::lasx_dot(..)` 仍可用） |
+| `src/arch/` | 能力探测 `SimdPath` + LASX/LSX 的 load/store/splat 样板 |
+| `src/ops/*.rs` | **算子层**：一个内核一个文件，接收切片，`match SimdPath` 分派，自带测试 |
+| `src/ffi/*.rs` | **C ABI 导出层**：15 个 `#[unsafe(no_mangle)]` 符号，只做裸指针 → 切片 |
+| `cli/` | 独立 crate `lasx_bench`：性能基准 CLI（`Group` enum + `match` 分派） |
+
+分层约定：算子只处理安全的切片，指针有效性与长度约定收敛在 `ffi`；新增内核 =
+在 `ops/` 加一个文件 + 在 `ffi/` 加一个薄包装。15 个导出符号名与语义保持不变。
 
 ## 2. 内核详解（15 个 FFI 内核）
 
@@ -664,7 +681,7 @@ unsafe {
 
 ## 7. 测试与验证
 
-### 7.1 测试清单（`src/lib.rs` 底部 `mod batch_tests`，共 6 个）
+### 7.1 测试清单（重构后按算子分散在 `src/ops/*.rs`，共 14 个）
 
 | # | 测试名 | 验证内容 | 断言 |
 |---|---|---|---|
@@ -674,6 +691,18 @@ unsafe {
 | 4 | `test_j2_accel_batch_matches_scalar` | `lasx_j2_accel_batch` vs `scalar_j2`（不同公式实现） | <1e-9，n∈{0,1,2,4,9,20} |
 | 5 | `test_rk4_j2_step_scalar_fma_vs_plain_reference` | FMA 版 `rk4_j2_step_scalar`（`f64::mul_add`）vs 分离 mul+add 旧版参考 `step_plain` | 单步 ≤1 ulp；**50 步**累积 <1e-9 |
 | 6 | `test_ballistic_step_batch_matches_scalar` | `lasx_ballistic_step` 向量路径 vs 标量 `euler_step` 全量参考（修复阻力符号+重力+位置用新速度后） | 速度绝对误差 <1e-3、位置 <1e-2，n=64，dt=0.005 |
+| 7 | `quant_tests::test_dot_i8_matches_exact_i64_reference` | `lasx_dot_i8` vs i64 精确参考 | **逐位相等**；覆盖块边界、i32 回绕、(−128)² 的 i16 溢出 |
+| 8 | `dense_tests::test_matmul_f32_matches_reference` | `lasx_matmul` vs f64 参考 | 相对误差 <1e-4，11 组形状 |
+| 9 | `dense_tests::test_matmul_f64_matches_reference` | `lasx_matmul_f64` vs f64 参考 | 相对误差 <1e-12 |
+| 10 | `reduce_tests::test_dot_matches_f64_reference` | `lasx_dot` vs f64 参考 | 相对误差 <1e-5，28 组 n，**LASX 与强制 LSX 两路各自校验** |
+| 11 | `reduce_tests::test_sum_matches_f64_reference` | `lasx_sum` vs f64 参考 | 同上 |
+| 12 | `arch::tests::test_detect_is_lasx_without_force` | 无强制时 `SimdPath::detect()` | 真机上为 `Lasx` |
+| 13 | `arch::tests::test_force_lsx_is_thread_local_and_reversible` | 钩子是线程级且可复位 | 置 true 后为 `Lsx`，置回后为 `Lasx` |
+| 14 | `arch::tests::test_hw_caps_reports_lsx_and_lasx` | `hardware()` 探测 | LSX 与 LASX 都为真 |
+
+> 第 7–11 项是性能优化 v2 阶段补齐的回归测试（原先这些内核**没有**守护）；
+> 各测试随对应算子放在 `src/ops/<算子>.rs` 的 `#[cfg(test)] mod tests` 内，
+> 共享夹具在 `src/ops/testutil.rs`。
 
 > 注：第 6 项为**绝对误差**断言（非 `rel_err` 相对误差），因弹道量为 f32 且速度
 > 可能过零，相对度量不稳定；该测试守护 ballistic 向量路径与标量参考的物理一致性
@@ -737,9 +766,13 @@ unsafe {
 - 构建 / 测试：
 
   ```bash
-  cargo +nightly build --release      # 产物：liblasx_rs.so (cdylib) + rlib
-  cargo +nightly test --release       # 需 LoongArch 真机
+  cargo +nightly build --release                # 产物：liblasx_rs.so (cdylib) + rlib
+  cargo +nightly test --release                 # 需 LoongArch 真机
+  cargo +nightly build --workspace --release    # 连基准 CLI（lasx_bench）一起构建
+  cargo +nightly run -p lasx_bench --release    # 跑性能基准（可加过滤子串）
   ```
+
+  workspace 布局：根包 `lasx_rs`（库）+ 成员 `cli`（包名 `lasx_bench`，基准 CLI）。
 
 - loongarch64 nightly 工具链安装示例（README 给出）：
   `rustup toolchain install nightly-loongarch64-unknown-linux-gnu`。
@@ -755,7 +788,7 @@ unsafe {
    std**（官方 nightly 分发不稳定/网络受限时可靠），cargo check 无需链接器，
    验证源码在 loongarch64 nightly 下可编译。文件末尾注释明确：**真机测试不在
    GitHub 执行**（官方 runner 无 loongarch64 二进制），由自建 Git Panel CI
-   （http://192.168.1.29，龙芯真机，push 自动触发）覆盖。
+   （http://192.168.1.64，龙芯真机，push 自动触发）覆盖。
 
 **`git-panel-ci.yml`**（名为 "Git Panel CI"，4 步）：
 
@@ -785,7 +818,7 @@ unsafe {
 
 ## 9. Caveats 与限制
 
-以下条目全部来自源码注释/结构推导，逐条对应 `src/lib.rs`。
+以下条目来自源码注释/结构推导；模块路径见 §1.5。
 
 ### 9.1 降级覆盖不全（LASX-only 内核）
 
@@ -909,16 +942,16 @@ LASX 检测依赖 `cpucfg` 指令 + `CFG2.bit7`。在虚拟化/模拟器中若 c
 
 | 符号 | 说明 |
 |---|---|
-| `ld_f32` / `st_f32` / `ld_f64` / `st_f64` | LASX 256 位加载/存储（`xvld/xvst` 偏移 0） |
-| `zero_f32` / `zero_f64` | LASX 置零（`xvldi(0)`） |
-| `splat_f32` / `splat_f64` | LASX 广播（`xvreplgr2vr_w/d`） |
-| `ld4_f32` / `st4_f32` / `zero4_f32` / `ld2_f64` / `st2_f64` | LSX 128 位加载/存储/置零 |
-| `splat2_f64` | LSX f64 广播 |
-| `has_lasx` | 硬件 LASX 检测（cpucfg CFG2.bit7）+ 线程级 FORCE_LSX 与操作 |
+| `arch::lasx::{load_f32x8, store_f32x8, load_f64x4, store_f64x4}` | LASX 256 位加载/存储 |
+| `arch::lasx::{zero_f32x8, zero_f64x4, zero_i32x8}` | LASX 置零（`xvldi(0)`） |
+| `arch::lasx::{splat_f32, splat_f64}` | LASX 广播（`xvreplgr2vr_w/d`） |
+| `arch::lsx::{load_f32x4, store_f32x4, zero_f32x4, load_f64x2, store_f64x2, splat_f64}` | LSX 128 位样板 |
+| `arch::{SimdPath, HwCaps, hardware}` | 能力探测与路径分派（cpucfg CFG2） |
 | `euler_step` | 弹道标量欧拉步（LSX/标量降级 + 向量路径尾循环） |
 | `j2_accel_vec` | J2 加速度 lane 版本（RK4 向量路径用） |
 | `rk4_j2_step_scalar` | RK4 J2 标量步（非 LASX 兜底 + 向量路径尾循环；FMA 版） |
-| `mod batch_tests` | 6 个测试（见 §7） |
+| `ops::testutil` | 测试共用夹具（`cfg(test)`，见 §7） |
+| `ffi::{reduce, matmul, quant, batch, physics, memory}` | 15 个 `lasx_*` 导出符号所在模块 |
 
 ---
 
