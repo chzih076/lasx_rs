@@ -7,10 +7,13 @@ use lasx_rs::*;
 use std::hint::black_box;
 
 pub fn matmul(rows: &mut Vec<Row>) {
+    // 256³ 以下打包/流式基本持平，384³ 起打包明显更优（perf-report §19）
     for &(m, k, n) in &[
         (64usize, 64usize, 64usize),
         (128, 128, 128),
         (256, 256, 256),
+        (384, 384, 384),
+        (512, 512, 512),
     ] {
         let mut rng = Lcg::new((m * 1000 + k * 10 + n) as u64);
         let a = AlignedBuf::fill_with(m * k, |_| rng.f32());

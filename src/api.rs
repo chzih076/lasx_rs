@@ -252,6 +252,37 @@ pub fn matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Alig
     Ok(c)
 }
 
+/// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快，见 perf-report §19）。
+///
+/// 与 [`matmul`] **逐位一致**（每个输出元素的累加次序相同）。`matmul` 会按形状自动
+/// 选择；这个入口用于调用方想自己控制、或做 A/B 测量。
+///
+/// # Errors
+/// 同 [`matmul`]。
+pub fn matmul_f32_packed(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+) -> Result<AlignedVec<f32>> {
+    expect_len(
+        "matmul_f32_packed",
+        "a",
+        a.len(),
+        checked_mul("matmul_f32_packed", "m×k", m, k)?,
+    )?;
+    expect_len(
+        "matmul_f32_packed",
+        "b",
+        b.len(),
+        checked_mul("matmul_f32_packed", "k×n", k, n)?,
+    )?;
+    let mut c = AlignedVec::<f32>::new(checked_mul("matmul_f32_packed", "m×n", m, n)?);
+    crate::ops::matmul::matmul_f32_packed(m, k, n, a, b, c.as_mut_slice());
+    Ok(c)
+}
+
 /// f64 版 [`matmul`]。
 ///
 /// # Errors

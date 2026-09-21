@@ -199,13 +199,15 @@ cargo run -p lasx_bench --release -- scenario  # 真实调用场景（多步传�
 | `lasx_dot` | n=4096 | 316 ns | 17.6× |
 | `lasx_sum` | n=64 Ki | 6.1 µs | 14.8× |
 | `lasx_dot_i8` | n=64 Ki | 7.9 µs | 1.35× |
-| `lasx_matmul` f32 | 64³ | **7.8 µs** | 4.20× |
-| `lasx_matmul` f32 | 128³ | **63.0 µs** | 3.58× |
-| `lasx_matmul` f32 | 256³ | **546 µs** | 4.47× |
+| `lasx_matmul` f32 | 64³ | **7.6 µs** | 4.25× |
+| `lasx_matmul` f32 | 128³ | **62.3 µs** | 3.57× |
+| `lasx_matmul` f32 | 256³ | **545.5 µs** | 4.49× |
+| `lasx_matmul` f32 | 512³ | **4.91 ms** | 3.96× |
 | `lasx_matmul_f64` | 128³ | **134 µs** | 4.65× |
 
-硬件 FMA 峰值实测 LASX 93.2 / LSX 46.5 GFLOP/s（2.00×）；f32 matmul 达 61.5–67.6
-GFLOP/s（峰值的 66–72%）。
+硬件 FMA 峰值实测 LASX 93.2 / LSX 46.5 GFLOP/s（2.00×）；f32 matmul 从 64³ 到 512³
+**稳定在 54.6–68.9 GFLOP/s**（峰值的 59–74%），靠的是"列块在外 + 打包 B 面板"
+（Goto/BLIS 的 packing，见 perf-report §19）——256³ 以上此前会掉到 ~30。
 
 > **对齐建议**：LASX 是 32 字节访存，调用方缓冲区若 32 字节对齐可再快约 1.1–1.56×
 > （L1 驻留规模上最明显）。**不要假设缓冲区天然对齐**——实测 glibc `malloc` 与

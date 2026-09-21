@@ -25,6 +25,18 @@ const COL_ORDER_MAX_M: usize = 128;
 
 /// 走"列块在外"次序的 `n` 下限：n 太小时 A 的重读代价相对更高，不值得切换。
 const COL_ORDER_MIN_N: usize = 1024;
+
+/// 打包路径的 `m` 下限：打包本身要走两遍 B（读+写），只有当行块足够多
+/// （流式次序会因此把 B 读很多遍）时才摊得掉。按行切并行的**每线程**只有 m/线程数 行，
+/// 所以这个下限同时保护了并行路径——否则每个线程都会把整块 B 打包一遍。
+const PACK_MIN_M: usize = 32;
+
+/// 打包路径的 `k` 下限：k 太小时打包那一遍的开销摊不掉（k=128 的宽形状实测 0.74×）。
+const PACK_MIN_K: usize = 192;
+
+/// 打包路径的工作量下限（`m×k×n`，即乘加次数）：128³（4.2 MFLOP）打包 0.85×，
+/// 192³（14 MFLOP）起转为正收益。
+const PACK_MIN_WORK: u128 = 8_000_000;
 use std::arch::loongarch64::*;
 
 /// f32 矩阵乘 `C[m×n] = A[m×k]·B[k×n]`（行主序）。
@@ -38,8 +50,19 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
     if m == 0 || n == 0 {
         return;
     }
-    // 小 m、大 n：B 的复用度只有 m/4，流式次序会把 B 读 m/4 遍。改成"列块在外"，
-    // 让 B 只流一遍（实测 100×448×19147 快 5.8×，方阵无回归，见 perf-report §18）。
+    // 路径选择（三条都**逐位一致**，只是访存次序不同；数字见 perf-report §18/§19）：
+    //   1) 打包 B 面板：让微内核的 k 循环顺序读。交叉点实测在 work ≈ 8 MFLOP、k ≈ 192
+    //      ——128³ 是 0.85×，192³ 起 1.12×，384³ 1.74×，512³ 1.5×，1024³ 1.3×；
+    //      k=128 的宽形状只有 0.74×，所以有 k 下限。
+    //   2) 列块在外：k 小、m 小、n 大——打包摊不掉，但仍要让 B 只流一遍。
+    //   3) 流式：其余（工作集本来就装得下缓存）。
+    if m >= PACK_MIN_M
+        && k >= PACK_MIN_K
+        && (m as u128) * (k as u128) * (n as u128) >= PACK_MIN_WORK
+    {
+        matmul_f32_packed(m, k, n, a, b, c);
+        return;
+    }
     if m <= COL_ORDER_MAX_M && n >= COL_ORDER_MIN_N {
         matmul_f32_cols_block(m, k, n, 0, n, a, b, c, COL_BLOCK);
         return;
@@ -145,6 +168,244 @@ pub(crate) fn matmul_f32_cols_block(
             let c_row = &mut c[i * n..(i + 1) * n];
             row_tail_range_f32(a_row, c_row, b, k, n, from, j1);
         }
+    }
+}
+
+// B 面板打包用的线程局部缓冲（跨调用复用，避免每次 malloc 1.8 MB）。
+thread_local! {
+    static PACK_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// "打包 B + 宏内核"路径：小 m、大 n 时的主力。
+///
+/// Goto/BLIS 的做法是**打包**（packing）：把 B 的一段列面板复制成"k 方向连续"的布局，
+/// 于是微内核的 k 循环是顺序读，而不是 [`matmul_f32`] 里那种"读 128 B 跳 `n×4`"。
+/// 打包本身要走一遍 B（顺序读、128 B 连续写），但这**一遍**换来后面所有行扫描的
+/// 顺序访问——B 被读 `m/4` 遍，省下的是 `m/4 - 1` 遍的跨距访问。
+///
+/// 布局：`packed[(s*k + p)*32 + r] = B[p][jb + s*32 + r]`（s 是 32 列条带号）。
+/// 数值与 [`matmul_f32`] **逐位一致**（每个输出元素的 p 升序累加不变）。
+///
+/// 参考水位：同形状 OpenBLAS 0.3.34（LASX，la464）单线程 32.6 ms / 52.7 GFLOP/s。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let m4 = m / 4 * 4;
+    let n32 = n / 32 * 32;
+    let strips_total = n32 / 32;
+    // 一次打包的列数：面板 `k×nc×4` 要留在 L2（3 MiB/核）里，预算取 2 MiB
+    let nc_strips = pack_strips(k);
+
+    PACK_BUF.with(|buf| {
+        let mut packed = buf.borrow_mut();
+        packed.resize(k * nc_strips * 32, 0.0);
+        let mut s0 = 0;
+        while s0 < strips_total {
+            let s1 = (s0 + nc_strips).min(strips_total);
+            let jb = s0 * 32;
+            let nc = (s1 - s0) * 32;
+            pack_b(k, n, jb, nc, b, &mut packed);
+            // 宏内核：每个 32 列条带（打包后连续）× 每 4 行
+            for s in s0..s1 {
+                let strip = &packed[(s - s0) * k * 32..(s - s0 + 1) * k * 32];
+                let j = s * 32;
+                let mut i = 0;
+                while i < m4 {
+                    tile4x32_packed(i, k, strip, a, c, n, j);
+                    i += 4;
+                }
+                // 不足 4 行的尾部行
+                while i < m {
+                    let a_row = &a[i * k..(i + 1) * k];
+                    let c_row = &mut c[i * n..(i + 1) * n];
+                    row_tail_packed(a_row, strip, c_row, k, j);
+                    i += 1;
+                }
+            }
+            s0 = s1;
+        }
+    });
+    // 列尾 [n32, n)：走原来的跨距尾路径（列数 < 32，代价可忽略）
+    if n > n32 {
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            let c_row = &mut c[i * n..(i + 1) * n];
+            row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+        }
+    }
+}
+
+/// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*32 + r]`。
+///
+/// 外层走 `p`：这样读 B 是**顺序**的（每行 `nc×4` 字节连续），写是 128 B 连续小块。
+#[inline]
+fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
+    let strips = nc / 32;
+    for p in 0..k {
+        let row = &b[p * n + jb..p * n + jb + nc];
+        for s in 0..strips {
+            let dst = (s * k + p) * 32;
+            packed[dst..dst + 32].copy_from_slice(&row[s * 32..s * 32 + 32]);
+        }
+    }
+}
+
+/// 微内核：4 行 × 32 列，B 从**打包缓冲**里连续读（每条带 `k×32` 个 f32）。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn tile4x32_packed(
+    i0: usize,
+    k: usize,
+    strip: &[f32],
+    a: &[f32],
+    c: &mut [f32],
+    n: usize,
+    j: usize,
+) {
+    let a0 = &a[i0 * k..(i0 + 1) * k];
+    let a1 = &a[(i0 + 1) * k..(i0 + 2) * k];
+    let a2 = &a[(i0 + 2) * k..(i0 + 3) * k];
+    let a3 = &a[(i0 + 3) * k..(i0 + 4) * k];
+    let mut rows = c[i0 * n..(i0 + 4) * n].chunks_mut(n);
+    let c0 = rows.next().expect("4 行");
+    let c1 = rows.next().expect("4 行");
+    let c2 = rows.next().expect("4 行");
+    let c3 = rows.next().expect("4 行");
+
+    let (mut r0a, mut r0b, mut r0c, mut r0d) = z4();
+    let (mut r1a, mut r1b, mut r1c, mut r1d) = z4();
+    let (mut r2a, mut r2b, mut r2c, mut r2d) = z4();
+    let (mut r3a, mut r3b, mut r3c, mut r3d) = z4();
+    for p in 0..k {
+        let base = p * 32;
+        // 顺序读：p 前进 32 个 f32
+        let vb0 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base)) };
+        let vb1 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 8)) };
+        let vb2 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 16)) };
+        let vb3 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 24)) };
+        let s0 = lasx::splat_f32(a0[p]);
+        let s1 = lasx::splat_f32(a1[p]);
+        let s2 = lasx::splat_f32(a2[p]);
+        let s3 = lasx::splat_f32(a3[p]);
+        unsafe {
+            r0a = lasx_xvfmadd_s(vb0, s0, r0a);
+            r0b = lasx_xvfmadd_s(vb1, s0, r0b);
+            r0c = lasx_xvfmadd_s(vb2, s0, r0c);
+            r0d = lasx_xvfmadd_s(vb3, s0, r0d);
+            r1a = lasx_xvfmadd_s(vb0, s1, r1a);
+            r1b = lasx_xvfmadd_s(vb1, s1, r1b);
+            r1c = lasx_xvfmadd_s(vb2, s1, r1c);
+            r1d = lasx_xvfmadd_s(vb3, s1, r1d);
+            r2a = lasx_xvfmadd_s(vb0, s2, r2a);
+            r2b = lasx_xvfmadd_s(vb1, s2, r2b);
+            r2c = lasx_xvfmadd_s(vb2, s2, r2c);
+            r2d = lasx_xvfmadd_s(vb3, s2, r2d);
+            r3a = lasx_xvfmadd_s(vb0, s3, r3a);
+            r3b = lasx_xvfmadd_s(vb1, s3, r3b);
+            r3c = lasx_xvfmadd_s(vb2, s3, r3c);
+            r3d = lasx_xvfmadd_s(vb3, s3, r3d);
+        }
+    }
+    unsafe {
+        lasx::store_f32x8(c0.as_mut_ptr().add(j), r0a);
+        lasx::store_f32x8(c0.as_mut_ptr().add(j + 8), r0b);
+        lasx::store_f32x8(c0.as_mut_ptr().add(j + 16), r0c);
+        lasx::store_f32x8(c0.as_mut_ptr().add(j + 24), r0d);
+        lasx::store_f32x8(c1.as_mut_ptr().add(j), r1a);
+        lasx::store_f32x8(c1.as_mut_ptr().add(j + 8), r1b);
+        lasx::store_f32x8(c1.as_mut_ptr().add(j + 16), r1c);
+        lasx::store_f32x8(c1.as_mut_ptr().add(j + 24), r1d);
+        lasx::store_f32x8(c2.as_mut_ptr().add(j), r2a);
+        lasx::store_f32x8(c2.as_mut_ptr().add(j + 8), r2b);
+        lasx::store_f32x8(c2.as_mut_ptr().add(j + 16), r2c);
+        lasx::store_f32x8(c2.as_mut_ptr().add(j + 24), r2d);
+        lasx::store_f32x8(c3.as_mut_ptr().add(j), r3a);
+        lasx::store_f32x8(c3.as_mut_ptr().add(j + 8), r3b);
+        lasx::store_f32x8(c3.as_mut_ptr().add(j + 16), r3c);
+        lasx::store_f32x8(c3.as_mut_ptr().add(j + 24), r3d);
+    }
+}
+
+/// 单行 × 32 列，B 从打包缓冲读（不足 4 行的尾部行）。
+#[inline]
+fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], k: usize, j: usize) {
+    let mut acc0 = lasx::zero_f32x8();
+    let mut acc1 = lasx::zero_f32x8();
+    let mut acc2 = lasx::zero_f32x8();
+    let mut acc3 = lasx::zero_f32x8();
+    for (p, &a_p) in a_row.iter().enumerate() {
+        let va = lasx::splat_f32(a_p);
+        let base = p * 32;
+        unsafe {
+            let b0 = lasx::load_f32x8(strip.as_ptr().add(base));
+            let b1 = lasx::load_f32x8(strip.as_ptr().add(base + 8));
+            let b2 = lasx::load_f32x8(strip.as_ptr().add(base + 16));
+            let b3 = lasx::load_f32x8(strip.as_ptr().add(base + 24));
+            acc0 = lasx_xvfmadd_s(b0, va, acc0);
+            acc1 = lasx_xvfmadd_s(b1, va, acc1);
+            acc2 = lasx_xvfmadd_s(b2, va, acc2);
+            acc3 = lasx_xvfmadd_s(b3, va, acc3);
+        }
+    }
+    unsafe {
+        lasx::store_f32x8(c_row.as_mut_ptr().add(j), acc0);
+        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 8), acc1);
+        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 16), acc2);
+        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 24), acc3);
+    }
+    let _ = k;
+}
+
+/// 手写 8 行 × 16 列打包微内核（16 个累加器，2 个 B 向量 + 8 个 A 广播/轮）。
+///
+/// 相比 4×32：B 的 L2 复用遍数从 25 降到 12.5（`m/MR`），且打包条带只有 `k×16×4`
+/// = 28 KB，能连带 A 行一起待在 L1（4×32 的条带是 57 KB，正好卡在 L1 边缘）。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn pack_strips(k: usize) -> usize {
+    const L2_BUDGET: usize = 2 * 1024 * 1024;
+    let per_strip = (k * 32 * 4).max(1);
+    (L2_BUDGET / per_strip).clamp(1, 256)
+}
+
+/// 强制走"流式"次序（**测试对照用**；生产路径由 [`matmul_f32`] 按形状分派）。
+#[cfg(test)]
+pub(crate) fn matmul_f32_stream_ref(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    let m4 = m / 4 * 4;
+    let n32 = n / 32 * 32;
+    let mut i = 0;
+    while i < m4 {
+        let mut j = 0;
+        while j < n32 {
+            tile4x32_f32(i, j, k, n, a, b, c);
+            j += 32;
+        }
+        i += 4;
+    }
+    let mut i = 0;
+    while i < m4 {
+        for r in 0..4 {
+            let a_row = &a[(i + r) * k..(i + r + 1) * k];
+            let c_row = &mut c[(i + r) * n..(i + r + 1) * n];
+            row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+        }
+        i += 4;
+    }
+    while i < m {
+        let a_row = &a[i * k..(i + 1) * k];
+        let c_row = &mut c[i * n..(i + 1) * n];
+        cols32_f32(a_row, c_row, b, n);
+        row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+        i += 1;
     }
 }
 
@@ -353,7 +614,6 @@ mod tests {
 mod cols_exp {
     use super::*;
     use crate::ops::testutil::Lcg;
-    use std::time::Instant;
 
     /// 32 对齐的列区间入口必须与全量入口**逐位一致**，且区间外一个字节都不写。
     #[test]
@@ -400,89 +660,39 @@ mod cols_exp {
             }
         }
     }
-
-    fn median(mut v: Vec<f64>) -> f64 {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    }
-
-    /// 列块宽度定标（宽形状），以及与"流式"次序的成对比较（含方阵回归）。
+    /// 三条路径（打包 / 列块 / 流式）必须**逐位一致**。
     #[test]
-    fn paired_wide_vs_stream() {
-        // 1) 宽形状：列块宽度扫描
-        let (m, k, n) = (100usize, 448usize, 19147usize);
-        let mut rng = Lcg(0x77aa);
-        let a: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
-        let b: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
-        let flop = 2.0 * m as f64 * k as f64 * n as f64;
-        let mut c = vec![0f32; m * n];
-        let t_stream = median(
-            (0..3)
-                .map(|_| {
-                    let t = Instant::now();
-                    matmul_f32(m, k, n, &a, &b, &mut c);
-                    t.elapsed().as_secs_f64()
-                })
-                .collect(),
-        );
-        println!(
-            "宽形状 {m}×{k}×{n}: 流式 {:.1} ms / {:.1} GF/s",
-            t_stream * 1e3,
-            flop / t_stream / 1e9
-        );
-        for &cb in &[32usize, 64, 128, 256, 512, 1024, 4096] {
-            let t = median(
-                (0..3)
-                    .map(|_| {
-                        let t = Instant::now();
-                        matmul_f32_cols_block(m, k, n, 0, n, &a, &b, &mut c, cb);
-                        t.elapsed().as_secs_f64()
-                    })
-                    .collect(),
-            );
-            println!(
-                "  列块 {cb:>5}: {:.1} ms / {:.1} GF/s  （{:.2}×）",
-                t * 1e3,
-                flop / t / 1e9,
-                t_stream / t
-            );
-        }
-
-        // 2) 方阵回归：列块序不应拖慢
-        for &s0 in &[256usize, 512] {
-            let mut rng = Lcg(0x33cc);
-            let a: Vec<f32> = (0..s0 * s0).map(|_| rng.f64() as f32).collect();
-            let b: Vec<f32> = (0..s0 * s0).map(|_| rng.f64() as f32).collect();
-            let mut c1 = vec![0f32; s0 * s0];
-            let mut c2 = vec![0f32; s0 * s0];
-            matmul_f32(s0, s0, s0, &a, &b, &mut c1);
-            matmul_f32_cols_block(s0, s0, s0, 0, s0, &a, &b, &mut c2, COL_BLOCK);
-            assert_eq!(c1, c2, "方阵 {s0} 两种次序不一致");
-            let f = 2.0 * (s0 * s0 * s0) as f64;
-            let ts = median(
-                (0..3)
-                    .map(|_| {
-                        let t = Instant::now();
-                        matmul_f32(s0, s0, s0, &a, &b, &mut c1);
-                        t.elapsed().as_secs_f64()
-                    })
-                    .collect(),
-            );
-            let tc = median(
-                (0..3)
-                    .map(|_| {
-                        let t = Instant::now();
-                        matmul_f32_cols_block(s0, s0, s0, 0, s0, &a, &b, &mut c2, COL_BLOCK);
-                        t.elapsed().as_secs_f64()
-                    })
-                    .collect(),
-            );
-            println!(
-                "方阵 {s0}³: 流式 {:.1} GF/s  列块 {:.1} GF/s （{:.2}×）",
-                f / ts / 1e9,
-                f / tc / 1e9,
-                ts / tc
-            );
+    fn packed_paths_bit_exact() {
+        let mut rng = Lcg(0x9e37);
+        for &(m, k, n) in &[
+            (1usize, 1usize, 32usize),
+            (3, 5, 64),
+            (5, 7, 96),
+            (8, 8, 64),
+            (13, 17, 128),
+            (100, 448, 1024),
+            (100, 448, 19147),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
+            let mut want = vec![f32::NAN; m * n];
+            matmul_f32_stream_ref(m, k, n, &a, &b, &mut want);
+            let mut cols = vec![f32::NAN; m * n];
+            matmul_f32_cols_block(m, k, n, 0, n, &a, &b, &mut cols, COL_BLOCK);
+            let mut pack = vec![f32::NAN; m * n];
+            matmul_f32_packed(m, k, n, &a, &b, &mut pack);
+            for i in 0..m * n {
+                assert_eq!(
+                    cols[i].to_bits(),
+                    want[i].to_bits(),
+                    "列块 {m}×{k}×{n} @ {i}"
+                );
+                assert_eq!(
+                    pack[i].to_bits(),
+                    want[i].to_bits(),
+                    "打包 {m}×{k}×{n} @ {i}"
+                );
+            }
         }
     }
 }

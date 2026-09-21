@@ -60,6 +60,12 @@ pub mod pool;
 
 pub use arch::lasx_force_lsx_thread;
 
+/// 内部基准用的转发（不面向使用者；生产路径由 `lasx_matmul` 的按形状分派选择）。
+#[doc(hidden)]
+pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    ops::matmul::matmul_f32_packed(m, k, n, a, b, c);
+}
+
 // 历史 API 兼容：`lasx_*` 符号原先位于 crate 根，继续在此重导出，
 // 使既有的 `lasx_rs::lasx_dot(..)` 调用与文档无需改动。
 pub use ffi::attitude::{

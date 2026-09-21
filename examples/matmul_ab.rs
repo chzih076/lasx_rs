@@ -1,0 +1,51 @@
+//! 单形状 A/B：按参数跑一条路径，打印中位数。用于**进程级交替**测量
+//! （同进程交替会被彼此的缓存足迹干扰，跨进程交替只受机器负载漂移影响，取多轮即可）。
+//!
+//! `cargo run --release --example matmul_ab -- <m> <k> <n> <stream|packed>`
+
+use std::time::Instant;
+
+use lasx_rs::aligned::AlignedVec;
+
+fn main() {
+    let arg: Vec<String> = std::env::args().collect();
+    let m: usize = arg[1].parse().unwrap();
+    let k: usize = arg[2].parse().unwrap();
+    let n: usize = arg[3].parse().unwrap();
+    let path = arg.get(4).cloned().unwrap_or_else(|| "stream".into());
+
+    let mut rng = 0x1234_5678u64;
+    let mut next = move || {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((rng >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let a = AlignedVec::<f32>::fill_with(m * k, |_| next());
+    let b = AlignedVec::<f32>::fill_with(k * n, |_| next());
+    let mut c = AlignedVec::<f32>::new(m * n);
+    let flop = 2.0 * m as f64 * k as f64 * n as f64;
+
+    let mut run = || match path.as_str() {
+        "packed" => lasx_rs::ops_bench_packed(m, k, n, &a, &b, &mut c),
+        "stream" => lasx_rs::lasx_matmul(
+            m as i32,
+            k as i32,
+            n as i32,
+            a.as_ptr(),
+            b.as_ptr(),
+            c.as_mut_ptr(),
+        ),
+        other => panic!("未知路径 {other}"),
+    };
+    run();
+    let mut ts = Vec::new();
+    for _ in 0..7 {
+        let t = Instant::now();
+        run();
+        ts.push(t.elapsed().as_secs_f64());
+    }
+    ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let t = ts[ts.len() / 2];
+    println!("{:.2} {:.1}", t * 1e3, flop / t / 1e9);
+}
