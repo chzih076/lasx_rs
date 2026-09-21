@@ -9,7 +9,14 @@
 //! v4 试过两级 L2 分块与 6 行微块，**都被实测否掉了**：4×32 已经是这台机器上
 //! 16 个累加器能做到的最优形状，详见 `docs/perf-report.md` §16。
 //!
-//! 数值行为不变：每个输出元素仍是**沿 k 的单个 f32 累加器**，累加次序与 v2 完全一致。
+//! v6 = **k 分块**：打包条带按 k 主序存放，所以一段 k 就是一段连续内存。把 k 切成
+//! `K_CHUNK` 步的块、**k 块在外层、行块在内层**，就能让每个 k 块的 B（32 KB）被所有
+//! 行块反复命中，并与 A 的 4 行、C 的 4×32 一起待在 L1（64 KB）里。实测见 §21：
+//! 512³ +13~26%、1024³ +7~26%、2048³ +91%，256³ 持平（k=256 的条带本来就装得进 L1）。
+//! 代价是 C 每块读写一次（k=1024 时多 3 次），相对算力可忽略。
+//!
+//! 数值行为不变：每个输出元素仍是**沿 k 的单个 f32 累加器**，累加次序与 v2 完全一致
+//! （k 分块只是把同一个 f32 部分和分段落到 C 再读回，落盘/读回是精确的）。
 //!
 //! **LASX-only**：没有降级分支，无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
 
@@ -37,6 +44,15 @@ const PACK_MIN_K: usize = 192;
 /// 打包路径的工作量下限（`m×k×n`，即乘加次数）：128³（4.2 MFLOP）打包 0.85×，
 /// 192³（14 MFLOP）起转为正收益。
 const PACK_MIN_WORK: u128 = 8_000_000;
+
+/// k 方向分块的"L1 预算"与块长。打包条带按 k 主序存放，所以一个 k 块就是一段连续内存。
+///
+/// 动机（实测，`512×k×512`）：条带 24–48 KB 时 61 GF/s，条带 64 KB（正好等于 L1 的
+/// 64 KB）掉到 54.7，96–128 KB 掉到 47–49。k=1024 不分块时条带就是 128 KB。
+/// 所以条带本身超过 `L1_BUDGET` 才分块，块长取 `K_CHUNK`（32 KB）；
+/// k ≤ 384 时条带 ≤ 48 KB，直接一整块跑，避免白白多读写 C。
+const L1_BUDGET: usize = 48 * 1024;
+const K_CHUNK: usize = 256;
 use std::arch::loongarch64::*;
 
 /// f32 矩阵乘 `C[m×n] = A[m×k]·B[k×n]`（行主序）。
@@ -207,22 +223,43 @@ pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f3
             let jb = s0 * 32;
             let nc = (s1 - s0) * 32;
             pack_b(k, n, jb, nc, b, &mut packed);
-            // 宏内核：每个 32 列条带（打包后连续）× 每 4 行
-            for s in s0..s1 {
-                let strip = &packed[(s - s0) * k * 32..(s - s0 + 1) * k * 32];
-                let j = s * 32;
-                let mut i = 0;
-                while i < m4 {
-                    tile4x32_packed(i, k, strip, a, c, n, j);
-                    i += 4;
+            // 宏内核：**k 分块在外、行块在内**。这样每个 k 块打包后的 B
+            //（K_CHUNK×32×4 = 24 KB）会被所有行块反复命中，并与 A 的 4 行、C 的 4×32
+            // 一起待在 L1 里。代价是 C 每块读写一次（k=1024 时多 5 次），相对算力可忽略。
+            let kb_size = if k * 32 * 4 <= L1_BUDGET { k } else { K_CHUNK };
+            let mut kb0 = 0;
+            while kb0 < k {
+                let kb = kb_size.min(k - kb0);
+                let first = kb0 == 0;
+                for s in s0..s1 {
+                    let base = (s - s0) * k * 32 + kb0 * 32;
+                    let strip = &packed[base..base + kb * 32];
+                    let j = s * 32;
+                    let mut i = 0;
+                    while i < m4 {
+                        let ct = &mut c[i * n..(i + 4) * n];
+                        tile4x32_chunk(
+                            kb,
+                            first,
+                            strip,
+                            &a[i * k + kb0..i * k + kb0 + kb],
+                            &a[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
+                            &a[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
+                            &a[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
+                            ct,
+                            n,
+                            j,
+                        );
+                        i += 4;
+                    }
+                    // 不足 4 行的尾部行
+                    while i < m {
+                        let c_row = &mut c[i * n..(i + 1) * n];
+                        row_tail_packed(&a[i * k + kb0..i * k + kb0 + kb], strip, c_row, first, j);
+                        i += 1;
+                    }
                 }
-                // 不足 4 行的尾部行
-                while i < m {
-                    let a_row = &a[i * k..(i + 1) * k];
-                    let c_row = &mut c[i * n..(i + 1) * n];
-                    row_tail_packed(a_row, strip, c_row, k, j);
-                    i += 1;
-                }
+                kb0 += kb;
             }
             s0 = s1;
         }
@@ -252,23 +289,26 @@ fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32
     }
 }
 
-/// 微内核：4 行 × 32 列，B 从**打包缓冲**里连续读（每条带 `k×32` 个 f32）。
+/// 微内核：4 行 × 32 列 × **kb 个 k 步**，B 从打包缓冲连续读。
+///
+/// `first` 为真表示这是该 (行块, 列条带) 的第一个 k 块，累加器从 0 起；否则先把 C 里
+/// 已有的部分和读进累加器再继续加——**结合次序与不分块时完全一致**（都是按 p 递增累加
+/// f32 部分和），所以结果逐位不变。
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn tile4x32_packed(
-    i0: usize,
-    k: usize,
+fn tile4x32_chunk(
+    kb: usize,
+    first: bool,
     strip: &[f32],
-    a: &[f32],
-    c: &mut [f32],
+    a0: &[f32],
+    a1: &[f32],
+    a2: &[f32],
+    a3: &[f32],
+    ct: &mut [f32],
     n: usize,
     j: usize,
 ) {
-    let a0 = &a[i0 * k..(i0 + 1) * k];
-    let a1 = &a[(i0 + 1) * k..(i0 + 2) * k];
-    let a2 = &a[(i0 + 2) * k..(i0 + 3) * k];
-    let a3 = &a[(i0 + 3) * k..(i0 + 4) * k];
-    let mut rows = c[i0 * n..(i0 + 4) * n].chunks_mut(n);
+    let mut rows = ct.chunks_mut(n);
     let c0 = rows.next().expect("4 行");
     let c1 = rows.next().expect("4 行");
     let c2 = rows.next().expect("4 行");
@@ -278,7 +318,28 @@ fn tile4x32_packed(
     let (mut r1a, mut r1b, mut r1c, mut r1d) = z4();
     let (mut r2a, mut r2b, mut r2c, mut r2d) = z4();
     let (mut r3a, mut r3b, mut r3c, mut r3d) = z4();
-    for p in 0..k {
+    if !first {
+        // SAFETY: j..j+32 在行内（调用方保证 32 列条带完整）。
+        unsafe {
+            r0a = lasx::load_f32x8(c0.as_ptr().add(j));
+            r0b = lasx::load_f32x8(c0.as_ptr().add(j + 8));
+            r0c = lasx::load_f32x8(c0.as_ptr().add(j + 16));
+            r0d = lasx::load_f32x8(c0.as_ptr().add(j + 24));
+            r1a = lasx::load_f32x8(c1.as_ptr().add(j));
+            r1b = lasx::load_f32x8(c1.as_ptr().add(j + 8));
+            r1c = lasx::load_f32x8(c1.as_ptr().add(j + 16));
+            r1d = lasx::load_f32x8(c1.as_ptr().add(j + 24));
+            r2a = lasx::load_f32x8(c2.as_ptr().add(j));
+            r2b = lasx::load_f32x8(c2.as_ptr().add(j + 8));
+            r2c = lasx::load_f32x8(c2.as_ptr().add(j + 16));
+            r2d = lasx::load_f32x8(c2.as_ptr().add(j + 24));
+            r3a = lasx::load_f32x8(c3.as_ptr().add(j));
+            r3b = lasx::load_f32x8(c3.as_ptr().add(j + 8));
+            r3c = lasx::load_f32x8(c3.as_ptr().add(j + 16));
+            r3d = lasx::load_f32x8(c3.as_ptr().add(j + 24));
+        }
+    }
+    for p in 0..kb {
         let base = p * 32;
         // 顺序读：p 前进 32 个 f32
         let vb0 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base)) };
@@ -330,11 +391,20 @@ fn tile4x32_packed(
 
 /// 单行 × 32 列，B 从打包缓冲读（不足 4 行的尾部行）。
 #[inline]
-fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], k: usize, j: usize) {
+fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], first: bool, j: usize) {
     let mut acc0 = lasx::zero_f32x8();
     let mut acc1 = lasx::zero_f32x8();
     let mut acc2 = lasx::zero_f32x8();
     let mut acc3 = lasx::zero_f32x8();
+    if !first {
+        // SAFETY: j..j+32 在行内（调用方保证 32 列条带完整）。
+        unsafe {
+            acc0 = lasx::load_f32x8(c_row.as_ptr().add(j));
+            acc1 = lasx::load_f32x8(c_row.as_ptr().add(j + 8));
+            acc2 = lasx::load_f32x8(c_row.as_ptr().add(j + 16));
+            acc3 = lasx::load_f32x8(c_row.as_ptr().add(j + 24));
+        }
+    }
     for (p, &a_p) in a_row.iter().enumerate() {
         let va = lasx::splat_f32(a_p);
         let base = p * 32;
@@ -355,7 +425,6 @@ fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], k: usize, j:
         lasx::store_f32x8(c_row.as_mut_ptr().add(j + 16), acc2);
         lasx::store_f32x8(c_row.as_mut_ptr().add(j + 24), acc3);
     }
-    let _ = k;
 }
 
 /// 手写 8 行 × 16 列打包微内核（16 个累加器，2 个 B 向量 + 8 个 A 广播/轮）。
