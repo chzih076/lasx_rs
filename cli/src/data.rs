@@ -40,56 +40,56 @@ impl Lcg {
 }
 
 /// 伪随机轨道状态（LEO/GEO/椭圆/高轨混合），与 `src/lib.rs` 测试同构
-pub fn states(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut x = Vec::with_capacity(n);
-    let mut y = Vec::with_capacity(n);
-    let mut z = Vec::with_capacity(n);
+pub fn states(n: usize) -> (AlignedBuf<f64>, AlignedBuf<f64>, AlignedBuf<f64>) {
+    let mut x = AlignedBuf::new(n);
+    let mut y = AlignedBuf::new(n);
+    let mut z = AlignedBuf::new(n);
     for i in 0..n {
         let a = 6.8e6 + (i as f64) * 1.7e6;
         let e = 0.05 + 0.3 * (i as f64) / n as f64;
         let th = (i as f64) * 2.39996;
         let r = a * (1.0 - e * e) / (1.0 + e * (th * 1.7).cos());
         let ph = (i as f64) * 1.131;
-        x.push(r * th.cos() * ph.cos());
-        y.push(r * th.sin() * ph.cos());
-        z.push(r * ph.sin());
+        x[i] = r * th.cos() * ph.cos();
+        y[i] = r * th.sin() * ph.cos();
+        z[i] = r * ph.sin();
     }
     (x, y, z)
 }
 
 /// 轨道速度（量级 ~7.5 km/s，方向随样本变化）
-pub fn velocities(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut vx = Vec::with_capacity(n);
-    let mut vy = Vec::with_capacity(n);
-    let mut vz = Vec::with_capacity(n);
+pub fn velocities(n: usize) -> (AlignedBuf<f64>, AlignedBuf<f64>, AlignedBuf<f64>) {
+    let mut vx = AlignedBuf::new(n);
+    let mut vy = AlignedBuf::new(n);
+    let mut vz = AlignedBuf::new(n);
     for i in 0..n {
         let ph = (i as f64) * 0.713;
         let v = 7.4e3 + 200.0 * ph.sin();
-        vx.push(v * ph.cos());
-        vy.push(v * ph.sin());
-        vz.push(0.05 * v * (ph * 2.0).sin());
+        vx[i] = v * ph.cos();
+        vy[i] = v * ph.sin();
+        vz[i] = 0.05 * v * (ph * 2.0).sin();
     }
     (vx, vy, vz)
 }
 
 #[derive(Clone)]
 pub struct Soa6 {
-    pub rx: Vec<f64>,
-    pub ry: Vec<f64>,
-    pub rz: Vec<f64>,
-    pub vx: Vec<f64>,
-    pub vy: Vec<f64>,
-    pub vz: Vec<f64>,
+    pub rx: AlignedBuf<f64>,
+    pub ry: AlignedBuf<f64>,
+    pub rz: AlignedBuf<f64>,
+    pub vx: AlignedBuf<f64>,
+    pub vy: AlignedBuf<f64>,
+    pub vz: AlignedBuf<f64>,
 }
 
 impl Soa6 {
     pub fn new(
-        rx: Vec<f64>,
-        ry: Vec<f64>,
-        rz: Vec<f64>,
-        vx: Vec<f64>,
-        vy: Vec<f64>,
-        vz: Vec<f64>,
+        rx: AlignedBuf<f64>,
+        ry: AlignedBuf<f64>,
+        rz: AlignedBuf<f64>,
+        vx: AlignedBuf<f64>,
+        vy: AlignedBuf<f64>,
+        vz: AlignedBuf<f64>,
     ) -> Self {
         Soa6 {
             rx,
