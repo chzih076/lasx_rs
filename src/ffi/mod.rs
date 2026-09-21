@@ -13,16 +13,27 @@
 //! | [`batch`] | `lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_batch_distance2d` |
 //! | [`physics`] | `lasx_ballistic_step`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch` |
 //! | [`memory`] | `lasx_alloc` |
+//! | [`checked`] | 14 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
+//! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助 |
 //!
 //! # 安全约定
 //!
 //! 所有导出函数都是**安全函数**（非 `unsafe fn`），遵循 C ABI 惯例：调用方保证
-//! 传入的指针对声明的长度有效、可读/可写且不重叠。长度参数为负或为 0 时不做额外
-//! 防护（见手册 Caveats）。
+//! 传入的指针对声明的长度有效、可读/可写且不重叠。
+//!
+//! # 两种用法
+//!
+//! - **原始 15 个符号**（本模块各子模块）：不做任何校验，误用即 UB——适合已经
+//!   自己保证前置条件的调用方，零开销；
+//! - **[`checked`] 的 `lasx_*_checked` 变体**：多一个 `int *status` 出参，先校验
+//!   指针/长度/形状/物理常数，失败时写入 [`status::LasxStatus`] 并返回安全中性值。
+//!   需要把错误**上抛**给上层（如脚本语言）时用它。
 
 pub mod batch;
+pub mod checked;
 pub mod matmul;
 pub mod memory;
 pub mod physics;
 pub mod quant;
 pub mod reduce;
+pub mod status;
