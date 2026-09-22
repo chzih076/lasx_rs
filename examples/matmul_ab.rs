@@ -25,6 +25,10 @@ fn main() {
     let b = AlignedVec::<f32>::fill_with(k * n, |_| next());
     let mut c = AlignedVec::<f32>::new(m * n);
     let flop = 2.0 * m as f64 * k as f64 * n as f64;
+    // f64 侧（`packed64` / `stream64`）另开一份缓冲
+    let a64 = AlignedVec::<f64>::fill_with(m * k, |_| next() as f64);
+    let b64 = AlignedVec::<f64>::fill_with(k * n, |_| next() as f64);
+    let mut c64 = AlignedVec::<f64>::new(m * n);
 
     let mut run = || match path.as_str() {
         "packed" => lasx_rs::ops_bench_packed(m, k, n, &a, &b, &mut c),
@@ -36,6 +40,8 @@ fn main() {
             b.as_ptr(),
             c.as_mut_ptr(),
         ),
+        "packed64" => lasx_rs::ops_bench_packed_f64(m, k, n, &a64, &b64, &mut c64),
+        "stream64" => lasx_rs::ops_bench_stream_f64(m, k, n, &a64, &b64, &mut c64),
         other => panic!("未知路径 {other}"),
     };
     run();

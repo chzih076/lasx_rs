@@ -47,7 +47,14 @@ pub fn matmul(rows: &mut Vec<Row>) {
         );
     }
 
-    for &(m, k, n) in &[(64usize, 64usize, 64usize), (128, 128, 128)] {
+    // f64 的打包阈值是 k ≥ 192 / work ≥ 8M：64³、128³ 都在阈值下（走流式），
+    // 加 256³、512³ 才能看到打包 + k 分块的收益（见 perf-report §22）。
+    for &(m, k, n) in &[
+        (64usize, 64usize, 64usize),
+        (128, 128, 128),
+        (256, 256, 256),
+        (512, 512, 512),
+    ] {
         let mut rng = Lcg::new((m * 7 + k * 13 + n) as u64);
         let a = AlignedBuf::fill_with(m * k, |_| rng.f64());
         let b = AlignedBuf::fill_with(k * n, |_| rng.f64());

@@ -66,6 +66,18 @@ pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &
     ops::matmul::matmul_f32_packed(m, k, n, a, b, c);
 }
 
+/// 同上，f64 侧（`docs/perf-report.md` §22 的 A/B 用）。
+#[doc(hidden)]
+pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    ops::matmul_f64::matmul_f64_packed(m, k, n, a, b, c);
+}
+
+/// 强制 f64 走流式次序（A/B 基准）。
+#[doc(hidden)]
+pub fn ops_bench_stream_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    ops::matmul_f64::matmul_f64_stream(m, k, n, a, b, c);
+}
+
 // 历史 API 兼容：`lasx_*` 符号原先位于 crate 根，继续在此重导出，
 // 使既有的 `lasx_rs::lasx_dot(..)` 调用与文档无需改动。
 pub use ffi::attitude::{
