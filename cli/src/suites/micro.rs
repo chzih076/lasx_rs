@@ -142,8 +142,12 @@ pub fn fma_peak_lasx() -> f64 {
     unsafe {
         let a: m256 = std::mem::transmute(lasx_xvreplgr2vr_w(0x3f80_0000));
         let b: m256 = std::mem::transmute(lasx_xvreplgr2vr_w(0x3f00_0000));
+        // **16 条独立累加链**：8 条链时量到的是 FMA 延迟上限（≈2.66 条/周期），
+        // 16 条才够盖住延迟、量到流水线吞吐（≈3.96 条/周期）。见 docs/dev.md §6.2。
         let (mut v0, mut v1, mut v2, mut v3) = (a, a, a, a);
         let (mut v4, mut v5, mut v6, mut v7) = (a, a, a, a);
+        let (mut v8, mut v9, mut v10, mut v11) = (a, a, a, a);
+        let (mut v12, mut v13, mut v14, mut v15) = (a, a, a, a);
         for _ in 0..FMA_ITERS {
             v0 = lasx_xvfmadd_s(a, b, v0);
             v1 = lasx_xvfmadd_s(a, b, v1);
@@ -153,12 +157,23 @@ pub fn fma_peak_lasx() -> f64 {
             v5 = lasx_xvfmadd_s(a, b, v5);
             v6 = lasx_xvfmadd_s(a, b, v6);
             v7 = lasx_xvfmadd_s(a, b, v7);
+            v8 = lasx_xvfmadd_s(a, b, v8);
+            v9 = lasx_xvfmadd_s(a, b, v9);
+            v10 = lasx_xvfmadd_s(a, b, v10);
+            v11 = lasx_xvfmadd_s(a, b, v11);
+            v12 = lasx_xvfmadd_s(a, b, v12);
+            v13 = lasx_xvfmadd_s(a, b, v13);
+            v14 = lasx_xvfmadd_s(a, b, v14);
+            v15 = lasx_xvfmadd_s(a, b, v15);
         }
         let s = lasx_xvfadd_s(
-            lasx_xvfadd_s(v0, v1),
+            lasx_xvfadd_s(lasx_xvfadd_s(v0, v1), lasx_xvfadd_s(v2, v3)),
             lasx_xvfadd_s(
-                lasx_xvfadd_s(v2, v3),
                 lasx_xvfadd_s(lasx_xvfadd_s(v4, v5), lasx_xvfadd_s(v6, v7)),
+                lasx_xvfadd_s(
+                    lasx_xvfadd_s(lasx_xvfadd_s(v8, v9), lasx_xvfadd_s(v10, v11)),
+                    lasx_xvfadd_s(lasx_xvfadd_s(v12, v13), lasx_xvfadd_s(v14, v15)),
+                ),
             ),
         );
         let mut tmp = [0f32; 8];
@@ -178,6 +193,8 @@ pub fn fma_peak_lsx() -> f64 {
         let b: m128 = std::mem::transmute(lsx_vreplgr2vr_w(0x3f00_0000));
         let (mut v0, mut v1, mut v2, mut v3) = (a, a, a, a);
         let (mut v4, mut v5, mut v6, mut v7) = (a, a, a, a);
+        let (mut v8, mut v9, mut v10, mut v11) = (a, a, a, a);
+        let (mut v12, mut v13, mut v14, mut v15) = (a, a, a, a);
         for _ in 0..FMA_ITERS {
             v0 = lsx_vfmadd_s(a, b, v0);
             v1 = lsx_vfmadd_s(a, b, v1);
@@ -187,12 +204,23 @@ pub fn fma_peak_lsx() -> f64 {
             v5 = lsx_vfmadd_s(a, b, v5);
             v6 = lsx_vfmadd_s(a, b, v6);
             v7 = lsx_vfmadd_s(a, b, v7);
+            v8 = lsx_vfmadd_s(a, b, v8);
+            v9 = lsx_vfmadd_s(a, b, v9);
+            v10 = lsx_vfmadd_s(a, b, v10);
+            v11 = lsx_vfmadd_s(a, b, v11);
+            v12 = lsx_vfmadd_s(a, b, v12);
+            v13 = lsx_vfmadd_s(a, b, v13);
+            v14 = lsx_vfmadd_s(a, b, v14);
+            v15 = lsx_vfmadd_s(a, b, v15);
         }
         let s = lsx_vfadd_s(
-            lsx_vfadd_s(v0, v1),
+            lsx_vfadd_s(lsx_vfadd_s(v0, v1), lsx_vfadd_s(v2, v3)),
             lsx_vfadd_s(
-                lsx_vfadd_s(v2, v3),
                 lsx_vfadd_s(lsx_vfadd_s(v4, v5), lsx_vfadd_s(v6, v7)),
+                lsx_vfadd_s(
+                    lsx_vfadd_s(lsx_vfadd_s(v8, v9), lsx_vfadd_s(v10, v11)),
+                    lsx_vfadd_s(lsx_vfadd_s(v12, v13), lsx_vfadd_s(v14, v15)),
+                ),
             ),
         );
         let mut tmp = [0f32; 4];
@@ -207,8 +235,8 @@ pub fn fma_peak_lsx() -> f64 {
 
 pub fn fma_peak() {
     // FLOP = 累加器数 × 通道数 × 迭代数 × 2（乘 + 加）
-    let flops_lasx = (8 * 8 * FMA_ITERS * 2) as f64;
-    let flops_lsx = (8 * 4 * FMA_ITERS * 2) as f64;
+    let flops_lasx = (16 * 8 * FMA_ITERS * 2) as f64;
+    let flops_lsx = (16 * 4 * FMA_ITERS * 2) as f64;
 
     let t_lasx = timeit(|| {
         let _ = black_box(fma_peak_lasx());
@@ -220,7 +248,7 @@ pub fn fma_peak() {
     let g_lasx = flops_lasx / t_lasx.as_secs_f64() / 1e9;
     let g_lsx = flops_lsx / t_lsx.as_secs_f64() / 1e9;
     println!();
-    println!("## 纯寄存器 FMA 吞吐（无内存访问，8 条独立累加链）");
+    println!("## 纯寄存器 FMA 吞吐（无内存访问，**16 条独立累加链**）");
     println!();
     println!("| 路径 | 宽度 | FLOP/s | 相对峰值 |");
     println!("|---|---|---|---|");
@@ -233,6 +261,12 @@ pub fn fma_peak() {
     println!(
         "> LASX/LSX 吞吐比 = **{:.2}×**（若 LA664 的 256 位 FMA 为满宽实现应接近 2.00×）",
         g_lasx / g_lsx
+    );
+    println!(">");
+    println!(
+        "> 口径说明：链数必须 ≥ 16 才量得到**吞吐**上限；8 条链时只有 93.6 GFLOP/s \
+         （≈2.66 条/周期），那是 FMA 延迟上限（延迟 ≈3 周期）。历史报告里把 8 链的 \
+         93.2 当成峰值，已更正。"
     );
 }
 

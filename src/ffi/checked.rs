@@ -683,9 +683,19 @@ pub extern "C" fn lasx_quat_to_dcm_batch_checked(
             or_fail!(checked_slice(qz, n), status, ()),
         )
     };
+    // 9 个输出数组**必须逐个走 checked_slice_mut**：`_checked` 变体的契约就是
+    // "NULL + n > 0 报 NullPointer 而不是 UB"，这里曾经漏掉（其余 checked 包装都做了）。
+    // 注意不能把 `or_fail!` 放进闭包：它的失败分支是裸 `return`，在闭包里会退化成 `()`。
     let mp = [m0, m1, m2, m3, m4, m5, m6, m7, m8];
-    let m: [&mut [f64]; 9] =
-        std::array::from_fn(|k| unsafe { std::slice::from_raw_parts_mut(mp[k], n) });
+    let mut tmp: Vec<&mut [f64]> = Vec::with_capacity(9);
+    for &p in &mp {
+        tmp.push(or_fail!(unsafe { checked_slice_mut(p, n) }, status, ()));
+    }
+    let m: [&mut [f64]; 9] = match tmp.try_into() {
+        Ok(a) => a,
+        // 容量恒为 9，不可能走到这里；不写状态是安全的（宁可报错也不要 UB）
+        Err(_) => return,
+    };
     LasxStatus::Ok.write(status);
     crate::ops::quat_to_dcm_batch::quat_to_dcm_batch(qw, qx, qy, qz, m);
 }
@@ -721,6 +731,35 @@ mod tests {
         let d = lasx_dot_checked(a.as_ptr(), a.as_ptr(), -1, &mut st);
         assert_eq!(st, LasxStatus::NegativeLength as i32);
         assert_eq!(d, 0.0);
+    }
+
+    /// `lasx_quat_to_dcm_batch_checked` 的 9 个输出也必须做空指针校验（曾经漏掉）。
+    #[test]
+    fn test_quat_to_dcm_null_output_is_reported() {
+        let q = [1.0f64, 0.0, 0.0, 0.0];
+        let mut out = [0.0f64; 9];
+        let p = out.as_mut_ptr();
+        // 其余 8 个有效、只有第 9 个是 NULL ⇒ 仍须报 NullPointer 且不写任何输出
+        let mut st = 999;
+        lasx_quat_to_dcm_batch_checked(
+            q.as_ptr(),
+            q.as_ptr(),
+            q.as_ptr(),
+            q.as_ptr(),
+            p,
+            unsafe { p.add(1) },
+            unsafe { p.add(2) },
+            unsafe { p.add(3) },
+            unsafe { p.add(4) },
+            unsafe { p.add(5) },
+            unsafe { p.add(6) },
+            unsafe { p.add(7) },
+            std::ptr::null_mut(),
+            1,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::NullPointer as i32);
+        assert!(out.iter().all(|&v| v == 0.0), "校验失败时不得触碰输出");
     }
 
     #[test]
