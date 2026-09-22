@@ -83,6 +83,10 @@
 //! 一次调用涉及的元素总数小于 [`MIN_PARALLEL_LEN`] 时自动原地串行执行：派活/唤醒的
 //! 开销不值得。
 
+pub mod sched;
+
+pub use sched::{pick_rows, Job, Pick, Strategy};
+
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -112,6 +116,15 @@ struct Slot {
     n: usize,
     /// 本块的行数（按元素切分时即元素个数）——闭包拿它省得自己反推。
     rows: usize,
+    /// **多块模式**：各数组的基址与**每行字节数**（行主序），worker 逐块自行派生指针。
+    /// 存字节数是因为 worker 循环对元素类型 `T` 不透明（它只有擦除后的 `*mut u8`）。
+    /// 单块模式下不用（`ptrs`/`lens` 已经算好）。
+    bases: [*mut u8; MAX_ARRAYS],
+    row_bytes: [usize; MAX_ARRAYS],
+    /// 每行**元素个数**（切片长度用它，指针偏移用上面的 `row_bytes`）。
+    widths: [usize; MAX_ARRAYS],
+    /// 本轮作业表长度；`0` 表示"单块模式"（用 `ptrs`/`lens`/`rows`）。
+    n_jobs: usize,
 }
 
 /// 类型擦除的入口：把裸指针还原成 `[&mut [T]; N]` 并调用闭包。
@@ -131,6 +144,12 @@ struct Shared {
     panicked: AtomicBool,
     /// 第一个 panic 的载荷（只在 `panicked` 为真时上锁读取）。
     payload: Mutex<Option<Box<dyn Any + Send>>>,
+    /// 本轮作业表（多块模式）。调用方在 epoch 递增前写入，worker 在轮内只读。
+    jobs: UnsafeCell<sched::Jobs>,
+    /// 动态领取的下一个作业号（仅 `dynamic` 为真时使用）。
+    next_job: AtomicUsize,
+    /// 本轮是否动态领取。
+    dynamic: AtomicBool,
     slots: Vec<UnsafeCell<Slot>>,
     /// 本轮的类型擦除入口与闭包指针。
     call: UnsafeCell<(Thunk, *const ())>,
@@ -168,6 +187,9 @@ impl WorkerPool {
             stop: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
             payload: Mutex::new(None),
+            jobs: UnsafeCell::new(sched::Jobs::new()),
+            next_job: AtomicUsize::new(0),
+            dynamic: AtomicBool::new(false),
             slots: (0..threads)
                 .map(|_| {
                     UnsafeCell::new(Slot {
@@ -175,6 +197,10 @@ impl WorkerPool {
                         lens: [0; MAX_ARRAYS],
                         n: 0,
                         rows: 0,
+                        bases: [std::ptr::null_mut(); MAX_ARRAYS],
+                        row_bytes: [0; MAX_ARRAYS],
+                        widths: [0; MAX_ARRAYS],
+                        n_jobs: 0,
                     })
                 })
                 .collect(),
@@ -302,6 +328,112 @@ impl WorkerPool {
         self.dispatch_rows::<T, N, _>(bases, widths, rows, rows_per, f);
     }
 
+    /// 按**编译期策略** `S` 切分派活（行块形状）。语义与
+    /// [`Self::for_each_row_block_mut`] 完全一致，只是"怎么切"由策略决定：
+    /// 策略是零尺寸类型 ⇒ 每处调用各自单态化，派活路径上**没有运行时分支**。
+    ///
+    /// ```ignore
+    /// pool.for_each_row_block_mut_with::<sched::RowBlock, _, 2, _>(
+    ///     m, 4, [(&mut a, k), (c, n)], |rows, [ab, cb]| { /* … */ });
+    /// ```
+    pub fn for_each_row_block_mut_with<S: Strategy, T: Send, const N: usize, F>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        mut arrays: [(&mut [T], usize); N],
+        f: F,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+    {
+        if self.row_blocks_serial(rows, row_gran, &arrays) {
+            f(rows, arrays.map(|(s, _)| s)); // 不切：整块交给闭包（与选哪个策略无关）
+            return;
+        }
+        let (bases, widths) = row_block_ptrs(&mut arrays);
+        let jobs = S::plan(rows, self.threads, row_gran);
+        self.dispatch_jobs(bases, widths, jobs, false, f);
+    }
+
+    /// 与上面同，但**动态领取**：块长 `block_rows`，worker 用原子计数器抢块。
+    ///
+    /// 适合负载不均或机器有后台抢占的场景（块足够碎时把线程间差异压到最小）。
+    pub fn for_each_row_block_mut_dynamic<T: Send, const N: usize, F>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        block_rows: usize,
+        mut arrays: [(&mut [T], usize); N],
+        f: F,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+    {
+        if self.row_blocks_serial(rows, row_gran, &arrays) {
+            f(rows, arrays.map(|(s, _)| s));
+            return;
+        }
+        let (bases, widths) = row_block_ptrs(&mut arrays);
+        let jobs = sched::plan_blocked(rows, block_rows, row_gran);
+        self.dispatch_jobs(bases, widths, jobs, true, f);
+    }
+
+    /// 按**运行期决策** [`Pick`] 派活：这里是"编译期确认路径"的落点——
+    /// `match` 是穷尽的，新增一个 `Pick` 变体会让**所有**分派点编译失败，
+    /// 逼着作者逐处想清楚该不该用它，而不是悄悄落进某个默认分支。
+    pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        mut arrays: [(&mut [T], usize); N],
+        pick: Pick,
+        f: F,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+    {
+        match pick {
+            Pick::Chunk => {
+                self.for_each_row_block_mut_with::<sched::Chunk, _, N, _>(rows, row_gran, arrays, f)
+            }
+            Pick::RowBlock => self
+                .for_each_row_block_mut_with::<sched::RowBlock, _, N, _>(rows, row_gran, arrays, f),
+            Pick::Blocked { block_rows } => {
+                if self.row_blocks_serial(rows, row_gran, &arrays) {
+                    f(rows, arrays.map(|(s, _)| s));
+                    return;
+                }
+                let (bases, widths) = row_block_ptrs(&mut arrays);
+                let jobs = sched::plan_blocked(rows, block_rows, row_gran);
+                self.dispatch_jobs(bases, widths, jobs, false, f);
+            }
+            Pick::Dynamic { block_rows } => self
+                .for_each_row_block_mut_dynamic::<T, N, _>(rows, row_gran, block_rows, arrays, f),
+        }
+    }
+
+    /// 行块接口的公共前置：校验各数组长度，并判断本次是否**原地串行**（不派活）。
+    ///
+    /// 只借用切片（不取指针），这样串行分支可以直接把原切片交给闭包，
+    /// 不需要从裸指针重建、也就没有生命周期把戏。
+    fn row_blocks_serial<T, const N: usize>(
+        &self,
+        rows: usize,
+        row_gran: usize,
+        arrays: &[(&mut [T], usize); N],
+    ) -> bool {
+        assert!(row_gran > 0, "行粒度至少为 1");
+        let mut total = 0usize;
+        for (k, (s, w)) in arrays.iter().enumerate() {
+            let want = rows.checked_mul(*w).expect("rows × 行宽 溢出");
+            assert_eq!(
+                s.len(),
+                want,
+                "第 {k} 个数组长度 {} 与 rows × 行宽 = {want} 不符",
+                s.len()
+            );
+            total = total.saturating_add(want);
+        }
+        self.threads == 1 || rows < 2 || total < MIN_PARALLEL_LEN
+    }
+
     /// 派活内核：第 k 个数组按行宽 `widths[k]` 解释，共 `rows` 行；每个 worker 取一段连续行。
     ///
     /// 各数组长度必须等于 `rows × widths[k]`（由上面的公开接口校验），
@@ -331,6 +463,7 @@ impl WorkerPool {
             }
             slot.n = N;
             slot.rows = r;
+            slot.n_jobs = 0; // 单块模式
             for k in 0..N {
                 let off = start * widths[k];
                 // SAFETY: 数组长度为 rows*widths[k]（调用方已校验），
@@ -343,6 +476,60 @@ impl WorkerPool {
         // SAFETY: 上面的槽位覆盖本次调用的全部数据，且各数组长度由公开接口校验为
         // `rows × widths[k]`、行区间互不重叠；`f` 在栈上存活到本函数返回。
         // publish 返回时所有 worker 已执行完毕（或已被拦下的 panic 已取回）。
+        unsafe { self.publish(thunk::<T, N, F>, &f as *const F as *const ()) };
+    }
+
+    /// 按**作业表**派活：支持"每 worker 多块"（静态轮转）与"动态领取"两种模式。
+    ///
+    /// 与 [`Self::dispatch_rows`] 的区别只有分配方式：那个是"每 worker 一段连续行"，
+    /// 这里是"一张 `(起始行, 行数)` 作业表 + 领取规则"。规则由 [`Pick`] 穷尽决定：
+    ///
+    /// - `Pick::Blocked`：静态轮转——worker `w` 领 `jobs[w], jobs[w+T], …`（`T` = 线程数）。
+    ///   块数多于线程数时能吸收轻度负载不均，且没有原子竞争。
+    /// - `Pick::Dynamic`：动态领取——所有 worker 用 `next_job` 的 `fetch_add` 抢块。
+    ///   块足够碎时把线程间的不均压到最小（机器有后台抢占时尤其有用），代价是每块一次原子操作。
+    ///
+    /// # Panics
+    /// 各数组长度必须等于 `rows × 行宽`；`jobs` 必须恰好覆盖 `[0, rows)`。
+    fn dispatch_jobs<T: Send, const N: usize, F>(
+        &mut self,
+        bases: [*mut T; N],
+        widths: [usize; N],
+        jobs: sched::Jobs,
+        dynamic: bool,
+        f: F,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+    {
+        const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
+        let threads = self.threads;
+        // SAFETY: 调用方独占（`&mut self`），且写入发生在 epoch 递增之前。
+        unsafe { *self.shared.jobs.get() = jobs };
+        self.shared.dynamic.store(dynamic, Ordering::Relaxed);
+        self.shared.next_job.store(0, Ordering::Relaxed);
+        let n_jobs = unsafe { (*self.shared.jobs.get()).len() };
+        // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
+        #[allow(clippy::needless_range_loop)]
+        for w in 0..threads {
+            // SAFETY: slots[w] 只由第 w 个 worker 访问
+            let slot = unsafe { &mut *self.shared.slots[w].get() };
+            // 静态轮转下第 w 个 worker 至少有一个作业才要干活（动态模式则人人可能要抢）
+            let has_work = dynamic || w < n_jobs;
+            if !has_work {
+                slot.n = 0;
+                continue;
+            }
+            slot.n = N;
+            slot.rows = 0;
+            slot.n_jobs = n_jobs;
+            for k in 0..N {
+                slot.bases[k] = bases[k] as *mut u8;
+                // 行宽同时存"元素个数"（切片长度）与"字节数"（指针偏移）：
+                // worker 侧对 `T` 不透明，指针只能按字节算。
+                slot.widths[k] = widths[k];
+                slot.row_bytes[k] = widths[k] * std::mem::size_of::<T>();
+            }
+        }
         unsafe { self.publish(thunk::<T, N, F>, &f as *const F as *const ()) };
     }
 
@@ -423,18 +610,64 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
         let (thunk, func) = unsafe { *sh.call.get() };
         let slot = unsafe { &*sh.slots[i].get() };
         if slot.n > 0 {
-            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                thunk(slot.rows, &slot.ptrs[..slot.n], &slot.lens[..slot.n], func);
-            }))
-            .err();
-            if let Some(p) = payload {
-                // 只留第一个载荷；无论怎样都要计数，否则主线程永远等不到 done
-                let mut guard = sh.payload.lock().unwrap();
-                if guard.is_none() {
-                    *guard = Some(p);
+            // 跑一块：多块模式下由 `bases`/`widths`/作业行区间现场派生指针；
+            // 单块模式下 `ptrs`/`lens` 已经在派活时算好（热路径不变）。
+            let run_block = |start: usize, rows: usize, ptrs: &[*mut u8], lens: &[usize]| {
+                let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    thunk(rows, ptrs, lens, func);
+                }))
+                .err();
+                if let Some(p) = payload {
+                    // 只留第一个载荷；无论怎样都要计数，否则主线程永远等不到 done
+                    let mut guard = sh.payload.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(p);
+                    }
+                    drop(guard);
+                    sh.panicked.store(true, Ordering::Release);
+                    return false;
                 }
-                drop(guard);
-                sh.panicked.store(true, Ordering::Release);
+                let _ = start;
+                true
+            };
+            if slot.n_jobs == 0 {
+                run_block(
+                    slot.rows,
+                    slot.rows,
+                    &slot.ptrs[..slot.n],
+                    &slot.lens[..slot.n],
+                );
+            } else {
+                // SAFETY: 作业表在本轮内只读（调用方在 done 计数到齐前不会改它）
+                let jobs = unsafe { &*sh.jobs.get() };
+                let mut ptrs = [std::ptr::null_mut(); MAX_ARRAYS];
+                let mut lens = [0usize; MAX_ARRAYS];
+                let mut one = |idx: usize| -> bool {
+                    let job = jobs[idx];
+                    for k in 0..slot.n {
+                        // SAFETY: 数组长度为 rows×widths[k]，job 覆盖在 [0, rows) 内
+                        // 字节偏移：bases[k] + 起始行 × 每行字节数
+                        ptrs[k] = unsafe { slot.bases[k].add(job.start * slot.row_bytes[k]) };
+                        lens[k] = job.rows * slot.widths[k];
+                    }
+                    run_block(job.start, job.rows, &ptrs[..slot.n], &lens[..slot.n])
+                };
+                if sh.dynamic.load(Ordering::Relaxed) {
+                    loop {
+                        let idx = sh.next_job.fetch_add(1, Ordering::Relaxed);
+                        if idx >= jobs.len() || !one(idx) {
+                            break;
+                        }
+                    }
+                } else {
+                    let mut idx = i;
+                    while idx < jobs.len() {
+                        if !one(idx) {
+                            break;
+                        }
+                        idx += sh.slots.len();
+                    }
+                }
             }
         }
         sh.done.fetch_add(1, Ordering::Release);
@@ -458,6 +691,19 @@ unsafe fn thunk<T, const N: usize, F>(
         std::array::from_fn(|k| std::slice::from_raw_parts_mut(ptrs[k] as *mut T, lens[k]));
     let f = &*(func as *const F);
     f(rows, arrays);
+}
+
+/// 从"行主序切片 + 行宽"取出基址与行宽（派活用）。
+fn row_block_ptrs<T, const N: usize>(
+    arrays: &mut [(&mut [T], usize); N],
+) -> ([*mut T; N], [usize; N]) {
+    let mut bases = [std::ptr::null_mut(); N];
+    let mut widths = [0usize; N];
+    for (k, (s, w)) in arrays.iter_mut().enumerate() {
+        bases[k] = s.as_mut_ptr();
+        widths[k] = *w;
+    }
+    (bases, widths)
 }
 
 /// 初始占位入口（`call` 需要初值；任何真实调用都会覆盖它）。
@@ -649,6 +895,36 @@ mod tests {
             assert!(
                 data.iter().all(|&v| v == round + 1),
                 "第 {round} 轮结果不对——池跨调用复用有问题"
+            );
+        }
+    }
+
+    /// 每种调度策略都必须**恰好访问每一行一次**（不多、不少、不重）。
+    /// 这是策略层唯一真正的正确性不变式——`sched` 里的纯函数测试管切分，
+    /// 这里管"派活 + 领取规则"真的按切分执行。
+    #[test]
+    fn row_block_strategies_visit_every_row_once() {
+        let mut pool = WorkerPool::new(5);
+        let (rows, width) = (2000usize, 3usize);
+        let picks = [
+            Pick::Chunk,
+            Pick::RowBlock,
+            Pick::Blocked { block_rows: 7 },
+            Pick::Dynamic { block_rows: 7 },
+        ];
+        for pick in picks {
+            let mut data = vec![0usize; rows * width];
+            pool.for_each_row_block_mut_picked(rows, 1, [(&mut data, width)], pick, |n, [d]| {
+                for i in 0..n {
+                    for k in 0..width {
+                        d[i * width + k] += 1;
+                    }
+                }
+            });
+            assert!(
+                data.iter().all(|&v| v == 1),
+                "{}: 有行没跑到或跑了多次",
+                pick.name()
             );
         }
     }

@@ -19,6 +19,7 @@
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
 use crate::ops::matmul;
+use crate::pool::sched::Pick;
 
 /// 走"共享打包面板"分支的 `m` 下限。
 ///
@@ -47,6 +48,24 @@ pub fn matmul_f32(
     a: &mut [f32],
     b: &[f32],
     c: &mut [f32],
+) {
+    // 调度策略按形状选一次（穷尽枚举，见 `pool::sched`）：矩阵乘的行内核按 4 行复用 B，
+    // 所以 `gran = 4`；块数/动态与否由 `pick_rows` 的工作量判据决定。
+    let pick = crate::pool::pick_rows(m, pool.threads(), 4);
+    matmul_f32_with_pick(pool, m, k, n, a, b, c, pick);
+}
+
+/// 与 [`matmul_f32`] 同，但**显式指定调度策略**（A/B 与调优用）。
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_f32_with_pick(
+    pool: &mut WorkerPool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &mut [f32],
+    b: &[f32],
+    c: &mut [f32],
+    pick: Pick,
 ) {
     assert_eq!(
         a.len(),
@@ -90,7 +109,7 @@ pub fn matmul_f32(
             let nc = (s1 - s0) * 32;
             matmul::pack_b(k, n, jb, nc, b, &mut packed);
             let panel = &packed[..k * nc];
-            pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
                 let m4 = rows / 4 * 4;
                 matmul::matmul_f32_packed_rows(k, n, jb, nc, panel, ab, cb, m4);
             });
@@ -98,7 +117,7 @@ pub fn matmul_f32(
         }
         // 列尾 [n32, n)：每个线程处理自己那些行（与顺序路径同一函数 ⇒ 逐位一致）
         if n > n32 {
-            pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
                 for i in 0..rows {
                     let a_row = &ab[i * k..(i + 1) * k];
                     let c_row = &mut cb[i * n..(i + 1) * n];

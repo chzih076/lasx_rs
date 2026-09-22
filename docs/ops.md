@@ -587,6 +587,26 @@ for _ in 0..steps {
 > 逐位对照）。
 
 
+### 9.5 调度策略（`pool::sched`）：编译期选路 + 运行期穷尽枚举
+
+切分方式独立成了一层，调用方可以显式指定：
+
+| 策略 | 形状 | 什么时候用 |
+|---|---|---|
+| `Pick::Chunk` | 连续等分 | 每行代价相同的内核（`sum`/`dot`/`axpy`/SOA 批量） |
+| `Pick::RowBlock` | 等分 + 对齐行粒度 | 矩阵乘（行粒度 4）；**默认** |
+| `Pick::Blocked { block_rows }` | 固定块长、块数可多于线程数 | 轻度负载不均 |
+| `Pick::Dynamic { block_rows }` | 原子计数器抢块 | 线程数超过物理核、每线程仍有 ≥32 行（实测 1024³/24 线程 +23%） |
+
+- 策略是**零尺寸类型**（`sched::Chunk`/`RowBlock`/`Blocked<BLOCK>`），入口
+  `pool.for_each_row_block_mut_with::<S, …>(…)` 对策略泛型化 ⇒ 编译期单态化、无运行时分支；
+- 运行期选择用穷尽枚举 `Pick` + `pool.for_each_row_block_mut_picked(…)`：新增策略时
+  所有分派点都会编译失败，逼作者逐处确认，而不是悄悄落进默认分支；
+- `parallel::matmul_f32` 默认用 `pool::pick_rows(m, threads, 4)` 自动选；
+  `parallel::matmul_f32_with_pick(…)` 可显式指定（调优/对比用）；
+- 切分本身是纯函数：`sched` 的测试对 `rows × threads × gran` 的组合断言"恰好覆盖
+  `[0, rows)`、块不重叠、非末尾块对齐粒度"，池级测试断言"每种策略恰好访问每行一次"。
+
 ## 10. 对齐缓冲：`AlignedVec` 与 `lasx_alloc`
 
 `ALIGN = 64`：既是 LASX 要求的 32 字节的倍数，也让首地址落在缓存行边界上。

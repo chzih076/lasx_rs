@@ -35,10 +35,26 @@ fn main() {
 
     // 池只建一次（与真实调用一致），供 `pool` 路径复用
     let threads: usize = arg.get(5).map(|s| s.parse().unwrap()).unwrap_or(12);
+    // `pool` 路径的调度策略（第 6 个参数）：auto/chunk/rowblock/blocked/dynamic
+    let strategy = arg.get(6).cloned().unwrap_or_else(|| "auto".into());
+    let pick = || match strategy.as_str() {
+        "auto" => lasx_rs::pool::pick_rows(m, threads, 4),
+        "chunk" => lasx_rs::pool::Pick::Chunk,
+        "rowblock" => lasx_rs::pool::Pick::RowBlock,
+        "blocked" => lasx_rs::pool::Pick::Blocked {
+            block_rows: (m.div_ceil(threads) / 4).max(4),
+        },
+        "dynamic" => lasx_rs::pool::Pick::Dynamic {
+            block_rows: (m.div_ceil(threads) / 4).max(4),
+        },
+        other => panic!("未知策略 {other}"),
+    };
     let mut pool = lasx_rs::pool::WorkerPool::new(threads);
 
     let mut run = || match path.as_str() {
-        "pool" => lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, &mut a, &b, &mut c),
+        "pool" => {
+            lasx_rs::parallel::matmul_f32_with_pick(&mut pool, m, k, n, &mut a, &b, &mut c, pick())
+        }
         "packed" => lasx_rs::ops_bench_packed(m, k, n, &a, &b, &mut c),
         "stream" => lasx_rs::lasx_matmul(
             m as i32,
