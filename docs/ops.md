@@ -885,7 +885,7 @@ nm -D --defined-only target/release/liblasx_rs.so \
 | 问题 | 处理 |
 |---|---|
 | `lasx_quat_to_dcm_batch_checked` 的 9 个输出数组直接 `from_raw_parts_mut`，没走 `checked_slice_mut`，`NULL + n > 0` 会 UB | 已改为逐个 `checked_slice_mut` 校验，并补测试 `test_quat_to_dcm_null_output_is_reported` |
-| 根 `README.md:17` 写"逐位确定：向量化与标量结果一致"，口径过宽 | 本文 §2.1 已给出精确口径（分块内逐位一致 + 跨实现 <1e-9）；README 的措辞待其作者统一 |
+| 旧 `README.md` 写"逐位确定：向量化与标量结果一致"，口径过宽 | 已按本文 §2.1 的精确口径改写根 README（并列出 `ballistic_step` 不保证逐位一致、`axpy` 允许 1 ulp 两处例外） |
 
 ### 16.2 旧文档的过时描述（已随旧文档删除而消解，清单保留备查）
 
