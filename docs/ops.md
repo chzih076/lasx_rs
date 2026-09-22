@@ -394,7 +394,8 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
   rm²  = x² + (y² + z²)          // 右结合
   rm = √rm²;  rm³ = rm·rm²;  rm⁵ = rm³·rm²
   j2k  = 1.5 · J2 · μ · Re²      // 取正值
-  zr2  = z² / rm²;  k = j2k / rm⁵;  vcen = −μ / rm³
+  inv2 = 1/rm²;  invrm = inv2·rm;  inv3 = inv2·invrm;  inv5 = inv3·inv2
+  zr2  = z²·inv2;  k = j2k·inv5;  vcen = −μ·inv3
   a_x  = fma(k·x, 5·zr2 − 1, vcen·x)
   a_y  = fma(k·y, 5·zr2 − 1, vcen·y)
   a_z  = fma(k·z, 5·zr2 − 3, vcen·z)
@@ -795,7 +796,8 @@ P2.1 是唯一"零风险、纯收益"的一项（逐位不变），建议作为�
 通用无损压缩进内核热路径（解码速率差 9 倍，且压缩比只有 1.2–1.4×）；帧间 XOR + 字节平面
 （轨迹上反而没有帮助，相关性不够强）；把浮点当均匀字节估收益（随机 f32 也能压到约 0.816，
 但只是"少传 18%"，不是数量级）；木桶模型只对"多线程 + DRAM 到顶"成立（1 线程时短板是
-算力，受 `xvfdiv_d` 除法吞吐限制，此时"牺牲算力换带宽"是反的）。
+算力，受 `xvfdiv_d` 除法吞吐限制（每元素每步 4 次除法 + 4 次开方，见 `docs/dev.md` §13），
+此时"牺牲算力换带宽"是反的）。
 
 ### 13.5 待定
 

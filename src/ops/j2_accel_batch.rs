@@ -58,14 +58,21 @@ fn j2_accel_batch_lasx(
             )
         };
         let vrm = unsafe { lasx_xvfsqrt_d(vrm2) };
-        let vrm3 = unsafe { lasx_xvfmul_d(vrm, vrm2) };
-        let vrm5 = unsafe { lasx_xvfmul_d(vrm3, vrm2) };
+        // **只做一次除法**：有了 1/|r|²，其余倒数用乘法推出来
+        //   invrm = (1/|r|²)·|r| = 1/|r|，inv3 = (1/|r|²)·(1/|r|) = 1/|r|³，
+        //   inv5 = inv3·(1/|r|²) = 1/|r|⁵，zr2 = z²·(1/|r|²)
+        // 比"三次除法"多 ~2 ulp 舍入（有意，见 docs/dev.md §13）；三条路径同式 ⇒ 仍逐位一致。
+        let vone = lasx::splat_f64(1.0);
+        let vinv2 = unsafe { lasx_xvfdiv_d(vone, vrm2) };
+        let vinvrm = unsafe { lasx_xvfmul_d(vinv2, vrm) };
+        let vinv3 = unsafe { lasx_xvfmul_d(vinv2, vinvrm) };
+        let vinv5 = unsafe { lasx_xvfmul_d(vinv3, vinv2) };
         // 中心项 −μ·r/|r|³
-        let vcen = unsafe { lasx_xvfdiv_d(vmu, vrm3) };
+        let vcen = unsafe { lasx_xvfmul_d(vmu, vinv3) };
         // J2 项系数（正）：1.5·J2·μ·Re²/rm⁵
-        let vk = unsafe { lasx_xvfdiv_d(vj2k, vrm5) };
+        let vk = unsafe { lasx_xvfmul_d(vj2k, vinv5) };
         // zr2 = (z/|r|)²
-        let vzr2 = unsafe { lasx_xvfdiv_d(lasx_xvfmul_d(vz, vz), vrm2) };
+        let vzr2 = unsafe { lasx_xvfmul_d(lasx_xvfmul_d(vz, vz), vinv2) };
         let m1 = unsafe { lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v1) };
         let m3 = unsafe { lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v3) };
         // a_x = −μ·x/rm³ + k·x·(5·zr2−1)（k 正 = −k_j2）
@@ -89,11 +96,14 @@ fn j2_accel_batch_lasx(
         // 与向量路径逐位同式（结合律/除式/末项 FMA 完全一致），保证任一分块逐位一致
         let rm2 = rx[j] * rx[j] + (ry[j] * ry[j] + rz[j] * rz[j]);
         let rm = rm2.sqrt();
-        let rm3 = rm * rm2;
-        let rm5 = rm3 * rm2;
+        // 与向量路径同式：1 次除法 + 乘法推导
+        let inv2 = 1.0 / rm2;
+        let invrm = inv2 * rm;
+        let inv3 = inv2 * invrm;
+        let inv5 = inv3 * inv2;
         let zr2 = (rz[j] * rz[j]) / rm2;
-        let k = j2k / rm5;
-        let vcen = -mu / rm3;
+        let k = j2k * inv5;
+        let vcen = -mu * inv3;
         ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
         ay[j] = f64::mul_add(k * ry[j], 5.0 * zr2 - 1.0, vcen * ry[j]);
         az[j] = f64::mul_add(k * rz[j], 5.0 * zr2 - 3.0, vcen * rz[j]);
@@ -133,11 +143,15 @@ fn j2_accel_batch_lsx(
             )
         };
         let vrm = unsafe { lsx_vfsqrt_d(vrm2) };
-        let vrm3 = unsafe { lsx_vfmul_d(vrm, vrm2) };
-        let vrm5 = unsafe { lsx_vfmul_d(vrm3, vrm2) };
-        let vcen = unsafe { lsx_vfdiv_d(vmu, vrm3) };
-        let vk = unsafe { lsx_vfdiv_d(vs, vrm5) };
-        let vzr2 = unsafe { lsx_vfdiv_d(lsx_vfmul_d(vz, vz), vrm2) };
+        // 与 LASX / 标量路径**同式**：1 次除法 + 乘法推导（docs/dev.md §13）
+        let vone = lsx::splat_f64(1.0);
+        let vinv2 = unsafe { lsx_vfdiv_d(vone, vrm2) };
+        let vinvrm = unsafe { lsx_vfmul_d(vinv2, vrm) };
+        let vinv3 = unsafe { lsx_vfmul_d(vinv2, vinvrm) };
+        let vinv5 = unsafe { lsx_vfmul_d(vinv3, vinv2) };
+        let vcen = unsafe { lsx_vfmul_d(vmu, vinv3) };
+        let vk = unsafe { lsx_vfmul_d(vs, vinv5) };
+        let vzr2 = unsafe { lsx_vfmul_d(lsx_vfmul_d(vz, vz), vinv2) };
         let m1 = unsafe { lsx_vfsub_d(lsx_vfmul_d(v5, vzr2), v1) };
         let m3 = unsafe { lsx_vfsub_d(lsx_vfmul_d(v5, vzr2), v3) };
         unsafe {
@@ -160,11 +174,14 @@ fn j2_accel_batch_lsx(
         // 与 LSX 向量路径逐位同式（同结合/除式/末项 FMA）
         let rm2 = rx[j] * rx[j] + (ry[j] * ry[j] + rz[j] * rz[j]);
         let rm = rm2.sqrt();
-        let rm3 = rm * rm2;
-        let rm5 = rm3 * rm2;
+        // 与向量路径同式：1 次除法 + 乘法推导
+        let inv2 = 1.0 / rm2;
+        let invrm = inv2 * rm;
+        let inv3 = inv2 * invrm;
+        let inv5 = inv3 * inv2;
         let zr2 = (rz[j] * rz[j]) / rm2;
-        let k = j2k / rm5;
-        let vcen = -mu / rm3;
+        let k = j2k * inv5;
+        let vcen = -mu * inv3;
         ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
         ay[j] = f64::mul_add(k * ry[j], 5.0 * zr2 - 1.0, vcen * ry[j]);
         az[j] = f64::mul_add(k * rz[j], 5.0 * zr2 - 3.0, vcen * rz[j]);
@@ -200,6 +217,81 @@ mod tests {
         }
         (ax, ay, az)
     }
+    /// 精度回归：`1/|r|³`、`1/|r|⁵`、`zr2` 由 `1/|r|²` 用乘法推导（省掉两次除法），
+    /// 比直接除法多几次舍入。上界取 8 ulp，并打印实测最坏值供文档引用。
+    #[test]
+    fn reciprocal_derivation_precision() {
+        let mut worst3 = 0f64;
+        let mut worst5 = 0f64;
+        let mut worst_zr2 = 0f64;
+        for i in 0..4096 {
+            // |r|² ∈ [1, 10)：覆盖典型近地轨道量级
+            let rm2 = 1.0 + 9.0 * (i as f64) / 4096.0;
+            let rm = rm2.sqrt();
+            let inv2 = 1.0 / rm2;
+            let invrm = inv2 * rm;
+            let inv3 = inv2 * invrm;
+            let inv5 = inv3 * inv2;
+            let e3 = 1.0 / (rm2 * rm);
+            let e5 = 1.0 / (rm2 * rm2 * rm);
+            worst3 = worst3.max(((inv3 - e3) / e3).abs());
+            worst5 = worst5.max(((inv5 - e5) / e5).abs());
+            let z = 0.37 * rm;
+            let zr2 = (z * z) * inv2;
+            let exact = (z * z) / rm2;
+            worst_zr2 = worst_zr2.max(((zr2 - exact) / exact).abs());
+        }
+        println!("最坏相对偏差：1/|r|³={worst3:e} 1/|r|⁵={worst5:e} zr2={worst_zr2:e}");
+        let bound = 8.0 * f64::EPSILON;
+        assert!(worst3 < bound, "1/|r|³ {worst3:e}");
+        assert!(worst5 < bound, "1/|r|⁵ {worst5:e}");
+        assert!(worst_zr2 < bound, "zr2 {worst_zr2:e}");
+    }
+
+    /// LASX 与 LSX 两条向量路径必须**逐位一致**（本轮把每阶段 3 次除法降成 1 次后仍成立，
+    /// 因为两条路径用的是完全同式的算式）。
+    #[test]
+    fn lasx_vs_lsx_bit_exact() {
+        const MU: f64 = 3.986004418e14;
+        const J2: f64 = 1.08262668e-3;
+        const RE: f64 = 6.378137e6;
+        let n = 257usize; // 覆盖 2 元素向量的尾部
+        let (x, y, z) = states(n);
+        let (mut ax1, mut ay1, mut az1) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        let (mut ax2, mut ay2, mut az2) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        lasx_j2_accel_batch(
+            x.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            MU,
+            J2,
+            RE,
+            ax1.as_mut_ptr(),
+            ay1.as_mut_ptr(),
+            az1.as_mut_ptr(),
+            n as i32,
+        );
+        crate::arch::lasx_force_lsx_thread(true);
+        lasx_j2_accel_batch(
+            x.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            MU,
+            J2,
+            RE,
+            ax2.as_mut_ptr(),
+            ay2.as_mut_ptr(),
+            az2.as_mut_ptr(),
+            n as i32,
+        );
+        crate::arch::lasx_force_lsx_thread(false);
+        for i in 0..n {
+            assert_eq!(ax1[i].to_bits(), ax2[i].to_bits(), "ax @ {i}");
+            assert_eq!(ay1[i].to_bits(), ay2[i].to_bits(), "ay @ {i}");
+            assert_eq!(az1[i].to_bits(), az2[i].to_bits(), "az @ {i}");
+        }
+    }
+
     #[test]
     fn test_j2_accel_batch_matches_scalar() {
         for n in [0usize, 1, 2, 4, 9, 20] {

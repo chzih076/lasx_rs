@@ -75,6 +75,147 @@ unsafe fn probe_dkernel(strip: &[f64], at: &[f64], k: usize) -> f64 {
     black_box(sink)
 }
 
+/// 除法/开方类探针：`xvfdiv_d` / `xvfsqrt_d`（精确）vs `xvfrecipe_d` / `xvfrsqrte_d`（估算）
+/// 与"估算 + N 步牛顿迭代"的吞吐。用于判断"用近似除法换速度"值不值得（`docs/dev.md` §9.5）。
+#[inline(never)]
+unsafe fn probe_special(variant: &str) -> f64 {
+    let a = splat_f64(1.5);
+    let two = splat_f64(2.0);
+    // 初值：从 1.0 起迭代，保证既不溢出也不收敛到 0
+    let init = splat_f64(1.0);
+    let (mut v0, mut v1, mut v2, mut v3) = (init, init, init, init);
+    let (mut v4, mut v5, mut v6, mut v7) = (init, init, init, init);
+    let (mut v8, mut v9, mut v10, mut v11) = (init, init, init, init);
+    let (mut v12, mut v13, mut v14, mut v15) = (init, init, init, init);
+    macro_rules! step {
+        ($op:expr) => {{
+            v0 = $op(v0);
+            v1 = $op(v1);
+            v2 = $op(v2);
+            v3 = $op(v3);
+            v4 = $op(v4);
+            v5 = $op(v5);
+            v6 = $op(v6);
+            v7 = $op(v7);
+            v8 = $op(v8);
+            v9 = $op(v9);
+            v10 = $op(v10);
+            v11 = $op(v11);
+            v12 = $op(v12);
+            v13 = $op(v13);
+            v14 = $op(v14);
+            v15 = $op(v15);
+        }};
+    }
+    // 牛顿迭代：r ← r·(2 − d·r)；两步用 fnmadd + fmul
+    macro_rules! nr2 {
+        ($r:expr, $d:expr) => {{
+            let e = lasx_xvfnmadd_d($d, $r, two);
+            let r = lasx_xvfmul_d($r, e);
+            let e = lasx_xvfnmadd_d($d, r, two);
+            lasx_xvfmul_d(r, e)
+        }};
+    }
+    // 独立操作数版本：操作数都是常量寄存器，16 条指令互不依赖 ⇒ 量到吞吐而非延迟
+    macro_rules! indep {
+        ($op:expr) => {{
+            v0 = $op;
+            v1 = $op;
+            v2 = $op;
+            v3 = $op;
+            v4 = $op;
+            v5 = $op;
+            v6 = $op;
+            v7 = $op;
+            v8 = $op;
+            v9 = $op;
+            v10 = $op;
+            v11 = $op;
+            v12 = $op;
+            v13 = $op;
+            v14 = $op;
+            v15 = $op;
+        }};
+    }
+    let b = splat_f64(2.5);
+    for _ in 0..FMA_ITERS {
+        match variant {
+            "dfdiv_i" => indep!(lasx_xvfdiv_d(a, b)),
+            "dfsqrt_i" => indep!(lasx_xvfsqrt_d(a)),
+            "drecipe_i" => indep!(lasx_xvfrecipe_d(a)),
+            "drsqrte_i" => indep!(lasx_xvfrsqrte_d(a)),
+            "dfma_i" => indep!(lasx_xvfmadd_d(a, b, a)),
+            "dfdiv" => step!(|x| lasx_xvfdiv_d(a, x)),
+            "dfsqrt" => step!(lasx_xvfsqrt_d),
+            "drecipe" => step!(lasx_xvfrecipe_d),
+            "drcp1" => step!(|x| nr2!(lasx_xvfrecipe_d(x), x)),
+            "drsqrte" => step!(lasx_xvfrsqrte_d),
+            "drsqrt1" => step!(|x| nr2!(lasx_xvfrsqrte_d(x), x)),
+            _ => step!(lasx_xvfsqrt_d),
+        }
+    }
+    let mut tmp = [0f64; 4];
+    let mut sum = 0f64;
+    for v in [
+        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
+    ] {
+        store_f64x4(tmp.as_mut_ptr(), v);
+        sum += tmp.iter().sum::<f64>();
+    }
+    black_box(sum)
+}
+
+/// 精度实测：把 x ∈ [0.5, 4) 上的估算/迭代结果与精确值比，返回最大相对误差。
+fn special_accuracy() -> Vec<(&'static str, f64)> {
+    let n = 4096usize;
+    let xs: Vec<f64> = (0..n)
+        .map(|i| 0.5 + 3.0 * (i as f64) / (n as f64))
+        .collect();
+    let mut out = Vec::new();
+    unsafe {
+        for (name, steps) in [
+            ("估算 0 步", 0usize),
+            ("牛顿 1 步", 1),
+            ("牛顿 2 步", 2),
+            ("牛顿 3 步", 3),
+        ] {
+            let mut worst_rcp = 0f64;
+            let mut worst_rsq = 0f64;
+            for chunk in xs.as_chunks::<4>().0 {
+                let x = load_f64x4(chunk.as_ptr());
+                let mut r = lasx_xvfrecipe_d(x);
+                let mut s = lasx_xvfrsqrte_d(x);
+                // 注意：这套 stdarch 绑定里 `lasx_xvfnmadd_d(a,b,c)` 实测是 **−(a·b) − c**
+                // （不是 x86 vfnmadd 的 −(a·b)+c），所以这里用 mul/sub 写，避免踩坑。
+                let two = splat_f64(2.0);
+                let three = splat_f64(3.0);
+                let half = splat_f64(0.5);
+                for _ in 0..steps {
+                    // r ← r·(2 − x·r)
+                    let e = lasx_xvfsub_d(two, lasx_xvfmul_d(x, r));
+                    r = lasx_xvfmul_d(r, e);
+                    // s ← s·(3 − x·s²)/2
+                    let t = lasx_xvfmul_d(x, lasx_xvfmul_d(s, s));
+                    let e = lasx_xvfsub_d(three, t);
+                    s = lasx_xvfmul_d(lasx_xvfmul_d(s, half), e);
+                }
+                let mut rb = [0f64; 4];
+                let mut sb = [0f64; 4];
+                store_f64x4(rb.as_mut_ptr(), r);
+                store_f64x4(sb.as_mut_ptr(), s);
+                for k in 0..4 {
+                    worst_rcp = worst_rcp.max(((rb[k] - 1.0 / chunk[k]) / (1.0 / chunk[k])).abs());
+                    worst_rsq = worst_rsq
+                        .max(((sb[k] - 1.0 / chunk[k].sqrt()) / (1.0 / chunk[k].sqrt())).abs());
+                }
+            }
+            out.push((name, worst_rcp));
+            out.push((name, worst_rsq));
+        }
+    }
+    out
+}
+
 /// `fma16`：16 条独立 FMA，无任何访存 —— 量 f32 侧 FP 流水线峰值。
 ///
 /// 注意：累加器必须写成 **16 个独立变量**。写成 `[m256; 16]` + `iter_mut()` 时 LLVM 能把
@@ -243,6 +384,20 @@ fn main() {
     let strip_d = AlignedVec::<f64>::fill_with(k * 16, |i| (i % 13) as f64 * 0.25);
     let at_d = AlignedVec::<f64>::fill_with(4 * k, |i| (i % 7) as f64 * 0.125);
 
+    if variant == "acc" {
+        println!("估算指令与牛顿迭代的最大相对误差（x ∈ [0.5, 4)，4096 个样本）：");
+        println!();
+        println!("| 迭代步数 | 1/x | 1/√x |");
+        println!("|---|---|---|");
+        let rows = special_accuracy();
+        for pair in rows.chunks(2) {
+            println!("| {} | {:.3e} | {:.3e} |", pair[0].0, pair[0].1, pair[1].1);
+        }
+        println!();
+        println!("（周期/次见 kernel_probe 的 dfdiv/drecipe/drcp1 变体：精确除法 4.0、估算 6.8、估算+2 步牛顿 16.5）");
+        return;
+    }
+
     let run = || -> f64 {
         unsafe {
             match variant.as_str() {
@@ -250,6 +405,8 @@ fn main() {
                 "norepl" => probe_norepl(&strip, k),
                 "kernel" => probe_kernel(&strip, &at, k),
                 "dfma16" => probe_dfma16(),
+                "dfdiv" | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i"
+                | "dfsqrt_i" | "drecipe_i" | "drsqrte_i" | "dfma_i" => probe_special(&variant),
                 "dkernel" => probe_dkernel(&strip_d, &at_d, k),
                 "c2x48" => probe_rc::<2, 6>(&strip, &at, k),
                 "c2x64" => probe_rc::<2, 8>(&strip, &at, k),
@@ -265,7 +422,9 @@ fn main() {
     };
 
     let per_iter = match variant.as_str() {
-        "fma16" | "norepl" | "kernel" | "dfma16" | "dkernel" => 16.0,
+        "fma16" | "norepl" | "kernel" | "dfma16" | "dkernel" | "dfdiv" | "dfsqrt" | "drecipe"
+        | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i" | "dfsqrt_i" | "drecipe_i" | "drsqrte_i"
+        | "dfma_i" => 16.0,
         other => {
             let (rs, cs) = other
                 .trim_start_matches('c')
@@ -286,7 +445,10 @@ fn main() {
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let t = ts[ts.len() / 2];
     // 纯 FMA 探针不遍历 k，只按 FMA_ITERS 计
-    let pure = variant == "fma16" || variant == "dfma16";
+    let pure = matches!(
+        variant.as_str(),
+        "fma16" | "dfma16" | "dfdiv" | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1"
+    );
     let fmas = if pure {
         per_iter * FMA_ITERS as f64
     } else {

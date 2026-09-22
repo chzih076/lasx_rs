@@ -181,11 +181,15 @@ unsafe fn j2_accel_vec(
         lasx_xvfadd_d(lasx_xvfmul_d(vy, vy), lasx_xvfmul_d(vz, vz)),
     );
     let vrm = lasx_xvfsqrt_d(vrm2);
-    let vrm3 = lasx_xvfmul_d(vrm, vrm2);
-    let vrm5 = lasx_xvfmul_d(vrm3, vrm2);
-    let vcen = lasx_xvfdiv_d(vmu, vrm3); // −μ/|r|³
-    let vk = lasx_xvfdiv_d(vj2k, vrm5); // +1.5·J2·μ·Re²/|r|⁵
-    let vzr2 = lasx_xvfdiv_d(lasx_xvfmul_d(vz, vz), vrm2);
+    // 1 次除法 + 乘法推导（与 j2_accel_batch 的 LASX/标量路径同式，见 docs/dev.md §13）
+    let vone = lasx::splat_f64(1.0);
+    let vinv2 = lasx_xvfdiv_d(vone, vrm2);
+    let vinvrm = lasx_xvfmul_d(vinv2, vrm);
+    let vinv3 = lasx_xvfmul_d(vinv2, vinvrm);
+    let vinv5 = lasx_xvfmul_d(vinv3, vinv2);
+    let vcen = lasx_xvfmul_d(vmu, vinv3); // −μ/|r|³
+    let vk = lasx_xvfmul_d(vj2k, vinv5); // +1.5·J2·μ·Re²/|r|⁵
+    let vzr2 = lasx_xvfmul_d(lasx_xvfmul_d(vz, vz), vinv2);
     let m1 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v1); // 5·zr2−1
     let m3 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v3); // 5·zr2−3
     let ax = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vx), m1, lasx_xvfmul_d(vcen, vx));
@@ -211,11 +215,14 @@ pub(crate) fn rk4_j2_step_scalar(
         // 结合序与向量路径 `lasx_xvfadd_d(x·x, xvfadd_d(y·y, z·z))` 一致
         let rm2 = x * x + (y * y + z * z);
         let rm = rm2.sqrt();
-        let rm3 = rm * rm2;
-        let rm5 = rm3 * rm2;
-        let zr2 = (z * z) / rm2; // 与向量路径 `lasx_xvfdiv_d(xvfmul(z,z), rm2)` 一致
-        let k = j2k / rm5;
-        let vcen = -mu / rm3;
+        // 与向量路径同式：1 次除法 + 乘法推导
+        let inv2 = 1.0 / rm2;
+        let invrm = inv2 * rm;
+        let inv3 = inv2 * invrm;
+        let inv5 = inv3 * inv2;
+        let zr2 = (z * z) * inv2;
+        let k = j2k * inv5;
+        let vcen = -mu * inv3;
         // a = k·x·(5·zr2−1) + vcen·x（FMA 融合末加，与 `j2_accel_vec` 同式）
         [
             f64::mul_add(k * x, 5.0 * zr2 - 1.0, vcen * x),
