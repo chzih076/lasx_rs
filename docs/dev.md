@@ -651,6 +651,7 @@ cargo build --release --example <工具> && cp target/release/examples/<工具> 
 | `dot_q4` 大集 | 3.6–7.2 GB/s（38–44%） | 已到 2.0 FMA/周期墙；除非授权改浮点结合次序 |
 | `rk4`/`j2` 再快 | §13 已把除法降到每元素 4 次（sqrt 4 次），实测吞吐 ≈ 每个"昂贵操作" 4 周期 ⇒ 已到当前公式的算术地板 | 要进一步只能改公式/放宽精度，或把 4 个 RK4 阶段并行化 |
 | 无损压缩路线 | 结论已记在 ops.md | 若要做，是"换更窄的表示"而非通用压缩 |
+| unsafe 审查工具 | Miri + cargo-careful 已接入（§17），lint 已启用；**Rudra**（panic safety / higher-order / data race 三种 pattern）与 **Kani** 未接入 | 若要更深的静态分析，Rudra 需要装 `rustc-dev` 并按特定 nightly 构建；本机的 Miri 已覆盖别名/越界/数据竞争 |
 | 动态调度的细调 | §14.3 的判据是两条粗规则（`threads ≥ 20 && per_thread ≥ 32`），块长取每线程的 1/4 | 若要在特定形状上再榨 5–10%，得先有可信的负载模型（当前噪声 ±10%，细调量不出来） |
 
 ---
@@ -1002,3 +1003,82 @@ for i in 0..面板数:
 **要么只有一个面板**（n ≤ 1024 时 `strips_total ≤ nc_strips`）——也就是说**流水压根没重叠过任何东西**。
 换成 `n = 4096/8192` 的多面板形状后才看到真实收益。
 和 §14.4 的"首轮偏慢"是同一类错误：**A/B 之前先确认被测机制确实被触发**。
+
+---
+
+## 17. unsafe 审查：可用工具、落地策略与一次真实收获
+
+规模先摆出来：全仓库 **406 个 `unsafe {` 块 + 43 个 `unsafe fn` + 2 个 `unsafe impl`**，
+而 `SAFETY` 注释只有 58 条。所以这一轮的目标不是"再写点注释"，而是**引入工具 + 定策略**。
+
+### 17.1 工具盘点（本机实测能不能跑）
+
+| 工具 | 本机可用性 | 用途 | 结论 |
+|---|---|---|---|
+| **Miri** | ✅ `rustup component add miri` 对 `loongarch64-unknown-linux-gnu` 有组件，能跑 | 解释执行 MIR 查 UB：越界、未初始化、别名违反（Stacked/Tree Borrows）、数据竞争 | **已用**：`aligned` 5 测试 ✅、`pool` 作业表/多块/动态领取那条 15.5 s ✅，`-Zmiri-tree-borrows` 亦 ✅ |
+| **cargo-careful** | ✅ `cargo install cargo-careful` 成功（v0.4.10） | 用**带额外检查的 std** 跑整个测试套件（原生速度，比 Miri 快几个数量级） | **已用，并抓到一个真 bug**（见 17.3） |
+| **Clippy `undocumented_unsafe_blocks`** | ✅ 内置 | 每个 `unsafe` 块必须紧邻 SAFETY 说明 | **已启用**（crate 级 `warn`，CI 强制） |
+| Rudra | ⚠️ 需 `rustc-dev` 组件 + 特定 nightly，且要自行构建 | 静态分析 unsafe 的三种 bug pattern（panic safety / higher-order / data race） | 未接入（列为可选，见 §12） |
+| Kani | ⚠️ 需 CBMC，loongarch64 主机支持未验证 | 有界模型检验 | 未接入 |
+| `-Zsanitizer=address` | ⚠️ 未在 loongarch64 上验证 | ASan | 未接入 |
+| cargo-geiger | ⚠️ 未安装 | unsafe 用量度量（不出结论） | 未接入（统计意义有限，上面的数字够用） |
+
+命令（都不进 CI：Miri 慢 ~3 个数量级、careful 首次要建 sysroot）：
+
+```bash
+rustup component add miri
+cargo miri test --lib aligned::                                  # 纯指针/分配设施
+cargo miri test --lib pool::tests::row_block_strategies_visit_every_row_once
+MIRIFLAGS="-Zmiri-tree-borrows" cargo miri test --lib pool::tests::row_block_strategies_visit_every_row_once
+cargo install cargo-careful && cargo careful test --release --lib
+```
+
+**Miri 的硬边界**：它不能执行 LLVM intrinsic，所以 LASX/LSX 内核**跑不了**——能审的是
+"非 SIMD 的基础设施"（`aligned`、`pool`、`ffi::status` 的长度/空指针逻辑）。这不是缺陷，
+而是分工：内核的 unsafe 是"在刚校验过的切片上调用 intrinsic"，真正容易藏 UB 的是
+指针算术、生命周期与并发那几处，而它们恰好都在可审范围内。
+
+### 17.2 lint 策略：基础设施逐块写、内核显式豁免
+
+`undocumented_unsafe_blocks` 一开就是 **305 条**告警，其中约 250 条在 `src/ops/*`，
+全部是同一句"在已校验切片上调用 LASX intrinsic"。逐块抄注释只会把真正的不变量淹没，
+所以采用**分层策略**（写在 `src/lib.rs` 顶部的策略注释里）：
+
+- **基础设施强制**（`pool` / `arch` / `aligned` / `api` / `parallel` / `scalar_ref`）：
+  逐块写 SAFETY。原有 13 处缺口已全部补齐（其中 `unsafe impl Sync/Send for Shared`、
+  worker 取槽位、`thunk` 调用、arch 的 transmute 等）。
+- **`src/ops/*` 与 `src/ffi/*` 显式豁免**：文件头写明豁免理由——同一组前提在**函数级
+  SAFETY 段**统一说明；模块头同时声明"更不允许新增无说明的 unsafe"。
+
+效果：`cargo clippy --workspace --release --all-targets` 在**启用该 lint 的情况下 0 告警**，
+CI 的零告警守护继续成立；新模块默认受这条 lint 约束。
+
+### 17.3 真实收获：`cargo careful` 抓到一处契约违反（已修）
+
+`cargo careful test --release --lib` 首跑 **83 passed / 1 failed**：
+
+```text
+ops::cross3_batch::tests::test_cross3_properties
+assertion `left == right` failed: 原地 oy 与非原地不一致
+  left:  [… , 315809.28817912744]
+  right: [… , -929.495838831918]
+```
+
+只有**最后一个元素**不一致。根因：`cross3_batch` 的模块文档明确承诺
+"**允许原地：三个输出可与任意输入别名**"，但**标量尾**是逐分量"算一个写一个"：
+
+```rust
+ox[j] = ay[j]*bz[j] - az[j]*by[j];   // 若 ox 与 bx 同一缓冲，bx[j] 到此已被覆盖
+oy[j] = az[j]*bx[j] - ax[j]*bz[j];   // ← 读到的是刚写进去的 ox[j]
+```
+
+向量路径恰好"先载入本轮全部 a/b、再写回"，所以只有标量尾（本例 37 个元素里的最后 1 个）
+暴露出来；而它**是否暴露取决于编译条件**——普通 release 测试碰巧通过，
+`-Zcareful` 换了 std 与代码布局后失败。这正是"顺序依赖"这类问题的典型形态：
+不是内存不安全，但**语义随 codegen 变化**，比崩溃更隐蔽。
+
+修法：尾部也**先读齐、再写回**（三处表达式不变，保持与向量路径逐位一致）。修完
+`cargo careful test --release --lib` **84 passed / 0 failed**，普通测试同样全绿。
+
+**这条比任何注释都有价值**：它说明"允许原地"这类承诺必须有测试覆盖，
+而 `cargo-careful`/Miri 这类工具正好能把"靠运气通过"的实现打回原形。

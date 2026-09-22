@@ -4,6 +4,11 @@
 //!
 //! 规模小于 [`SMALL_N`] 时直接走标量：向量建立 + f64 落盘 + 最终归约的固定开销
 //! 在十几个元素上摊不薄（实测 n=8 时向量路径反而比标量慢 1.7×，n≥16 才反超）。
+
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
 use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};
 use std::arch::loongarch64::*;

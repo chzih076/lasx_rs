@@ -1,6 +1,11 @@
 //! `lasx_vec3_add_scaled_batch` —— 批量缩放加 `o[i] = a[i] + s·b[i]`（f64 SOA，三分量独立）。
 //!
 //! LASX 缺失时走 LSX 128 位路径。
+
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
 use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};
 use std::arch::loongarch64::*;

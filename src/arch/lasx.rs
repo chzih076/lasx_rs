@@ -49,18 +49,21 @@ pub unsafe fn store_f64x4(p: *mut f64, v: F64x4) {
 /// 全零 `f32` 向量。
 #[inline]
 pub fn zero_f32x8() -> F32x8 {
+    // SAFETY: `xvldi 0` 是全零向量，transmute 只在 m256i/m256 之间换名字，无前提。
     unsafe { std::mem::transmute(lasx_xvldi(0)) }
 }
 
 /// 全零 `f64` 向量。
 #[inline]
 pub fn zero_f64x4() -> F64x4 {
+    // SAFETY: `xvldi 0` 是全零向量，transmute 只在 m256i/m256 之间换名字，无前提。
     unsafe { std::mem::transmute(lasx_xvldi(0)) }
 }
 
 /// 全零 8×`i32` 向量（整数内核的累加器初值）。
 #[inline]
 pub fn zero_i32x8() -> m256i {
+    // SAFETY: 纯寄存器操作（生成全零向量），不碰内存，无前提。
     unsafe { lasx_xvldi(0) }
 }
 
@@ -68,6 +71,7 @@ pub fn zero_i32x8() -> m256i {
 #[inline]
 pub fn splat_f32(x: f32) -> F32x8 {
     let bits = x.to_bits() as i32;
+    // SAFETY: 纯寄存器操作（GPR 位型 → 向量广播），不碰内存，无前提。
     unsafe { std::mem::transmute(lasx_xvreplgr2vr_w(bits)) }
 }
 
@@ -75,5 +79,6 @@ pub fn splat_f32(x: f32) -> F32x8 {
 #[inline]
 pub fn splat_f64(x: f64) -> F64x4 {
     let bits = x.to_bits() as i64;
+    // SAFETY: 纯寄存器操作（GPR 位型 → 向量广播），不碰内存，无前提。
     unsafe { std::mem::transmute(lasx_xvreplgr2vr_d(bits)) }
 }

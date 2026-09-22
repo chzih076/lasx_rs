@@ -1,5 +1,10 @@
 //! 量化内核的 C ABI 导出（LASX-only）。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 /// int8 量化点积。
 ///
 /// C 签名：`int lasx_dot_i8(const int8_t *a, const int8_t *b, int n)`

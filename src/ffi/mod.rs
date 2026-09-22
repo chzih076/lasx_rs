@@ -30,6 +30,11 @@
 //!   指针/长度/形状/物理常数，失败时写入 [`status::LasxStatus`] 并返回安全中性值。
 //!   需要把错误**上抛**给上层（如脚本语言）时用它。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 pub mod attitude;
 pub mod batch;
 pub mod checked;

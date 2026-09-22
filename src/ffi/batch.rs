@@ -1,5 +1,10 @@
 //! SOA 批量几何内核的 C ABI 导出。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 /// 批量 3 分量模长 `out[i] = √(xs[i]²+ys[i]²+zs[i]²)`。
 ///
 /// C 签名：`void lasx_norm3_batch(const double *xs, const double *ys, const double *zs, double *out, int n)`

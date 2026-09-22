@@ -8,6 +8,11 @@
 //!
 //! **允许原地**：三个输出可与任意输入别名（向量路径先取完本轮的 a/b 再写回）。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};
 use std::arch::loongarch64::*;
@@ -69,9 +74,19 @@ fn cross3_batch_lasx(
         i += 4;
     }
     for j in i..n {
-        ox[j] = ay[j] * bz[j] - az[j] * by[j];
-        oy[j] = az[j] * bx[j] - ax[j] * bz[j];
-        oz[j] = ax[j] * by[j] - ay[j] * bx[j];
+        // **先读齐、再写回**：本模块承诺"三个输出可与任意输入别名"（见模块文档），
+        // 逐分量"算一个写一个"会在完全原地（ox≡bx、oy≡by、oz≡bz）时读到刚被覆盖的值。
+        // 表达式与向量路径同结合次序，故仍逐位一致。
+        // （这个顺序依赖是 `cargo careful` 用带额外检查的 std 跑测试时暴露的：
+        //  向量路径恰好先载入全部输入才写，只有标量尾的最后一个元素出现过不一致。）
+        let (nx, ny, nz) = (
+            ay[j] * bz[j] - az[j] * by[j],
+            az[j] * bx[j] - ax[j] * bz[j],
+            ax[j] * by[j] - ay[j] * bx[j],
+        );
+        ox[j] = nx;
+        oy[j] = ny;
+        oz[j] = nz;
     }
 }
 
@@ -113,9 +128,19 @@ fn cross3_batch_lsx(
         i += 2;
     }
     for j in i..n {
-        ox[j] = ay[j] * bz[j] - az[j] * by[j];
-        oy[j] = az[j] * bx[j] - ax[j] * bz[j];
-        oz[j] = ax[j] * by[j] - ay[j] * bx[j];
+        // **先读齐、再写回**：本模块承诺"三个输出可与任意输入别名"（见模块文档），
+        // 逐分量"算一个写一个"会在完全原地（ox≡bx、oy≡by、oz≡bz）时读到刚被覆盖的值。
+        // 表达式与向量路径同结合次序，故仍逐位一致。
+        // （这个顺序依赖是 `cargo careful` 用带额外检查的 std 跑测试时暴露的：
+        //  向量路径恰好先载入全部输入才写，只有标量尾的最后一个元素出现过不一致。）
+        let (nx, ny, nz) = (
+            ay[j] * bz[j] - az[j] * by[j],
+            az[j] * bx[j] - ax[j] * bz[j],
+            ax[j] * by[j] - ay[j] * bx[j],
+        );
+        ox[j] = nx;
+        oy[j] = ny;
+        oz[j] = nz;
     }
 }
 

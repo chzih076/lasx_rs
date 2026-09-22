@@ -31,6 +31,7 @@ pub unsafe fn store_f32x4(p: *mut f32, v: F32x4) {
 /// 全零 `f32` 向量。
 #[inline]
 pub fn zero_f32x4() -> F32x4 {
+    // SAFETY: `vldi 0` 是全零向量，transmute 只在 m128i/m128 之间换名字，无前提。
     unsafe { std::mem::transmute(lsx_vldi(0)) }
 }
 
@@ -56,5 +57,6 @@ pub unsafe fn store_f64x2(p: *mut f64, v: F64x2) {
 #[inline]
 pub fn splat_f64(x: f64) -> F64x2 {
     let bits = x.to_bits() as i64;
+    // SAFETY: 纯寄存器操作（GPR 位型 → 向量广播），不碰内存，无前提。
     unsafe { std::mem::transmute(lsx_vreplgr2vr_d(bits)) }
 }

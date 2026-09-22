@@ -40,6 +40,11 @@
 //!
 //! **LASX-only**：没有降级分支，无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::arch::loongarch64::*;
 
 /// 一组（32 字节 = 64 个 nibble）的组内部分和：16 个 i16 lane，每 lane 两个 nibble 乘积之和。

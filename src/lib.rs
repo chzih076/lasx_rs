@@ -44,6 +44,14 @@
 //!
 //! 测试/验证用的线程级降级钩子见 [`lasx_force_lsx_thread`]。
 #![feature(stdarch_loongarch)]
+// **unsafe 审查**：`undocumented_unsafe_blocks` 要求每个 `unsafe` 块都紧邻一条 SAFETY 说明。
+// 策略（见 docs/dev.md §17）：
+// - `src/pool`、`src/arch`、`src/aligned`、`src/api`、`src/parallel`、`src/scalar_ref.rs`
+//   这些**基础设施**里逐块写清楚（那里才是指针/生命周期/并发不变量的所在）；
+// - `src/ops/*`、`src/ffi/*` 里同一组前提下的 intrinsic 调用是重复的（406 个 unsafe 块里
+//   约 300 个是这种），逐块抄注释只会变噪声 —— 这些文件显式豁免，不变量在各自函数级 SAFETY
+//   段里统一给出（模块头也写了豁免理由）。
+#![warn(clippy::undocumented_unsafe_blocks)]
 // SIMD intrinsics 固有：裸 i8 向量 ↔ 类型化向量（F32x8/F64x4 等）的 transmute，
 // 目标类型由辅助函数签名约束，显式标注为样板噪音。
 #![allow(clippy::missing_transmute_annotations)]

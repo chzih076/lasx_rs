@@ -8,6 +8,11 @@
 //! "数组真实长度是否与声明的形状一致"只有知道长度的上层（如 YouLiLong 原生扩展）
 //! 才判得了，那里用 [`LasxStatus::BadShape`]。
 
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
+// **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use super::status::{
     checked_finite, checked_len, checked_mul, checked_positive, checked_slice, checked_slice_mut,
     LasxStatus,

@@ -165,7 +165,9 @@ struct Shared {
 //   而调用方在 `done == threads`（Acquire）之后才返回，因此 worker 读取期间
 //   调用方不会改动它们；
 // - epoch/done/stop/panicked 都是原子量，payload 由 `Mutex` 保护。
+// SAFETY: 见上面那条不变量清单（独占派活 `&mut self` + 代次发布 + 原子计数）。
 unsafe impl Sync for Shared {}
+// SAFETY: 同上——`Shared` 只被 `Arc` 在线程间传递，内部可变状态由上面的规则保护。
 unsafe impl Send for Shared {}
 
 /// 常驻工作线程池。
@@ -549,6 +551,7 @@ impl WorkerPool {
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待。
         // SAFETY: 槽位覆盖本次调用的全部数据、各数组长度由公开接口校验为 `rows × widths[k]`、
         // 行区间互不重叠；`f` 与 `during` 都在本函数栈帧上活到 `wait()` 之后。
+        // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
         unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
         during();
         self.wait();
@@ -584,6 +587,7 @@ impl WorkerPool {
         unsafe { *self.shared.jobs.get() = jobs };
         self.shared.dynamic.store(dynamic, Ordering::Relaxed);
         self.shared.next_job.store(0, Ordering::Relaxed);
+        // SAFETY: `jobs` 刚由本函数写入（独占 `&mut self`，且在发布之前），本轮内无别名写入。
         let n_jobs = unsafe { (*self.shared.jobs.get()).len() };
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
         #[allow(clippy::needless_range_loop)]
@@ -608,6 +612,7 @@ impl WorkerPool {
             }
         }
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待
+        // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
         unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
         during();
         self.wait();
@@ -706,12 +711,16 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
         }
         // SAFETY: 见 Shared 的 Sync 说明——本 worker 只读 slots[i]，调用方在
         // done 计数到齐前不会改它们。
+        // SAFETY: 调用方在 `done` 计数到齐前不会改写 `call`/`slots`（见 Shared 的不变量清单）。
         let (thunk, func) = unsafe { *sh.call.get() };
+        // SAFETY: 同上，且 `slots[i]` 只由第 i 个 worker 访问。
         let slot = unsafe { &*sh.slots[i].get() };
         if slot.n > 0 {
             // 跑一块：多块模式下由 `bases`/`widths`/作业行区间现场派生指针；
             // 单块模式下 `ptrs`/`lens` 已经在派活时算好（热路径不变）。
             let run_block = |start: usize, rows: usize, ptrs: &[*mut u8], lens: &[usize]| {
+                // SAFETY: 入口与闭包指针由派活方在发布前写入；`ptrs`/`lens` 是本轮该 worker
+                // 自己那段（互不重叠），由派活方按 `rows × widths` 校验过。
                 let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     thunk(rows, ptrs, lens, func);
                 }))
