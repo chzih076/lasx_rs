@@ -39,7 +39,7 @@ fn sq_lasx(vx: m256d, vy: m256d, vz: m256d) -> m256d {
     }
 }
 
-/// `1/n`，且 `n == 0` 的 lane 精确置 0（用 `andn(mask, inv)`，见 perf-report 的探针）。
+/// `1/n`，且 `n == 0` 的 lane 精确置 0（用 `andn(mask, inv)`，见 dev.md §6.3 的探针）。
 #[inline]
 fn recip_masked_lasx(n: m256d) -> m256d {
     unsafe {

@@ -1,7 +1,7 @@
 #![feature(stdarch_loongarch)]
 //! 微内核探针：把 `tile4x32_chunk` 的循环体放到 **L1 热数据**上，量它自身的 FMA/周期上限。
 //!
-//! 结论（本机 Loongson-3B6000 / LA664，2.2 GHz，见 `docs/perf-report.md` §21）：
+//! 结论（本机 Loongson-3B6000 / LA664，2.2 GHz，见 `docs/dev.md` §6.3）：
 //!
 //! | 变体 | 每轮内容 | FMA/周期 | GFLOP/s |
 //! |---|---|---|---|

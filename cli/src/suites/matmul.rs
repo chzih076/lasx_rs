@@ -7,7 +7,7 @@ use lasx_rs::*;
 use std::hint::black_box;
 
 pub fn matmul(rows: &mut Vec<Row>) {
-    // 256³ 以下打包/流式基本持平，384³ 起打包明显更优（perf-report §19）
+    // 256³ 以下打包/流式基本持平，384³ 起打包明显更优（dev.md §8.4）
     for &(m, k, n) in &[
         (64usize, 64usize, 64usize),
         (128, 128, 128),
@@ -48,7 +48,7 @@ pub fn matmul(rows: &mut Vec<Row>) {
     }
 
     // f64 的打包阈值是 k ≥ 192 / work ≥ 8M：64³、128³ 都在阈值下（走流式），
-    // 加 256³、512³ 才能看到打包 + k 分块的收益（见 perf-report §22）。
+    // 加 256³、512³ 才能看到打包 + k 分块的收益（见 dev.md §8.1）。
     for &(m, k, n) in &[
         (64usize, 64usize, 64usize),
         (128, 128, 128),

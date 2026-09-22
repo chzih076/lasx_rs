@@ -252,7 +252,7 @@ pub fn matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Alig
     Ok(c)
 }
 
-/// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快，见 perf-report §19）。
+/// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快，见 dev.md §8.1）。
 ///
 /// 与 [`matmul`] **逐位一致**（每个输出元素的累加次序相同）。`matmul` 会按形状自动
 /// 选择；这个入口用于调用方想自己控制、或做 A/B 测量。

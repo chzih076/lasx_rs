@@ -1,234 +1,88 @@
 # lasx_rs
 
-**lasx_rs 是为龙芯平台推出的向量库，支持调用龙芯架构里面的 LASX（256 位）与 LSX（128 位）向量指令集。**
+面向 **LoongArch64（龙芯 3B6000 / LA664，LASX 256 位）** 的数学内核库：零依赖、Rust 实现、
+导出稳定的 C ABI，另有安全 Rust API 与常驻工作池。
 
-批量数值内核（点积/缩放/范数/距离/引力加速度等），无 LASX CPU（3A5000/3A6000 等 LSX-only）
-自动降级 LSX 路径，逐位确定。
+覆盖三类负载：**归约与稠密线性代数**（`dot`/`sum`/`axpy`/`matmul` 的 f32 与 f64）、
+**量化点积**（int8、GGUF 风格 Q4）、**批量物理与姿态/几何**（J2 引力、RK4 步、弹道、
+3 分量模长、四元数旋转/DCM 等）。
 
-## 特性
+## 特点
 
-- **LASX 256 位**：`lasx_*` intrinsics 批量内核（axpy / dot / norm3 / 距离 / J2 加速度 / RK4 步）
-- **批量姿态/几何（7 个）**：叉积、单位化、3×3·向量、四元数单位化/乘法/旋转/DCM——
-  与 loong-sci `attitude`/`orbit` 的标量实现逐位一致，实测比标量快 **2.7–6.4×**
-- **LSX 128 位降级**：LSX-only CPU 自动走 128 位路径（线程级强制降级钩子用于验证/测试）
-- **Rust 原生 API**（`lasx_rs::api`）：`&[T]` 进出、形状不符返回 `Err`、输出是 32 字节
-  对齐的 `AlignedVec`；与 C ABI 走同一段内核，**没有可测开销**
-- **零依赖**：纯 std + `stdarch_loongarch`（nightly）
-- **逐位确定**：向量化与标量结果一致（防回归测试守护）
-- **可选常驻线程池 + 多核调用策略层**（`lasx_rs::pool` / `lasx_rs::parallel`，Rust API）：
-  多核铺开批量内核、线程跨调用复用；小数据自动原地串行。矩阵乘 12 线程约 **5.4×**、
-  16 线程约 **8.5×**。**不新增任何 C ABI 符号**（走 `rlib`）
+- **零第三方依赖**，只用 `core::arch::loongarch64` 的 LASX/LSX intrinsic。
+- **43 个导出符号**：22 个裸版本 + 21 个带 `int *status` 的 `_checked` 版本。
+  最初的 15 个 `lasx_*` 符号签名与语义**永不改动**，新能力一律追加。
+- **位精确**：同一算子的 LASX / LSX / 标量尾 / 打包 / 分块等所有路径，对同一输入给出
+  **逐位相同**的结果（测试用 `to_bits()` 比对）。**边界**：`lasx_ballistic_step` 的向量与标量
+  实现在不同循环结构下不保证逐位一致，`lasx_axpy` 允许 1 ulp 以内差异；跨实现数值差 < 1e-9。
+- **打包 + k 分块的矩阵乘**：f32 512³ 约 60 GFLOP/s（单线程，实测峰值 140 GFLOP/s 的 43%）。
+- **常驻工作池**：多星多步传播场景端到端比"每步新建线程"快 1.77×（跨 200 步复用）。
 
-## 仓库
+## 快速开始
 
-| 平台 | 地址 |
+```bash
+# 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
+cargo build --release          # 产出 liblasx_rs.so + rlib
+cargo test --release           # 74 单测 + 6 文档测试
+cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
+
+# 基准：不带参数跑全部套件，带子串只跑匹配套件
+cargo run -p lasx_bench --release -- large
+cargo run -p lasx_bench --release -- dot_q4
+
+# 单形状矩阵乘 A/B：<m> <k> <n> <packed|cols|stream|packed64|stream64>
+cargo run --release --example matmul_ab -- 512 512 512 packed
+```
+
+`.cargo/config.toml` 里 `rustflags = ["-C", "target-feature=+lasx"]`，所以默认产物假定 CPU 有 LASX；
+`.cargo/config.toml` 的示例从简：见文件内注释。
+
+## 实测性能（2026-09-22，Loongson-3B6000，单线程）
+
+| 项 | 读数 |
 |---|---|
-| GitCode（主） | `git@gitcode.com:H076lik/lasx_rs.git` / <https://gitcode.com/H076lik/lasx_rs> |
-| GitHub（镜像） | `git@github.com:chzih076/lasx_rs.git` / <https://github.com/chzih076/lasx_rs> |
+| FMA 吞吐上限（16 条独立链） | **140.3 GFLOP/s**（3.96 条/周期）；LSX 70.1（2.00×） |
+| 含 A 广播的内核墙（微内核探针） | **2.00 FMA/周期**（f32 70.3、f64 35.1 GFLOP/s） |
+| `lasx_matmul` f32 64³/256³/512³ | 68.5 / 61.8 / 59.7 GFLOP/s |
+| `lasx_matmul_f64` 128³/512³ | 31.3 / 27.6 GFLOP/s |
+| `lasx_matmul`（12 线程，`parallel`） | 128³ **563** GFLOP/s（加速 8.5×） |
+| 单流只读 / 双流只读 / 12 线程只读（32 MiB） | 7.5–8.9 / 7.0–8.9 / 17.4 GB/s |
+| 常驻池 vs 每步新建线程（n=2^18，8 线程） | 894.7 µs vs 1.08 ms（7.80× vs 7.20×） |
 
-## 代码结构
+与同机 OpenBLAS 0.3.34（单线程）对照：f32 128³ 快 1.34×、256³ 快 1.04×、512³ 落后 1.06×、
+1024³ 落后 1.19×；f64 512³ 落后 1.12×。完整表格、方法学与根因分析见 `docs/dev.md`。
 
-按"算法 / ABI / 工具"三层切分，算子一个文件，方便定位与增量添加：
+## 算子一览
 
-```
-lasx_rs/
-├── Cargo.toml            # workspace 根 + lasx_rs 库（cdylib + rlib）
-├── src/
-│   ├── lib.rs            # crate 根：模块声明 + 历史 API 重导出
-│   ├── arch/             # 架构抽象层
-│   │   ├── mod.rs        #   SimdPath enum：能力探测 + 路径分派
-│   │   ├── lasx.rs       #   LASX 256 位 load/store/splat 样板
-│   │   └── lsx.rs        #   LSX 128 位样板
-│   ├── api.rs            # Rust 原生 API：切片进出 + Result + 对齐输出（不导出符号）
-│   ├── pool.rs           # 可选常驻线程池（WorkerPool）：纯 Rust API，不导出符号
-│   ├── parallel.rs       # 把内核铺到池上的多核调用策略层（matmul / rk4 步）
-│   ├── ops/              # 算子层：一个内核一个文件（含各自的 #[cfg(test)]）
-│   │   ├── dot.rs  sum.rs  axpy.rs  dot_f64.rs  dot_i8.rs  dot_q4.rs
-│   │   ├── matmul.rs  matmul_f64.rs
-│   │   ├── norm3_batch.rs  vec3_add_scaled_batch.rs  batch_distance2d.rs
-│   │   ├── ballistic_step.rs  j2_accel_batch.rs  rk4_j2_step_batch.rs
-│   │   └── testutil.rs   #   测试共用夹具（仅 cfg(test)）
-│   └── ffi/              # C ABI 导出层：只做裸指针 → 切片，不含计算
-│       ├── reduce.rs  matmul.rs  quant.rs  batch.rs  physics.rs  memory.rs
-├── examples/             # 调用方示例：pool_axpy.rs、matmul_pooled.rs
-├── cli/                  # 独立 crate `lasx_bench`：性能基准 CLI
-│   └── src/{main,group,timing,report,data,scalar_ref,suites/*}.rs
-└── yll/                  # 独立 crate `lasx_yll`：YouLiLong 原生扩展（产出 liblasx.so）
-    └── src/{lib,yll,convert,funcs}.rs + lib.ylh / youli.yaml / test_lasx.yli
-```
+| 分类 | 符号 |
+|---|---|
+| 归约/稠密 | `lasx_dot`（f32，带 LSX）、`lasx_sum`、`lasx_axpy`、`lasx_dot_f64`、`lasx_matmul`、`lasx_matmul_f64` |
+| 量化 | `lasx_dot_i8`（int8）、`lasx_dot_q4`（每 32 字节一组 scale） |
+| 批量几何 | `lasx_batch_distance2d`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch` |
+| 批量物理 | `lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch`、`lasx_ballistic_step` |
+| 批量姿态（7 个） | `lasx_cross3_batch`、`lasx_unitize3_batch`、`lasx_mat3_mul_vec3_batch`、`lasx_quat_normalize_batch`、`lasx_quat_mul_batch`、`lasx_quat_rotate_batch`、`lasx_quat_to_dcm_batch` |
+| 内存 | `lasx_alloc`（32 字节对齐） |
 
-分层约定：
-
-- **算子只接收切片**（`&[T]` / `&mut [T]`），裸指针解引用与长度约定收敛在 `ffi` 一层；
-- **两套 ABI**：22 个 `lasx_*` 零校验（误用即 UB）；另有 21 个 `lasx_*_checked`
-  带 `int *status` 出参，校验失败写入错误码并返回安全中性值——需要把错误上抛给上层时用它；
-- 支持降级的算子在入口用 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`；
-- LASX-only 的算子在模块文档里显式标注；
-- 历史 15 个 C ABI 符号名与语义保持不变（`lasx_rs::lasx_dot(..)` 继续可用）；
-  姿态/几何批处理是**新增**的 7 个符号，不改动任何一个旧符号。
-
-## 构建
-
-**依赖 nightly Rust（含 `stdarch_loongarch` 实验特性）**：
-
-```bash
-# .cargo/config.toml 已配置：rustflags = ["-C", "target-feature=+lasx"]
-cargo build --release          # 构建库（workspace 默认成员）
-cargo test --release           # 单元测试 + 文档测试
-cargo build --workspace --release   # 连基准 CLI 一起构建
-```
-
-> **注意**：本库依赖**实验版本 rustc**（nightly + `#![feature(stdarch_loongarch)]`），
-> 需 loongarch64 nightly 工具链（如 `rustup toolchain install nightly-loongarch64-unknown-linux-gnu`）。
-
-## 用法
-
-**Rust（推荐）**：切片进、`Result` 出、需要输出的内核直接返回 32 字节对齐的缓冲。
-
-```rust
-use lasx_rs::api;
-
-let a = [1.0f32, 2.0, 3.0, 4.0];
-let b = [1.0f32; 4];
-
-let d = api::dot(&a, &b)?;                       // Result<f32, api::Error>
-let s = api::sum(&a);                            // 不会失败，直接返回 f32
-let c = api::matmul(2, 2, 2, &a, &b)?;           // Result<AlignedVec<f32>, _>
-let out = api::norm3_batch(&xs, &ys, &zs)?;      // 输出已对齐，无需自己 malloc
-
-// 原地内核取 &mut
-api::axpy(2.0, &x, &mut y)?;
-api::rk4_j2_step_batch(&mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz, mu, j2, re, dt)?;
-```
-
-形状不符是 `Err`（带算子名、参数名、期望值与实际值，实现了 `std::error::Error`），
-**不是 UB**：
-
-```rust
-assert_eq!(
-    api::dot(&a, &b[..2]).unwrap_err().to_string(),
-    "dot: 参数 b 的长度应为 4，实际 2"
-);
-```
-
-**C / Dart 等 FFI 调用方**用裸指针版本（零校验，误用即 UB，但也是最快的）：
-
-```rust
-// crate 根的历史重导出与显式路径等价
-let out = lasx_rs::lasx_dot(a.as_ptr(), b.as_ptr(), n);
-let out = lasx_rs::ffi::reduce::lasx_dot(a.as_ptr(), b.as_ptr(), n);
-```
-
-```dart
-final lib = DynamicLibrary.open('liblasx_rs.so');
-// 绑定 lasx_dot / lasx_axpy / lasx_norm3_batch 等
-```
-
-**要多核**时用库内常驻池（只走 `rlib`，不经过 C ABI）：
-
-```rust
-use lasx_rs::aligned::AlignedVec;
-use lasx_rs::pool::WorkerPool;
-
-let mut pool = WorkerPool::new(12);        // 建一次，跨调用/跨步复用
-// 常见负载的切分形状已经固定好了
-lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
-for _ in 0..steps {
-    lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt, rx, ry, rz, vx, vy, vz);
-}
-```
-
-完整可运行版本：`cargo run --release --example pool_axpy`、
-`cargo run --release --example matmul_pooled`（都自带与单线程的逐位对照）。
-
-## YouLiLong 原生扩展
-
-`yll/` 是把本库接进 [YouLiLong](../../) 语言的原生扩展，构建后产出 `liblasx.so`：
-
-```bash
-cargo build --release -p lasx_yll
-cp target/release/liblasx.so yll/
-<YouLiLong>/target/release/youli_long yll/test_lasx.yli   # 端到端测试
-```
-
-```youlilong
-use "./lasx"
-
-a = [1.0, 2.0, 3.0, 4.0]
-print(lasx.dot(a, [1.0, 1.0, 1.0, 1.0]))   // 10
-print(lasx.norm3([3.0], [4.0], [0.0]))     // [5]
-
-// 多星多步传播：多核 + 常驻池，数组只转换一次（比脚本里循环 call 单步快 110×）
-final = lasx.propagate(rx, ry, rz, vx, vy, vz, mu, j2, re, dt, 200)
-
-try {
-    lasx.dot(a, [1.0])                     // 长度不一致
-} catch (e) {
-    print(e)   // 无效操作: a 与 b 长度不一致：4 vs 1
-}
-```
-
-**所有调用错误都上抛**：参数不是数组、元素不是数值、长度/形状不自洽、int8 越界、
-物理常数非法——一律返回 `yll_error(...)`，解释器抛成可 `try/catch` 的运行时错误，
-不静默返回 0。详见 [yll/README.md](yll/README.md)。
-
-## 性能基准
-
-基准是独立的 CLI crate，零外部依赖：
-
-```bash
-cargo run -p lasx_bench --release              # 全部内核，约 2 分钟
-cargo run -p lasx_bench --release -- matmul    # 只跑组名含 matmul 的套件
-cargo run -p lasx_bench --release -- fma       # 纯寄存器 FMA 吞吐
-cargo run -p lasx_bench --release -- scenario  # 真实调用场景（多步传播/高频小调用/融合 vs 拼接）
-```
-
-> **调用策略本身影响很大**（基准同时也是示例，`-- scenario` 给出实测）：
-> 多步传播时**复用常驻线程池**比每步新建线程端到端快 **2.1–2.3×**；
-> **用融合内核**（`lasx_rk4_j2_step_batch`）比用原语拼同一个 RK4 步快 **2.8×**；
-> 小数组高频调用每次有 10–25 ns 的固定开销；**别把分配/克隆放进热路径**；
-> 脚本侧循环调用批量内核时，**每次调用的数据搬运**（而非内核）才是瓶颈——
-> YouLiLong 扩展里 `propagate` 比脚本循环快 **约 100×**（见 [yll/README](yll/README.md)）。
-
-三种口径：**LASX**（原生 256 位）/ **强制 LSX**（线程级降级钩子）/ **标量**基线。
-
-实测结论（Loongson-3B6000 / LA664，优化后）：
-
-| 内核 | 规模 | LASX 计时 | 相对标量 |
-|---|---|---|---|
-| `lasx_dot` | n=4096 | 316 ns | 17.6× |
-| `lasx_sum` | n=64 Ki | 6.1 µs | 14.8× |
-| `lasx_dot_i8` | n=64 Ki | 7.9 µs | 1.35× |
-| `lasx_matmul` f32 | 64³ | **7.6 µs** | 4.25× |
-| `lasx_matmul` f32 | 128³ | **62.3 µs** | 3.57× |
-| `lasx_matmul` f32 | 256³ | **545.5 µs** | 4.49× |
-| `lasx_matmul` f32 | 512³ | **4.91 ms** | 3.96× |
-| `lasx_matmul_f64` | 128³ | **134 µs** | 4.65× |
-
-硬件 FMA 峰值实测 LASX 93.2 / LSX 46.5 GFLOP/s（2.00×）；f32 matmul 从 64³ 到 512³
-**稳定在 54.6–68.9 GFLOP/s**（峰值的 59–74%），靠的是"列块在外 + 打包 B 面板"
-（Goto/BLIS 的 packing，见 perf-report §19）——256³ 以上此前会掉到 ~30。
-
-> **对齐建议**：LASX 是 32 字节访存，调用方缓冲区若 32 字节对齐可再快约 1.1–1.56×
-> （L1 驻留规模上最明显）。**不要假设缓冲区天然对齐**——实测 glibc `malloc` 与
-> Dart FFI 的缓冲区只有约一半落在 32 字节边界上；用 `posix_memalign(&p, 32, n)` /
-> C11 `aligned_alloc(32, n)`，或本库的 `lasx_alloc`（已保证 32 字节对齐）。
-> 代码片段见 [manual.md §5.5](docs/manual.md)，量化对比见
-> `cargo run -p lasx_bench --release -- align`。
-完整数据、根因分析与优化前后对比见 **[docs/perf-report.md](docs/perf-report.md)**。
+每个算子的签名、语义与数值约定见 `docs/ops.md`；另有安全 Rust API（`lasx_rs::api`，22 个函数）
+与多核接口（`lasx_rs::pool` / `lasx_rs::parallel`）。
 
 ## 文档
 
-- **[docs/manual.md](docs/manual.md)**：完整技术手册（中文）——架构与设计、
-  22 个 FFI 内核逐一详解、量化内核、批量物理内核、批量姿态/几何内核、FFI 使用指南（C/Dart/Rust）、
-  性能基准方法、测试与验证、构建与集成、Caveats 与限制、API 索引；
-- **[docs/perf-report.md](docs/perf-report.md)**：性能实测报告与优化记录；
-- **[docs/nn-ops.md](docs/nn-ops.md)**：神经网络算子分析（llama.cpp/ggml 的 102 个算子、
-  量化块布局、**本机 LASX 实测**缺口清单：f16 GEMM 11× / softmax 7× / f16 GEMV 3.7×）；
-- **[docs/compression.md](docs/compression.md)**：无损压缩与「带宽换算力」的可行性
-  测量（结论：快照 1.22×、轨迹 1.40×，且解码速率 0.37 GB/s 远低于内核消费
-  3.3 GB/s，**不进内核热路径**）与后续路线；
-- **[docs/README.md](docs/README.md)**：文档目录索引。
+- **[docs/ops.md](docs/ops.md)** —— 算子与用法：43 个符号总表、数值契约、降级覆盖、
+  Rust/C/Dart 调用、池与并行、NN 算子现状、无损压缩路线。
+- **[docs/dev.md](docs/dev.md)** —— 架构与性能：分层与约定、测试与 CI、性能方法学、
+  全量实测数据、矩阵乘深挖、**被否掉的尝试清单**、复现步骤与已知缺口。
+
+## 仓库
+
+| 远端 | 地址 |
+|---|---|
+| GitCode（主） | `git@gitcode.com:H076lik/lasx_rs.git` / <https://gitcode.com/H076lik/lasx_rs> |
+| GitHub（镜像） | `git@github.com:chzih076/lasx_rs.git` / <https://github.com/chzih076/lasx_rs> |
+| 局域网 panel | `http://192.168.1.64/api/git/lasx_rs.git`（CI 走同一个 panel） |
+
+CI 四步：`Format check` → `Build release` → `Test release` → `Clippy (zero warnings guard)`。
+**CI 从不跑基准**（基准受后台负载影响，不适合当门禁）。
 
 ## 许可
 

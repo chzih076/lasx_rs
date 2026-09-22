@@ -4,7 +4,7 @@
 //! 一次算 4 行 × 16 列（16 个 4 通道累加器），同一段 B 被 4 行复用。
 //! 不做 B 转置、不做跨 lane 水平归约。
 //!
-//! v2：把 f32 侧验证过的**打包 + k 分块**照搬过来（见 `docs/perf-report.md` §22）。
+//! v2：把 f32 侧验证过的**打包 + k 分块**照搬过来（见 `docs/dev.md` §8.2）。
 //! 原路径（`rows4_f64`）每次 k 步都要按 `n` 跨距读 B，B 被 `m/4` 遍重复读；
 //! 打包后 B 变成 16 列一条带的连续内存，再把 k 切成 `K_CHUNK` 步的块、**k 块在外、
 //! 行块在内**，让每个 k 块的条带与 A 的 4 行、C 的 4×16 一起待在 L1 里。
@@ -50,7 +50,7 @@ pub(crate) fn matmul_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: 
     matmul_f64_stream(m, k, n, a, b, c);
 }
 
-/// 原始的流式次序（`docs/perf-report.md` §22 的 A/B 基准，也是小形状的生产路径）。
+/// 原始的流式次序（`docs/dev.md` §8.5 的 A/B 基准，也是小形状的生产路径）。
 pub(crate) fn matmul_f64_stream(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     let mut i = 0;
     while i + 4 <= m {

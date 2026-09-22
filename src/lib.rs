@@ -66,13 +66,13 @@ pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &
     ops::matmul::matmul_f32_packed(m, k, n, a, b, c);
 }
 
-/// 同上，f64 侧（`docs/perf-report.md` §22 的 A/B 用）。
+/// 同上，f64 侧（`docs/dev.md` §8.5 的 A/B 用）。
 #[doc(hidden)]
 pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     ops::matmul_f64::matmul_f64_packed(m, k, n, a, b, c);
 }
 
-/// 强制 f32 走"列块在外"次序（A/B 基准；`docs/perf-report.md` §23）。
+/// 强制 f32 走"列块在外"次序（A/B 基准；`docs/dev.md` §8.4）。
 #[doc(hidden)]
 pub fn ops_bench_cols_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     ops::matmul::matmul_f32_cols_block(m, k, n, 0, n, a, b, c, ops::matmul::COL_BLOCK);

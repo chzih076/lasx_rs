@@ -3,7 +3,7 @@
 //! 运行：`cargo run --release --example pool_axpy`
 //!
 //! 要点：
-//! - 池**建一次、跨调用复用**——每步新建线程的代价摊不掉（见 `docs/perf-report.md` §13.3）；
+//! - 池**建一次、跨调用复用**——每步新建线程的代价摊不掉（见 `docs/dev.md` §7.6）；
 //! - 走 `rlib` 直接调用，**不经过 C ABI**，因此池不引入任何新导出符号；
 //! - 小数据（< [`lasx_rs::pool::MIN_PARALLEL_LEN`]）会自动原地串行，调用方无需分支。
 
