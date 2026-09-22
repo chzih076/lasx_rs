@@ -602,6 +602,9 @@ for _ in 0..steps {
   `pool.for_each_row_block_mut_with::<S, …>(…)` 对策略泛型化 ⇒ 编译期单态化、无运行时分支；
 - 运行期选择用穷尽枚举 `Pick` + `pool.for_each_row_block_mut_picked(…)`：新增策略时
   所有分派点都会编译失败，逼作者逐处确认，而不是悄悄落进默认分支；
+- `pool.for_each_row_block_mut_picked_deferred(…, f, during)`：在"已派活、尚未等待"时由主线程
+  执行 `during`（矩阵乘用它做**双缓冲打包**：worker 算当前面板时主线程打包下一个，
+  多面板形状实测 +24~29%，见 `docs/dev.md` §16）。`f`/`during`/数据在同一栈帧 ⇒ 不需要 unsafe；
 - `parallel::matmul_f32` 默认用 `pool::pick_rows(m, threads, 4)` 自动选；
   `parallel::matmul_f32_with_pick(…)` 可显式指定（调优/对比用）；
 - 切分本身是纯函数：`sched` 的测试对 `rows × threads × gran` 的组合断言"恰好覆盖

@@ -101,19 +101,59 @@ pub fn matmul_f32_with_pick(
         let n32 = n / 32 * 32;
         let strips_total = n32 / 32;
         let nc_strips = matmul::pack_strips(k);
-        let mut packed = vec![0f32; k * nc_strips * 32];
-        let mut s0 = 0;
-        while s0 < strips_total {
-            let s1 = (s0 + nc_strips).min(strips_total);
-            let jb = s0 * 32;
-            let nc = (s1 - s0) * 32;
-            matmul::pack_b(k, n, jb, nc, b, &mut packed);
-            let panel = &packed[..k * nc];
-            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
-                let m4 = rows / 4 * 4;
-                matmul::matmul_f32_packed_rows(k, n, jb, nc, panel, ab, cb, m4);
-            });
-            s0 = s1;
+        // 面板清单（每个面板 = nc_strips 个 32 列条带；最后一个可能更短）
+        let panels: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut s0 = 0;
+            while s0 < strips_total {
+                let s1 = (s0 + nc_strips).min(strips_total);
+                v.push((s0 * 32, (s1 - s0) * 32));
+                s0 = s1;
+            }
+            v
+        };
+        // **双缓冲打包流水**：worker 算第 i 个面板时，主线程（否则只是空转自旋）打包第 i+1 个。
+        // 打包是 B 的一遍读+写，原来串行做，是 Amdahl 项。实测（多面板形状，见 dev.md §16）：
+        // 1024×1024×4096 +24%、512×512×8192 +31%；单面板形状没有可重叠的部分，与原来一致。
+        let cap = k * nc_strips * 32;
+        let mut buf_a = vec![0f32; cap];
+        let mut buf_b = vec![0f32; cap];
+        matmul::pack_b(k, n, panels[0].0, panels[0].1, b, &mut buf_a);
+        for (i, &(jb, nc)) in panels.iter().enumerate() {
+            let next = panels.get(i + 1).copied();
+            if i % 2 == 0 {
+                pool.for_each_row_block_mut_picked_deferred(
+                    m,
+                    4,
+                    [(a, k), (c, n)],
+                    pick,
+                    |rows, [ab, cb]| {
+                        let m4 = rows / 4 * 4;
+                        matmul::matmul_f32_packed_rows(k, n, jb, nc, &buf_a[..k * nc], ab, cb, m4);
+                    },
+                    || {
+                        if let Some((njb, nnc)) = next {
+                            matmul::pack_b(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
+                        }
+                    },
+                );
+            } else {
+                pool.for_each_row_block_mut_picked_deferred(
+                    m,
+                    4,
+                    [(a, k), (c, n)],
+                    pick,
+                    |rows, [ab, cb]| {
+                        let m4 = rows / 4 * 4;
+                        matmul::matmul_f32_packed_rows(k, n, jb, nc, &buf_b[..k * nc], ab, cb, m4);
+                    },
+                    || {
+                        if let Some((njb, nnc)) = next {
+                            matmul::pack_b(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
+                        }
+                    },
+                );
+            }
         }
         // 列尾 [n32, n)：每个线程处理自己那些行（与顺序路径同一函数 ⇒ 逐位一致）
         if n > n32 {

@@ -175,6 +175,8 @@ pub struct WorkerPool {
     shared: Arc<Shared>,
     handles: Vec<std::thread::JoinHandle<()>>,
     threads: usize,
+    /// 是否有已发布但未 `wait()` 的作业（`submit`/`wait` 配对用）。
+    in_flight: bool,
 }
 
 impl WorkerPool {
@@ -218,6 +220,7 @@ impl WorkerPool {
             shared,
             handles,
             threads,
+            in_flight: false,
         }
     }
 
@@ -247,7 +250,7 @@ impl WorkerPool {
         }
         let base = data.as_mut_ptr();
         let rows_per = len.div_ceil(self.threads).max(1);
-        self.dispatch_rows::<T, 1, _>([base], [1], len, rows_per, |_rows, [c]| f(c));
+        self.dispatch_rows::<T, 1, _, _>([base], [1], len, rows_per, |_rows, [c]| f(c), || {});
     }
 
     /// 把 `N` 个**等长**数组同步切段并行处理（SOA 批量内核的常见形状），
@@ -269,7 +272,7 @@ impl WorkerPool {
         }
         let bases = arrays.map(|a| a.as_mut_ptr());
         let rows_per = len.div_ceil(self.threads).max(1);
-        self.dispatch_rows::<T, N, _>(bases, [1; N], len, rows_per, |_rows, a| f(a));
+        self.dispatch_rows::<T, N, _, _>(bases, [1; N], len, rows_per, |_rows, a| f(a), || {});
     }
 
     /// 按**行块**切分：`arrays[k]` 是 `(行主序数组, 每行元素数)`，
@@ -325,7 +328,7 @@ impl WorkerPool {
             .div_ceil(self.threads)
             .max(1)
             .next_multiple_of(row_gran);
-        self.dispatch_rows::<T, N, _>(bases, widths, rows, rows_per, f);
+        self.dispatch_rows::<T, N, _, _>(bases, widths, rows, rows_per, f, || {});
     }
 
     /// 按**编译期策略** `S` 切分派活（行块形状）。语义与
@@ -340,25 +343,12 @@ impl WorkerPool {
         &mut self,
         rows: usize,
         row_gran: usize,
-        mut arrays: [(&mut [T], usize); N],
+        arrays: [(&mut [T], usize); N],
         f: F,
     ) where
         F: Fn(usize, [&mut [T]; N]) + Sync,
     {
-        if self.row_blocks_serial(rows, row_gran, &arrays) {
-            f(rows, arrays.map(|(s, _)| s)); // 不切：整块交给闭包（与选哪个策略无关）
-            return;
-        }
-        let (bases, widths) = row_block_ptrs(&mut arrays);
-        let jobs = S::plan(rows, self.threads, row_gran);
-        // **快路径**：`Chunk`/`RowBlock` 的作业表就是"每 worker 一段连续行、块长一致"，
-        // 与 `dispatch_rows` 的分配完全相同 ⇒ 走原热路径（指针在派活时算好，worker 侧
-        // 没有作业表循环）。实测漏掉这一步会让 512³/16 线程掉 30%（见 dev.md §14.4）。
-        if !S::MULTI && !jobs.is_empty() {
-            self.dispatch_rows(bases, widths, rows, jobs[0].rows, f);
-            return;
-        }
-        self.dispatch_jobs(bases, widths, jobs, false, f);
+        self.row_block_static::<S, T, N, F, fn()>(rows, row_gran, arrays, f, || {});
     }
 
     /// 与上面同，但**动态领取**：块长 `block_rows`，worker 用原子计数器抢块。
@@ -369,51 +359,125 @@ impl WorkerPool {
         rows: usize,
         row_gran: usize,
         block_rows: usize,
-        mut arrays: [(&mut [T], usize); N],
+        arrays: [(&mut [T], usize); N],
         f: F,
     ) where
         F: Fn(usize, [&mut [T]; N]) + Sync,
     {
-        if self.row_blocks_serial(rows, row_gran, &arrays) {
-            f(rows, arrays.map(|(s, _)| s));
-            return;
-        }
-        let (bases, widths) = row_block_ptrs(&mut arrays);
-        let jobs = sched::plan_blocked(rows, block_rows, row_gran);
-        self.dispatch_jobs(bases, widths, jobs, true, f);
+        self.row_block_run(
+            rows,
+            row_gran,
+            arrays,
+            Pick::Dynamic { block_rows },
+            f,
+            || {},
+        );
     }
 
-    /// 按**运行期决策** [`Pick`] 派活：这里是"编译期确认路径"的落点——
-    /// `match` 是穷尽的，新增一个 `Pick` 变体会让**所有**分派点编译失败，
-    /// 逼着作者逐处想清楚该不该用它，而不是悄悄落进某个默认分支。
     pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        arrays: [(&mut [T], usize); N],
+        pick: Pick,
+        f: F,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+    {
+        self.row_block_run(rows, row_gran, arrays, pick, f, || {});
+    }
+
+    /// 与上面同，但额外接受一个 **`during` 闭包**：它在本轮**已发布、尚未等待**时
+    /// 由主线程执行——也就是"趁 worker 干活，主线程做点别的事"（矩阵乘的双缓冲打包）。
+    ///
+    /// 为什么用 scoped 回调而不是 `submit()`/`wait()` 两个方法：闭包 `f` 活在本函数的
+    /// 栈帧上，一旦 `submit()` 提前返回、worker 还在调它，就是悬垂引用。把"等待期间做的事"
+    /// 变成传进来的 `during`，`f` 与数据在整个过程内都活着 ⇒ **不需要 unsafe**；
+    /// 而且 `during` 无法捕获 `arrays`（已被本调用移走）或 `&mut pool`（已借出），
+    /// 借用检查器替我们挡掉了数据竞争。
+    pub fn for_each_row_block_mut_picked_deferred<T: Send, const N: usize, F, D>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        arrays: [(&mut [T], usize); N],
+        pick: Pick,
+        f: F,
+        during: D,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+        D: FnOnce(),
+    {
+        self.row_block_run(rows, row_gran, arrays, pick, f, during);
+    }
+
+    /// [`Self::for_each_row_block_mut_picked`] 与 [`Self::submit_row_block_mut_picked`]
+    /// 的公共实现；`wait_now = false` 表示只发布不等（见 `publish_no_wait` 的 Safety）。
+    #[allow(clippy::too_many_arguments)]
+    fn row_block_run<T: Send, const N: usize, F, D>(
         &mut self,
         rows: usize,
         row_gran: usize,
         mut arrays: [(&mut [T], usize); N],
         pick: Pick,
         f: F,
+        during: D,
     ) where
         F: Fn(usize, [&mut [T]; N]) + Sync,
+        D: FnOnce(),
     {
         match pick {
             Pick::Chunk => {
-                self.for_each_row_block_mut_with::<sched::Chunk, _, N, _>(rows, row_gran, arrays, f)
+                self.row_block_static::<sched::Chunk, T, N, F, D>(rows, row_gran, arrays, f, during)
             }
             Pick::RowBlock => self
-                .for_each_row_block_mut_with::<sched::RowBlock, _, N, _>(rows, row_gran, arrays, f),
+                .row_block_static::<sched::RowBlock, T, N, F, D>(rows, row_gran, arrays, f, during),
             Pick::Blocked { block_rows } => {
                 if self.row_blocks_serial(rows, row_gran, &arrays) {
                     f(rows, arrays.map(|(s, _)| s));
+                    during();
                     return;
                 }
                 let (bases, widths) = row_block_ptrs(&mut arrays);
                 let jobs = sched::plan_blocked(rows, block_rows, row_gran);
-                self.dispatch_jobs(bases, widths, jobs, false, f);
+                self.dispatch_jobs::<T, N, _, _>(bases, widths, jobs, false, f, during);
             }
-            Pick::Dynamic { block_rows } => self
-                .for_each_row_block_mut_dynamic::<T, N, _>(rows, row_gran, block_rows, arrays, f),
+            Pick::Dynamic { block_rows } => {
+                if self.row_blocks_serial(rows, row_gran, &arrays) {
+                    f(rows, arrays.map(|(s, _)| s));
+                    during();
+                    return;
+                }
+                let (bases, widths) = row_block_ptrs(&mut arrays);
+                let jobs = sched::plan_blocked(rows, block_rows, row_gran);
+                self.dispatch_jobs::<T, N, _, _>(bases, widths, jobs, true, f, during);
+            }
         }
+    }
+
+    /// 静态策略（`Chunk`/`RowBlock`）的公共实现。
+    fn row_block_static<S: Strategy, T: Send, const N: usize, F, D>(
+        &mut self,
+        rows: usize,
+        row_gran: usize,
+        mut arrays: [(&mut [T], usize); N],
+        f: F,
+        during: D,
+    ) where
+        F: Fn(usize, [&mut [T]; N]) + Sync,
+        D: FnOnce(),
+    {
+        if self.row_blocks_serial(rows, row_gran, &arrays) {
+            f(rows, arrays.map(|(s, _)| s));
+            during();
+            return;
+        }
+        let (bases, widths) = row_block_ptrs(&mut arrays);
+        let jobs = S::plan(rows, self.threads, row_gran);
+        if !S::MULTI && !jobs.is_empty() {
+            self.dispatch_rows(bases, widths, rows, jobs[0].rows, f, during);
+            return;
+        }
+        self.dispatch_jobs::<T, N, _, _>(bases, widths, jobs, false, f, during);
     }
 
     /// 行块接口的公共前置：校验各数组长度，并判断本次是否**原地串行**（不派活）。
@@ -445,15 +509,17 @@ impl WorkerPool {
     ///
     /// 各数组长度必须等于 `rows × widths[k]`（由上面的公开接口校验），
     /// 否则下面的指针算术就越界了。`rows_per` 是本轮的块大小（≥ 1）。
-    fn dispatch_rows<T: Send, const N: usize, F>(
+    fn dispatch_rows<T: Send, const N: usize, F, D>(
         &mut self,
         bases: [*mut T; N],
         widths: [usize; N],
         rows: usize,
         rows_per: usize,
         f: F,
+        during: D,
     ) where
         F: Fn(usize, [&mut [T]; N]) + Sync,
+        D: FnOnce(),
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
@@ -480,10 +546,12 @@ impl WorkerPool {
             }
         }
 
-        // SAFETY: 上面的槽位覆盖本次调用的全部数据，且各数组长度由公开接口校验为
-        // `rows × widths[k]`、行区间互不重叠；`f` 在栈上存活到本函数返回。
-        // publish 返回时所有 worker 已执行完毕（或已被拦下的 panic 已取回）。
-        unsafe { self.publish(thunk::<T, N, F>, &f as *const F as *const ()) };
+        // 发布 → **主线程做 `during`（worker 正在算）** → 等待。
+        // SAFETY: 槽位覆盖本次调用的全部数据、各数组长度由公开接口校验为 `rows × widths[k]`、
+        // 行区间互不重叠；`f` 与 `during` 都在本函数栈帧上活到 `wait()` 之后。
+        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        during();
+        self.wait();
     }
 
     /// 按**作业表**派活：支持"每 worker 多块"（静态轮转）与"动态领取"两种模式。
@@ -498,15 +566,17 @@ impl WorkerPool {
     ///
     /// # Panics
     /// 各数组长度必须等于 `rows × 行宽`；`jobs` 必须恰好覆盖 `[0, rows)`。
-    fn dispatch_jobs<T: Send, const N: usize, F>(
+    fn dispatch_jobs<T: Send, const N: usize, F, D>(
         &mut self,
         bases: [*mut T; N],
         widths: [usize; N],
         jobs: sched::Jobs,
         dynamic: bool,
         f: F,
+        during: D,
     ) where
         F: Fn(usize, [&mut [T]; N]) + Sync,
+        D: FnOnce(),
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
         let threads = self.threads;
@@ -537,7 +607,10 @@ impl WorkerPool {
                 slot.row_bytes[k] = widths[k] * std::mem::size_of::<T>();
             }
         }
-        unsafe { self.publish(thunk::<T, N, F>, &f as *const F as *const ()) };
+        // 发布 → **主线程做 `during`（worker 正在算）** → 等待
+        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        during();
+        self.wait();
     }
 
     /// 发布一轮并等到全部 worker 完成（有 panic 则续抛）。
@@ -545,7 +618,17 @@ impl WorkerPool {
     /// # Safety
     /// 调用方必须保证：所有 `slots` 已填好、`func` 与槽位里的指针在本次调用期间有效，
     /// 且 `func` 指向的闭包类型与 `t` 期望的一致。
-    unsafe fn publish(&mut self, t: Thunk, func: *const ()) {
+    /// 只发布、不等待（**unsafe**）：调用方**必须**随后调用 [`Self::wait`]。
+    ///
+    /// 存在的意义是让调用方在 worker 干活时做"只有主线程能做的事"——典型用途是矩阵乘
+    /// 的**双缓冲打包**：worker 算当前面板时，主线程打包下一个面板（`docs/dev.md` §16）。
+    /// 对外它只经 [`WorkerPool::for_each_row_block_mut_picked_deferred`] 暴露：那个门面把
+    /// "等待期间做的事"做成 `during` 回调，闭包与数据都活在同一个栈帧里，因而不需要 unsafe。
+    ///
+    /// # Safety
+    /// 在 `wait()` 返回之前，调用方不得访问本次派活的数组或闭包捕获的数据（worker 正在
+    /// 读写它们），也不得再次调用本池的派活接口（池只有一套作业槽与代次）。
+    unsafe fn publish_no_wait(&mut self, t: Thunk, func: *const ()) {
         *self.shared.call.get() = (t, func);
         self.shared.done.store(0, Ordering::Relaxed);
         self.shared.panicked.store(false, Ordering::Relaxed);
@@ -554,6 +637,15 @@ impl WorkerPool {
             self.shared.epoch.fetch_add(1, Ordering::Release);
         }
         self.shared.wake.notify_all();
+        self.in_flight = true;
+    }
+
+    /// 等到本轮全部 worker 完成（有 panic 则续抛）。没有在飞作业时直接返回。
+    pub fn wait(&mut self) {
+        if !self.in_flight {
+            return;
+        }
+        self.in_flight = false;
         while self.shared.done.load(Ordering::Acquire) < self.threads {
             std::hint::spin_loop();
         }
