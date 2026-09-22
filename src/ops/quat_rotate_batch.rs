@@ -148,16 +148,18 @@ fn normalize_lsx(w: m128d, x: m128d, y: m128d, z: m128d) -> (m128d, m128d, m128d
         let mask = lsx_vfcmp_clt_d(n, lsx::splat_f64(super::quat_normalize_batch::DEGENERATE));
         let bits = |v: m128d| std::mem::transmute::<m128d, m128i>(v);
         let unbits = |v: m128i| std::mem::transmute::<m128i, m128d>(v);
+        // 同分母 ⇒ 1 次除法（与 LASX/标量路径同式，见 docs/dev.md §13.6）
+        let inv = lsx_vfdiv_d(lsx::splat_f64(1.0), n);
         let wo = unbits(lsx_vor_v(
-            lsx_vandn_v(mask, bits(lsx_vfdiv_d(w, n))),
+            lsx_vandn_v(mask, bits(lsx_vfmul_d(w, inv))),
             lsx_vand_v(
                 mask,
                 std::mem::transmute::<m128d, m128i>(lsx::splat_f64(1.0)),
             ),
         ));
-        let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(x, n))));
-        let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(y, n))));
-        let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(z, n))));
+        let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(x, inv))));
+        let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(y, inv))));
+        let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(z, inv))));
         (wo, xo, yo, zo)
     }
 }
@@ -183,7 +185,10 @@ fn tail(
         let (w, x, y, z) = if n < super::quat_normalize_batch::DEGENERATE {
             (1.0, 0.0, 0.0, 0.0)
         } else {
-            (qw[i] / n, qx[i] / n, qy[i] / n, qz[i] / n)
+            {
+                let inv = 1.0 / n;
+                (qw[i] * inv, qx[i] * inv, qy[i] * inv, qz[i] * inv)
+            }
         };
         let r = [
             1.0 - 2.0 * (y * y + z * z),
@@ -236,7 +241,10 @@ mod tests {
                 let (w, x, y, z) = if nn < 1e-15 {
                     (1.0, 0.0, 0.0, 0.0)
                 } else {
-                    (qw[i] / nn, qx[i] / nn, qy[i] / nn, qz[i] / nn)
+                    {
+                        let inv = 1.0 / nn;
+                        (qw[i] * inv, qx[i] * inv, qy[i] * inv, qz[i] * inv)
+                    }
                 };
                 let r = [
                     1.0 - 2.0 * (y * y + z * z),
@@ -289,6 +297,68 @@ mod tests {
             let m = (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]).sqrt();
             let mo = (ox[i] * ox[i] + (oy[i] * oy[i] + oz[i] * oz[i])).sqrt();
             assert!(rel_err(mo, m) < 1e-15, "旋转应保长：{mo} vs {m}");
+        }
+    }
+
+    /// 路径一致性：LASX vs LSX、向量体 vs 标量尾（本轮 4 次除法 → 1 次后的守护）。
+    #[test]
+    fn paths_bit_exact() {
+        const N: usize = 261;
+        let mut rng = Lcg(0x517e_2b3c);
+        let q: Vec<[f64; 4]> = (0..N)
+            .map(|_| [rng.f64(), rng.f64(), rng.f64(), rng.f64()])
+            .collect();
+        let v: Vec<[f64; 3]> = (0..N).map(|_| [rng.f64(), rng.f64(), rng.f64()]).collect();
+        let run = |force_lsx: bool, count: usize| -> Vec<[f64; 3]> {
+            let (qw, qx, qy, qz) = (
+                q.iter().map(|v| v[0]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[1]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[2]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[3]).collect::<Vec<_>>(),
+            );
+            let (vx, vy, vz) = (
+                v.iter().map(|v| v[0]).collect::<Vec<_>>(),
+                v.iter().map(|v| v[1]).collect::<Vec<_>>(),
+                v.iter().map(|v| v[2]).collect::<Vec<_>>(),
+            );
+            let (mut ox, mut oy, mut oz) = (vec![0.0; count], vec![0.0; count], vec![0.0; count]);
+            crate::arch::lasx_force_lsx_thread(force_lsx);
+            lasx_quat_rotate_batch(
+                qw.as_ptr(),
+                qx.as_ptr(),
+                qy.as_ptr(),
+                qz.as_ptr(),
+                vx.as_ptr(),
+                vy.as_ptr(),
+                vz.as_ptr(),
+                ox.as_mut_ptr(),
+                oy.as_mut_ptr(),
+                oz.as_mut_ptr(),
+                count as i32,
+            );
+            crate::arch::lasx_force_lsx_thread(false);
+            (0..count).map(|i| [ox[i], oy[i], oz[i]]).collect()
+        };
+        let lasx = run(false, N);
+        let lsx = run(true, N);
+        for i in 0..N {
+            for k in 0..3 {
+                assert_eq!(
+                    lasx[i][k].to_bits(),
+                    lsx[i][k].to_bits(),
+                    "LASX/LSX i={i} k={k}"
+                );
+            }
+        }
+        let body = run(false, 256);
+        for i in 0..256 {
+            for k in 0..3 {
+                assert_eq!(
+                    body[i][k].to_bits(),
+                    lasx[i][k].to_bits(),
+                    "体/尾 i={i} k={k}"
+                );
+            }
         }
     }
 }

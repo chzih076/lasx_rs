@@ -155,16 +155,18 @@ fn normalize_lsx(w: m128d, x: m128d, y: m128d, z: m128d) -> (m128d, m128d, m128d
         let mask = lsx_vfcmp_clt_d(n, lsx::splat_f64(super::quat_normalize_batch::DEGENERATE));
         let bits = |v: m128d| std::mem::transmute::<m128d, m128i>(v);
         let unbits = |v: m128i| std::mem::transmute::<m128i, m128d>(v);
+        // 同分母 ⇒ 1 次除法（与 LASX/标量路径同式，见 docs/dev.md §13.6）
+        let inv = lsx_vfdiv_d(lsx::splat_f64(1.0), n);
         let wo = unbits(lsx_vor_v(
-            lsx_vandn_v(mask, bits(lsx_vfdiv_d(w, n))),
+            lsx_vandn_v(mask, bits(lsx_vfmul_d(w, inv))),
             lsx_vand_v(
                 mask,
                 std::mem::transmute::<m128d, m128i>(lsx::splat_f64(1.0)),
             ),
         ));
-        let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(x, n))));
-        let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(y, n))));
-        let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(z, n))));
+        let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(x, inv))));
+        let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(y, inv))));
+        let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(z, inv))));
         (wo, xo, yo, zo)
     }
 }
@@ -178,7 +180,9 @@ fn tail(qw: &[f64], qx: &[f64], qy: &[f64], qz: &[f64], m: [&mut [f64]; 9], from
         let (w, x, y, z) = if n < super::quat_normalize_batch::DEGENERATE {
             (1.0, 0.0, 0.0, 0.0)
         } else {
-            (qw[i] / n, qx[i] / n, qy[i] / n, qz[i] / n)
+            // 与向量路径同式：1 次除法 + 乘法
+            let inv = 1.0 / n;
+            (qw[i] * inv, qx[i] * inv, qy[i] * inv, qz[i] * inv)
         };
         let r = [
             1.0 - 2.0 * (y * y + z * z),
@@ -201,7 +205,7 @@ fn tail(qw: &[f64], qx: &[f64], qy: &[f64], qz: &[f64], m: [&mut [f64]; 9], from
 #[cfg(test)]
 mod tests {
     use crate::ffi::attitude::lasx_quat_to_dcm_batch;
-    use crate::ops::testutil::{rel_err, states};
+    use crate::ops::testutil::{rel_err, states, Lcg};
 
     /// 用 R 旋转向量必须与 `quat_rotate` 的公式逐位一致。
     #[test]
@@ -247,8 +251,14 @@ mod tests {
                 2.0 * (y * z + w * x),
                 1.0 - 2.0 * (x * x + y * y),
             ];
+            // 与精确除法参考比紧相对误差（内核用"1 次除法 + 乘法"，见 docs/dev.md §13.6）
             for k in 0..9 {
-                assert_eq!(m[k][i].to_bits(), r[k].to_bits(), "i={i} k={k}");
+                assert!(
+                    rel_err(m[k][i], r[k]) < 1e-15,
+                    "i={i} k={k}: {} vs {}",
+                    m[k][i],
+                    r[k]
+                );
             }
             // 正交性：R·Rᵀ ≈ I
             for r0 in 0..3 {
@@ -260,6 +270,68 @@ mod tests {
                         "i={i} 正交性 ({r0},{c0}) = {dot}"
                     );
                 }
+            }
+        }
+    }
+
+    /// 路径一致性：LASX vs LSX、向量体 vs 标量尾（本轮 4 次除法 → 1 次后的守护）。
+    #[test]
+    fn paths_bit_exact() {
+        const N: usize = 261;
+        let mut rng = Lcg(0x2c4d_3e5f);
+        let q: Vec<[f64; 4]> = (0..N)
+            .map(|_| [rng.f64(), rng.f64(), rng.f64(), rng.f64()])
+            .collect();
+        let run = |force_lsx: bool, count: usize| -> Vec<[f64; 9]> {
+            let (qw, qx, qy, qz) = (
+                q.iter().map(|v| v[0]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[1]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[2]).collect::<Vec<_>>(),
+                q.iter().map(|v| v[3]).collect::<Vec<_>>(),
+            );
+            let mut m: Vec<Vec<f64>> = (0..9).map(|_| vec![0.0; count]).collect();
+            let mp: [*mut f64; 9] = std::array::from_fn(|k| m[k].as_mut_ptr());
+            crate::arch::lasx_force_lsx_thread(force_lsx);
+            lasx_quat_to_dcm_batch(
+                qw.as_ptr(),
+                qx.as_ptr(),
+                qy.as_ptr(),
+                qz.as_ptr(),
+                mp[0],
+                mp[1],
+                mp[2],
+                mp[3],
+                mp[4],
+                mp[5],
+                mp[6],
+                mp[7],
+                mp[8],
+                count as i32,
+            );
+            crate::arch::lasx_force_lsx_thread(false);
+            (0..count)
+                .map(|i| std::array::from_fn(|k| m[k][i]))
+                .collect()
+        };
+        let lasx = run(false, N);
+        let lsx = run(true, N);
+        for i in 0..N {
+            for k in 0..9 {
+                assert_eq!(
+                    lasx[i][k].to_bits(),
+                    lsx[i][k].to_bits(),
+                    "LASX/LSX i={i} k={k}"
+                );
+            }
+        }
+        let body = run(false, 256);
+        for i in 0..256 {
+            for k in 0..9 {
+                assert_eq!(
+                    body[i][k].to_bits(),
+                    lasx[i][k].to_bits(),
+                    "体/尾 i={i} k={k}"
+                );
             }
         }
     }

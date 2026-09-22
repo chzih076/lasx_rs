@@ -46,14 +46,16 @@ pub(super) fn normalize_lasx(
         let mask = lasx_xvfcmp_clt_d(n, tiny);
         let bits = |v: m256d| std::mem::transmute::<m256d, m256i>(v);
         let unbits = |v: m256i| std::mem::transmute::<m256i, m256d>(v);
+        // 4 个分量同分母 ⇒ **只做一次除法**，其余用乘法（见 docs/dev.md §13.6）
+        let inv = lasx_xvfdiv_d(lasx::splat_f64(1.0), n);
         // 退化 lane：andn 清成 +0.0；w 再 or 上 1.0 的位型 ⇒ (1,0,0,0)
         let wo = unbits(lasx_xvor_v(
-            lasx_xvandn_v(mask, bits(lasx_xvfdiv_d(w, n))),
+            lasx_xvandn_v(mask, bits(lasx_xvfmul_d(w, inv))),
             lasx_xvand_v(mask, one_bits()),
         ));
-        let xo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfdiv_d(x, n))));
-        let yo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfdiv_d(y, n))));
-        let zo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfdiv_d(z, n))));
+        let xo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfmul_d(x, inv))));
+        let yo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfmul_d(y, inv))));
+        let zo = unbits(lasx_xvandn_v(mask, bits(lasx_xvfmul_d(z, inv))));
         (wo, xo, yo, zo)
     }
 }
@@ -108,15 +110,17 @@ fn quat_normalize_batch_lsx(qw: &mut [f64], qx: &mut [f64], qy: &mut [f64], qz: 
             let tiny = lsx::splat_f64(DEGENERATE);
             let mask = lsx_vfcmp_clt_d(mag, tiny);
             let one = lsx::splat_f64(1.0);
+            // 同分母 ⇒ 1 次除法（与 LASX 路径同式）
+            let inv = lsx_vfdiv_d(one, mag);
             let bits = |v: m128d| std::mem::transmute::<m128d, m128i>(v);
             let unbits = |v: m128i| std::mem::transmute::<m128i, m128d>(v);
             let wo = unbits(lsx_vor_v(
-                lsx_vandn_v(mask, bits(lsx_vfdiv_d(w, mag))),
+                lsx_vandn_v(mask, bits(lsx_vfmul_d(w, inv))),
                 lsx_vand_v(mask, std::mem::transmute::<m128d, m128i>(one)),
             ));
-            let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(x, mag))));
-            let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(y, mag))));
-            let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfdiv_d(z, mag))));
+            let xo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(x, inv))));
+            let yo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(y, inv))));
+            let zo = unbits(lsx_vandn_v(mask, bits(lsx_vfmul_d(z, inv))));
             lsx::store_f64x2(qw.as_mut_ptr().add(i), wo);
             lsx::store_f64x2(qx.as_mut_ptr().add(i), xo);
             lsx::store_f64x2(qy.as_mut_ptr().add(i), yo);
@@ -151,7 +155,7 @@ fn tail(qw: &mut [f64], qx: &mut [f64], qy: &mut [f64], qz: &mut [f64], from: us
 #[cfg(test)]
 mod tests {
     use crate::ffi::attitude::lasx_quat_normalize_batch;
-    use crate::ops::testutil::Lcg;
+    use crate::ops::testutil::{rel_err, Lcg};
 
     #[test]
     fn test_quat_normalize_batch_matches_reference() {
@@ -182,11 +186,20 @@ mod tests {
                 z.as_mut_ptr(),
                 n as i32,
             );
+            // 内核现在用"1 次除法 + 乘法"（docs/dev.md §13.6），与精确除法的参考差 ≤ 2 ulp，
+            // 所以这里比紧相对误差；逐位一致性由 LASX/LSX/尾部的路径间测试保证。
             for i in 0..n {
-                assert_eq!(w[i].to_bits(), want[i].0.to_bits(), "n={n} i={i} w");
-                assert_eq!(x[i].to_bits(), want[i].1.to_bits(), "n={n} i={i} x");
-                assert_eq!(y[i].to_bits(), want[i].2.to_bits(), "n={n} i={i} y");
-                assert_eq!(z[i].to_bits(), want[i].3.to_bits(), "n={n} i={i} z");
+                for (got, want_v, name) in [
+                    (w[i], want[i].0, "w"),
+                    (x[i], want[i].1, "x"),
+                    (y[i], want[i].2, "y"),
+                    (z[i], want[i].3, "z"),
+                ] {
+                    assert!(
+                        rel_err(got, want_v) < 1e-15,
+                        "n={n} i={i} {name}: {got} vs {want_v}"
+                    );
+                }
             }
         }
     }
@@ -217,5 +230,75 @@ mod tests {
             let m = ((w[i] * w[i] + x[i] * x[i]) + y[i] * y[i]) + z[i] * z[i];
             assert!((m.sqrt() - 1.0).abs() < 1e-15, "i={i} 模长 {}", m.sqrt());
         }
+    }
+
+    /// 路径一致性：**LASX vs LSX** 与 **向量体 vs 标量尾** 都必须逐位相同。
+    /// （本轮把 4 次除法换成 1 次除法 + 乘法后，这条性质仍然成立。）
+    #[test]
+    fn paths_bit_exact() {
+        let mut rng = Lcg(0x9e37_1a2b);
+        let n = 261usize; // = 4·65 + 1，同时覆盖 LASX(4 宽) 与 LSX(2 宽) 的尾部
+        let src: Vec<[f64; 4]> = (0..n)
+            .map(|_| [rng.f64(), rng.f64(), rng.f64(), rng.f64()])
+            .collect();
+        let run = |force_lsx: bool, count: usize| -> Vec<[f64; 4]> {
+            let (mut w, mut x, mut y, mut z) = (
+                src.iter().map(|v| v[0]).collect::<Vec<_>>(),
+                src.iter().map(|v| v[1]).collect::<Vec<_>>(),
+                src.iter().map(|v| v[2]).collect::<Vec<_>>(),
+                src.iter().map(|v| v[3]).collect::<Vec<_>>(),
+            );
+            crate::arch::lasx_force_lsx_thread(force_lsx);
+            lasx_quat_normalize_batch(
+                w.as_mut_ptr(),
+                x.as_mut_ptr(),
+                y.as_mut_ptr(),
+                z.as_mut_ptr(),
+                count as i32,
+            );
+            crate::arch::lasx_force_lsx_thread(false);
+            (0..count).map(|i| [w[i], x[i], y[i], z[i]]).collect()
+        };
+        let lasx = run(false, n);
+        let lsx = run(true, n);
+        for i in 0..n {
+            for k in 0..4 {
+                assert_eq!(
+                    lasx[i][k].to_bits(),
+                    lsx[i][k].to_bits(),
+                    "LASX/LSX i={i} k={k}"
+                );
+            }
+        }
+        // 向量体 vs 尾部：n = 256 与 n = 261 的前 256 个元素必须逐位一致
+        let body = run(false, 256);
+        for i in 0..256 {
+            for k in 0..4 {
+                assert_eq!(
+                    body[i][k].to_bits(),
+                    lasx[i][k].to_bits(),
+                    "体/尾 i={i} k={k}"
+                );
+            }
+        }
+    }
+
+    /// 精度回归：单位化改成 `w·(1/n)` 后与精确除法 `w/n` 的最坏相对偏差。
+    #[test]
+    fn reciprocal_derivation_precision() {
+        let mut worst = 0f64;
+        for i in 0..4096 {
+            // 四元数分量与模长都覆盖：|q| ∈ [0.5, 4)
+            let t = 0.5 + 3.5 * (i as f64) / 4096.0;
+            let n = t;
+            let w = 0.371 * t;
+            let inv = 1.0 / n;
+            let got = w * inv;
+            let exact = w / n;
+            worst = worst.max(((got - exact) / exact).abs());
+            assert!(got.to_bits() != 0 || exact.to_bits() != 0);
+        }
+        println!("单位化最坏相对偏差：{worst:e}");
+        assert!(worst < 4.0 * f64::EPSILON, "{worst:e}");
     }
 }
