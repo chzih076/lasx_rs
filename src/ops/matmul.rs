@@ -36,11 +36,11 @@ const COL_ORDER_MIN_N: usize = 1024;
 /// 打包路径的 `m` 下限：打包本身要走两遍 B（读+写），只有当行块足够多
 /// （流式次序会因此把 B 读很多遍）时才摊得掉。按行切并行的**每线程**只有 m/线程数 行，
 /// 所以这个下限同时保护了并行路径——否则每个线程都会把整块 B 打包一遍。
-const PACK_MIN_M: usize = 32;
+pub(crate) const PACK_MIN_M: usize = 32;
 
 /// 打包路径的 `k` 下限。§23 重新测过：配合 k 分块，k=64 起打包就大胜"列块/流式"
 /// （`64×96×8192` 21 → 45 GFLOP/s、`256×64×4096` 23 → 58），所以从 192 降到 64。
-const PACK_MIN_K: usize = 64;
+pub(crate) const PACK_MIN_K: usize = 64;
 
 /// 极宽 `n` 的例外：当 `k` 很小而 `n` 极大时，列块路径只复制一遍 B 面板、且面板只有
 /// `k×128×4`，比打包（要整体复制一遍 B = `k×n×4` 字节）更划算。实测 `100×64×19147`
@@ -53,7 +53,7 @@ const K_ALWAYS_PACK: usize = 192;
 
 /// 打包路径的工作量下限（`m×k×n`，即乘加次数）：128³（4.2 MFLOP）打包 0.85×，
 /// 192³（14 MFLOP）起转为正收益。
-const PACK_MIN_WORK: u128 = 8_000_000;
+pub(crate) const PACK_MIN_WORK: u128 = 8_000_000;
 
 /// k 方向分块的"L1 预算"与块长。打包条带按 k 主序存放，所以一个 k 块就是一段连续内存。
 ///
@@ -237,44 +237,9 @@ pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f3
             let jb = s0 * 32;
             let nc = (s1 - s0) * 32;
             pack_b(k, n, jb, nc, b, &mut packed);
-            // 宏内核：**k 分块在外、行块在内**。这样每个 k 块打包后的 B
-            //（K_CHUNK×32×4 = 24 KB）会被所有行块反复命中，并与 A 的 4 行、C 的 4×32
-            // 一起待在 L1 里。代价是 C 每块读写一次（k=1024 时多 5 次），相对算力可忽略。
-            let kb_size = if k * 32 * 4 <= L1_BUDGET { k } else { K_CHUNK };
-            let mut kb0 = 0;
-            while kb0 < k {
-                let kb = kb_size.min(k - kb0);
-                let first = kb0 == 0;
-                for s in s0..s1 {
-                    let base = (s - s0) * k * 32 + kb0 * 32;
-                    let strip = &packed[base..base + kb * 32];
-                    let j = s * 32;
-                    let mut i = 0;
-                    while i < m4 {
-                        let ct = &mut c[i * n..(i + 4) * n];
-                        tile4x32_chunk(
-                            kb,
-                            first,
-                            strip,
-                            &a[i * k + kb0..i * k + kb0 + kb],
-                            &a[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
-                            &a[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
-                            &a[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
-                            ct,
-                            n,
-                            j,
-                        );
-                        i += 4;
-                    }
-                    // 不足 4 行的尾部行
-                    while i < m {
-                        let c_row = &mut c[i * n..(i + 1) * n];
-                        row_tail_packed(&a[i * k + kb0..i * k + kb0 + kb], strip, c_row, first, j);
-                        i += 1;
-                    }
-                }
-                kb0 += kb;
-            }
+            // 面板打包好后，交给"用已打包面板算一个行块"的入口（并行层复用同一个入口，
+            // 于是打包只做一次、面板跨线程共享）。
+            matmul_f32_packed_rows(k, n, jb, nc, &packed, a, c, m4);
             s0 = s1;
         }
     });
@@ -288,11 +253,79 @@ pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f3
     }
 }
 
+/// 用**已打包**的列面板计算 `a_rows`/`c_rows` 对应的那些行。
+///
+/// `packed` 是 [`pack_b`] 的产物（`k × nc`，32 列条带主序）；`a_rows.len()/k` 是本块行数。
+/// 并行层（[`crate::parallel::matmul_f32`]）用它复用**同一份**打包面板：打包只做一遍，
+/// 各线程只读共享面板。每行的列尾 `[n32, n)` 由 [`row_tail_range_f32`] 单独处理。
+///
+/// 顺序版的 [`matmul_f32_packed`] 走的是同一个函数（`m4` 之后的行尾由调用方补），
+/// 所以并行与单线程**逐位一致**（每个输出元素沿 k 的升序累加不变）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f32_packed_rows(
+    k: usize,
+    n: usize,
+    jb: usize,
+    nc: usize,
+    packed: &[f32],
+    a_rows: &[f32],
+    c_rows: &mut [f32],
+    m4: usize,
+) {
+    // k == 0 时不会走进这个入口（调用方已提前返回），用 checked_div 让 clippy 与读者都放心
+    let m = a_rows.len().checked_div(k).unwrap_or(0);
+    let strips = nc / 32;
+    // 宏内核：**k 分块在外、行块在内**。这样每个 k 块打包后的 B
+    //（K_CHUNK×32×4 = 32 KB）会被所有行块反复命中，并与 A 的 4 行、C 的 4×32
+    // 一起待在 L1 里。代价是 C 每块读写一次（k=1024 时多 3 次），相对算力可忽略。
+    let kb_size = if k * 32 * 4 <= L1_BUDGET { k } else { K_CHUNK };
+    let mut kb0 = 0;
+    while kb0 < k {
+        let kb = kb_size.min(k - kb0);
+        let first = kb0 == 0;
+        for s in 0..strips {
+            let base = s * k * 32 + kb0 * 32;
+            let strip = &packed[base..base + kb * 32];
+            let j = jb + s * 32;
+            let mut i = 0;
+            while i < m4 {
+                let ct = &mut c_rows[i * n..(i + 4) * n];
+                tile4x32_chunk(
+                    kb,
+                    first,
+                    strip,
+                    &a_rows[i * k + kb0..i * k + kb0 + kb],
+                    &a_rows[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
+                    &a_rows[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
+                    &a_rows[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
+                    ct,
+                    n,
+                    j,
+                );
+                i += 4;
+            }
+            // 不足 4 行的尾部行
+            while i < m {
+                let c_row = &mut c_rows[i * n..(i + 1) * n];
+                row_tail_packed(
+                    &a_rows[i * k + kb0..i * k + kb0 + kb],
+                    strip,
+                    c_row,
+                    first,
+                    j,
+                );
+                i += 1;
+            }
+        }
+        kb0 += kb;
+    }
+}
+
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*32 + r]`。
 ///
 /// 外层走 `p`：这样读 B 是**顺序**的（每行 `nc×4` 字节连续），写是 128 B 连续小块。
 #[inline]
-fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
+pub(crate) fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
     let strips = nc / 32;
     for p in 0..k {
         let row = &b[p * n + jb..p * n + jb + nc];
@@ -447,7 +480,7 @@ fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], first: bool,
 /// = 28 KB，能连带 A 行一起待在 L1（4×32 的条带是 57 KB，正好卡在 L1 边缘）。
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pack_strips(k: usize) -> usize {
+pub(crate) fn pack_strips(k: usize) -> usize {
     const L2_BUDGET: usize = 2 * 1024 * 1024;
     let per_strip = (k * 32 * 4).max(1);
     (L2_BUDGET / per_strip).clamp(1, 256)
@@ -602,7 +635,7 @@ fn row_tail_f32(a_row: &[f32], c_row: &mut [f32], b: &[f32], k: usize, n: usize,
 
 /// 单行的列尾 `[j0, j1)`：先 8 列块再标量。`n` 始终是 B/C 的**行跨距**。
 #[inline]
-fn row_tail_range_f32(
+pub(crate) fn row_tail_range_f32(
     a_row: &[f32],
     c_row: &mut [f32],
     b: &[f32],

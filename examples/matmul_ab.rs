@@ -1,7 +1,10 @@
 //! 单形状 A/B：按参数跑一条路径，打印中位数。用于**进程级交替**测量
 //! （同进程交替会被彼此的缓存足迹干扰，跨进程交替只受机器负载漂移影响，取多轮即可）。
 //!
-//! `cargo run --release --example matmul_ab -- <m> <k> <n> <stream|packed>`
+//! `cargo run --release --example matmul_ab -- <m> <k> <n> <stream|packed|cols|packed64|stream64|pool> [线程数]`
+//!
+//! `pool` 走 `parallel::matmul_f32`（常驻池按行块切分），用于核对多核口径——
+//! 例如 `matmul_ab 1024 1024 1024 pool 24`。
 
 use std::time::Instant;
 
@@ -21,7 +24,7 @@ fn main() {
             .wrapping_add(1442695040888963407);
         ((rng >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    let a = AlignedVec::<f32>::fill_with(m * k, |_| next());
+    let mut a = AlignedVec::<f32>::fill_with(m * k, |_| next());
     let b = AlignedVec::<f32>::fill_with(k * n, |_| next());
     let mut c = AlignedVec::<f32>::new(m * n);
     let flop = 2.0 * m as f64 * k as f64 * n as f64;
@@ -30,7 +33,12 @@ fn main() {
     let b64 = AlignedVec::<f64>::fill_with(k * n, |_| next() as f64);
     let mut c64 = AlignedVec::<f64>::new(m * n);
 
+    // 池只建一次（与真实调用一致），供 `pool` 路径复用
+    let threads: usize = arg.get(5).map(|s| s.parse().unwrap()).unwrap_or(12);
+    let mut pool = lasx_rs::pool::WorkerPool::new(threads);
+
     let mut run = || match path.as_str() {
+        "pool" => lasx_rs::parallel::matmul_f32(&mut pool, m, k, n, &mut a, &b, &mut c),
         "packed" => lasx_rs::ops_bench_packed(m, k, n, &a, &b, &mut c),
         "stream" => lasx_rs::lasx_matmul(
             m as i32,

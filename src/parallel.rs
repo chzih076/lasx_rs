@@ -18,6 +18,19 @@
 //! 数值一致性：这些函数只把**行/下标区间**分给不同线程，每个输出元素的计算过程与
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
+use crate::ops::matmul;
+
+/// 走"共享打包面板"分支的 `m` 下限。
+///
+/// 面板打包在并行层是**串行**做的（各线程只读共享面板），所以它带来一个 Amdahl 项：
+/// 打包只与 `k·n` 成正比，而计算与 `m·k·n` 成正比 ⇒ 打包占比 ≈ 常数/`m`。
+/// 实测（16 线程、`examples/matmul_ab ... pool 16`）：`m = 48/100/300` 时共享打包
+/// **反而慢 40–75%**（那时旧版按线程各拿 m/线程数 行，落到流式路径、没有打包开销），
+/// 而 `m ≥ 512` 时共享打包赢（512³ +19%、1024³ +76%…+240%）。交叉点取 512。
+///
+/// 注：更彻底的做法是**把面板打包也并行化**（池里按块长切分、各线程打自己那些条带），
+/// 那样这个阈值就不需要了 —— 记为下一步（`docs/dev.md` §12）。
+const SHARED_PACK_MIN_M: usize = 512;
 use crate::pool::WorkerPool;
 
 /// 多核 `C[m×n] = A[m×k] · B[k×n]`（行主序，`B` 只读共享）。
@@ -57,6 +70,45 @@ pub fn matmul_f32(
         c.fill(0.0); // 空内积：结果是全零矩阵（内核的 k 循环走 0 次，不会写 C）
         return;
     }
+    // ---- 打包分支：**打包一次、跨线程共享** ----
+    //
+    // 不这样做的话，每个线程各自走一遍 `lasx_matmul`，而它内部会**各自打包一整份 B**
+    // （1024³ 每份 4 MB）：24 线程 = 96 MB，远超 L3（32 MB），于是线程越多越慢
+    // （实测 6 线程 274 GF/s → 12 线程 175 → 24 线程 93）。这里改成：并行层按面板
+    // 打包一次，再把行块分给各线程，线程只读共享面板（面板本身留在共享 L3 里）。
+    let work = (m as u128) * (k as u128) * (n as u128);
+    if m >= SHARED_PACK_MIN_M && k >= matmul::PACK_MIN_K && n >= 32 && work >= matmul::PACK_MIN_WORK
+    {
+        let n32 = n / 32 * 32;
+        let strips_total = n32 / 32;
+        let nc_strips = matmul::pack_strips(k);
+        let mut packed = vec![0f32; k * nc_strips * 32];
+        let mut s0 = 0;
+        while s0 < strips_total {
+            let s1 = (s0 + nc_strips).min(strips_total);
+            let jb = s0 * 32;
+            let nc = (s1 - s0) * 32;
+            matmul::pack_b(k, n, jb, nc, b, &mut packed);
+            let panel = &packed[..k * nc];
+            pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+                let m4 = rows / 4 * 4;
+                matmul::matmul_f32_packed_rows(k, n, jb, nc, panel, ab, cb, m4);
+            });
+            s0 = s1;
+        }
+        // 列尾 [n32, n)：每个线程处理自己那些行（与顺序路径同一函数 ⇒ 逐位一致）
+        if n > n32 {
+            pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+                for i in 0..rows {
+                    let a_row = &ab[i * k..(i + 1) * k];
+                    let c_row = &mut cb[i * n..(i + 1) * n];
+                    matmul::row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+                }
+            });
+        }
+        return;
+    }
+
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
                 // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
     pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
@@ -179,7 +231,9 @@ mod tests {
     use super::*;
     use crate::aligned::AlignedVec;
 
-    /// 池化矩阵乘必须与单线程**逐位一致**，并覆盖行尾补齐（m 不是线程数整数倍）。
+    /// 池化矩阵乘必须与单线程**逐位一致**。形状要同时覆盖三条分支：
+    /// 小形状（走 `lasx_matmul` 的流式/列块路径）、`m < SHARED_PACK_MIN_M` 的回退、
+    /// 以及 `m ≥ 512` 的**共享打包面板**分支（含行尾 513 = 128·4+1 与列尾 130 = 4·32+2）。
     #[test]
     fn test_matmul_f32_matches_serial_bit_for_bit() {
         let mut pool = WorkerPool::new(7);
@@ -189,6 +243,9 @@ mod tests {
             (64, 64, 64),
             (129, 33, 17),
             (256, 96, 40),
+            (128, 256, 96),  // 回退分支（m < 512）
+            (512, 512, 64),  // 共享打包分支
+            (513, 448, 130), // 共享打包 + 行尾 + 列尾
         ] {
             let (mut a, b) = (
                 AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.25),
