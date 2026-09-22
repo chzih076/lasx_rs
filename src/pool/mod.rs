@@ -351,6 +351,13 @@ impl WorkerPool {
         }
         let (bases, widths) = row_block_ptrs(&mut arrays);
         let jobs = S::plan(rows, self.threads, row_gran);
+        // **快路径**：`Chunk`/`RowBlock` 的作业表就是"每 worker 一段连续行、块长一致"，
+        // 与 `dispatch_rows` 的分配完全相同 ⇒ 走原热路径（指针在派活时算好，worker 侧
+        // 没有作业表循环）。实测漏掉这一步会让 512³/16 线程掉 30%（见 dev.md §14.4）。
+        if !S::MULTI && !jobs.is_empty() {
+            self.dispatch_rows(bases, widths, rows, jobs[0].rows, f);
+            return;
+        }
         self.dispatch_jobs(bases, widths, jobs, false, f);
     }
 
