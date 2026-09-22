@@ -72,6 +72,12 @@ pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], 
     ops::matmul_f64::matmul_f64_packed(m, k, n, a, b, c);
 }
 
+/// 强制 f32 走"列块在外"次序（A/B 基准；`docs/perf-report.md` §23）。
+#[doc(hidden)]
+pub fn ops_bench_cols_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    ops::matmul::matmul_f32_cols_block(m, k, n, 0, n, a, b, c, ops::matmul::COL_BLOCK);
+}
+
 /// 强制 f64 走流式次序（A/B 基准）。
 #[doc(hidden)]
 pub fn ops_bench_stream_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {

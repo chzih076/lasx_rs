@@ -40,6 +40,7 @@ fn main() {
             b.as_ptr(),
             c.as_mut_ptr(),
         ),
+        "cols" => lasx_rs::ops_bench_cols_f32(m, k, n, &a, &b, &mut c),
         "packed64" => lasx_rs::ops_bench_packed_f64(m, k, n, &a64, &b64, &mut c64),
         "stream64" => lasx_rs::ops_bench_stream_f64(m, k, n, &a64, &b64, &mut c64),
         other => panic!("未知路径 {other}"),

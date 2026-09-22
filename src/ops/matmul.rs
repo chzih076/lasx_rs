@@ -38,8 +38,18 @@ const COL_ORDER_MIN_N: usize = 1024;
 /// 所以这个下限同时保护了并行路径——否则每个线程都会把整块 B 打包一遍。
 const PACK_MIN_M: usize = 32;
 
-/// 打包路径的 `k` 下限：k 太小时打包那一遍的开销摊不掉（k=128 的宽形状实测 0.74×）。
-const PACK_MIN_K: usize = 192;
+/// 打包路径的 `k` 下限。§23 重新测过：配合 k 分块，k=64 起打包就大胜"列块/流式"
+/// （`64×96×8192` 21 → 45 GFLOP/s、`256×64×4096` 23 → 58），所以从 192 降到 64。
+const PACK_MIN_K: usize = 64;
+
+/// 极宽 `n` 的例外：当 `k` 很小而 `n` 极大时，列块路径只复制一遍 B 面板、且面板只有
+/// `k×128×4`，比打包（要整体复制一遍 B = `k×n×4` 字节）更划算。实测 `100×64×19147`
+/// 列块 39.7 vs 打包 33.5 GFLOP/s；而 `n ≤ 16384` 时打包仍然领先（`64×96×8192`、
+/// `128×128×2048` 分别是 +80%、+71%）。所以只在这个交叉区间保留列块路径。
+const WIDE_N_FOR_COLS: usize = 16384;
+
+/// `k` 大于等于这个值时，打包**无条件**胜出（与 `n` 多大无关）：§19/§23 的交叉点。
+const K_ALWAYS_PACK: usize = 192;
 
 /// 打包路径的工作量下限（`m×k×n`，即乘加次数）：128³（4.2 MFLOP）打包 0.85×，
 /// 192³（14 MFLOP）起转为正收益。
@@ -67,13 +77,17 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
         return;
     }
     // 路径选择（三条都**逐位一致**，只是访存次序不同；数字见 perf-report §18/§19）：
-    //   1) 打包 B 面板：让微内核的 k 循环顺序读。交叉点实测在 work ≈ 8 MFLOP、k ≈ 192
-    //      ——128³ 是 0.85×，192³ 起 1.12×，384³ 1.74×，512³ 1.5×，1024³ 1.3×；
-    //      k=128 的宽形状只有 0.74×，所以有 k 下限。
+    //   1) 打包 B 面板：让微内核的 k 循环顺序读。交叉点实测 work ≈ 8 MFLOP；k 下限
+    //      在 §21 的 k 分块落地后从 192 降到 64（见 `PACK_MIN_K`），只有"小 k + 极宽 n"
+    //      例外仍走列块（见 `WIDE_N_FOR_COLS`）。
     //   2) 列块在外：k 小、m 小、n 大——打包摊不掉，但仍要让 B 只流一遍。
     //   3) 流式：其余（工作集本来就装得下缓存）。
+    // 极宽 n + 小 k 时列块路径更划算（只复制一遍 B 面板），见 `WIDE_N_FOR_COLS`
+    let cols_regime = m <= COL_ORDER_MAX_M && n >= COL_ORDER_MIN_N;
+    let wide_n_small_k = cols_regime && k < K_ALWAYS_PACK && n > WIDE_N_FOR_COLS;
     if m >= PACK_MIN_M
         && k >= PACK_MIN_K
+        && !wide_n_small_k
         && (m as u128) * (k as u128) * (n as u128) >= PACK_MIN_WORK
     {
         matmul_f32_packed(m, k, n, a, b, c);
