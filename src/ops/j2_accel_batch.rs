@@ -101,7 +101,7 @@ fn j2_accel_batch_lasx(
         let invrm = inv2 * rm;
         let inv3 = inv2 * invrm;
         let inv5 = inv3 * inv2;
-        let zr2 = (rz[j] * rz[j]) / rm2;
+        let zr2 = (rz[j] * rz[j]) * inv2;
         let k = j2k * inv5;
         let vcen = -mu * inv3;
         ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
@@ -179,7 +179,7 @@ fn j2_accel_batch_lsx(
         let invrm = inv2 * rm;
         let inv3 = inv2 * invrm;
         let inv5 = inv3 * inv2;
-        let zr2 = (rz[j] * rz[j]) / rm2;
+        let zr2 = (rz[j] * rz[j]) * inv2;
         let k = j2k * inv5;
         let vcen = -mu * inv3;
         ax[j] = f64::mul_add(k * rx[j], 5.0 * zr2 - 1.0, vcen * rx[j]);
@@ -246,6 +246,51 @@ mod tests {
         assert!(worst3 < bound, "1/|r|³ {worst3:e}");
         assert!(worst5 < bound, "1/|r|⁵ {worst5:e}");
         assert!(worst_zr2 < bound, "zr2 {worst_zr2:e}");
+    }
+
+    /// **逐元素内核的分块无关性**：同一个元素不管落在向量体里还是标量尾里，
+    /// 都必须给出逐位相同的结果（本轮把除法换成乘法推导时差点破坏这条）。
+    #[test]
+    fn vector_and_tail_bit_exact() {
+        const MU: f64 = 3.986004418e14;
+        const J2: f64 = 1.08262668e-3;
+        const RE: f64 = 6.378137e6;
+        for k in [1usize, 8, 64] {
+            let nv = 4 * k; // 向量体覆盖的元素数（LASX）
+            let (x, y, z) = states(nv + 3);
+            let (mut ax1, mut ay1, mut az1) = (vec![0.0; nv], vec![0.0; nv], vec![0.0; nv]);
+            let (mut ax2, mut ay2, mut az2) =
+                (vec![0.0; nv + 3], vec![0.0; nv + 3], vec![0.0; nv + 3]);
+            lasx_j2_accel_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                MU,
+                J2,
+                RE,
+                ax1.as_mut_ptr(),
+                ay1.as_mut_ptr(),
+                az1.as_mut_ptr(),
+                nv as i32,
+            );
+            lasx_j2_accel_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                MU,
+                J2,
+                RE,
+                ax2.as_mut_ptr(),
+                ay2.as_mut_ptr(),
+                az2.as_mut_ptr(),
+                (nv + 3) as i32,
+            );
+            for i in 0..nv {
+                assert_eq!(ax1[i].to_bits(), ax2[i].to_bits(), "ax @ {i} (k={k})");
+                assert_eq!(ay1[i].to_bits(), ay2[i].to_bits(), "ay @ {i} (k={k})");
+                assert_eq!(az1[i].to_bits(), az2[i].to_bits(), "az @ {i} (k={k})");
+            }
+        }
     }
 
     /// LASX 与 LSX 两条向量路径必须**逐位一致**（本轮把每阶段 3 次除法降成 1 次后仍成立，
