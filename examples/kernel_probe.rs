@@ -216,6 +216,39 @@ fn special_accuracy() -> Vec<(&'static str, f64)> {
     out
 }
 
+/// `dkernel2x32`：f64 的 2 行 × 32 列（16 个累加器 = 2×8 个 4 宽向量）。
+///
+/// 与 `dkernel`（4 行 × 16 列）同为 16 个累加器，但每 k 步的 A 广播从 4 次降到 2 次、
+/// B 载入从 4 条升到 8 条。按"每行每 k 步 2 周期"的模型，FMA/周期 = C/8 ⇒ 16 列是 2.0、
+/// 32 列理论 4.0（受 FP 峰值 3.97 与 B 载入吞吐约束）。这个探针就是来验这条的。
+#[inline(never)]
+unsafe fn probe_dkernel2x32(strip: &[f64], at: &[f64], k: usize) -> f64 {
+    let mut r0 = [zero_f64x4(); 8];
+    let mut r1 = [zero_f64x4(); 8];
+    for _ in 0..ITERS {
+        for p in 0..k {
+            let ptr = strip.as_ptr().add(p * 32);
+            let mut b = [zero_f64x4(); 8];
+            for (i, bi) in b.iter_mut().enumerate() {
+                *bi = load_f64x4(ptr.add(i * 4));
+            }
+            let a0 = splat_f64(*at.get_unchecked(p));
+            let a1 = splat_f64(*at.get_unchecked(k + p));
+            for i in 0..8 {
+                r0[i] = lasx_xvfmadd_d(b[i], a0, r0[i]);
+                r1[i] = lasx_xvfmadd_d(b[i], a1, r1[i]);
+            }
+        }
+    }
+    let mut tmp = [0f64; 4];
+    let mut sink = 0f64;
+    for v in r0.iter().chain(r1.iter()) {
+        store_f64x4(tmp.as_mut_ptr(), *v);
+        sink += tmp.iter().sum::<f64>();
+    }
+    black_box(sink)
+}
+
 /// `fma16`：16 条独立 FMA，无任何访存 —— 量 f32 侧 FP 流水线峰值。
 ///
 /// 注意：累加器必须写成 **16 个独立变量**。写成 `[m256; 16]` + `iter_mut()` 时 LLVM 能把
@@ -382,6 +415,7 @@ fn main() {
     let strip = AlignedVec::<f32>::fill_with(k * 32, |i| (i % 13) as f32 * 0.25);
     let at = AlignedVec::<f32>::fill_with(4 * k, |i| (i % 7) as f32 * 0.125);
     let strip_d = AlignedVec::<f64>::fill_with(k * 16, |i| (i % 13) as f64 * 0.25);
+    let strip_d2 = AlignedVec::<f64>::fill_with(k * 32, |i| (i % 13) as f64 * 0.25);
     let at_d = AlignedVec::<f64>::fill_with(4 * k, |i| (i % 7) as f64 * 0.125);
 
     if variant == "acc" {
@@ -408,6 +442,7 @@ fn main() {
                 "dfdiv" | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i"
                 | "dfsqrt_i" | "drecipe_i" | "drsqrte_i" | "dfma_i" => probe_special(&variant),
                 "dkernel" => probe_dkernel(&strip_d, &at_d, k),
+                "dkernel2x32" => probe_dkernel2x32(&strip_d2, &at_d, k),
                 "c2x48" => probe_rc::<2, 6>(&strip, &at, k),
                 "c2x64" => probe_rc::<2, 8>(&strip, &at, k),
                 "c3x40" => probe_rc::<3, 5>(&strip, &at, k),
@@ -422,9 +457,9 @@ fn main() {
     };
 
     let per_iter = match variant.as_str() {
-        "fma16" | "norepl" | "kernel" | "dfma16" | "dkernel" | "dfdiv" | "dfsqrt" | "drecipe"
-        | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i" | "dfsqrt_i" | "drecipe_i" | "drsqrte_i"
-        | "dfma_i" => 16.0,
+        "fma16" | "norepl" | "kernel" | "dfma16" | "dkernel" | "dkernel2x32" | "dfdiv"
+        | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i" | "dfsqrt_i"
+        | "drecipe_i" | "drsqrte_i" | "dfma_i" => 16.0,
         other => {
             let (rs, cs) = other
                 .trim_start_matches('c')
