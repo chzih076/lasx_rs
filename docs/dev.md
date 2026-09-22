@@ -328,15 +328,27 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 | `lasx_j2_accel_batch` f64 | 1048576 | 9.09 ms | 8.71 ms | 0.96× | 115.4 M sample/s |
 | `lasx_ballistic_step` f32 | 1048576 | 2.58 ms | 3.05 ms | 1.18× | 405.9 M shot/s |
 | `lasx_rk4_j2_step_batch` f64 | 262144 | 7.04 ms | 7.16 ms | 1.02× | 37.2 M sample/s |
-| `lasx_cross3_batch` f64 | 4096 / 262144 | 6.3 µs / 821 µs | 40.6 µs / 3.28 ms | 6.42× / 3.99× | 2.87–5.83 G flop/s |
-| `lasx_unitize3_batch` f64 | 4096 / 262144 | 20.1 µs / 1.29 ms | 60.0 µs / 4.02 ms | 2.99× / 3.11× | 2.23–2.24 G flop/s |
-| `lasx_quat_rotate_batch` f64 | 4096 / 262144 | 52.6 µs / 4.10 ms | 162.7 µs / 11.23 ms | 3.10× / 2.74× | 2.56–3.12 G flop/s |
+
+姿态/几何 7 个内核（`cargo run -p lasx_bench --release -- attitude`，两个规模）：
+
+| 内核 | n=4096 | 标量 | 比 | n=262144 | 标量 | 比 |
+|---|---|---|---|---|---|---|
+| `lasx_cross3_batch` | 6.3 µs | 40.6 µs | **6.42×** | 835.3 µs | 3.24 ms | **3.88×** |
+| `lasx_mat3_mul_vec3_batch` | 13.5 µs | 110.4 µs | **8.17×** | 2.78 ms | 9.42 ms | **3.39×** |
+| `lasx_quat_mul_batch` | 14.2 µs | 61.2 µs | **4.32×** | 1.87 ms | 5.32 ms | **2.85×** |
+| `lasx_unitize3_batch` | 20.1 µs | 59.9 µs | 2.98× | 1.29 ms | 4.00 ms | 3.09× |
+| `lasx_quat_normalize_batch` | 26.7 µs | 85.2 µs | 3.19× | 1.72 ms | 5.89 ms | 3.42× |
+| `lasx_quat_to_dcm_batch` | 41.6 µs | 133.2 µs | 3.21× | 4.07 ms | 9.39 ms | 2.31× |
+| `lasx_quat_rotate_batch` | 52.4 µs | 162.9 µs | 3.11× | 4.06 ms | 11.15 ms | 2.75× |
+
+（这组算子的"单元素算力/字节比"很低——叉积 9 flop 读 48 B 写 24 B——所以规模一大就趋近内存带宽，
+缓存驻留时才是 SIMD 的主场：同一内核 4096 档普遍比 262144 档高 1.4–2.4×。2026-09-22 之前 CLI 只样板了
+其中 3 个，现已补全 7 个。）
 
 - `norm3`/`vec3_add_scaled`/`distance2d`/`j2` 的"标量列"是 1.00×：这些内核的标量参考在 `+lasx` 下
   被 LLVM 完整向量化，所以**这四行的"标量"其实是另一份向量实现**；它们的收益要看大集占比（§7.2）。
-- 姿态批处理（`cross3`/`unitize3`/`quat_rotate` 及另外 4 个未进 CLI 套件的 `mat3_mul_vec3`/`quat_normalize`/
-  `quat_mul`/`quat_to_dcm`）在"标量真的没被向量化"的口径下是 **2.7–6.4×**（见 §10 的历史记录）。
-  CLI 的 `attitude` 套件目前只样板了 3 个；补全 4 个是已知缺口（§12）。
+- 姿态批处理 7 个内核在"标量真的没被向量化"的口径下是 **2.31–8.17×**（上表；LLVM 不会替这些
+  算子生成 LASX，所以这里的标量列是可信对照）。
 
 ### 7.5 对齐与分派开销
 
@@ -615,7 +627,6 @@ cargo build --release --example <工具> && cp target/release/examples/<工具> 
 
 | 缺口 | 现状 | 下一步 |
 |---|---|---|
-| `attitude` 套件只覆盖 3/7 个姿态内核 | `mat3_mul_vec3`/`quat_normalize`/`quat_mul`/`quat_to_dcm` 有实现、有测试，但没进 CLI 基准 | 补上标量参考与 4 行基准 |
 | f64 大矩阵 | CLI `matmul` 只到 512³；1024³ 只有历史读数 | 扩规模，并核对是否仍落后 OpenBLAS 1.1× |
 | 多核大矩阵乘 | 512³ 12 线程 257.7 vs OpenBLAS 305.8–337.3 GFLOP/s | 减少 B 的重复读（B 打包后跨线程共享？或按列块并行） |
 | `f64` 内核离天花板还有 20% | 512³ 27.6 / 35.1 = 79%（f32 是 85%） | 2 行 × 32 列（16 个累加器）或 A 打包 + lane 广播；注意 128³ 由 `work` 阈值保护 |
