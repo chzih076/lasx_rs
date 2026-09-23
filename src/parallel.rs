@@ -19,6 +19,7 @@
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
 use crate::ops::matmul;
+use crate::ops::matmul_f64 as matmul64;
 use crate::pool::sched::Pick;
 
 /// 走"共享打包面板"分支的 `m` 下限。
@@ -213,10 +214,106 @@ pub fn matmul_f64(
     if m == 0 || n == 0 {
         return;
     }
+    let pick = crate::pool::pick_rows(m, pool.threads(), 4);
     if k == 0 {
         c.fill(0.0);
         return;
     }
+    // ---- 打包分支：与 f32 侧同源（打包一次、跨线程共享 + 双缓冲流水）----
+    //
+    // 不做这一步的话，每个线程各自走 `lasx_matmul_f64`，而它会各自打包一整份 B
+    // （f64 的 B 字节数是 f32 的两倍：1024³ 每份 8 MB），24 线程 = 192 MB ≫ L3（32 MB），
+    // 实测线程越多越慢：6 线程 110 GF/s → 12 线程 77 → 16 线程 62 → 24 线程 46。
+    let work = (m as u128) * (k as u128) * (n as u128);
+    if m >= matmul64::PACK_MIN_M
+        && k >= matmul64::PACK_MIN_K
+        && n >= 16
+        && work >= matmul64::PACK_MIN_WORK
+    {
+        let n16 = n / 16 * 16;
+        let strips_total = n16 / 16;
+        let nc_strips = matmul64::pack_strips(k);
+        let panels: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut s0 = 0;
+            while s0 < strips_total {
+                let s1 = (s0 + nc_strips).min(strips_total);
+                v.push((s0 * 16, (s1 - s0) * 16));
+                s0 = s1;
+            }
+            v
+        };
+        let cap = k * nc_strips * 16;
+        let mut buf_a = vec![0f64; cap];
+        let mut buf_b = vec![0f64; cap];
+        matmul64::pack_b_f64(k, n, panels[0].0, panels[0].1, b, &mut buf_a);
+        for (i, &(jb, nc)) in panels.iter().enumerate() {
+            let next = panels.get(i + 1).copied();
+            if i % 2 == 0 {
+                pool.for_each_row_block_mut_picked_deferred(
+                    m,
+                    4,
+                    [(a, k), (c, n)],
+                    pick,
+                    |rows, [ab, cb]| {
+                        let m4 = rows / 4 * 4;
+                        matmul64::matmul_f64_packed_rows(
+                            k,
+                            n,
+                            jb,
+                            nc,
+                            &buf_a[..k * nc],
+                            ab,
+                            cb,
+                            m4,
+                        );
+                    },
+                    || {
+                        if let Some((njb, nnc)) = next {
+                            matmul64::pack_b_f64(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
+                        }
+                    },
+                );
+            } else {
+                pool.for_each_row_block_mut_picked_deferred(
+                    m,
+                    4,
+                    [(a, k), (c, n)],
+                    pick,
+                    |rows, [ab, cb]| {
+                        let m4 = rows / 4 * 4;
+                        matmul64::matmul_f64_packed_rows(
+                            k,
+                            n,
+                            jb,
+                            nc,
+                            &buf_b[..k * nc],
+                            ab,
+                            cb,
+                            m4,
+                        );
+                    },
+                    || {
+                        if let Some((njb, nnc)) = next {
+                            matmul64::pack_b_f64(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
+                        }
+                    },
+                );
+            }
+        }
+        // 列尾 [n16, n)：与顺序路径同一函数 ⇒ 逐位一致
+        if n > n16 {
+            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
+                for i in 0..rows {
+                    let a_row = &ab[i * k..(i + 1) * k];
+                    let c_row = &mut cb[i * n..(i + 1) * n];
+                    matmul64::row_tail_f64(a_row, c_row, b, k, n, n16);
+                }
+            });
+        }
+        return;
+    }
+
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
                 // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
     pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
@@ -337,35 +434,51 @@ mod tests {
         }
     }
 
-    /// f64 版同上。
+    /// f64 版同上，形状覆盖三条分支：小形状（流式）、共享打包 + 单面板、
+    /// 以及**共享打包 + 多面板 + 双缓冲流水**（`(512, 512, 2048)`：16 列一条带 ⇒ 128 条带
+    /// ⇒ 8 个面板）与行尾/列尾。
     #[test]
     fn test_matmul_f64_matches_serial_bit_for_bit() {
         let mut pool = WorkerPool::new(5);
-        let (m, k, n) = (100usize, 48usize, 37usize);
-        let (mut a, b) = (
-            AlignedVec::<f64>::fill_with(m * k, |i| ((i % 29) as f64 - 14.0) * 0.125),
-            AlignedVec::<f64>::fill_with(k * n, |i| ((i % 31) as f64 - 15.0) * 0.0625),
-        );
-        let mut want = AlignedVec::<f64>::new(m * n);
-        let mut got = AlignedVec::<f64>::new(m * n);
-        crate::lasx_matmul_f64(
-            m as i32,
-            k as i32,
-            n as i32,
-            a.as_ptr(),
-            b.as_ptr(),
-            want.as_mut_ptr(),
-        );
-        matmul_f64(
-            &mut pool,
-            m,
-            k,
-            n,
-            a.as_mut_slice(),
-            b.as_slice(),
-            got.as_mut_slice(),
-        );
-        assert_eq!(want.as_slice(), got.as_slice(), "f64 矩阵乘与单线程不一致");
+        for &(m, k, n) in &[
+            (100usize, 48usize, 37usize),
+            (128, 256, 96),
+            (512, 512, 64),   // 共享打包、单面板
+            (512, 512, 2048), // 共享打包、多面板（流水）
+            (513, 448, 130),  // 行尾 + 列尾
+        ] {
+            let (mut a, b) = (
+                AlignedVec::<f64>::fill_with(m * k, |i| ((i % 29) as f64 - 14.0) * 0.125),
+                AlignedVec::<f64>::fill_with(k * n, |i| ((i % 31) as f64 - 15.0) * 0.0625),
+            );
+            let mut want = AlignedVec::<f64>::new(m * n);
+            let mut got = AlignedVec::<f64>::new(m * n);
+            crate::lasx_matmul_f64(
+                m as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                b.as_ptr(),
+                want.as_mut_ptr(),
+            );
+            matmul_f64(
+                &mut pool,
+                m,
+                k,
+                n,
+                a.as_mut_slice(),
+                b.as_slice(),
+                got.as_mut_slice(),
+            );
+            for i in 0..m * n {
+                // 逐位比较：f64 的 == 会把 -0.0/0.0 视为相等，也会漏掉 NaN 的位型差异
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "f64 池化 {m}×{k}×{n} @ {i}"
+                );
+            }
+        }
     }
 
     /// 池化 RK4 步必须与单线程逐位一致（切块边界不得影响结果）。

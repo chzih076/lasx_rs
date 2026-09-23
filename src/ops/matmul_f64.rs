@@ -24,18 +24,24 @@ use crate::arch::lasx;
 use std::arch::loongarch64::*;
 
 /// 打包路径的 `m` 下限：打包要走两遍 B（读+写），只有行块足够多时才摊得掉。
-const PACK_MIN_M: usize = 32;
+pub(crate) const PACK_MIN_M: usize = 32;
 /// 打包路径的 `k` 下限。f64 侧**没有**列块路径可退，所以配合 k 分块后下限可以比 f32
 /// 更激进地取 64（§23 实测：`256×64×4096` 11.2 → 28.6、`128×128×2048` 11.1 → 27.7
 /// GFLOP/s）；小的方阵由 `PACK_MIN_WORK` 挡住（128³ 只有 2.1 M < 8 M，仍走流式）。
-const PACK_MIN_K: usize = 64;
+pub(crate) const PACK_MIN_K: usize = 64;
 /// 打包路径的工作量下限（`m×k×n` 乘加次数）。
-const PACK_MIN_WORK: u128 = 8_000_000;
+pub(crate) const PACK_MIN_WORK: u128 = 8_000_000;
 
 /// k 分块的 L1 预算与块长：条带是 `k×16×8` 字节，超过 `L1_BUDGET` 就分块。
 /// 数值来自 f32 侧的实测（条带 24–48 KB 最优、等于 L1 时开始掉），f64 条带同口径。
-const L1_BUDGET: usize = 48 * 1024;
-const K_CHUNK: usize = 256;
+pub(crate) const L1_BUDGET: usize = 48 * 1024;
+pub(crate) const K_CHUNK: usize = 256;
+
+/// 一次打包的条带数：面板 `k×nc×8` 要留在 L2（3 MiB/核）里，预算取 2 MiB。
+pub(crate) fn pack_strips(k: usize) -> usize {
+    let per_strip = (k * 16 * 8).max(1);
+    (2 * 1024 * 1024 / per_strip).clamp(1, 256)
+}
 
 thread_local! {
     /// 打包缓冲：按 `(条带, k)` 主序存放，条带内是 16 列一段。
@@ -182,7 +188,14 @@ fn cols16_f64(a_row: &[f64], c_row: &mut [f64], b: &[f64], n: usize) {
 
 /// 单行的列尾：`[j0, n)`，先 4 列块再标量。
 #[inline]
-fn row_tail_f64(a_row: &[f64], c_row: &mut [f64], b: &[f64], k: usize, n: usize, j0: usize) {
+pub(crate) fn row_tail_f64(
+    a_row: &[f64],
+    c_row: &mut [f64],
+    b: &[f64],
+    k: usize,
+    n: usize,
+    j0: usize,
+) {
     let mut j = j0;
     while j + 4 <= n {
         let mut acc = lasx::zero_f64x4();
@@ -208,11 +221,7 @@ pub(crate) fn matmul_f64_packed(m: usize, k: usize, n: usize, a: &[f64], b: &[f6
     let m4 = m / 4 * 4;
     let n16 = n / 16 * 16;
     let strips_total = n16 / 16;
-    // 一次打包的列数：面板 `k×nc×8` 留在 L2（3 MiB/核）里，预算取 2 MiB
-    let nc_strips = {
-        let per_strip = (k * 16 * 8).max(1);
-        (2 * 1024 * 1024 / per_strip).clamp(1, 256)
-    };
+    let nc_strips = pack_strips(k);
 
     PACK_BUF.with(|buf| {
         let mut packed = buf.borrow_mut();
@@ -223,47 +232,8 @@ pub(crate) fn matmul_f64_packed(m: usize, k: usize, n: usize, a: &[f64], b: &[f6
             let jb = s0 * 16;
             let nc = (s1 - s0) * 16;
             pack_b_f64(k, n, jb, nc, b, &mut packed);
-            // k 块在外、行块在内：每个 k 块的条带被所有行块反复命中，留在 L1
-            let kb_size = if k * 16 * 8 <= L1_BUDGET { k } else { K_CHUNK };
-            let mut kb0 = 0;
-            while kb0 < k {
-                let kb = kb_size.min(k - kb0);
-                let first = kb0 == 0;
-                for s in s0..s1 {
-                    let base = (s - s0) * k * 16 + kb0 * 16;
-                    let strip = &packed[base..base + kb * 16];
-                    let j = s * 16;
-                    let mut i = 0;
-                    while i < m4 {
-                        let ct = &mut c[i * n..(i + 4) * n];
-                        tile4x16_chunk(
-                            kb,
-                            first,
-                            strip,
-                            &a[i * k + kb0..i * k + kb0 + kb],
-                            &a[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
-                            &a[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
-                            &a[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
-                            ct,
-                            n,
-                            j,
-                        );
-                        i += 4;
-                    }
-                    while i < m {
-                        let c_row = &mut c[i * n..(i + 1) * n];
-                        row_tail_packed_f64(
-                            &a[i * k + kb0..i * k + kb0 + kb],
-                            strip,
-                            c_row,
-                            first,
-                            j,
-                        );
-                        i += 1;
-                    }
-                }
-                kb0 += kb;
-            }
+            // 面板打包好后交给公共入口（并行层复用同一个入口 ⇒ 打包只做一次、跨线程共享）
+            matmul_f64_packed_rows(k, n, jb, nc, &packed, a, c, m4);
             s0 = s1;
         }
     });
@@ -277,9 +247,70 @@ pub(crate) fn matmul_f64_packed(m: usize, k: usize, n: usize, a: &[f64], b: &[f6
     }
 }
 
+/// 用**已打包**的列面板计算 `a_rows`/`c_rows` 对应的那些行（并行层复用的入口）。
+///
+/// `packed` 是 [`pack_b_f64`] 的产物（`k × nc`，16 列条带主序）；`a_rows.len()/k` 是本块行数。
+/// 每行的列尾 `[n16, n)` 由调用方用 [`row_tail_f64`] 补。顺序版的 [`matmul_f64_packed`]
+/// 走的是同一个函数，所以并行与单线程**逐位一致**。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f64_packed_rows(
+    k: usize,
+    n: usize,
+    jb: usize,
+    nc: usize,
+    packed: &[f64],
+    a_rows: &[f64],
+    c_rows: &mut [f64],
+    m4: usize,
+) {
+    let m = a_rows.len().checked_div(k).unwrap_or(0);
+    let strips = nc / 16;
+    // k 块在外、行块在内：每个 k 块的条带被所有行块反复命中，留在 L1
+    let kb_size = if k * 16 * 8 <= L1_BUDGET { k } else { K_CHUNK };
+    let mut kb0 = 0;
+    while kb0 < k {
+        let kb = kb_size.min(k - kb0);
+        let first = kb0 == 0;
+        for s in 0..strips {
+            let base = s * k * 16 + kb0 * 16;
+            let strip = &packed[base..base + kb * 16];
+            let j = jb + s * 16;
+            let mut i = 0;
+            while i < m4 {
+                let ct = &mut c_rows[i * n..(i + 4) * n];
+                tile4x16_chunk(
+                    kb,
+                    first,
+                    strip,
+                    &a_rows[i * k + kb0..i * k + kb0 + kb],
+                    &a_rows[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
+                    &a_rows[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
+                    &a_rows[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
+                    ct,
+                    n,
+                    j,
+                );
+                i += 4;
+            }
+            while i < m {
+                let c_row = &mut c_rows[i * n..(i + 1) * n];
+                row_tail_packed_f64(
+                    &a_rows[i * k + kb0..i * k + kb0 + kb],
+                    strip,
+                    c_row,
+                    first,
+                    j,
+                );
+                i += 1;
+            }
+        }
+        kb0 += kb;
+    }
+}
+
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*16 + r]`（16 列一条带）。
 #[inline]
-fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
+pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
     let strips = nc / 16;
     for p in 0..k {
         let row = &b[p * n + jb..p * n + jb + nc];

@@ -29,7 +29,7 @@ fn main() {
     let mut c = AlignedVec::<f32>::new(m * n);
     let flop = 2.0 * m as f64 * k as f64 * n as f64;
     // f64 侧（`packed64` / `stream64`）另开一份缓冲
-    let a64 = AlignedVec::<f64>::fill_with(m * k, |_| next() as f64);
+    let mut a64 = AlignedVec::<f64>::fill_with(m * k, |_| next() as f64);
     let b64 = AlignedVec::<f64>::fill_with(k * n, |_| next() as f64);
     let mut c64 = AlignedVec::<f64>::new(m * n);
 
@@ -65,6 +65,10 @@ fn main() {
             c.as_mut_ptr(),
         ),
         "cols" => lasx_rs::ops_bench_cols_f32(m, k, n, &a, &b, &mut c),
+        "pool64" => {
+            let mut p = lasx_rs::pool::WorkerPool::new(threads);
+            lasx_rs::parallel::matmul_f64(&mut p, m, k, n, &mut a64, &b64, &mut c64)
+        }
         "packed64" => lasx_rs::ops_bench_packed_f64(m, k, n, &a64, &b64, &mut c64),
         "stream64" => lasx_rs::ops_bench_stream_f64(m, k, n, &a64, &b64, &mut c64),
         other => panic!("未知路径 {other}"),
