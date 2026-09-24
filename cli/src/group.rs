@@ -25,6 +25,8 @@ pub enum Group {
     RmsNorm,
     /// 逐元素激活：SiLU / GELU-quick（NN 侧 N1）。
     Activation,
+    /// 旋转位置编码（NN 侧 N1）。
+    Rope,
     /// 批量 3 分量模长。
     Attitude,
     Large,
@@ -65,6 +67,7 @@ impl Group {
         Group::Softmax,
         Group::RmsNorm,
         Group::Activation,
+        Group::Rope,
         Group::Attitude,
         Group::Large,
         Group::Norm3,
@@ -94,6 +97,7 @@ impl Group {
             Group::Softmax => "softmax",
             Group::RmsNorm => "rms",
             Group::Activation => "act",
+            Group::Rope => "rope",
             Group::Attitude => "attitude",
             Group::Large => "large",
             Group::Norm3 => "norm3",

@@ -171,6 +171,65 @@ pub extern "C" fn lasx_gelu_erf(x: *const f32, out: *mut f32, n: i32) {
     }
 }
 
+/// 旋转位置编码（RoPE）：每行前 `n_dims` 列旋转、其余原样复制。
+///
+/// C 签名：`void lasx_rope(const float *x, const float *cos, const float *sin, float *out,
+///                        int n_rows, int n_cols, int n_dims, int mode)`
+///
+/// `mode`：`0` = NeoX（配对 `(i, i + n_dims/2)`，HF `rotate_half`）、`1` = GptJ（配对
+/// `(2i, 2i+1)`）；其它值就地返回。`cos`/`sin` 各 `n_rows × (n_dims/2)`（行主序），
+/// **与 mode 无关**（同一张表两种配对都能用）。允许 `out == x`（就地）。
+///
+/// # Safety（C 侧）
+/// `x`/`out` 各至少 `n_rows × n_cols` 个元素，`cos`/`sin` 各至少 `n_rows × (n_dims/2)` 个，
+/// `n_dims` 为偶数且 `≤ n_cols`。这几条**只靠约定**（原始符号零校验）：违反会读写越界。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_rope(
+    x: *const f32,
+    cos: *const f32,
+    sin: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    n_dims: i32,
+    mode: i32,
+) {
+    let Some((rows, cols, n_dims, m)) = rope_shape(n_rows, n_cols, n_dims, mode) else {
+        return; // 原始符号零校验：形状/mode 不合法就地返回（误用即 UB 是历史约定）
+    };
+    let n = rows * cols;
+    let tables = rows * (n_dims / 2);
+    // SAFETY: FFI 约定——见函数文档的 # Safety。
+    unsafe {
+        let x = std::slice::from_raw_parts(x, n);
+        let out = std::slice::from_raw_parts_mut(out, n);
+        let cos = std::slice::from_raw_parts(cos, tables);
+        let sin = std::slice::from_raw_parts(sin, tables);
+        crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, m, out);
+    }
+}
+
+/// RoPE 的形状/mode 解算：`(rows, cols, n_dims, mode)`；不合法返回 `None`。
+///
+/// `n_dims == 0` 是**合法**的（整块复制、等于不旋转）；`rows × cols` 溢出也返回 `None`。
+fn rope_shape(
+    n_rows: i32,
+    n_cols: i32,
+    n_dims: i32,
+    mode: i32,
+) -> Option<(usize, usize, usize, crate::ops::rope::RopeMode)> {
+    if n_rows < 0 || n_cols < 0 || n_dims < 0 {
+        return None;
+    }
+    let (rows, cols, n_dims) = (n_rows as usize, n_cols as usize, n_dims as usize);
+    if n_dims % 2 != 0 || n_dims > cols {
+        return None;
+    }
+    let m = crate::ops::rope::RopeMode::from_i32(mode)?;
+    rows.checked_mul(cols)?;
+    Some((rows, cols, n_dims, m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +249,115 @@ mod tests {
         // cols = 0：什么都不写、不崩
         let mut empty: Vec<f32> = Vec::new();
         lasx_softmax_rows(x.as_ptr(), std::ptr::null(), empty.as_mut_ptr(), 3, 0, 1.0);
+    }
+
+    /// RoPE 的 FFI 自检：**就地 == 异地**（这里才测得到真正的别名：同一个指针既当输入又当
+    /// 输出，正是 C 调用方的用法）、两种 mode 的旋转与 f64 参考一致、形状不合法就地返回。
+    #[test]
+    fn test_rope_ffi() {
+        let (rows, cols, n_dims) = (3usize, 16usize, 16usize);
+        let positions: Vec<f32> = (0..rows).map(|r| r as f32).collect();
+        let (cos, sin) = crate::ops::rope::rope_tables(&positions, n_dims, 10_000.0);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|k| (k as f32).mul_add(0.13, -2.0))
+            .collect();
+        for mode in [0i32, 1] {
+            let mut away = vec![0f32; x.len()];
+            lasx_rope(
+                x.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                away.as_mut_ptr(),
+                rows as i32,
+                cols as i32,
+                n_dims as i32,
+                mode,
+            );
+            // 就地：同一个缓冲当输入与输出
+            let mut inplace = x.clone();
+            lasx_rope(
+                inplace.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                inplace.as_mut_ptr(),
+                rows as i32,
+                cols as i32,
+                n_dims as i32,
+                mode,
+            );
+            for k in 0..x.len() {
+                assert_eq!(
+                    inplace[k].to_bits(),
+                    away[k].to_bits(),
+                    "mode={mode} 就地 k={k}"
+                );
+            }
+            // 与 f64 参考比（旋转是正交变换，绝对误差应在 |x|·几 ulp 量级）
+            let half = n_dims / 2;
+            for r in 0..rows {
+                for i in 0..half {
+                    let (i0, i1) = if mode == 0 {
+                        (r * cols + i, r * cols + i + half)
+                    } else {
+                        (r * cols + 2 * i, r * cols + 2 * i + 1)
+                    };
+                    let (x0, x1) = (x[i0] as f64, x[i1] as f64);
+                    let (c, s) = (cos[r * half + i] as f64, sin[r * half + i] as f64);
+                    assert!(
+                        (away[i0] as f64 - (x0 * c - x1 * s)).abs() < 1e-6,
+                        "mode={mode} y0"
+                    );
+                    assert!(
+                        (away[i1] as f64 - (x0 * s + x1 * c)).abs() < 1e-6,
+                        "mode={mode} y1"
+                    );
+                }
+            }
+        }
+        // 不合法的形状 / mode：就地返回，不写输出
+        let mut out = vec![7f32; x.len()];
+        let before = out.clone();
+        for (rows_i, cols_i, dims_i, mode_i) in [
+            (3, 16, 7, 0),  // n_dims 奇数
+            (3, 16, 32, 0), // n_dims > cols
+            (-1, 16, 16, 0),
+            (3, 16, 16, 9), // mode 非法
+        ] {
+            lasx_rope(
+                x.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                out.as_mut_ptr(),
+                rows_i,
+                cols_i,
+                dims_i,
+                mode_i,
+            );
+            assert_eq!(
+                out, before,
+                "非法参数 ({rows_i},{cols_i},{dims_i},{mode_i}) 不该写输出"
+            );
+        }
+    }
+
+    /// `n_dims = 0`：整块复制（逐位）。
+    #[test]
+    fn test_rope_ffi_zero_dims_copies() {
+        let x: Vec<f32> = (0..12).map(|k| k as f32).collect();
+        let mut out = vec![0f32; x.len()];
+        lasx_rope(
+            x.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            out.as_mut_ptr(),
+            3,
+            4,
+            0,
+            0,
+        );
+        for k in 0..x.len() {
+            assert_eq!(out[k].to_bits(), x[k].to_bits(), "k={k}");
+        }
     }
 
     /// `silu`/`gelu_quick` 的 FFI 自检：就地 == 异地、对照 f64 参考、`n = 0` 不崩。

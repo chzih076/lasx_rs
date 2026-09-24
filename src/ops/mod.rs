@@ -40,6 +40,7 @@ pub mod quat_rotate_batch;
 pub mod quat_to_dcm_batch;
 pub mod rk4_j2_step_batch;
 pub mod rms_norm;
+pub mod rope;
 pub mod silu;
 pub mod softmax_rows;
 pub mod sum;

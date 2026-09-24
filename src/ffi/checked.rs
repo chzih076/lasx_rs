@@ -842,6 +842,54 @@ pub extern "C" fn lasx_gelu_erf_checked(x: *const f32, out: *mut f32, n: i32, st
     }
 }
 
+/// 带错误通道的 RoPE。C 签名：
+/// `void lasx_rope_checked(const float*, const float*, const float*, float*, int, int, int, int, int*)`
+///
+/// 校验顺序（与 `api::rope` 一致）：维度非负 → `n_dims` 偶数且 `≤ n_cols` → `mode` 合法
+/// （否则 `BadShape`）→ 乘积不溢出 → 三个输入与输出都非空指针。
+/// `n_dims = 0` 合法（整块复制）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_rope_checked(
+    x: *const f32,
+    cos: *const f32,
+    sin: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    n_dims: i32,
+    mode: i32,
+    status: *mut i32,
+) {
+    if n_rows < 0 || n_cols < 0 || n_dims < 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, cols, n_dims) = (n_rows as usize, n_cols as usize, n_dims as usize);
+    let Some(m) = crate::ops::rope::RopeMode::from_i32(mode) else {
+        LasxStatus::BadShape.write(status);
+        return;
+    };
+    if n_dims % 2 != 0 || n_dims > cols {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    let tables = or_fail!(checked_mul(rows, n_dims / 2), status, ());
+    // SAFETY: 调用方声明三输入各至少 `n`/`tables` 个元素、输出可写 `n` 个。
+    unsafe {
+        let (x, out) = (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        );
+        let (cos, sin) = (
+            or_fail!(checked_slice(cos, tables), status, ()),
+            or_fail!(checked_slice(sin, tables), status, ()),
+        );
+        LasxStatus::Ok.write(status);
+        crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, m, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +921,90 @@ mod tests {
         let d = lasx_dot_checked(a.as_ptr(), a.as_ptr(), -1, &mut st);
         assert_eq!(st, LasxStatus::NegativeLength as i32);
         assert_eq!(d, 0.0);
+    }
+
+    /// RoPE 的 `_checked`：形状/mode 非法报 `BadShape`、空指针报 `NullPointer`、成功写 `Ok`。
+    #[test]
+    fn test_rope_checked_paths() {
+        let (rows, cols, n_dims) = (2usize, 8usize, 8usize);
+        let x = vec![1.0f32; rows * cols];
+        let cos = vec![1.0f32; rows * n_dims / 2];
+        let sin = vec![0.0f32; rows * n_dims / 2];
+        let mut out = vec![0f32; rows * cols];
+        let mut st = 999;
+        lasx_rope_checked(
+            x.as_ptr(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            out.as_mut_ptr(),
+            rows as i32,
+            cols as i32,
+            n_dims as i32,
+            0,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
+        assert_eq!(out[0].to_bits(), 1.0f32.to_bits(), "c=1,s=0 应恒等");
+
+        // 形状/mode 非法 → BadShape
+        for (r, c, d, m) in [(2, 8, 7, 0), (2, 8, 16, 0), (-1, 8, 8, 0), (2, 8, 8, 5)] {
+            let mut st = 999;
+            lasx_rope_checked(
+                x.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                out.as_mut_ptr(),
+                r,
+                c,
+                d,
+                m,
+                &mut st,
+            );
+            assert_eq!(st, LasxStatus::BadShape as i32, "({r},{c},{d},{m})");
+        }
+
+        // 空指针 → NullPointer（表为空/输出为空都要抓到）
+        let mut st = 999;
+        lasx_rope_checked(
+            std::ptr::null(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            out.as_mut_ptr(),
+            rows as i32,
+            cols as i32,
+            n_dims as i32,
+            0,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::NullPointer as i32);
+        let mut st = 999;
+        lasx_rope_checked(
+            x.as_ptr(),
+            std::ptr::null(),
+            sin.as_ptr(),
+            out.as_mut_ptr(),
+            rows as i32,
+            cols as i32,
+            n_dims as i32,
+            0,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::NullPointer as i32, "cos 为空");
+
+        // n_dims = 0：合法，不读表（表可以是空指针）
+        let mut st = 999;
+        lasx_rope_checked(
+            x.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            out.as_mut_ptr(),
+            rows as i32,
+            cols as i32,
+            0,
+            0,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
     }
 
     /// 逐元素激活的 `_checked`：空指针/负长度被拦、`n = 0` 合法、成功路径真的写了输出。

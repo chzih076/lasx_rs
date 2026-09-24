@@ -25,9 +25,9 @@
 //! 逐元素、无归约。两个"写成哪种等价形式"的决定：
 //!
 //! 1. **不带 `copysign` 的写法**：`y = 0.5·x + 0.5·|x|·erf(|x|/√2)`。它与
-//!    `0.5x(1 + sign(x)·erf(|x|/√2))` 数学等价，但省掉了"按符号选 lane"（本机 stdarch 既没有
-//!    浮点 `copysign` 也没有按位 `and`/`xor`，只能靠比较 + 混合，更贵）；代价是一次 `|x|`
-//!    ——`abs` 用 `max(x, −x)` 实现（见 `arch::lasx::abs_f32x8`）。
+//!    `0.5x(1 + sign(x)·erf(|x|/√2))` 数学等价，但省掉了"按符号选 lane"（本机 stdarch
+//!    **没有**浮点 `copysign`，也**没有** `xvfabs_s`；按位 `and`/`xor` 其实有，见
+//!    `arch::lasx::abs_f32x8` 的说明）；代价是一次 `|x|` —— 现在是一条 `and 0x7FFFFFFF`。
 //! 2. **`exp` 与门控分母复用 [`crate::ops::nn_math`]**，与 `silu`/`gelu_quick`/`softmax` 同一串。
 //!
 //! 列尾是标量路径，用与向量同式的 [`gelu_erf_seq`]。

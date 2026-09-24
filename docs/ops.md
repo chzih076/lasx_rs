@@ -275,7 +275,8 @@ a = (0.254829592, −0.284496736, 1.421413741, −1.453152027, 1.061405429)
   折算到 gelu 输出上是 **2.1e-7**（出现在 `|x| ≈ 3.08`）；
 - 所以这个算子**不是"真 erf"**。要与 ggml 对齐请用 §2.8 的 `gelu_quick`；要"真 erf"得自己
   实现（本库不承诺逐位等于 PyTorch）；
-- `|x|` 用 `max(x, −x)`（本机 stdarch 没有 LASX 的 `xvfabs_s`/按位 `and`）；
+- `|x|` 用一条 `and 0x7FFFFFFF`（`arch::lasx::abs_f32x8`；本机 stdarch **没有** `xvfabs_s`，
+  按位 `and`/`xor` 是有的——我最初说"没有"是 grep 错了文件，见 `docs/dev.md` §20.6 的更正）；
 - **不带 `copysign` 的写法**：`y = 0.5·x + 0.5·|x|·erf(|x|/√2)`，与
   `0.5x(1 + sign(x)·erf(…))` 数学等价，但省掉"按符号选 lane"；
 - `exp` 复用 §2.6 那一串（`ops::nn_math`）。
@@ -300,6 +301,65 @@ a = (0.254829592, −0.284496736, 1.421413741, −1.453152027, 1.061405429)
   绝对幅度 ≤ A&S 的近似界，但"单调"这个直觉在 f32 下**不成立**，测试里只对 `x ≥ 0` 断言单调。
 - **`x = −inf` ⇒ NaN**（`0.5·inf + 0.5·(−inf)` 是未定式）。PyTorch 的 `gelu(−inf)` 同样是 NaN
   （同一个代数式），所以这不是本库特有的缺陷；契约只覆盖**有限输入**。`x = +inf` ⇒ `+inf` ✓。
+
+
+### 2.10 NN 侧：`lasx_rope`（旋转位置编码）
+
+**1）语义。** `rows × cols` 行主序，每行**前 `n_dims` 列**参与旋转，`[n_dims, cols)` 原样复制
+（partial rope）。每一对 `(x0, x1)`：
+
+```text
+y0 = fma(x0, c, −(x1·s))        // 两次舍入：x1·s 一次，fma 一次
+y1 = fma(x1, c,  (x0·s))
+```
+
+**2）两种配对 mode**（`mode` 的整数值是 C ABI 的一部分）：
+
+| mode | 值 | `i ∈ [0, n_dims/2)` 配 | 对照实现 |
+|---|---|---|---|
+| `NeoX` | `0` | `(i, i + n_dims/2)` | HF `rotate_half` / Llama / Qwen |
+| `GptJ` | `1` | `(2i, 2i+1)` | ggml `ROPE_TYPE_NORMAL` / 原始 GPT-J |
+
+**3）`cos`/`sin` 表是输入**（`rows × (n_dims/2)`、行主序，第 `r` 行第 `i` 列 = `θ_i = positions[r]·freq_base^(−2i/n_dims)`）。
+这样分层有两条理由：
+
+- **角度不依赖数据**：一次前向里每层每位置算一次就够（表是 `x` 的一半大小），把它塞进
+  "每个元素都算一遍"的内核等于把一次性成本乘上 head 数——与 §2.6 的 `exp`（自变量依赖数据、
+  必须逐元素算）**恰好相反**。llama.cpp 也是这么分的（rope cache + 旋转内核）；
+- **位精确承诺因此落在旋转上**：`sin`/`cos` 来自平台 libm，跨 libc 不保证逐位一致，本库**不承诺**
+  表的位型，只承诺"**给定同一张表**，向量路径与标量路径逐位相同"。要与别的实现严格对齐，
+  自己造表、只用 [`lasx_rope`] 的旋转契约。
+- 表**与 mode 无关**：同一张表两种配对都能用（`api::rope_tables` 不接 mode 参数）。
+
+**4）`NeoX` 走 LASX、`GptJ` 走标量**（这是本机 ISA 实测出来的结论，不是偷懒）：
+
+- `NeoX` 的两半各自连续 ⇒ 8 lanes = 8 个 `i`，2 load + 2 store，满 SIMD；
+- `GptJ` 需要把 16 个连续元素拆成偶/奇两半。本机 `xvpickev.w`/`xvpickod.w` 是**128 位 lane 内**
+  操作且（实测排布）`pickev(a,b) = [b0,b2,a0,a2 | b4,b6,a4,a6]`——要变回自然序就得对 `cos`/`sin`
+  施加同一个重排 π（跨 lane），一条 lane 内 shuffle 做不到。所以 GptJ 走标量旋转
+  （llama.cpp 的 rope 两种 mode 都是标量，这个选择不落后）。
+
+**5）由谁守**：逐位一致（`ops::rope` 单测：两 mode × `n_dims/2` 1..=17 边界 + 多种形状、
+`cos=1,sin=0` ⇒ **逐位恒等**、原地 == 异地在 FFI 层测）；数值（f64 参考的绝对误差 <1e-6、
+旋转保长度相对误差 <1e-6）；形状（`api`：`n_dims` 偶数且 `≤ cols`、表长 = `rows×n_dims/2`；
+`_checked`：同样规则 → `BadShape`/`NullPointer`）。
+**只靠约定的一条**：C 侧调 `lasx_rope` 时表与 `x` 的长度自洽——原始符号零校验，
+违反是**读写越界**（错结果甚至 UB），与 §19.7 第 2 条同类。
+
+**6）实测带宽**（`cargo run -p lasx_bench --release -- rope`，单线程；口径**3 条流**：
+读 `x` + 写 `out` + 读表一半）：
+
+| 形状 | `NeoX`（LASX） | `GptJ`（标量） | `NeoX`/标量 |
+|---|---|---|---|
+| 1×128 | 33 ns / 38.8 GB/s | 110 ns / 11.6 GB/s | 2.15× |
+| 32×128 | 569 ns / 72.0 GB/s | 3.2 µs / 12.9 GB/s | 3.21× |
+| 512×128 | 20.1 µs / 32.7 GB/s | 60.7 µs / 10.8 GB/s | 2.60× |
+| 4096×128 | 157 µs / 33.4 GB/s | 485 µs / 10.8 GB/s | 2.65× |
+| 8×4096（只转前 128 列） | 10.4 µs / 31.5 GB/s | 11.0 µs / 29.7 GB/s | 1.04× |
+
+两条读数值得注意：**(a)** `GptJ` 比 `NeoX` 慢约 3×，这就是"相邻配对的 SIMD 没做"的代价
+（若要做，潜在收益就是这 3×）；**(b)** 部分旋转（`n_dims ≪ cols`）时两者都退化成 memcpy
+主导（1.04×）——那时瓶颈不是旋转而是复制，这一点和 softmax 的"遍数决定一切"是同一类结论。
 
 
 ## 3. 指令集路径与降级覆盖
@@ -354,11 +414,11 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（53 个）
+## 4. 导出符号总表（55 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**27 个未带 `_checked`
-的 `lasx_*` + 26 个 `lasx_*_checked` = 53**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
-`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf` 各与其 checked 变体）。
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**28 个未带 `_checked`
+的 `lasx_*` + 27 个 `lasx_*_checked` = 55**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
+`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope` 各与其 checked 变体）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -395,7 +455,7 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 | `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
 | `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
 
-### 4.3 `_checked` 变体 26 个
+### 4.3 `_checked` 变体 27 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -408,7 +468,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-26 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+27 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
@@ -418,7 +478,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quat_normalize_batch_checked`、`lasx_quat_mul_batch_checked`、
 `lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
 `lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
-`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`。
+`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -450,9 +510,10 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | 加 1 个 NN（N1 首批） | 23 | 22 | 45 |
 | 加第 2 个 NN（`rms_norm`） | 24 | 23 | 47 |
 | 加 2 个激活（`silu`、`gelu_quick`） | 26 | 25 | 51 |
-| 加第 3 个激活（`gelu_erf`） | 27 | 26 | **53** |
+| 加第 3 个激活（`gelu_erf`） | 27 | 26 | 53 |
+| 加 RoPE（`rope`） | 28 | 27 | **55** |
 
-原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 5 个与其 checked 变体。
+原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 6 个与其 checked 变体。
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
 
@@ -623,6 +684,36 @@ lasx_gelu_erf_checked(x, out, n, &status);
 - **算力受限，不是带宽受限**：与 rms_norm 同为 2 条流，但 n ≈ 1M（工作集 8 MB，仍在 L3 内）
   时 rms_norm 17.2 GB/s vs `silu` 8.1 GB/s。瓶颈是 `exp`（每 8 元素 ~19 条向量指令 + 一次
   向量除法），见 §2.8 第 5 条。
+
+
+### 5.12 `lasx_rope` — 旋转位置编码（NeoX 走 LASX，GptJ 走标量）
+
+| 层 | 签名 |
+|---|---|
+| C（裸） | `void lasx_rope(const float *x, const float *cos, const float *sin, float *out, int n_rows, int n_cols, int n_dims, int mode)` |
+| C（`_checked`） | 同上 + 末尾 `int *status`；形状/mode 非法 → `BadShape`，空指针 → `NullPointer` |
+| Rust | `api::rope(&[f32], &[f32], &[f32], rows, cols, n_dims, RopeMode) -> Result<AlignedVec<f32>>`，另有 `api::rope_tables(positions, n_dims, freq_base)` 与便捷的 `api::rope_at(...)` |
+
+```rust
+use lasx_rs::api::{rope, rope_tables, RopeMode};
+// 表建一次（每层/每个位置一组角度），旋转可以反复做
+let (cos, sin) = rope_tables(&positions, 128, 10_000.0)?;
+let y = rope(&q, &cos, &sin, seq_len, 128, 128, RopeMode::NeoX)?;
+// 或者一步到位（每次都会重建表，别放进热循环）
+let y = api::rope_at(&q, &positions, seq_len, 128, 128, 10_000.0, RopeMode::NeoX)?;
+```
+
+```c
+lasx_rope(x, cos, sin, out, n_rows, n_cols, n_dims, /*mode=*/0);   /* 允许 out == x */
+lasx_rope_checked(x, cos, sin, out, n_rows, n_cols, n_dims, 1, &status);
+```
+
+- `cos`/`sin` 各 `n_rows × (n_dims/2)`、行主序，**与 mode 无关**；
+- `mode`：`0` = `NeoX`（`(i, i+d/2)`）、`1` = `GptJ`（`(2i, 2i+1)`）；
+- **实测**（单线程，3 条流口径）：`NeoX` 32–72 GB/s（1×128 时 38.8 GB/s、32×128 时 72.0 GB/s、
+  4096×128 时 33.4 GB/s），是朴素标量循环的 **2.2–3.2×**；`GptJ` 10.8–12.9 GB/s
+  （标量路径，见 §2.10 第 4 条）；部分旋转（`n_dims ≪ cols`，如 8×4096 只转 128 列）时两者都
+  退化成 memcpy 主导（1.04×）。
 
 
 ## 6. 批量几何与物理算子
@@ -1198,7 +1289,7 @@ LASX）；对本库而言这批算子价值更高，因为 `api`/`pool`/`paralle
 | `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask | **已落地**（§2.6 契约、§5.9 用法） |
 | `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | **已落地**（§2.7 契约、§5.10 用法） |
 | `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | **已落地**（§2.8/§2.9 契约、§5.11 用法）：`silu`、`gelu_quick`、`gelu_erf` 三个入口 |
-| `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 | 待做 |
+| `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 | **已落地**（§2.10 契约、§5.12 用法）：`NeoX` 走 LASX、`GptJ` 走标量（本机 shuffle 只在 128 位 lane 内，见 §2.10 第 4 条） |
 
 **N2（GGML 格式互操作，按需）**：`quantize_rows_q8_0`（激活量化：Q8_0 块 + f16 scale）、
 `dot_q4_0_q8_0`/`gemv_q4_0`（llama.cpp 的 Q4_0 块布局 18 B/32，与现有 `dot_q4` 布局不同）、

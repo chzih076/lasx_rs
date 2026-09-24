@@ -42,6 +42,9 @@
 //! 因此 `?` 与 `Box<dyn Error>` 都能直接用。
 
 use crate::aligned::AlignedVec;
+// `RopeMode` 定义在私有的 `ops::rope` 里（内核的家），在这里**重新导出**成公开名字：
+// `ops` 整体是私有的（内核不该成为公开 API），但类型本身可以是公开可达的。
+pub use crate::ops::rope::RopeMode;
 
 /// `api` 层可能返回的错误：形状不符、形状相乘溢出、物理常数非法。
 ///
@@ -85,6 +88,19 @@ pub enum Error {
         /// 实际取值。
         value: f64,
     },
+    /// 某个参数取值不合法，但不是长度/有限性/正负号这三类（例如"必须为偶数"）。
+    ///
+    /// 加这个变体是因为 `rope` 的 `n_dims` 既不是长度不符也不是大小越界，而是一个**约束**；
+    /// 硬塞进 `Shape` 会给出误导的消息（"长度应为 X，实际 Y" 说不清"必须是偶数"）。
+    /// `Error` 是 `#[non_exhaustive]` 的，新增变体不破坏下游的 `match`。
+    BadValue {
+        /// 算子名。
+        op: &'static str,
+        /// 参数名，如 `"n_dims"`。
+        what: &'static str,
+        /// 约束说明（直接进错误消息）。
+        requirement: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -103,6 +119,11 @@ impl std::fmt::Display for Error {
             Error::NotPositive { op, what, value } => {
                 write!(f, "{op}: 常数 {what} 必须为正，得到 {value}")
             }
+            Error::BadValue {
+                op,
+                what,
+                requirement,
+            } => write!(f, "{op}: 参数 {what} 必须{requirement}"),
         }
     }
 }
@@ -404,6 +425,128 @@ pub fn gelu_erf(x: &[f32]) -> AlignedVec<f32> {
     }
     crate::ops::gelu_erf::gelu_erf_f32(x, out.as_mut_slice());
     out
+}
+
+/* ==================== NN：RoPE ==================== */
+
+/// 旋转位置编码（RoPE）：`rows × cols` 行主序，每行**前 `n_dims` 列**参与旋转。
+///
+/// `cos`/`sin` 各 `rows × (n_dims/2)`、行主序（第 `r` 行第 `i` 列 = `θ_i` 的余弦/正弦），
+/// 通常由 [`rope_tables`] 生成。表**与 mode 无关**：同一张表两种配对都能用。
+///
+/// # 数值契约（见 `docs/ops.md` §2.10）
+/// - 每一对元素：`y0 = fma(x0, c, −(x1·s))`、`y1 = fma(x1, c, x0·s)`（**两次舍入**）；
+/// - `[n_dims, cols)` 的元素**原样复制**（partial rope）；
+/// - 逐元素、无归约；`NeoX` 走 LASX（8 对/向量），`GptJ` 走标量（原因见 `ops::rope` 模块文档）；
+/// - 表生成本身**不在位精确承诺内**（`sin`/`cos` 来自平台 libm），承诺的是"给定同一张表，
+///   向量与标量逐位相同"。
+///
+/// # Errors
+/// - `x.len() != rows × cols`、`cos`/`sin` 长度不等于 `rows × n_dims/2`（[`Error::Shape`]）；
+/// - `n_dims > cols`、`n_dims` 不是偶数（[`Error::BadValue`]）；
+/// - `rows × cols` 溢出 `usize`（[`Error::Overflow`]）。
+pub fn rope(
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    rows: usize,
+    cols: usize,
+    n_dims: usize,
+    mode: RopeMode,
+) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("rope", "rows×cols", rows, cols)?;
+    expect_len("rope", "x", x.len(), n)?;
+    if !n_dims.is_multiple_of(2) {
+        return Err(Error::BadValue {
+            op: "rope",
+            what: "n_dims",
+            requirement: "是偶数（元素两两成对）",
+        });
+    }
+    if n_dims > cols {
+        return Err(Error::Shape {
+            op: "rope",
+            what: "n_dims",
+            expected: cols,
+            got: n_dims,
+        });
+    }
+    let table_len = checked_mul("rope", "rows×(n_dims/2)", rows, n_dims / 2)?;
+    expect_len("rope", "cos", cos.len(), table_len)?;
+    expect_len("rope", "sin", sin.len(), table_len)?;
+    let mut out = AlignedVec::<f32>::new(n);
+    if n == 0 {
+        return Ok(out);
+    }
+    // SAFETY: 上面已校验 `x.len() == rows*cols`、表长 `== rows*(n_dims/2)`、`n_dims` 偶数且
+    // `≤ cols` —— 正是 `ops::rope::rope_f32` 要求的那几条前提。
+    unsafe {
+        crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, mode, out.as_mut_slice())
+    };
+    Ok(out)
+}
+
+/// 生成 RoPE 的 `cos`/`sin` 表：`positions.len() × (n_dims/2)`、行主序。
+///
+/// 第 `r` 行第 `i` 列 = `θ_i = positions[r] · freq_base^(−2i/n_dims)` 的余弦/正弦。
+/// **标量、f64 算角度**（表只算一次，成本可忽略），且**不在位精确承诺内**：`sin`/`cos`
+/// 由平台 libm 提供，跨实现不保证逐位一致。要与别的实现严格对齐，请自己造表并只依赖
+/// [`rope`] 的旋转契约。
+///
+/// # Errors
+/// - `n_dims` 不是正偶数（[`Error::BadValue`]；`n_dims = 0` 没有意义，不做旋转就别调这里）；
+/// - `freq_base` 非有限（[`Error::NotFinite`]）或 `≤ 0`（[`Error::NotPositive`]）。
+pub fn rope_tables(
+    positions: &[f32],
+    n_dims: usize,
+    freq_base: f32,
+) -> Result<(AlignedVec<f32>, AlignedVec<f32>)> {
+    if n_dims == 0 || !n_dims.is_multiple_of(2) {
+        return Err(Error::BadValue {
+            op: "rope_tables",
+            what: "n_dims",
+            requirement: "是正偶数",
+        });
+    }
+    if !freq_base.is_finite() {
+        return Err(Error::NotFinite {
+            op: "rope_tables",
+            what: "freq_base",
+            value: freq_base as f64,
+        });
+    }
+    if freq_base <= 0.0 {
+        return Err(Error::NotPositive {
+            op: "rope_tables",
+            what: "freq_base",
+            value: freq_base as f64,
+        });
+    }
+    let (c, s) = crate::ops::rope::rope_tables(positions, n_dims, freq_base);
+    Ok((
+        AlignedVec::fill_with(c.len(), |i| c[i]),
+        AlignedVec::fill_with(s.len(), |i| s[i]),
+    ))
+}
+
+/// 便捷入口：按 `positions` 现场建表并旋转（等价于 [`rope_tables`] + [`rope`]）。
+///
+/// 一次前向里想复用表就别用这个——它会每次重新建表（表是 `x` 的一半大小，建表成本不可忽略）。
+///
+/// # Errors
+/// 同 [`rope`] 与 [`rope_tables`]。
+pub fn rope_at(
+    x: &[f32],
+    positions: &[f32],
+    rows: usize,
+    cols: usize,
+    n_dims: usize,
+    freq_base: f32,
+    mode: RopeMode,
+) -> Result<AlignedVec<f32>> {
+    expect_len("rope_at", "positions", positions.len(), rows)?;
+    let (cos, sin) = rope_tables(positions, n_dims, freq_base)?;
+    rope(x, &cos, &sin, rows, cols, n_dims, mode)
 }
 
 /* ==================== 矩阵乘 ==================== */
@@ -1092,6 +1235,80 @@ mod tests {
         assert!(silu(&[]).is_empty());
         assert!(gelu_quick(&[]).is_empty());
         assert!(gelu_erf(&[]).is_empty());
+    }
+
+    /// RoPE：与 C ABI 逐位一致、输出对齐、`rope_at` == `rope_tables` + `rope`；
+    /// 错误路径（`n_dims` 奇数 / 超列 / 表长度不符 / `freq_base` 非法）都给 `Err`。
+    #[test]
+    fn test_rope_matches_c_abi_and_errors() {
+        let (rows, cols, n_dims) = (5usize, 128usize, 128usize);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|k| (k as f32).mul_add(0.017, -1.0))
+            .collect();
+        let positions: Vec<f32> = (0..rows).map(|r| r as f32 * 1.5).collect();
+        let (cos, sin) = rope_tables(&positions, n_dims, 10_000.0).unwrap();
+        assert_eq!(cos.len(), rows * n_dims / 2);
+        assert_eq!(cos.as_ptr() as usize % ALIGN, 0, "表未对齐");
+
+        for mode in [RopeMode::NeoX, RopeMode::GptJ] {
+            let y = rope(&x, &cos, &sin, rows, cols, n_dims, mode).unwrap();
+            assert_eq!(y.as_ptr() as usize % ALIGN, 0, "输出未对齐");
+            let mut want = vec![0f32; x.len()];
+            crate::lasx_rope(
+                x.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                want.as_mut_ptr(),
+                rows as i32,
+                cols as i32,
+                n_dims as i32,
+                mode.as_i32(),
+            );
+            for k in 0..x.len() {
+                assert_eq!(y[k].to_bits(), want[k].to_bits(), "{mode:?} k={k}");
+            }
+            // 便捷入口与"先建表再旋转"逐位一致
+            let z = rope_at(&x, &positions, rows, cols, n_dims, 10_000.0, mode).unwrap();
+            for k in 0..x.len() {
+                assert_eq!(z[k].to_bits(), y[k].to_bits(), "{mode:?} rope_at k={k}");
+            }
+        }
+
+        // 错误路径
+        assert!(matches!(
+            rope(&x, &cos, &sin, rows, cols, 7, RopeMode::NeoX),
+            Err(Error::BadValue { what: "n_dims", .. })
+        ));
+        assert!(matches!(
+            rope(&x, &cos, &sin, rows, cols, cols + 2, RopeMode::NeoX),
+            Err(Error::Shape { what: "n_dims", .. })
+        ));
+        assert!(matches!(
+            rope(&x, &cos[..3], &sin, rows, cols, n_dims, RopeMode::NeoX),
+            Err(Error::Shape { what: "cos", .. })
+        ));
+        assert!(matches!(
+            rope_tables(&positions, 0, 10_000.0),
+            Err(Error::BadValue { what: "n_dims", .. })
+        ));
+        assert!(matches!(
+            rope_tables(&positions, n_dims, 0.0),
+            Err(Error::NotPositive {
+                what: "freq_base",
+                ..
+            })
+        ));
+        assert!(matches!(
+            rope_tables(&positions, n_dims, f32::NAN),
+            Err(Error::NotFinite {
+                what: "freq_base",
+                ..
+            })
+        ));
+        // 空输入
+        assert!(rope(&[], &[], &[], 0, 8, 8, RopeMode::NeoX)
+            .unwrap()
+            .is_empty());
     }
 
     /// 原地内核：结果与 C ABI 路径逐位一致，且原地语义正确（axpy 不改 x）。

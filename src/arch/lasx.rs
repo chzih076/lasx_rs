@@ -93,27 +93,40 @@ pub fn max_f32x8(a: F32x8, b: F32x8) -> F32x8 {
     unsafe { lasx_xvfmax_s(a, b) }
 }
 
-/// lane-wise 取负（`0.0 − x`）。
-///
-/// 为什么不用"翻转符号位"：本机 stdarch 快照**没有** LASX 的按位 `xor`（`lasx_xvxor_v`
-/// 未导出，只有 `xvxori.b` 那种按字节立即数异或，翻每个字节的最高位并不等于翻每个 `f32`
-/// lane 的符号位）。`0.0 − x` 在 IEEE 754 下对有限值/`±inf`/NaN 都是精确的按位取负，
-/// 唯一差别是 `x = ±0.0` 时两个零都得到 `+0.0`——而唯一的使用者 `exp` 对 `±0.0` 取值
-/// 逐位相同（见 `ops::nn_math::tests::test_sigmoid_vec_matches_scalar`）。
+/// 按位型广播到 8 个 32 位 lane（`splat_f32` 接受的是 `f32` 值，这里要的是**位型**，
+/// 返回整数向量——给按位 `and`/`xor` 当掩码用）。
 #[inline]
-pub fn neg_f32x8(x: F32x8) -> F32x8 {
-    // SAFETY: 纯寄存器操作，不碰内存，无前提。
-    unsafe { lasx_xvfsub_s(zero_f32x8(), x) }
+fn splat_bits_i32(bits: u32) -> m256i {
+    // SAFETY: 纯寄存器操作（GPR → 向量广播），不碰内存，无前提。
+    unsafe { lasx_xvreplgr2vr_w(bits as i32) }
 }
 
-/// lane-wise 绝对值（`max(x, −x)`）。
+/// lane-wise 取负（**翻转符号位**：`0x80000000`）。
 ///
-/// 为什么不是"清符号位"：本机 stdarch 快照既没有 LASX 的按位 `and`/`xor`，也没有
-/// `xvfabs_s`（只有 `xvfmaxa_s`，那是 `max(|a|,|b|)` 不是取绝对值）。`max(x, 0−x)` 对
-/// 有限值/`±inf`/NaN 都给出与 `abs` 相同的结果（`NaN` 传播为 NaN），代价是两条指令。
+/// 这是精确的按位取负（`±0`、`±inf`、NaN 都保留/翻转正确），一条指令。
+///
+/// **更正**（2026-09-24，写 `rope` 时发现）：这里原来写的是 `0.0 − x`，理由写成"本机 stdarch
+/// 快照没有 LASX 的按位 `xor`"。那个理由是**错的**——`lasx_xvxor_v`/`lasx_xvand_v` 是
+/// `portable.rs` 里**宏生成**的，当时只 grep 了 `generated.rs` 所以没找到。现在改成位翻转，
+/// 顺带把 `abs` 也改成一条 `and`（见下）。
+#[inline]
+pub fn neg_f32x8(x: F32x8) -> F32x8 {
+    // SAFETY: 纯寄存器操作，不碰内存；transmute 只在 m256/m256i 之间换名字（§1 的分层约定：
+    // 位型转换只出现在 arch）。
+    unsafe {
+        let xi: m256i = std::mem::transmute(x);
+        std::mem::transmute(lasx_xvxor_v(xi, splat_bits_i32(0x8000_0000)))
+    }
+}
+
+/// lane-wise 绝对值（清符号位：`and 0x7FFFFFFF`，一条指令）。
 #[inline]
 pub fn abs_f32x8(x: F32x8) -> F32x8 {
-    max_f32x8(x, neg_f32x8(x))
+    // SAFETY: 纯寄存器操作，不碰内存；transmute 只在 m256/m256i 之间换名字。
+    unsafe {
+        let xi: m256i = std::mem::transmute(x);
+        std::mem::transmute(lasx_xvand_v(xi, splat_bits_i32(0x7fff_ffff)))
+    }
 }
 
 /// lane-wise 浮点 → 整数**截断**（向零取整）。
