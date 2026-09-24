@@ -82,3 +82,33 @@ pub fn splat_f64(x: f64) -> F64x4 {
     // SAFETY: 纯寄存器操作（GPR 位型 → 向量广播），不碰内存，无前提。
     unsafe { std::mem::transmute(lasx_xvreplgr2vr_d(bits)) }
 }
+
+/// lane-wise `max`（8 个 `f32` 通道各自取较大者）。
+///
+/// 用于 softmax 的行内最大值：`max` 精确且满足结合律，所以水平归约的次序不影响结果——
+/// 行内归约里只有这一步是"次序无关"的（求和不是，见 `ops::softmax_rows` 的设计说明）。
+#[inline]
+pub fn max_f32x8(a: F32x8, b: F32x8) -> F32x8 {
+    // SAFETY: 纯寄存器操作，不碰内存，无前提。
+    unsafe { lasx_xvfmax_s(a, b) }
+}
+
+/// lane-wise 浮点 → 整数**截断**（向零取整）。
+///
+/// # Safety
+/// 纯寄存器操作、无内存前提；但语义上要求输入是可表示的整数值（否则结果未定义，与 C 的
+/// 浮点转整型一致）。`ops::softmax_rows` 的 `exp` 里，输入由 magic 数技巧保证是整数值。
+#[inline]
+pub unsafe fn trunc_i32(v: F32x8) -> m256i {
+    lasx_xvftintrz_w_s(v)
+}
+
+/// 由 8 个**偏置指数**构造 `2^n`（整数域左移 23 位后按位重解释成 `f32`）。
+///
+/// 放在 `arch` 是因为这是内核里唯一需要 `m256i ↔ m256` 转换的地方——§1 的分层约定是
+/// "transmute 只在 `arch` 出现"，内核里只出现这种语义化调用。
+#[inline]
+pub fn pow2_from_exponent(n: m256i) -> F32x8 {
+    // SAFETY: 纯寄存器操作（整数移位 + 位型重解释），不碰内存，无前提。
+    unsafe { std::mem::transmute(lasx_xvslli_w(n, 23)) }
+}

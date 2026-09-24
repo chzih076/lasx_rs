@@ -705,6 +705,45 @@ pub extern "C" fn lasx_quat_to_dcm_batch_checked(
     crate::ops::quat_to_dcm_batch::quat_to_dcm_batch(qw, qx, qy, qz, m);
 }
 
+/// 带错误通道的行内 softmax。
+///
+/// C 签名：`void lasx_softmax_rows_checked(const float*, const float*, float*, int, int, float, int*)`
+///
+/// `mask` 为 NULL 是**合法**输入（无 mask），与 `x`/`out` 的空指针区别对待：
+/// `n_rows × n_cols > 0` 时 `x`/`out` 为空报 `NullPointer`。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_softmax_rows_checked(
+    x: *const f32,
+    mask: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    scale: f32,
+    status: *mut i32,
+) {
+    if n_rows < 0 || n_cols < 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, cols) = (n_rows as usize, n_cols as usize);
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    // SAFETY: 见上；`mask` 允许 NULL（下面单独判）。
+    let (x, out) = unsafe {
+        (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        )
+    };
+    let mask = if mask.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: 调用方声明 `mask` 与 `x` 同形状。
+        or_fail!(unsafe { checked_slice(mask, n) }, status, ())
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::softmax_rows::softmax_rows(x, mask, scale, rows, cols, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

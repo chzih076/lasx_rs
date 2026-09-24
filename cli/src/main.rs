@@ -92,6 +92,7 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::DotQ4 => suites::quant::dot_q4(rows),
         Group::Matmul => suites::matmul::matmul(rows),
         Group::Plan => suites::plan::run(),
+        Group::Softmax => suites::softmax::softmax(rows),
         Group::Attitude => suites::attitude::attitude(rows),
         Group::Large => suites::large::run(),
         Group::Norm3 => suites::batch::norm3(rows),

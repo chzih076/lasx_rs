@@ -14,7 +14,7 @@
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（43 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（45 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -128,6 +128,47 @@ c[i][j] = fma(a[i][k-1], b[k-1][j], fma(… fma(a[i][0], b[0][j], 0) …))
 结合序不同（物理一致，绝对误差有测试守着）；`lasx_axpy` 允许 1 ulp 以内差异。
 
 
+### 2.6 NN 侧（N1 批次）的数值契约：`lasx_softmax_rows`
+
+`exp` 没有硬件指令，只能用多项式近似，所以这个算子的契约要写清楚"近似到什么程度、哪些
+东西是逐位承诺、哪些不在契约内"。
+
+**1）语义。** 行内 softmax（`rows × cols` 行主序）：
+
+```text
+out = exp(clamp_lo(scale·x + mask − 行内 max)) · (1/Σ)
+```
+
+- `mask` **可选**、同形状、**加性**（attention 的 `+ mask`）；C 侧用空指针表示无 mask；
+- **先减行内 max 再 `exp`**（数值必需，否则溢出）；
+- 归一化是 `e · (1/Σ)`（**一次除法 + 乘法**），不是逐元素除法——参考实现必须同样写
+  `e * (1.0 / sum)` 才逐位一致。
+
+**2）`exp` 的定义（这就是"契约"本身）。** `exp(x) = exp2 的 6 次多项式(f) · 2ⁿ`：
+
+```text
+t = x·LOG2E;  n = (t + 12582912.0) − 12582912.0;  f = t − n     // |f| ≤ 0.5
+p = Horner(f, (ln2)^k/k! , k ≤ 6)（全程 FMA）
+kk = clamp(trunc(n) + 127, 0, 254);  exp(x) = p · bitcast_f32(kk << 23)
+```
+
+- 相对误差 ~1e-10（多项式），**不是** libm `expf` 的逐位替代；与本库 f64 参考的相对误差
+  在 1e-7 量级（f32 本身的精度）；
+- **下溢恰好落到 0**：`x < −88.03` 时 `kk = 0` ⇒ `from_bits(0) = +0.0`。因此
+  `mask = −inf`（"完全屏蔽"）给出的是**精确的 0 权重**。输入在 `exp` 前夹到 `≥ −104`
+  （既保证这点，也挡住 magic 数取整失效与浮点转整型越界）；
+- 这套序列**标量与向量共用**，且行内求和用"8 个 per-lane 累加器 + 固定次序两两归约"，
+  列尾用 `−1e30` 填充后走同一条 lane-wise 路径 ⇒ **向量路径与标量模拟逐位一致**
+  （单测守着，`src/ops/softmax_rows.rs`）。设计推导见 `docs/dev.md` §20.1。
+
+**3）不在契约内。** 输入或 `mask` 含 `+inf`：`inf − inf = NaN`，属定义域问题，算子不处理。
+
+> 这条契约由测试守：逐位一致（标量模拟）、显式补齐 == 列尾路径、f64 参考精度、
+> 退化输入（行内全相等 / `scale=0` / `−inf` mask / 极负值不出 NaN）。
+> 后续 N1 算子（`rms_norm`、`silu`/`gelu`、`rope`、`dot_f16`）沿用同一套写法：
+> **先在本节写死 op 序列与"谁守"，再写代码**。
+
+
 ## 3. 指令集路径与降级覆盖
 
 ### 3.1 `SimdPath::detect()`
@@ -180,10 +221,10 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（43 个）
+## 4. 导出符号总表（45 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**22 个未带 `_checked`
-的 `lasx_*` + 21 个 `lasx_*_checked` = 43**。
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**23 个未带 `_checked`
+的 `lasx_*` + 22 个 `lasx_*_checked` = 45**（N1 批次新加 `lasx_softmax_rows` 与其 checked）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -270,8 +311,9 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 |---|---|---|---|
 | 历史 15 个 | 15 | 14（`lasx_alloc` 无 checked） | 29 |
 | 加 7 个姿态/几何 | 22 | 21 | 43 |
+| 加 1 个 NN（N1 首批） | 23 | 22 | **45** |
 
-原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个与其 checked 变体。
+原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 1 个与其 checked 变体。
 
 
 ## 5. 归约、稠密与量化算子
@@ -364,7 +406,28 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 - 实现：每批 4 组（128 字节）先把 8 个载入发出，再算 4 个独立组内部分和；归约与 f64
   累加**严格按组序**，浮点求和次序与逐组循环完全一致（逐位不变）。nibble ∈ [0,15]，
   乘积 ≤225、组内每 lane ≤900、总和 ≤14400，整数部分无溢出。
-- 精度：对精确参考相对误差 <1e-12；误差主要来自 f32 scale 表示（约 2⁻²⁴）。LASX-only。
+- 精度：对精确参考相对误差 <1e-12；误差主要来自 f32 尺度表示（约 2⁻²⁴）。LASX-only。
+
+
+### 5.9 `lasx_softmax_rows` — 行内 softmax（LASX-only）
+
+| 层 | 签名 |
+|---|---|
+| C（裸） | `void lasx_softmax_rows(const float *x, const float *mask, float *out, int n_rows, int n_cols, float scale)` |
+| C（`_checked`） | 同上 + 末尾 `int *status`；`mask` 允许 NULL，`x`/`out` 在 `n_rows×n_cols > 0` 时为空报 `NullPointer` |
+| Rust | `api::softmax_rows(&[f32], Option<&[f32]>, rows, cols, scale) -> Result<AlignedVec<f32>>` |
+
+- **语义**：`out = exp(scale·x + mask − 行内 max) · (1/Σ)`，`rows × cols` 行主序；
+  `mask` 是可选**加性**偏置（attention 的 `+ mask`）；
+- **数值契约**（`exp` 的 op 序列、下溢到精确 0、向量/标量逐位一致、`+inf` 不在契约内）
+  见 §2.6——那个算子的"精度"完全由那一节定义，读它比读这里的摘要有用；
+- **实测**（单线程，`cargo run -p lasx_bench --release -- softmax`）：
+  `128×128` 22.3 µs / 5.87 GB/s、`1024×1024` 1.21 ms / 6.96 GB/s、`32×4096` 144.6 µs /
+  7.25 GB/s；是朴素 Rust 行循环的 **4.9–5.9×**，约为 llama.cpp `SOFT_MAX` 典型值
+  （2.4–4 GB/s）的 **1.4–3×**。按真实访存（三遍：max / exp+sum / 归一）折算约 8.6–10.9 GB/s，
+  已在单线程带宽上限附近（推导见 `docs/dev.md` §20.1）；
+- **LASX-only**：无降级分支（未列在 §3.2 的降级表里，因为它是新增符号——新增即 LASX-only，
+  这一点在 §12.3 的批次说明里也写着）。
 
 
 ## 6. 批量几何与物理算子
@@ -918,7 +981,7 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 |---|---|---|---|
 | f16/bf16 GEMM（prefill） | 8.4 / 16.6 GFLOP/s | ~90（f32 实测） | ~11× / 5× |
 | f16/bf16 GEMV（decode） | 6.8 / 9.1 GB/s | ~25（DRAM） | ~3.7× |
-| `SOFT_MAX` | 典型 2.4–4 GB/s | ~25（DRAM） | ~7× |
+| `SOFT_MAX` | 典型 2.4–4 GB/s | ~~~25（DRAM）~~ | **已落地**：`lasx_softmax_rows` 实测 **5.7–7.3 GB/s**（§20/§12.4），朴素 Rust 循环的 4.9–5.9× |
 | `q6_K` | 9.8 GB/s | ~18（q4_K 实测） | ~1.8× |
 | `mxfp4`/`nvfp4` | 5.5 / 4.0 GB/s | ~18 | ~3–4.5× |
 | 没有缺口 | `q4_0`/`q4_K`/`q2_K`/`q3_K`/`q8_0`/`iq*`、`f32`、`ROPE`、`ADD` | — | ≈1× |
@@ -933,13 +996,13 @@ LASX）；对本库而言这批算子价值更高，因为 `api`/`pool`/`paralle
 
 **N1（推荐先做，纯 f32/f16，无格式锁定）**
 
-| 算子 | 说明 |
-|---|---|
-| `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 |
-| `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask |
-| `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 |
-| `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 |
-| `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 |
+| 算子 | 说明 | 状态 |
+|---|---|---|
+| `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 | 待做 |
+| `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask | **已落地**（§2.6 契约、§5.9 用法） |
+| `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | 待做 |
+| `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | 待做 |
+| `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 | 待做 |
 
 **N2（GGML 格式互操作，按需）**：`quantize_rows_q8_0`（激活量化：Q8_0 块 + f16 scale）、
 `dot_q4_0_q8_0`/`gemv_q4_0`（llama.cpp 的 Q4_0 块布局 18 B/32，与现有 `dot_q4` 布局不同）、
@@ -1058,7 +1121,7 @@ cp target/release/liblasx.so yll/
 `mt`、`align`、`dispatch`、`scenario`。方法学与全部读数详见 `docs/dev.md`。
 
 ```bash
-# 导出符号自检：期望 43 行（22 原始 + 21 checked）
+# 导出符号自检：期望 45 行（23 原始 + 22 checked）
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```

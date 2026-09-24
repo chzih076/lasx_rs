@@ -11,3 +11,4 @@ pub mod plan;
 pub mod quant;
 pub mod reduce;
 pub mod scenario;
+pub mod softmax;

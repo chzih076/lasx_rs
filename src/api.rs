@@ -250,6 +250,58 @@ pub fn axpy(alpha: f32, x: &[f32], y: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+/* ==================== NN：softmax ==================== */
+
+/// 行内 softmax：`out[i][j] = exp(scale·x[i][j] + mask[i][j] − max) / Σ`（`rows × cols` 行主序）。
+///
+/// `mask` 是**可选**的加性偏置（同形状；`None` = 无 mask）。返回值是新分配的对齐缓冲。
+///
+/// # 数值契约（见 `docs/ops.md` §2.6）
+/// - 行内先减 max 再 `exp`；归一化写成 `e · (1/Σ)`（一次除法 + 乘法），不是逐元素除法；
+/// - `exp` 是 `exp2` 的多项式近似（与 f64 参考的相对误差 ~1e-7 量级），**向量路径与标量
+///   模拟逐位一致**（单测守着）；
+/// - 下溢落到**精确 0**：`mask = −inf` 那种"完全屏蔽"的写法得到 0 权重，不是 1e-38；
+/// - 不在契约内：输入或 mask 含 `+inf`（`inf − inf = NaN`，是定义域问题）。
+///
+/// # Errors
+/// - `x.len() != rows × cols`（[`Error::Shape`]）；
+/// - `mask` 给了但长度不符（[`Error::Shape`]）；
+/// - `rows × cols` 溢出 `usize`（[`Error::Overflow`]）；
+/// - `scale` 非有限（[`Error::NotFinite`]）。
+pub fn softmax_rows(
+    x: &[f32],
+    mask: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+) -> Result<AlignedVec<f32>> {
+    if !scale.is_finite() {
+        return Err(Error::NotFinite {
+            op: "softmax_rows",
+            what: "scale",
+            value: scale as f64,
+        });
+    }
+    let n = checked_mul("softmax_rows", "rows×cols", rows, cols)?;
+    expect_len("softmax_rows", "x", x.len(), n)?;
+    if let Some(m) = mask {
+        expect_len("softmax_rows", "mask", m.len(), n)?;
+    }
+    let mut out = AlignedVec::<f32>::new(n);
+    if n == 0 {
+        return Ok(out);
+    }
+    crate::ops::softmax_rows::softmax_rows(
+        x,
+        mask.unwrap_or(&[]),
+        scale,
+        rows,
+        cols,
+        out.as_mut_slice(),
+    );
+    Ok(out)
+}
+
 /* ==================== 矩阵乘 ==================== */
 
 /// `C[m×n] = A[m×k] · B[k×n]`（行主序），返回新分配的对齐缓冲。

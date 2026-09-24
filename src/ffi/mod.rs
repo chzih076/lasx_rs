@@ -40,6 +40,7 @@ pub mod batch;
 pub mod checked;
 pub mod matmul;
 pub mod memory;
+pub mod nn;
 pub mod physics;
 pub mod quant;
 pub mod reduce;

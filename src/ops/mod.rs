@@ -36,6 +36,7 @@ pub mod quat_normalize_batch;
 pub mod quat_rotate_batch;
 pub mod quat_to_dcm_batch;
 pub mod rk4_j2_step_batch;
+pub mod softmax_rows;
 pub mod sum;
 pub mod unitize3_batch;
 pub mod vec3_add_scaled_batch;

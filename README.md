@@ -10,7 +10,7 @@
 ## 特点
 
 - **零第三方依赖**，只用 `core::arch::loongarch64` 的 LASX/LSX intrinsic。
-- **43 个导出符号**：22 个裸版本 + 21 个带 `int *status` 的 `_checked` 版本。
+- **45 个导出符号**：23 个裸版本 + 22 个带 `int *status` 的 `_checked` 版本。
   最初的 15 个 `lasx_*` 符号签名与语义**永不改动**，新能力一律追加。
 - **位精确**：同一算子的 LASX / LSX / 标量尾 / 打包 / 分块等所有路径，对同一输入给出
   **逐位相同**的结果（测试用 `to_bits()` 比对）。**边界**：`lasx_ballistic_step` 的向量与标量
@@ -71,7 +71,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 
 ## 文档
 
-- **[docs/ops.md](docs/ops.md)** —— 算子与用法：43 个符号总表、数值契约、降级覆盖、
+- **[docs/ops.md](docs/ops.md)** —— 算子与用法：45 个符号总表、数值契约、降级覆盖、
   Rust/C/Dart 调用、池与并行、NN 算子现状、无损压缩路线。
 - **[docs/dev.md](docs/dev.md)** —— 架构与性能：分层与约定、测试与 CI、性能方法学、
   全量实测数据、矩阵乘深挖、**被否掉的尝试清单**、复现步骤与已知缺口。
