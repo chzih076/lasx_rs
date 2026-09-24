@@ -17,13 +17,16 @@
   实现在不同循环结构下不保证逐位一致，`lasx_axpy` 允许 1 ulp 以内差异；跨实现数值差 < 1e-9。
 - **打包 + k 分块的矩阵乘**：f32 512³ 约 60 GFLOP/s（单线程，实测峰值 140 GFLOP/s 的 43%）。
 - **常驻工作池**：多星多步传播场景端到端比"每步新建线程"快 1.77×（跨 200 步复用）。
+- **矩阵视图与打包计划**：`view::MatRef` 把形状/跨距变成构造时校验一次的对象；
+  `plan::MatmulPlan` 把 `B` 打包一次反复用（`B` 固定时每次调用省掉一次 `O(k·n)` 搬运与一次
+  输出分配，且与 `api::matmul` 逐位一致），计划只读，可 `Arc` 给多线程共享同一份打包 `B`。
 
 ## 快速开始
 
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release          # 产出 liblasx_rs.so + rlib
-cargo test --release           # 74 单测 + 6 文档测试
+cargo test --release           # 97 单测 + 11 文档测试（另 2 个 doc 示例标 ignore）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 
 # 基准：不带参数跑全部套件，带子串只跑匹配套件
@@ -63,8 +66,8 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 | 批量姿态（7 个） | `lasx_cross3_batch`、`lasx_unitize3_batch`、`lasx_mat3_mul_vec3_batch`、`lasx_quat_normalize_batch`、`lasx_quat_mul_batch`、`lasx_quat_rotate_batch`、`lasx_quat_to_dcm_batch` |
 | 内存 | `lasx_alloc`（32 字节对齐） |
 
-每个算子的签名、语义与数值约定见 `docs/ops.md`；另有安全 Rust API（`lasx_rs::api`，22 个函数）
-与多核接口（`lasx_rs::pool` / `lasx_rs::parallel`）。
+每个算子的签名、语义与数值约定见 `docs/ops.md`；另有安全 Rust API（`lasx_rs::api`，22 个函数）、
+矩阵视图与打包计划（`lasx_rs::view` / `lasx_rs::plan`）、多核接口（`lasx_rs::pool` / `lasx_rs::parallel`）。
 
 ## 文档
 

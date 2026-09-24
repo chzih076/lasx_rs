@@ -16,12 +16,15 @@
 |---|---|---|---|
 | `lasx_rs::ffi`（43 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
+| `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 独占派活（`&mut self`）、形状不符 panic |
 
-三层走**同一段内核**：`api`/`pool` 只是校验/调度薄包装，结果与直接调 `lasx_*` 逐位一致
-（`api` 与 `parallel` 都有逐位对照测试）。怎么选：
+四层走**同一段内核**：`api`/`view`/`plan`/`pool` 只是校验/调度薄包装，结果与直接调
+`lasx_*` 逐位一致（`api`、`plan`、`parallel` 都有逐位对照测试）。怎么选：
 
 - Rust 普通场景用 `lasx_rs::api`；形状不符返回 `Err`，不是 UB。
+- 矩阵形状参数容易记错时用 `lasx_rs::view`；同一个 `B` 要乘很多个 `A` 时用
+  `lasx_rs::plan::MatmulPlan`（见 §8.1、§8.2）。
 - Rust 且已自校验形状、要绕开校验开销：直接用 crate 根的 `lasx_rs::lasx_dot(..)` 等，
   与 `lasx_rs::ffi::reduce::lasx_dot(..)` 等价（历史重导出）。
 - C / Dart 用 `lasx_*`；需要把错误上抛给上层时用 `lasx_*_checked`。
@@ -520,6 +523,103 @@ lasx_force_lsx_thread(false);         // 记得复位
 ```
 
 
+### 8.1 矩阵视图 `view::MatRef` / `view::MatMut`
+
+`api` 的矩阵接口把形状写成三个裸数字：`api::matmul(m, k, n, &a, &b)`。谁是谁、跟切片长度
+对不对得上全靠调用方记——本仓库在这上面真的踩过坑（对齐后的列数 `n32` 当行跨距传进微内核、
+把"既是循环上界又是 `B` 行跨距"的参数交换、基准里 `(m,k,n)` 写反）。
+
+`view` 把"形状 + 跨距"和数据放在一个对象里，**构造时校验一次**，之后按行列取数不出错：
+
+| 构造/方法 | 说明 |
+|---|---|
+| `MatRef::row_major(&[T], rows, cols)` | 行主序视图（C 习惯：一行挨着一行） |
+| `MatRef::col_major(&[T], rows, cols)` | 列主序视图（Fortran/BLAS 习惯，即"预先转置好的权重"） |
+| `MatRef::row_major_strided(&[T], rows, cols, row_stride)` | 零拷贝切块：每行占 `row_stride` 个元素（可带 padding） |
+| `rows()` / `cols()` / `is_empty()` / `row_stride()` / `col_stride()` | 形状与跨距读数 |
+| `row(i)` → `RowRef` / `row_checked(i)` / `iter_rows()` | 取整行。`RowRef` 支持 `get(j)`、`as_slice()`（连续时）、`iter()`、`to_vec()` |
+| `get(i, j)` | 单个元素（与布局无关） |
+| `transpose()` | **零拷贝**转置视角；`m.transpose().row(j)` 就是第 `j` 列 |
+| `as_row_major_contiguous()` → `Option<&[T]>` | 布局正好是连续行主序时给出切片（能不能直接下给向量内核的判据） |
+| `to_row_major_vec()` | 不是那个布局时**明确复制**一份（代价写在名字里） |
+| `MatMut::row_major(&mut [T], rows, cols)` / `row_mut(i)` / `fill(v)` | 可写视图（只提供行主序，内核输出都是行主序） |
+
+失败发生在**构造**处，消息带期望值与实际值：
+
+```rust
+use lasx_rs::view::MatRef;
+
+let data: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+let m = MatRef::row_major(&data, 4, 3)?;      // 4 行 3 列
+assert_eq!(m.row(1).to_vec(), vec![4.0, 5.0, 6.0]);
+assert_eq!(m.get(1, 2), 6.0);
+
+// 同一块数据的列主序视角，零拷贝
+let c = m.transpose();                         // 3 行 4 列
+assert_eq!(c.row(0).to_vec(), vec![1.0, 4.0, 7.0, 10.0]);
+
+// 长度不对：Error::Shape 说清期望与实际，而不是等算子里越界
+let e = MatRef::<f32>::row_major(&data, 4, 4).unwrap_err();
+assert!(e.to_string().contains("16") && e.to_string().contains("12"));
+# Ok::<(), lasx_rs::api::Error>(())
+```
+
+> 为什么要多一个 `RowRef` 而不是直接返回 `&[T]`：**列主序矩阵的一行在内存里不连续**。
+> 与其返回一个骗人的切片（那正是"行跨距搞错"这类 bug 的温床），不如返回一个按下标取数的
+> 小视图；布局连续时 `RowRef::as_slice()` 仍然给回真正的切片。
+
+
+### 8.2 计划复用 `plan::MatmulPlan`
+
+`api::matmul` 每次调用都要把 `B` 按列条带重新打包一遍（微内核才能顺序读 `B`，见 §5.5），
+代价是 `O(k·n)`；小矩阵上它比乘法本身还贵。`MatmulPlan` 把这个打包**提前到构造时**，
+之后每次调用只算乘法：
+
+```rust
+use lasx_rs::{api, plan::MatmulPlan, view::MatRef};
+
+let (m, k, n) = (64, 256, 256);
+let a = vec![0.5f32; m * k];
+let b = vec![0.25f32; k * n];
+
+let plan = MatmulPlan::from_row_major(&b, k, n)?;   // ① 打包一次
+let c1 = plan.run(&a)?;                             // ② 反复算，m 由 a.len()/k 推出
+let mut c2 = vec![0f32; m * n];
+plan.run_into(&a, &mut c2)?;                        // ③ 写进自己的缓冲，零分配
+
+// 与一次性 api::matmul 逐位一致
+let want = api::matmul(m, k, n, &a, &b)?;
+assert_eq!(&c1[..], &want[..]);
+assert_eq!(&c2[..], &want[..]);
+# Ok::<(), lasx_rs::api::Error>(())
+```
+
+| 接口 | 说明 |
+|---|---|
+| `MatmulPlan::new(&MatRef<T>)` | 从**任意布局**的 `B` 视图构造（行主序 / 列主序 / 带跨距 / 转置视角都行） |
+| `MatmulPlan::from_row_major(&[T], k, n)` | 行主序 `B` 的便捷构造 |
+| `run(&[T]) -> Result<AlignedVec<T>>` | 新分配对齐输出；`m = a.len()/k` |
+| `run_into(&[T], &mut [T]) -> Result<()>` | 写进调用方缓冲。**只借用 `&self`**，可 `Arc` 给多线程各自写不相交的行段 |
+| `k()` / `n()` / `packed_bytes()` | 形状与内存代价（打包缓冲字节数） |
+
+边界与取舍：
+
+- `k == 0` 时 `m` 无法从 `a.len()` 推出，构造函数直接返回 `Error::NotPositive`；退化情形用
+  `api::matmul`。
+- 计划里存着一份打包好的 `B`（`packed_bytes()`，通常就是 `k×n×size_of::<T>()`），构造要做
+  一次 `O(k·n)` 搬运。**只算一次**就用 `api::matmul`（它按形状自选最快路径）。
+- 计划固定走"打包 + k 分块"路径；`api::matmul` 在个别形状上会选流式/列块路径，两者仍逐位一致。
+- 与 `matmul` 同前提：**需要 LASX**（LASX-only 清单见 §3.2）。
+- 实测（本机单线程，`cargo run -p lasx_bench --release -- plan`）：把"每次重打包 + 每次新分配
+  输出"两项都省掉后，`512³` f32 4.53 ms → 4.32 ms（1.05×）、`256³` f32 1.09×、
+  `1000×64×4096` 1.04×、f64 `128³` 1.08×；详细的"① 一次性 API / ② C 复用 / ③ 免打包"
+  三列对照与机制分析见 `docs/dev.md` §18。
+
+> 计划是**多线程共享一份打包 `B`** 的正规做法：`run_into` 取 `&self`，把 `MatmulPlan` 放进
+> `Arc` 即可，不需要 `parallel` 那一层，也不会有"每个线程各自打包一份 `B`"的病理
+> （对比 `docs/dev.md` §13.7）。
+
+
 ## 9. 多核并行：`WorkerPool` 与 `parallel`
 
 内核本身是单线程的（每个 `lasx_*` 只处理一段连续内存）。多核靠可选的**常驻**线程池。
@@ -852,6 +952,9 @@ cargo run -p lasx_bench --release -- align
 cargo run --release --example matmul_ab -- 256 256 256 packed
 cargo run --release --example matmul_ab -- 256 256 256 packed64
 
+# 计划复用对照（① 一次性 API / ② C 复用 / ③ 免打包，见 dev.md §18）
+cargo run -p lasx_bench --release -- plan
+
 cargo run --release --example pool_axpy        # 多核示例（自带逐位对照）
 cargo run --release --example matmul_pooled
 
@@ -860,8 +963,8 @@ cp target/release/liblasx.so yll/
 ```
 
 基准套件组名（过滤子串）：`dot`、`sum`、`axpy`、`dot_f64`、`dot_i8`、`dot_q4`、`matmul`、
-`attitude`、`large`、`norm3`、`vec3`、`distance2d`、`j2`、`ballistic`、`rk4`、`fma`、`mt`、
-`align`、`dispatch`、`scenario`。方法学与全部读数详见 `docs/dev.md`。
+`plan`、`attitude`、`large`、`norm3`、`vec3`、`distance2d`、`j2`、`ballistic`、`rk4`、`fma`、
+`mt`、`align`、`dispatch`、`scenario`。方法学与全部读数详见 `docs/dev.md`。
 
 ```bash
 # 导出符号自检：期望 43 行（22 原始 + 21 checked）

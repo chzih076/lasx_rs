@@ -17,6 +17,8 @@ pub enum Group {
     DotQ4,
     /// 矩阵乘（f32 + f64）。
     Matmul,
+    /// 矩阵乘计划复用（`B` 固定时打包一次）。
+    Plan,
     /// 批量 3 分量模长。
     Attitude,
     Large,
@@ -53,6 +55,7 @@ impl Group {
         Group::DotI8,
         Group::DotQ4,
         Group::Matmul,
+        Group::Plan,
         Group::Attitude,
         Group::Large,
         Group::Norm3,
@@ -78,6 +81,7 @@ impl Group {
             Group::DotI8 => "dot_i8",
             Group::DotQ4 => "dot_q4",
             Group::Matmul => "matmul",
+            Group::Plan => "plan",
             Group::Attitude => "attitude",
             Group::Large => "large",
             Group::Norm3 => "norm3",
@@ -103,6 +107,7 @@ impl Group {
                 | Group::Align
                 | Group::DispatchOverhead
                 | Group::Scenario
+                | Group::Plan
         )
     }
 

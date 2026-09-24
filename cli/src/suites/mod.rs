@@ -7,6 +7,7 @@ pub mod large;
 pub mod matmul;
 pub mod micro;
 pub mod physics;
+pub mod plan;
 pub mod quant;
 pub mod reduce;
 pub mod scenario;

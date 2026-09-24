@@ -87,7 +87,7 @@ static HW_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0
 
 /// 查询本机硬件能力。
 ///
-/// 快路径（已探测）是一条 `Relaxed` 原子读；未探测时走 [`probe_hw_caps`]。
+/// 快路径（已探测）是一条 `Relaxed` 原子读；未探测时走 `probe_hw_caps`。
 #[inline]
 pub fn hardware() -> HwCaps {
     use std::sync::atomic::Ordering;
