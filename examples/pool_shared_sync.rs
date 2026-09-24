@@ -1,9 +1,10 @@
-//! 第一步（pool 改 `&self`）开工前的验证：**那层同步到底要不要付钱**。
+//! `&self` 的同步开销与池的起效档位：给上层 `Auto` 判据提供输入。
 //!
-//! 两个问题：
+//! 三个问题：
 //! 1. `&self` 之后每次派活必然多一层同步（`OnceLock::get` + 原子，最坏还要一把互斥）。
-//!    它在 GEMM 的调用频率下可见吗？—— 尤其 DYN 档 batch 很小（16 行）的时候。
-//! 2. 顺带标定：池从小形状起到底在哪一档开始值（`Auto` 规则的输入）。
+//!    它在 GEMM 的调用频率下可见吗？
+//! 2. 可见性的边界在哪——**更小的 DYN 场景**（`M=16, K=N=64`，单次约 2 µs）同步占比多少？
+//! 3. 池从哪一档开始值？判据是"看行数"还是"看总工作量"？
 //!
 //! `cargo run --release --example pool_shared_sync`
 
@@ -62,8 +63,30 @@ fn sync_atomic_only() -> usize {
     id + COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 造一对 `(a, b)` 输入。
+fn inputs(m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+    (
+        (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect(),
+        (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect(),
+    )
+}
+
+/// 形状清单：小 DYN 场景、以及"行很多但每行很薄"（用来分离两个判据）。
+const SHAPES: &[(usize, usize, usize)] = &[
+    (16, 64, 64),   // 单次约 2 µs：同步开销开始可见的那一档
+    (64, 64, 64),   // 约 34 µs 的四分之一
+    (256, 64, 64),  // 行不少、每行薄
+    (1024, 64, 64), // 行很多、每行薄
+    (1024, 8, 8),   // 行极多、工作量极小：判据"看行数"还是"看工作量"的分水岭
+    (16, 256, 256), // 工作量与 64³ 同量级，但行数少
+    (32, 256, 256), // 已知盈亏平衡点
+    (64, 256, 256),
+    (256, 256, 256),
+    (1024, 256, 256),
+];
+
 fn main() {
-    println!("### 第一步验证：`&self` 的同步单价，以及池的起效档位");
+    println!("### `&self` 的同步单价、可见性边界，以及池的起效档位");
     println!();
 
     /* ============ 1. 同步原语单价 ============ */
@@ -103,19 +126,14 @@ fn main() {
     println!();
 
     /* ============ 2. 端到端：加在 DYN 热路径上 ============ */
-    // DYN 档的典型：K/N 固定（模型结构），M 每批不同
-    let (k, n) = (256usize, 256usize);
-    let b: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
     let pool_threads = 12;
-
-    println!("`K={k} N={n}`，单线程热路径（`MatmulPlan::run_into`）；");
-    println!("「+同步」= 每次调用前先付一遍最坏版同步。");
+    println!("「+同步」= 每次调用前先付一遍最坏版同步；单线程热路径是 `MatmulPlan::run_into`。");
     println!();
-    println!("| M | 干净 | +同步（原子版） | +同步（最坏版） | 同步占比 |");
+    println!("| M×K×N | 干净 | +同步（原子版） | +同步（最坏版） | 最坏版占比 |");
     println!("|---|---|---|---|---|");
 
-    for m in [16usize, 64, 256, 1024] {
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+    for &(m, k, n) in SHAPES {
+        let (a, b) = inputs(m, k, n);
         let mut c = vec![0f32; m * n];
         let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
 
@@ -133,13 +151,12 @@ fn main() {
             plan.run_into(&a, &mut c).unwrap();
             black_box(c[0]);
         });
-        let worst_pct = (ns(with_worst) - ns(clean)) / ns(with_worst) * 100.0;
         println!(
-            "| {m} | {:.1} µs | {:.1} µs | {:.1} µs | {:.3}% |",
+            "| {m}×{k}×{n} | {:.2} µs | {:.2} µs | {:.2} µs | {:.2}% |",
             ns(clean) / 1e3,
             ns(with_atomic) / 1e3,
             ns(with_worst) / 1e3,
-            worst_pct
+            (ns(with_worst) - ns(clean)) / ns(with_worst) * 100.0
         );
     }
     println!();
@@ -148,14 +165,14 @@ fn main() {
     println!(
         "同一形状：单线程（`MatmulPlan`）vs `{pool_threads}` 线程池（`parallel::matmul_f32`）。"
     );
-    println!("两张结果都做逐位比对，确保比的是同一份工作。");
+    println!("两列结果逐位比对，确保比的是同一份工作；工作量 = `M×K×N`。");
     println!();
-    println!("| M | 单线程 | {pool_threads} 线程 | 池/单线程 |");
-    println!("|---|---|---|---|");
+    println!("| M×K×N | 工作量 | 单线程 | {pool_threads} 线程 | 池/单线程 |");
+    println!("|---|---|---|---|---|");
 
     let pool = WorkerPool::new(pool_threads);
-    for m in [16usize, 32, 64, 128, 256, 1024] {
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+    for &(m, k, n) in SHAPES {
+        let (a, b) = inputs(m, k, n);
         let mut a_par = a.clone();
         let mut c = vec![0f32; m * n];
         let mut c_par = vec![0f32; m * n];
@@ -172,15 +189,16 @@ fn main() {
         assert_eq!(
             c.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             c_par.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-            "M={m}：池化与单线程不逐位一致"
+            "M×K×N={m}×{k}×{n}：池化与单线程不逐位一致"
         );
         println!(
-            "| {m} | {:.1} µs | {:.1} µs | {:.2}× |",
+            "| {m}×{k}×{n} | {:>8} kFLOP | {:.2} µs | {:.2} µs | {:.2}× |",
+            m * k * n / 1000,
             ns(serial) / 1e3,
             ns(par) / 1e3,
             ns(par) / ns(serial)
         );
     }
     println!();
-    println!("（倍数 < 1 表示池更快；≈1 表示这一档并行不划算。）");
+    println!("（倍数 < 1 表示池更快；≈1 或 > 1 表示这一档并行不划算。）");
 }

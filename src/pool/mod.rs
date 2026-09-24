@@ -1266,9 +1266,10 @@ mod tests {
     }
 
     /// `during` 在展开路径上必须先把 worker 收干净：否则 worker 会继续调用一个已经
-    /// 随着栈展开而析构的闭包（UB）。这里只验证"池没有挂死、下一轮结果正确"。
+    /// 随着栈展开而析构的闭包（**悬垂闭包 → UB**）。这里验证"展开之后池还能照常派活"，
+    /// 池干净只是附带结果；真正守的是"不 UB、不挂死"。
     #[test]
-    fn test_during_panic_leaves_pool_clean() {
+    fn test_during_panic_no_dangling_closure() {
         let pool = WorkerPool::new(4);
         let mut data = vec![0u64; 64 * 128];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -10,6 +10,7 @@
 //! | [`aligned`] | [`aligned::AlignedVec`]：保证 32 字节以上对齐的缓冲区（LASX 性能前提） |
 //! | [`view`] | [`view::MatRef`] / [`view::MatMut`]：带形状与跨距的矩阵视图，构造时校验一次 |
 //! | [`plan`] | [`plan::MatmulPlan`]：把 `B` 打包一次、反复算 `A·B`（`B` 固定时用它替代 [`api::matmul`]） |
+//! | [`shape`] | [`shape::Mat`] / [`shape::MatDyn`]：**形状进类型**（编译期排版 + 形状错误编译期报 + 声明式调用） |
 //! | [`pool`] | [`pool::WorkerPool`]：可选常驻线程池，把批量内核铺到多核且跨调用复用线程 |
 //! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`rk4_j2_step_batch`） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
@@ -68,6 +69,7 @@ mod ops;
 pub mod parallel;
 pub mod plan;
 pub mod pool;
+pub mod shape;
 pub mod view;
 
 pub use arch::lasx_force_lsx_thread;

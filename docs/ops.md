@@ -91,6 +91,43 @@
   `quat_to_dcm_batch` 的输出可直接喂给 `mat3_mul_vec3_batch`。
 
 
+### 2.5 契约（2026-09-24 定稿）
+
+这一节是**冻结的约定**：改内核、加路径、上公式 DSL 都不能违反。逐条都有测试守着。
+
+**1）累加顺序。** 每个输出元素是**沿 `k` 的单个累加器、`k` 升序、每步一条 FMA**：
+
+```text
+c[i][j] = fma(a[i][k-1], b[k-1][j], fma(… fma(a[i][0], b[0][j], 0) …))
+```
+
+`alpha`/`beta`（若启用）只能在**累加结束之后**按固定次序施加。任何"改写结合次序"的优化
+（把 `k` 拆成多个并行部分和再相加、用 `beta·y` 给累加器播种、跨 lane 水平归约）都**违反契约**。
+
+**2）路径无关性。** LASX / LSX / 标量尾 / 打包面板 / k 分块 / 并行切块 / `MatmulPlan` /
+`shape` 层，对同一输入给出**逐位相同**的结果（测试用 `to_bits()` 比对）。
+
+成立的前提有两条，换后端或换编译选项时要重新检查：
+
+- 所有中间结果**以与目标类型相同的精度存储**（IEEE 754 单/双精度）；
+  **不存在扩展精度寄存器**（x87 80 位那种）导致的"寄存器里更精确"的差异。
+  龙芯 LSX/LASX 是标准 IEEE 754，满足这条。
+- k 分块只是把**同一个部分和**分段写入 `C` 再读回：浮点数的存储/读取是精确的，
+  故分块不改变任何一位。
+
+**3）融合语义（已定稿，尚未启用）。** 若将来支持 `y = alpha·A·B + beta·y`：
+
+- **`beta` 默认 `0.0`**（覆盖输出，对齐 BLAS 的 `gemm`），**`alpha` 默认 `1.0`**；
+- 只有显式写出 `+ beta * y[…]` 才启用累加语义，不会"因为没写 beta 就默认累加"；
+- 施加次序固定为 `out = alpha·acc + beta·y_old`（两次舍入），**不是** BLAS 那种
+  "用 `beta·y` 给累加器播种"（那会改变累加结构，违反第 1 条）；
+- **性能承诺只有一句**：融合省掉对 `C` 的一整遍读写，**不改写 GEMM 内部结构**。
+  别处不得出现"融合接近 BLAS 语义""融合带来 2×"这类暗示。
+
+**4）逐位一致的例外（仅此两处，均有测试）。** `lasx_ballistic_step` 的向量/标量分支
+结合序不同（物理一致，绝对误差有测试守着）；`lasx_axpy` 允许 1 ulp 以内差异。
+
+
 ## 3. 指令集路径与降级覆盖
 
 ### 3.1 `SimdPath::detect()`
@@ -618,6 +655,49 @@ assert_eq!(&c2[..], &want[..]);
 > 计划是**多线程共享一份打包 `B`** 的正规做法：`run_into` 取 `&self`，把 `MatmulPlan` 放进
 > `Arc` 即可，不需要 `parallel` 那一层，也不会有"每个线程各自打包一份 `B`"的病理
 > （对比 `docs/dev.md` §13.7）。
+
+
+### 8.3 形状进类型 `shape::Mat` / `shape::MatDyn`
+
+前两节是"形状在运行期"。如果形状**编译期就知道**（模型结构固定、每层 `K/N` 写死在代码里），
+`shape` 层把它搬进类型，于是：形状错误变成**编译错误**，排版（面板数、k 分块、列尾、
+打包字节数）在 **const 求值**里定死。
+
+| 类型 | 含义 |
+|---|---|
+| `Mat<'a, T, R, C>` | `R×C` 只读视图（零开销：`&[T]` + 两个 const） |
+| `MatBuf<T, R, C>` | `R×C` 拥有者（输出），对齐缓冲 |
+| `MatDyn<'a, T, C>` | **DYN 档**：行数运行时、列数（`K`）在类型里 |
+| `MatBufDyn<T, C>` | DYN 档输出 |
+| `Layout<K, N>` | 编译期排版方案（`PANELS` / `K_CHUNKED` / `TAIL_COLS` / `PACK_BYTES`…） |
+| `Prepared<T, K, N>` | `B` 打包一次、反复用（内部就是 `MatmulPlan`） |
+
+```rust
+use lasx_rs::shape::{Mat, MatDyn, MatBufDyn};
+
+const K: usize = 256;
+const N: usize = 256;
+let w = Mat::<f32, { K }, { N }>::new(&weights)?;   // 权重 K×N
+let wp = w.prepare();                                // 打包一次
+
+let x = Mat::<f32, 64, { K }>::new(&batch)?;
+let y = x.mul(&w);            // ① 公式写法：K 由类型对齐 → MatBuf<64, K>
+let y2 = wp.apply(&x);        // ② 声明式：复用打包好的权重
+
+// ③ DYN 档：行数每批不同，K/N 仍是 const（排版照样编译期）
+let xd = MatDyn::<f32, { K }>::new(&other_batch)?;
+let mut yd = MatBufDyn::<f32, { N }>::with_rows(xd.rows());
+wp.apply_dyn_into(&xd, &mut yd);
+```
+
+- **K 对不上是编译错误**，报错指在公式那一行（`expected 512, found 256`）；
+- 构造函数只查长度，之后 `apply*` **不返回 `Result`**（形状已由类型担保）；
+- `shape::auto_threads(rows, k, n, machine)` 是 `Auto` 判据的纯函数形式（多核接线在下一步）；
+- 与 `api::matmul` **逐位一致**（走同一套打包 + k 分块内核，理由见 §2.5），
+  含 DYN 档的多种行数。
+
+> 三层的分工：**`view` 管布局**（列主序/跨距/转置）、**`plan` 管复用**（打包一次）、
+> **`shape` 管形状**（进类型）。它们可以叠：`shape::Prepared` 内部就是 `plan::MatmulPlan`。
 
 
 ## 9. 多核并行：`WorkerPool` 与 `parallel`
