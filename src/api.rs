@@ -355,6 +355,39 @@ pub fn rms_norm(
     Ok(out)
 }
 
+/* ==================== NN：逐元素激活 ==================== */
+
+/// SiLU（swish）：`y[i] = x[i] / (1 + exp(−x[i]))`，逐元素，返回新分配的对齐缓冲。
+///
+/// # 数值契约（见 `docs/ops.md` §2.8）
+/// - 公式写**直接除法**（`x / den`，单次舍入），不是 `x · (1/den)`——参考实现必须照抄
+///   才算逐位一致；
+/// - 门控分母 `1 + exp(−x)` 与 `exp` 用 `ops::nn_math` 那一份（自带输入夹取
+///   `[−104, +88]`，所以 `±inf` 不会走进 magic 数技巧）；
+/// - 逐元素、**无归约**，所以向量路径与标量尾逐位相同（测试里验）。这条与
+///   [`softmax_rows`] 不同：那里有归约，位精确要靠固定次序的设计。
+pub fn silu(x: &[f32]) -> AlignedVec<f32> {
+    let mut out = AlignedVec::<f32>::new(x.len());
+    if x.is_empty() {
+        return out;
+    }
+    crate::ops::silu::silu_f32(x, out.as_mut_slice());
+    out
+}
+
+/// GELU 的 sigmoid 近似（ggml `GELU_QUICK`）：`y[i] = x[i] / (1 + exp(−1.702·x[i]))`。
+///
+/// 契约同 [`silu`]：直接除法、共用 `nn_math` 的 `exp`、逐元素位精确。
+/// erf 形式（PyTorch 默认那个）是另一个入口，见 `docs/ops.md` §2.8 的规划。
+pub fn gelu_quick(x: &[f32]) -> AlignedVec<f32> {
+    let mut out = AlignedVec::<f32>::new(x.len());
+    if x.is_empty() {
+        return out;
+    }
+    crate::ops::gelu_quick::gelu_quick_f32(x, out.as_mut_slice());
+    out
+}
+
 /* ==================== 矩阵乘 ==================== */
 
 /// `C[m×n] = A[m×k] · B[k×n]`（行主序），返回新分配的对齐缓冲。
@@ -1007,6 +1040,32 @@ mod tests {
         let [ax, ay, az] = j2_accel_batch(&xs, &ys, &zs, 3.986e14, 1.0826e-3, 6.378e6).unwrap();
         assert!((ax.as_ptr() as usize).is_multiple_of(ALIGN) && ax[0] < 0.0 && az[0] == 0.0);
         assert_eq!(ay.len(), 1000);
+    }
+
+    /// 逐元素激活：与 C ABI 路径逐位一致、输出对齐、空输入不 panic。
+    #[test]
+    fn test_activations_match_c_abi() {
+        let n = 135usize; // 不是 8 的倍数：跨过"向量主体 + 标量尾"的边界
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 67.0) * 0.31).collect();
+
+        let y = silu(&x);
+        assert_eq!(y.as_ptr() as usize % ALIGN, 0, "silu 输出未按 {ALIGN} 对齐");
+        let mut want = vec![0f32; n];
+        crate::lasx_silu(x.as_ptr(), want.as_mut_ptr(), n as i32);
+        for i in 0..n {
+            assert_eq!(y[i].to_bits(), want[i].to_bits(), "silu[{i}]");
+        }
+
+        let g = gelu_quick(&x);
+        assert_eq!(g.as_ptr() as usize % ALIGN, 0, "gelu 输出未对齐");
+        crate::lasx_gelu_quick(x.as_ptr(), want.as_mut_ptr(), n as i32);
+        for i in 0..n {
+            assert_eq!(g[i].to_bits(), want[i].to_bits(), "gelu_quick[{i}]");
+        }
+
+        // 空输入：长度 0、不 panic
+        assert!(silu(&[]).is_empty());
+        assert!(gelu_quick(&[]).is_empty());
     }
 
     /// 原地内核：结果与 C ABI 路径逐位一致，且原地语义正确（axpy 不改 x）。

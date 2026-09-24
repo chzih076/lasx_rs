@@ -93,6 +93,19 @@ pub fn max_f32x8(a: F32x8, b: F32x8) -> F32x8 {
     unsafe { lasx_xvfmax_s(a, b) }
 }
 
+/// lane-wise 取负（`0.0 − x`）。
+///
+/// 为什么不用"翻转符号位"：本机 stdarch 快照**没有** LASX 的按位 `xor`（`lasx_xvxor_v`
+/// 未导出，只有 `xvxori.b` 那种按字节立即数异或，翻每个字节的最高位并不等于翻每个 `f32`
+/// lane 的符号位）。`0.0 − x` 在 IEEE 754 下对有限值/`±inf`/NaN 都是精确的按位取负，
+/// 唯一差别是 `x = ±0.0` 时两个零都得到 `+0.0`——而唯一的使用者 `exp` 对 `±0.0` 取值
+/// 逐位相同（见 `ops::nn_math::tests::test_sigmoid_vec_matches_scalar`）。
+#[inline]
+pub fn neg_f32x8(x: F32x8) -> F32x8 {
+    // SAFETY: 纯寄存器操作，不碰内存，无前提。
+    unsafe { lasx_xvfsub_s(zero_f32x8(), x) }
+}
+
 /// lane-wise 浮点 → 整数**截断**（向零取整）。
 ///
 /// # Safety

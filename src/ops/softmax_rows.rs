@@ -13,16 +13,18 @@
 //!    ——列尾不是一条单独的标量路径，因此不可能与主体不一致。
 //! 2. **行内求和是同序的**：保留 **8 个 per-lane 累加器**（lane `l` 累加下标 `j ≡ l (mod 8)`
 //!    的元素），最后按**固定次序的两两归约**折叠——这与标量模拟逐位一致（测试里验）。
-//! 3. **`exp` 的 op 序列标量/向量共用同一串**（见 [`exp_seq`] 的文档）。
+//! 3. **`exp` 的 op 序列标量/向量共用同一串**（现在独立成 [`crate::ops::nn_math`]，
+//!    `silu`/`gelu` 用的是同一份代码，不可能"各算子精度不同"）。
 //!
 //! # 数值行为
 //!
 //! - 行内先减 max（数值必需，否则 `exp` 溢出），再 `exp`；
-//! - `exp` 用 `exp2` 的 6 次多项式（`|f| ≤ 0.5` 时相对误差 ~1e-10）；
+//! - `exp` 是 [`crate::ops::nn_math`] 里那一串（`exp2` 的 6 次多项式，端到端实测相对误差
+//!   `|x| ≤ 20` 时 ≲ 1.1e-6、`|x| ≤ 87` 时 ≲ 3.9e-6，见 `docs/ops.md` §2.6）；
 //! - 归一化是 `e · (1/Σ)`（**一次除法 + 乘法**），不是逐元素除法——契约记在
 //!   `docs/ops.md`：参考实现必须同样写 `e * (1.0 / sum)` 才逐位一致；
-//! - 输入在 `exp` 前夹到 `≥ −87.0`：这既让"填充 lane"得到有限的极小值（而不是 NaN），
-//!   也挡住 `|x|` 极大时 magic 数技巧失效、浮点转整型越界的情形。
+//! - 输入夹取（`≥ −104.0`）由 `exp` **自己在入口做**：这既让"填充 lane"得到精确的 0
+//!   而不是 NaN，也挡住 `|x|` 极大时 magic 数技巧失效、浮点转整型越界的情形。
 //!
 //! # 可选加性 mask
 //!
@@ -35,94 +37,8 @@
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
 use crate::arch::lasx;
+use crate::ops::nn_math::exp_vec;
 use std::arch::loongarch64::*;
-
-/// `log2(e)`：`exp(x) = 2^(x·log2e)`。
-const LOG2E: f32 = std::f32::consts::LOG2_E;
-/// magic 数（`1.5·2²³`）：`floor(t) = (t + MAGIC) − MAGIC`，`|t| < 2²²` 时精确。
-const MAGIC: f32 = 12_582_912.0;
-/// `exp` 的输入下界夹取（**取 −104 是有理由的，不是随便挑的**）。
-///
-/// 作用有三个：
-///
-/// 1. `|x|` 极大时 magic 数取整技巧会失效、浮点转整型会越界——夹取把输入限制在序列的
-///    有效范围内；
-/// 2. 填充 lane 得到确定的极小值，而不是 NaN；
-/// 3. **−104 落在"下溢到精确 0"的阈值之内**：`n = floor(x·LOG2E)`，当 `x < −88.03` 时
-///    `n + 127 ≤ 0`，指数位为 0 ⇒ `from_bits(0) = +0.0` ⇒ 结果**恰好是 0**。
-///    于是 `mask = −inf`（attention 里"完全屏蔽"的常见写法）给出的是精确的 0 权重，
-///    而不是 1e-38 那种"近似 0"。实测：夹到 −87 时得到 1.04e-38，夹到 −104 时得到 0.0。
-///
-/// **不在契约内的输入**：`+inf`（无论来自 x 还是 mask）会让"减行内 max"出现 `inf − inf = NaN`，
-/// 这是定义域问题而不是精度问题，本算子不处理（调用方不该把 `+inf` 喂进 softmax）。
-const EXP_CLAMP_LO: f32 = -104.0;
-
-/// `exp2` 的多项式系数 `(ln2)^k / k!`（`k = 0..=6`）。`|f| ≤ 0.5` 时相对误差 ~1e-10。
-const EXP2_COEF: [f32; 7] = [
-    1.0,
-    std::f32::consts::LN_2, // (ln2)^1/1!
-    0.240_226_5,            // (ln2)^2/2!
-    0.055_504_11,           // (ln2)^3/3!
-    0.009_618_129,          // (ln2)^4/4!
-    0.001_333_355_8,        // (ln2)^5/5!
-    0.000_154_035_3,        // (ln2)^6/6!
-];
-
-/// `exp` 的**标量 op 序列**（与向量版逐条对应）。
-///
-/// 只在测试里用：它的作用是**把"同一串操作"写成可执行的规范**，让
-/// `test_matches_scalar_emulation_bit_for_bit` 能验"向量与标量逐位一致"这条承诺。
-/// （数值正确性另有**独立**的 f64 参考在 `test_accuracy_vs_f64_reference`，
-/// 按 `ops/mod.rs` 的约定不共用算子内部实现。）
-///
-/// ```text
-/// t = x·LOG2E                      // mul
-/// n = (t + MAGIC) − MAGIC          // floor(t)
-/// f = t − n                        // 精确（n 是整数值）
-/// p = c6; for k in (0..6).rev() { p = f.mul_add(p, ck) }   // Horner + FMA
-/// kk = clamp((n as i32) + 127, 0, 254)
-/// exp(x) = p · f32::from_bits(kk << 23)
-/// ```
-#[cfg(test)]
-#[inline]
-pub(crate) fn exp_seq(x: f32) -> f32 {
-    let t = x * LOG2E;
-    let n = (t + MAGIC) - MAGIC;
-    let f = t - n;
-    let mut p = EXP2_COEF[6];
-    for k in (0..6).rev() {
-        p = f.mul_add(p, EXP2_COEF[k]);
-    }
-    let kk = ((n as i32) + 127).clamp(0, 254) as u32;
-    p * f32::from_bits(kk << 23)
-}
-
-/// 8 lane 的向量版 `exp`（与 [`exp_seq`] 同一串操作）。
-#[inline]
-fn exp_vec(x: lasx::F32x8) -> lasx::F32x8 {
-    let c = |k: usize| lasx::splat_f32(EXP2_COEF[k]);
-    // SAFETY: 全为寄存器操作，不碰内存。
-    unsafe {
-        let t = lasx_xvfmul_s(x, lasx::splat_f32(LOG2E));
-        let magic = lasx::splat_f32(MAGIC);
-        let n = lasx_xvfsub_s(lasx_xvfadd_s(t, magic), magic);
-        let f = lasx_xvfsub_s(t, n);
-        let mut p = c(6);
-        for k in (0..6).rev() {
-            p = lasx_xvfmadd_s(f, p, c(k));
-        }
-        // 指数：截断取整 → +127 → 夹到 [0,254] → 左移 23 位（arch 里完成位型重解释）
-        let ki = lasx::trunc_i32(n);
-        let kk = lasx_xvmax_w(
-            lasx_xvmin_w(
-                lasx_xvadd_w(ki, lasx_xvreplgr2vr_w(127)),
-                lasx_xvreplgr2vr_w(254),
-            ),
-            lasx_xvreplgr2vr_w(0),
-        );
-        lasx_xvfmul_s(p, lasx::pow2_from_exponent(kk))
-    }
-}
 
 /// 取 8 lane 的最大值（固定次序的多路折叠；`max` 精确且次序无关）。
 #[inline]
@@ -148,7 +64,7 @@ fn hsum(v: lasx::F32x8) -> f32 {
 
 /// 把 `x[i][j0..cols]`（不足 8 个）装进一个 8 宽向量：其余 lane 填 `−1e30`。
 ///
-/// `−1e30` 在 `exp` 前会被夹到 [`EXP_CLAMP_LO`]，于是那些 lane 给出 `exp` 的极小值——
+/// `−1e30` 在 `exp` 入口被夹到下界，于是那些 lane 给出**精确 0**——
 /// 加到 `≥ 1` 的归一化分母上不改变任何一位（见模块文档第 1 条）。
 #[inline]
 fn tail_vector(x_row: &[f32], mask_row: &[f32], j0: usize, cols: usize, scale: f32) -> lasx::F32x8 {
@@ -220,7 +136,6 @@ pub(crate) fn softmax_rows(
 
         // ---- 第 2 遍：exp(d − max) 写进 out，同时按 per-lane 累加器求和 ----
         let mut acc = lasx::zero_f32x8();
-        let vclamp = lasx::splat_f32(EXP_CLAMP_LO);
         let mut j = 0;
         while j + 8 <= cols {
             // SAFETY: `j + 8 ≤ cols`。
@@ -233,8 +148,8 @@ pub(crate) fn softmax_rows(
                 };
                 let y = lasx_xvfmadd_s(vx, vscale, vm);
                 let d = lasx_xvfsub_s(y, vmax);
-                // 夹下界：填充 lane 与极负输入都落在 exp 的极小值上（有限、非 NaN）
-                exp_vec(lasx::max_f32x8(d, vclamp))
+                // 夹下界由 `exp` 入口负责：填充 lane 与极负输入都落到精确 0（有限、非 NaN）
+                exp_vec(d)
             };
             acc = unsafe { lasx_xvfadd_s(acc, e) };
             // SAFETY: `j + 8 ≤ cols`。
@@ -246,7 +161,7 @@ pub(crate) fn softmax_rows(
             // SAFETY: 寄存器操作。
             let e = unsafe {
                 let d = lasx_xvfsub_s(y, vmax);
-                exp_vec(lasx::max_f32x8(d, vclamp))
+                exp_vec(d)
             };
             acc = unsafe { lasx_xvfadd_s(acc, e) };
             let mut buf = [0f32; 8];
@@ -280,6 +195,7 @@ pub(crate) fn softmax_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::nn_math::exp_seq;
 
     /// 独立参考：**标量模拟同一串 op**（不调算子内部的任何函数，避免自证）。
     ///
@@ -304,8 +220,7 @@ mod tests {
             let m = (0..cols).map(y).fold(f32::NEG_INFINITY, f32::max);
             let mut acc = [0f32; 8];
             for j in 0..cols {
-                let d = (y(j) - m).max(EXP_CLAMP_LO);
-                let e = exp_seq(d);
+                let e = exp_seq(y(j) - m);
                 out[i * cols + j] = e;
                 acc[j % 8] += e;
             }

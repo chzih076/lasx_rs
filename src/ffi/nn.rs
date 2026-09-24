@@ -9,11 +9,17 @@
 //!                        int n_rows, int n_cols, float scale);
 //! void lasx_softmax_rows_checked(const float *x, const float *mask, float *out,
 //!                                int n_rows, int n_cols, float scale, int *status);
+//! void lasx_rms_norm(const float *x, const float *w, float *out, int n_rows, int n_cols, float eps);
+//! void lasx_silu(const float *x, float *out, int n);
+//! void lasx_gelu_quick(const float *x, float *out, int n);
 //! ```
 //!
 //! `mask` **可以为 NULL**（表示无加性 mask）；`checked` 变体对 NULL 与"x/out 为空指针"
 //! 分别处理：`mask == NULL` 是合法输入，`x`/`out` 在 `n_rows × n_cols > 0` 时为空则报
 //! [`crate::ffi::status::LasxStatus::NullPointer`]。
+//!
+//! `silu`/`gelu_quick` 是**逐元素**算子，形状只是 `n`（不需要 rows/cols），且允许
+//! `out == x`（就地）：内核每轮先读完 8 个再写回同样的 8 个位置。
 //!
 //! 数值契约（**不是**"差不多"）：`out = e · (1/Σ)`，`e = exp(clamp(scale·x + mask − max))`，
 //! `exp` 用 `exp2` 的 6 次多项式 + magic 数取整；向量路径与标量模拟**逐位一致**
@@ -104,6 +110,47 @@ pub extern "C" fn lasx_rms_norm(
     }
 }
 
+/// SiLU（swish）：`out[i] = x[i] / (1 + exp(−x[i]))`，逐元素。
+///
+/// C 签名：`void lasx_silu(const float *x, float *out, int n)`
+///
+/// 允许 `out == x`（就地）。`n < 0` 会被夹成 0（原始符号零校验，不做错误上报）。
+///
+/// 数值契约：**直接除法**（`x/den`，单次舍入，不是 `x·(1/den)`），`exp` 与门控分母用
+/// `ops::nn_math` 那一份；向量路径与标量尾逐位一致（`docs/ops.md` §2.8）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_silu(x: *const f32, out: *mut f32, n: i32) {
+    let n = n.max(0) as usize;
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `x`/`out` 各至少 n 个元素（允许同一块内存）。
+    unsafe {
+        let xs = std::slice::from_raw_parts(x, n);
+        let os = std::slice::from_raw_parts_mut(out, n);
+        crate::ops::silu::silu_f32(xs, os);
+    }
+}
+
+/// GELU 的 sigmoid 近似（ggml `GELU_QUICK`）：`out[i] = x[i] / (1 + exp(−1.702·x[i]))`。
+///
+/// C 签名：`void lasx_gelu_quick(const float *x, float *out, int n)`
+///
+/// 允许 `out == x`（就地）。契约同 `lasx_silu`（`docs/ops.md` §2.8）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gelu_quick(x: *const f32, out: *mut f32, n: i32) {
+    let n = n.max(0) as usize;
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `x`/`out` 各至少 n 个元素（允许同一块内存）。
+    unsafe {
+        let xs = std::slice::from_raw_parts(x, n);
+        let os = std::slice::from_raw_parts_mut(out, n);
+        crate::ops::gelu_quick::gelu_quick_f32(xs, os);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +170,41 @@ mod tests {
         // cols = 0：什么都不写、不崩
         let mut empty: Vec<f32> = Vec::new();
         lasx_softmax_rows(x.as_ptr(), std::ptr::null(), empty.as_mut_ptr(), 3, 0, 1.0);
+    }
+
+    /// `silu`/`gelu_quick` 的 FFI 自检：就地 == 异地、对照 f64 参考、`n = 0` 不崩。
+    #[test]
+    fn test_activation_ffi() {
+        let x: Vec<f32> = (-40..40).map(|i| i as f32 * 0.5).collect();
+        for (name, ffi, want) in [
+            (
+                "silu",
+                lasx_silu as extern "C" fn(*const f32, *mut f32, i32),
+                (|v: f64| v / (1.0 + (-v).exp())) as fn(f64) -> f64,
+            ),
+            (
+                "gelu_quick",
+                lasx_gelu_quick as extern "C" fn(*const f32, *mut f32, i32),
+                (|v: f64| v / (1.0 + (-(1.702 * v)).exp())) as fn(f64) -> f64,
+            ),
+        ] {
+            let mut out = vec![0f32; x.len()];
+            ffi(x.as_ptr(), out.as_mut_ptr(), x.len() as i32);
+            for (i, (&xi, &oi)) in x.iter().zip(out.iter()).enumerate() {
+                let want = want(xi as f64);
+                assert!(
+                    ((oi as f64) - want).abs() < 1e-5,
+                    "{name}[{i}] x={xi} got={oi} want={want}"
+                );
+            }
+            // 就地：同一块内存
+            let mut inplace = x.clone();
+            ffi(inplace.as_ptr(), inplace.as_mut_ptr(), inplace.len() as i32);
+            for (i, (a, b)) in inplace.iter().zip(out.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name} 就地[{i}] 与异地不一致");
+            }
+            // n = 0：不写、不崩
+            ffi(x.as_ptr(), std::ptr::null_mut(), 0);
+        }
     }
 }

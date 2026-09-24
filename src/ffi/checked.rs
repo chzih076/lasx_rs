@@ -784,6 +784,45 @@ pub extern "C" fn lasx_rms_norm_checked(
     crate::ops::rms_norm::rms_norm(x, w, eps, rows, cols, out);
 }
 
+/// 带错误通道的 SiLU：`out[..n] = x[..n]/(1+exp(−x[..n]))`。
+///
+/// C 签名：`void lasx_silu_checked(const float*, float*, int, int*)`
+///
+/// `n < 0` 报 [`LasxStatus::NegativeLength`]；`n > 0` 时 `x`/`out` 为空报 `NullPointer`。
+/// `n == 0` 是合法空操作（不要求非空指针）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_silu_checked(x: *const f32, out: *mut f32, n: i32, status: *mut i32) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 调用方声明 `x` 可读、`out` 可写且各至少 n 个元素（`n == 0` 时允许任意指针）。
+    unsafe {
+        let (x, out) = (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        );
+        LasxStatus::Ok.write(status);
+        crate::ops::silu::silu_f32(x, out);
+    }
+}
+
+/// 带错误通道的 GELU（sigmoid 近似）：`out[..n] = x[..n]/(1+exp(−1.702·x[..n]))`。
+///
+/// C 签名：`void lasx_gelu_quick_checked(const float*, float*, int, int*)`
+///
+/// 校验语义与 [`lasx_silu_checked`] 完全一致。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gelu_quick_checked(x: *const f32, out: *mut f32, n: i32, status: *mut i32) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 调用方声明 `x` 可读、`out` 可写且各至少 n 个元素（`n == 0` 时允许任意指针）。
+    unsafe {
+        let (x, out) = (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        );
+        LasxStatus::Ok.write(status);
+        crate::ops::gelu_quick::gelu_quick_f32(x, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +854,46 @@ mod tests {
         let d = lasx_dot_checked(a.as_ptr(), a.as_ptr(), -1, &mut st);
         assert_eq!(st, LasxStatus::NegativeLength as i32);
         assert_eq!(d, 0.0);
+    }
+
+    /// 逐元素激活的 `_checked`：空指针/负长度被拦、`n = 0` 合法、成功路径真的写了输出。
+    #[test]
+    fn test_activation_checked_paths() {
+        let x = [-3.0f32, -1.0, 0.0, 1.0, 3.0, 7.0];
+        let mut out = vec![0f32; x.len()];
+        for (name, f) in [
+            (
+                "silu",
+                lasx_silu_checked as extern "C" fn(*const f32, *mut f32, i32, *mut i32),
+            ),
+            ("gelu_quick", lasx_gelu_quick_checked),
+        ] {
+            // 成功路径
+            let mut st = 999;
+            f(x.as_ptr(), out.as_mut_ptr(), x.len() as i32, &mut st);
+            assert_eq!(st, LasxStatus::Ok as i32, "{name}");
+            assert!(out.iter().any(|&v| v != 0.0), "{name} 没有写输出");
+
+            // NULL 输入 / NULL 输出
+            for (px, po) in [
+                (std::ptr::null(), out.as_mut_ptr()),
+                (x.as_ptr(), std::ptr::null_mut()),
+            ] {
+                let mut st = 999;
+                f(px, po, x.len() as i32, &mut st);
+                assert_eq!(st, LasxStatus::NullPointer as i32, "{name}");
+            }
+
+            // 负长度
+            let mut st = 999;
+            f(x.as_ptr(), out.as_mut_ptr(), -3, &mut st);
+            assert_eq!(st, LasxStatus::NegativeLength as i32, "{name}");
+
+            // 长度 0：合法空操作（空指针也合法）
+            let mut st = 999;
+            f(std::ptr::null(), std::ptr::null_mut(), 0, &mut st);
+            assert_eq!(st, LasxStatus::Ok as i32, "{name}");
+        }
     }
 
     /// `lasx_quat_to_dcm_batch_checked` 的 9 个输出也必须做空指针校验（曾经漏掉）。

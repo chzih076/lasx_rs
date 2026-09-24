@@ -23,6 +23,8 @@ pub enum Group {
     Softmax,
     /// 行内 RMSNorm（NN 侧 N1）。
     RmsNorm,
+    /// 逐元素激活：SiLU / GELU-quick（NN 侧 N1）。
+    Activation,
     /// 批量 3 分量模长。
     Attitude,
     Large,
@@ -62,6 +64,7 @@ impl Group {
         Group::Plan,
         Group::Softmax,
         Group::RmsNorm,
+        Group::Activation,
         Group::Attitude,
         Group::Large,
         Group::Norm3,
@@ -90,6 +93,7 @@ impl Group {
             Group::Plan => "plan",
             Group::Softmax => "softmax",
             Group::RmsNorm => "rms",
+            Group::Activation => "act",
             Group::Attitude => "attitude",
             Group::Large => "large",
             Group::Norm3 => "norm3",

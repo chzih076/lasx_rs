@@ -1,5 +1,6 @@
 //! 各内核组的基准套件：每个 `pub fn` 对应一个 [`crate::group::Group`]。
 
+pub mod activation;
 pub mod align;
 pub mod attitude;
 pub mod batch;

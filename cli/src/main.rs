@@ -94,6 +94,7 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::Plan => suites::plan::run(),
         Group::Softmax => suites::softmax::softmax(rows),
         Group::RmsNorm => suites::rms_norm::rms_norm(rows),
+        Group::Activation => suites::activation::activation(rows),
         Group::Attitude => suites::attitude::attitude(rows),
         Group::Large => suites::large::run(),
         Group::Norm3 => suites::batch::norm3(rows),
