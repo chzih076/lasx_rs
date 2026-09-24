@@ -1561,3 +1561,60 @@ pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
 - 基准里**内联断言了 `Auto` 与 `Single` 逐位一致**（不是只在单测里），快但不能错；
 - `Auto` 在三个形状上都选 12（工作量 16.7 M/134 M/1.07 G ≥ 4 M，行数 256/512/1024 ≥ 48）。
 
+### 19.8 第 3 步 v1：公式 DSL 的范围、诊断与验证方式（2026-09-24）
+
+实现在 `macros/`（`lasx_rs_macros`，proc-macro、`publish = false`、**零第三方依赖**），
+用户只看到 `lasx_rs::matmul!`。规则与设计见该 crate 的文档（`cargo doc -p lasx_rs_macros`），
+这里只记**这篇文档层面需要知道的东西**。
+
+**v1 接受**：`操作数 '=' 操作数 '*' 操作数` 或 `操作数 '*' 操作数`，操作数形如 `x[M, K]`；
+固定按 `A·B` 读（右侧是权重）。**v1 不做**：权重在左、`alpha`/`beta` 融合、`+` 多操作数、
+无下标简写里判档（按全静态生成）。
+
+**分派规则**：大写开头 = 编译期 const（生成类型标注）、小写/`_` 开头 = 运行期值
+（宏自己 `let m = x.rows();` + 断言）；**同一维必须写同一个下标**（行、收缩、列各查一次，
+大小写档次不同也归到这一条，报错里点明"档次也不同"）。
+
+**已验证的诊断 transcript**（人工核对，因为 `trybuild` 要引依赖）：
+
+```text
+# 1) 同一维两侧下标不同：双锚定，两条错误分别指向 M 与 P
+error: 行维的下标不一致：输出写 `M`，左侧操作数写 `P`
+  --> examples/formula_dsl.rs:21:15
+21 |     matmul!(y[M, N] = x[P, K] * w[K, N]);
+   |               ^
+error: 两处必须写同一个下标（当前是 `M` 与 `P`）。大写=编译期 const、小写=运行期值；同一维必须一致
+  --> examples/formula_dsl.rs:21:25
+   |                         ^
+
+# 2) 标量前缀（v1 未实现 alpha）：指在 `alpha` 上，并给出替代做法
+error: v1 不支持标量前缀：`alpha * …`（`alpha` 缩放/融合还没实现）
+  --> examples/formula_dsl.rs:21:23
+21 |     matmul!(y[M, N] = alpha * x[M, K] * w[K, N]);
+   |                       ^^^^^
+error: 要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用
+```
+
+**验证方式（零依赖前提下）**：
+
+- **正面路径**进 CI：`shape::tests::test_formula_dsl_matches_api_bit_for_bit`（静态 + DYN +
+  无输出形态，与 `api::matmul` 逐位对照）、`examples/formula_dsl.rs`（`--all-targets` 会编译）、
+  `shape` 模块的 doctest；
+- **负面路径**用上表那种人工核对的 transcript 守（每加一条诊断就在本节补一条 transcript）；
+- 宏自己的纯逻辑（首字符分派、同一维同名检查）有 2 个单测——它们**只吃名字**，因为
+  `proc_macro` 类型在宏之外构造会 panic（`procedural macro API is used outside of a procedural macro`），
+  所以 Span 归位那一层不做单测、靠上面的 transcript。
+
+**写这版踩到的三个坑**（都写进了代码注释，避免以后重踩）：
+
+1. `"(".parse::<TokenStream>()` 会**失败**（不配对的定界符是非法 token 流），早先用它拼片段
+   并 `filter_map(..ok())`，括号被**静默丢掉**，生成的代码连语法都不成立 → 定界符必须走
+   `Group::new(Delimiter::…)`；
+2. 静态档写进已有输出要用 `Mat::mul_into`（`apply_into` 在 `Prepared` 上，不在 `Mat` 上）；
+3. `compile_error!` 的诊断位置取的是**它自己那棵小树**的跨度：只给字符串字面量设 Span 不够，
+   报错会指向整条 `matmul!(…)`；要把 Span 铺满整棵小树（`quote_spanned!` 的做法）才锚得住。
+
+**仍然做不到的**：proc-macro 没有名字解析，判断不了大写下标是不是 `const`。所以
+"大写下标必须是 const"只能写在文档里；rustc 的报错是 `cannot find value 'M' in this scope`。
+这条在 crate 文档里明说了，别当成遗漏。
+

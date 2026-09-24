@@ -884,4 +884,36 @@ mod tests {
             .apply_pooled(&pool, &x, &mut out);
         assert_eq!(bits_f32(out.as_slice()), bits_f32(&want), "Exact<3> 小形状");
     }
+
+    /// 公式 DSL 的**正面路径**：宏生成的代码进 CI 回归（静态 + DYN + 无输出，逐位对照）。
+    ///
+    /// 负面路径（诊断）没法在这里测：`trybuild` 要引依赖，与"零第三方依赖"冲突。
+    /// 所以负面路径用**人工核对的编译输出**守着，transcript 记在 `docs/dev.md §19.8`。
+    #[test]
+    fn test_formula_dsl_matches_api_bit_for_bit() {
+        const M: usize = 32;
+        const K: usize = 64;
+        const N: usize = 48;
+        let weights = f32s(K * N, 0xabc);
+        let batch = f32s(M * K, 0xdef);
+        let want = crate::api::matmul(M, K, N, &batch, &weights).unwrap();
+
+        let w = Mat::<f32, { K }, { N }>::new(&weights).unwrap();
+        let x = Mat::<f32, { M }, { K }>::new(&batch).unwrap();
+
+        // 全静态：大写下标 = 编译期 const（形状错了这里就编译不过）
+        let mut y = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(y[M, N] = x[M, K] * w[K, N]);
+        assert_eq!(bits_f32(y.as_slice()), bits_f32(&want), "静态公式");
+
+        // DYN：小写行下标 = 运行期值（宏自己绑定 `let m = xd.rows();` 并断言）
+        let xd = MatDyn::<f32, { K }>::new(&batch).unwrap();
+        let mut yd = MatBufDyn::<f32, { N }>::with_rows(M);
+        crate::matmul!(yd[m, N] = xd[m, K] * w[K, N]);
+        assert_eq!(bits_f32(yd.as_slice()), bits_f32(&want), "DYN 公式");
+
+        // 不带输出的形态（新分配）：静态档生成 `x.mul(&w)`
+        let expr = crate::matmul!(x[M, K] * w[K, N]);
+        assert_eq!(bits_f32(expr.as_slice()), bits_f32(&want), "无输出公式");
+    }
 }

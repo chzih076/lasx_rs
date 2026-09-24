@@ -307,6 +307,19 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Di
     let name_span = name.span();
 
     let Some(TokenTree::Group(arg)) = tokens.get(at + 1) else {
+        // 紧跟着 `*` 说明这是标量前缀（`alpha * x[..]`）：单独给消息，否则用户只看到
+        // "缺少下标"，看不出真正的问题是 v1 还没做 `alpha`/融合。
+        if let Some(TokenTree::Punct(star)) = tokens.get(at + 1) {
+            if star.as_char() == '*' {
+                return Err(Diagnostic::new(
+                    format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
+                    name_span,
+                )
+                .with_note(
+                    "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用",
+                ));
+            }
+        }
         return Err(Diagnostic::new(
             format!("`{name}` 后面缺少下标：请写成 `{name}[行下标, 列下标]`"),
             name_span,
