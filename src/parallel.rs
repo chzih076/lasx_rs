@@ -22,6 +22,16 @@ use crate::ops::matmul;
 use crate::ops::matmul_f64 as matmul64;
 use crate::pool::sched::Pick;
 
+thread_local! {
+    /// 双缓冲打包面板，**跨调用复用**。
+    ///
+    /// 为什么必须复用：`vec![0.0; cap]` 每次调用都会分配并清零（1024×1024×4096 时
+    /// 两块共 8 MB、256³ 时 4 MB）。对本就几十微秒的小形状，这笔开销比内核还贵——
+    /// 实测 256³/12 线程：每次分配 87 GF/s，复用后 310 GF/s（3.5×，见 dev.md §16.5）。
+    static PANEL_BUFS: std::cell::RefCell<[Vec<f32>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+}
+
 /// 走"共享打包面板"分支的 `m` 下限。
 ///
 /// 面板打包在并行层是**串行**做的（各线程只读共享面板），所以它带来一个 Amdahl 项：
@@ -32,7 +42,18 @@ use crate::pool::sched::Pick;
 ///
 /// 注：更彻底的做法是**把面板打包也并行化**（池里按块长切分、各线程打自己那些条带），
 /// 那样这个阈值就不需要了 —— 记为下一步（`docs/dev.md` §12）。
-const SHARED_PACK_MIN_M: usize = 512;
+/// 判据（**替代**原先的固定阈值 `SHARED_PACK_MIN_M = 512`）：回退路径每线程拿 `m/线程数` 行——
+/// - `per_thread >= PACK_MIN_M` 时，回退路径**会各自打包一整份 B**（病态，见 §13.7）
+///   ⇒ 必须走共享打包；
+/// - 否则回退路径落在**列块路径**（不打包、B 只从 DRAM 读一遍）⇒ 共享打包要额外读写
+///   一遍 B，通常更慢（实测 256³/12 线程：回退 327 vs 共享 223 GF/s）。
+///
+/// 实测交叉点与这条判据一致（12 线程）：384³（per_thread = 32）共享赢 287 vs 216；
+/// 256³（21）回退赢 327 vs 223；宽形状 m=300/100（25/8）回退赢；512³ 及以上两者持平偏共享。
+fn need_shared_pack(m: usize, threads: usize, pack_min_m: usize) -> bool {
+    threads > 1 && m / threads >= pack_min_m
+}
+
 use crate::pool::WorkerPool;
 
 /// 多核 `C[m×n] = A[m×k] · B[k×n]`（行主序，`B` 只读共享）。
@@ -97,7 +118,10 @@ pub fn matmul_f32_with_pick(
     // （实测 6 线程 274 GF/s → 12 线程 175 → 24 线程 93）。这里改成：并行层按面板
     // 打包一次，再把行块分给各线程，线程只读共享面板（面板本身留在共享 L3 里）。
     let work = (m as u128) * (k as u128) * (n as u128);
-    if m >= SHARED_PACK_MIN_M && k >= matmul::PACK_MIN_K && n >= 32 && work >= matmul::PACK_MIN_WORK
+    if need_shared_pack(m, pool.threads(), matmul::PACK_MIN_M)
+        && k >= matmul::PACK_MIN_K
+        && n >= 32
+        && work >= matmul::PACK_MIN_WORK
     {
         let n32 = n / 32 * 32;
         let strips_total = n32 / 32;
@@ -117,45 +141,73 @@ pub fn matmul_f32_with_pick(
         // 打包是 B 的一遍读+写，原来串行做，是 Amdahl 项。实测（多面板形状，见 dev.md §16）：
         // 1024×1024×4096 +24%、512×512×8192 +31%；单面板形状没有可重叠的部分，与原来一致。
         let cap = k * nc_strips * 32;
-        let mut buf_a = vec![0f32; cap];
-        let mut buf_b = vec![0f32; cap];
-        matmul::pack_b(k, n, panels[0].0, panels[0].1, b, &mut buf_a);
-        for (i, &(jb, nc)) in panels.iter().enumerate() {
-            let next = panels.get(i + 1).copied();
-            if i % 2 == 0 {
-                pool.for_each_row_block_mut_picked_deferred(
-                    m,
-                    4,
-                    [(a, k), (c, n)],
-                    pick,
-                    |rows, [ab, cb]| {
-                        let m4 = rows / 4 * 4;
-                        matmul::matmul_f32_packed_rows(k, n, jb, nc, &buf_a[..k * nc], ab, cb, m4);
-                    },
-                    || {
-                        if let Some((njb, nnc)) = next {
-                            matmul::pack_b(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
-                        }
-                    },
-                );
-            } else {
-                pool.for_each_row_block_mut_picked_deferred(
-                    m,
-                    4,
-                    [(a, k), (c, n)],
-                    pick,
-                    |rows, [ab, cb]| {
-                        let m4 = rows / 4 * 4;
-                        matmul::matmul_f32_packed_rows(k, n, jb, nc, &buf_b[..k * nc], ab, cb, m4);
-                    },
-                    || {
-                        if let Some((njb, nnc)) = next {
-                            matmul::pack_b(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
-                        }
-                    },
-                );
+        PANEL_BUFS.with(|cell| {
+            let mut bufs = cell.borrow_mut();
+            for b in bufs.iter_mut() {
+                if b.len() < cap {
+                    b.resize(cap, 0.0); // 只在增长时清零；之后跨调用复用
+                }
             }
-        }
+            let (buf_a, buf_b) = {
+                let (first, rest) = bufs.split_at_mut(1);
+                (&mut first[0], &mut rest[0])
+            };
+            matmul::pack_b(k, n, panels[0].0, panels[0].1, b, buf_a);
+            for (i, &(jb, nc)) in panels.iter().enumerate() {
+                let next = panels.get(i + 1).copied();
+                if i % 2 == 0 {
+                    pool.for_each_row_block_mut_picked_deferred(
+                        m,
+                        4,
+                        [(a, k), (c, n)],
+                        pick,
+                        |rows, [ab, cb]| {
+                            let m4 = rows / 4 * 4;
+                            matmul::matmul_f32_packed_rows(
+                                k,
+                                n,
+                                jb,
+                                nc,
+                                &buf_a[..k * nc],
+                                ab,
+                                cb,
+                                m4,
+                            );
+                        },
+                        || {
+                            if let Some((njb, nnc)) = next {
+                                matmul::pack_b(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
+                            }
+                        },
+                    );
+                } else {
+                    pool.for_each_row_block_mut_picked_deferred(
+                        m,
+                        4,
+                        [(a, k), (c, n)],
+                        pick,
+                        |rows, [ab, cb]| {
+                            let m4 = rows / 4 * 4;
+                            matmul::matmul_f32_packed_rows(
+                                k,
+                                n,
+                                jb,
+                                nc,
+                                &buf_b[..k * nc],
+                                ab,
+                                cb,
+                                m4,
+                            );
+                        },
+                        || {
+                            if let Some((njb, nnc)) = next {
+                                matmul::pack_b(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
+                            }
+                        },
+                    );
+                }
+            }
+        });
         // 列尾 [n32, n)：每个线程处理自己那些行（与顺序路径同一函数 ⇒ 逐位一致）
         if n > n32 {
             pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
@@ -225,7 +277,7 @@ pub fn matmul_f64(
     // （f64 的 B 字节数是 f32 的两倍：1024³ 每份 8 MB），24 线程 = 192 MB ≫ L3（32 MB），
     // 实测线程越多越慢：6 线程 110 GF/s → 12 线程 77 → 16 线程 62 → 24 线程 46。
     let work = (m as u128) * (k as u128) * (n as u128);
-    if m >= matmul64::PACK_MIN_M
+    if need_shared_pack(m, pool.threads(), matmul64::PACK_MIN_M)
         && k >= matmul64::PACK_MIN_K
         && n >= 16
         && work >= matmul64::PACK_MIN_WORK

@@ -73,14 +73,28 @@ fn main() {
         "stream64" => lasx_rs::ops_bench_stream_f64(m, k, n, &a64, &b64, &mut c64),
         other => panic!("未知路径 {other}"),
     };
+    // 样品内**重复**到 ~25 ms（与 CLI 的 `timeit` 同口径），5 个样品取中位。
+    //
+    // 为什么不能"一个样品一次调用"：小形状（256³ 多核只要 ~90 µs）里，池 worker 处于
+    // park 状态时的**唤醒延迟**占了大头——实测同一形状、同样 12 线程，
+    // 单次调用口径 85 GF/s vs 连续重复口径 375 GF/s（4.4×）。大形状（≥512³，毫秒级）
+    // 不受影响，但小形状会被严重低估。见 docs/dev.md §14.4。
     run();
-    let mut ts = Vec::new();
-    for _ in 0..7 {
+    let est = {
         let t = Instant::now();
         run();
-        ts.push(t.elapsed().as_secs_f64());
+        t.elapsed().as_secs_f64().max(1e-9)
+    };
+    let reps = ((0.025 / est) as usize).clamp(1, 100_000);
+    let mut ts = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        for _ in 0..reps {
+            run();
+        }
+        ts.push(t.elapsed().as_secs_f64() / reps as f64);
     }
     ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let t = ts[ts.len() / 2];
-    println!("{:.2} {:.1}", t * 1e3, flop / t / 1e9);
+    println!("{:.2} {:.1}  (reps={reps})", t * 1e3, flop / t / 1e9);
 }
