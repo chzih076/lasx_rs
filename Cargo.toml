@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "yll"]
+members = ["cli", "macros", "yll"]
 
 [package]
 name = "lasx_rs"
@@ -10,3 +10,7 @@ license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 公式 DSL 的宏实现：内部 crate、不发布、零第三方依赖（手写 TokenStream）
+lasx_rs_macros = { path = "macros" }

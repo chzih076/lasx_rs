@@ -74,6 +74,12 @@ pub mod view;
 
 pub use arch::lasx_force_lsx_thread;
 
+/// 公式 DSL：`matmul!(y[M, N] = x[M, K] * w[K, N])`。
+///
+/// 实现在内部的 `lasx_rs_macros`（`publish = false`，零第三方依赖），这里重导出，
+/// 于是用户视角只有一个依赖 `lasx_rs`。规则与诊断见 [`shape`] 模块文档。
+pub use lasx_rs_macros::matmul;
+
 /// 内部基准用的转发（不面向使用者；生产路径由 `lasx_matmul` 的按形状分派选择）。
 #[doc(hidden)]
 pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {

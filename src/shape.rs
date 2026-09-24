@@ -75,6 +75,36 @@
 //!
 //! 权重 `w` 仍是**全静态**类型 `Mat<K, N>`：DYN 只把"行"交给运行期，打包与排版不变。
 //!
+//! # 公式 DSL（`lasx_rs::matmul!`）
+//!
+//! 上面那些调用可以写成数学式子——**下标的大写/小写决定它是编译期 const 还是运行期值**，
+//! 一个宏同时覆盖两档（规则与诊断见 `lasx_rs_macros` 的 crate 文档）：
+//!
+//! ```
+//! use lasx_rs::matmul;
+//! use lasx_rs::shape::{Mat, MatBuf, MatBufDyn, MatDyn};
+//!
+//! const M: usize = 64;
+//! const K: usize = 256;
+//! const N: usize = 256;
+//! # let weights: Vec<f32> = (0..K * N).map(|i| (i % 13) as f32).collect();
+//! # let batch: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32).collect();
+//! let w = Mat::<f32, { K }, { N }>::new(&weights)?;
+//! let x = Mat::<f32, { M }, { K }>::new(&batch)?;
+//!
+//! // 全静态：下标大写 = 编译期 const，形状错了是编译错误
+//! let mut y = MatBuf::<f32, { M }, { N }>::new();
+//! matmul!(y[M, N] = x[M, K] * w[K, N]);
+//!
+//! // DYN：行下标小写 = 运行期值（宏自己 `let m = xd.rows();` 再断言）
+//! let xd = MatDyn::<f32, { K }>::new(&batch)?;
+//! let mut yd = MatBufDyn::<f32, { N }>::with_rows(M);
+//! matmul!(yd[m, N] = xd[m, K] * w[K, N]);
+//!
+//! assert_eq!(y.as_slice(), yd.as_slice());
+//! # Ok::<(), lasx_rs::api::Error>(())
+//! ```
+//!
 //! # 数值保证
 //!
 //! 本层不含任何新的数值路径：`Prepared` 里面就是 [`crate::plan::MatmulPlan`]（打包 +

@@ -1,0 +1,14 @@
+[package]
+name = "lasx_rs_macros"
+version = "0.1.0"
+edition = "2021"
+description = "lasx_rs 的公式 DSL 宏实现（内部 crate，不发布）"
+license = "MIT"
+publish = false
+
+[lib]
+proc-macro = true
+
+# 零第三方依赖：手写 TokenStream 解析，不用 syn/quote。
+# 理由见 docs/dev.md §19.3（第一条是"按 ident 首字符分派"，macro_rules! 做不到）。
+[dependencies]
