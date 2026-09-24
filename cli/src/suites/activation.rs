@@ -7,13 +7,35 @@
 use crate::data::{AlignedBuf, Lcg};
 use crate::report::{row3, Row};
 use crate::timing::{time_mode, timeit, Mode};
-use lasx_rs::ffi::nn::{lasx_gelu_quick, lasx_silu};
+use lasx_rs::ffi::nn::{lasx_gelu_erf, lasx_gelu_quick, lasx_silu};
 use std::hint::black_box;
 
-/// 标量参照：`silu` 与 `gelu_quick` 只差一个系数，合成一个函数少一份重复。
+/// 标量参照（朴素 Rust 循环，**同一个公式**，`exp` 用 `std`）：
+/// `c = 1.0` → silu，`c = 1.702` → gelu_quick，`c < 0` → gelu_erf。
+///
+/// `gelu_erf` 这里刻意用**同一个 A&S 7.1.26 的 f32 式子**，而不是 f64 的"真 erf"：
+/// 第一版参照写成了 f64（Taylor + 连分式），跑出来是 400–500×，那个数字毫无意义
+/// ——它比的是"我们没有做 f64 精度 erf"，不是 SIMD 的收益。
 fn scalar_act(x: &[f32], out: &mut [f32], c: f32) {
+    // A&S 7.1.26 的 a1..a5（最短往返十进制，与 ops::gelu_erf 里的位型相同）
+    const A: [f32; 5] = [
+        0.254_829_6,
+        -0.284_496_72,
+        1.421_413_8,
+        -1.453_152_1,
+        1.061_405_4,
+    ];
     for (o, &v) in out.iter_mut().zip(x.iter()) {
-        *o = v / (1.0 + (-(c * v)).exp());
+        *o = if c < 0.0 {
+            let ax = v.abs();
+            let z = ax * std::f32::consts::FRAC_1_SQRT_2;
+            let t = 1.0 / (0.327_591_1 * z + 1.0);
+            let poly = t * (A[0] + t * (A[1] + t * (A[2] + t * (A[3] + t * A[4]))));
+            let erf_a = 1.0 - poly * (-(z * z)).exp();
+            0.5 * v + 0.5 * ax * erf_a
+        } else {
+            v / (1.0 + (-(c * v)).exp())
+        };
     }
 }
 
@@ -31,6 +53,7 @@ pub fn activation(rows: &mut Vec<Row>) {
                 1.0f32,
             ),
             ("lasx_gelu_quick(LASX-only)", lasx_gelu_quick, 1.702),
+            ("lasx_gelu_erf(LASX-only)", lasx_gelu_erf, -1.0),
         ] {
             let lasx = time_mode(Mode::Lasx, || {
                 // `x`/`out` 各 n 个元素、长度一致（裸符号是 safe fn，内部自己取切片）。

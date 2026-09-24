@@ -245,12 +245,61 @@ y   = x / den             // 直接除法：单次舍入
 `|x| = 20` 时就已经 1.2e-6），不是算子本身的近似误差；正侧的相对误差被 `e^{−x}` 压掉，
 所以在 `|y| > 1` 的区间里比 §2.6 的 `exp` 包络还好。
 
-**5）实测带宽**（`cargo run -p lasx_bench --release -- act`，单线程）：**4.5–8.9 GB/s**，
-朴素 Rust 循环的 **7.1–13.8×**。与 §2.7 的 rms_norm 同为 2 条流，吞吐却只有它的一半到
-三分之一 ⇒ **这两个算子是算力受限，不是带宽受限**（同样的访存口径下 rms_norm 17.2 GB/s vs
-`silu` 8.1 GB/s，n ≈ 1M、工作集 8 MB 仍在 L3 内）。瓶颈是 `exp`：每 8 个元素约 19 条向量指令
-外加**一次向量除法**，而 rms_norm 每 8 个元素只要 2 条 `fma`。想再快得换更短的 `exp`
-多项式（精度换速度）或多项式整体重排，不属于本轮。
+**5）实测带宽**（`cargo run -p lasx_bench --release -- act`，单线程）：**4.2–8.9 GB/s**，
+朴素 Rust 循环（**同一个公式**）的 **6.7–13.9×**。与 §2.7 的 rms_norm 同为 2 条流，吞吐却只有
+它的一半到三分之一 ⇒ **这些算子是算力受限，不是带宽受限**（同样的访存口径下 rms_norm
+17.2 GB/s vs `silu` 8.1 GB/s，n ≈ 1M、工作集 8 MB 仍在 L3 内）。瓶颈是 `exp`：每 8 个元素约
+19 条向量指令外加**一次向量除法**，而 rms_norm 每 8 个元素只要 2 条 `fma`。想再快得换更短的
+`exp` 多项式（精度换速度）或多项式整体重排，不属于本轮。
+
+> 标量参照列有一个坑，记下来：`gelu_erf` 第一版的参照写成了 f64 的"真 erf"（Taylor +
+> 连分式），跑出来 400–500× ——那个数字**毫无意义**（它比的是"我们没做 f64 精度 erf"）。
+> 改成同一个 A&S f32 式子的朴素循环后是 7–10×，这才和另外两行可比。
+
+> `gelu_erf` 是同一族的第三个（§2.9），带宽与这两个同档。
+
+
+### 2.9 NN 侧：`lasx_gelu_erf`（erf 形式的 GELU）
+
+**1）语义。** `y = 0.5·x·(1 + erf(x/√2))`——PyTorch `gelu` 的默认定义（对照表见 §2.8）。
+
+**2）`erf` 的近似（契约的核心）。** `erf` 没有硬件指令，用 **Abramowitz & Stegun 7.1.26**：
+
+```text
+p = 0.3275911;  t = 1/(1 + p·|z|)                        // z = |x|/√2
+erf(|z|) ≈ 1 − ((((a5 t + a4)t + a3)t + a2)t + a1)·t·exp(−z²)     // 全程 FMA
+a = (0.254829592, −0.284496736, 1.421413741, −1.453152027, 1.061405429)
+```
+
+- 这个式子**本身**的最大绝对误差是 A&S 给的界 **1.5e-7**；本轮用 glibc 的 `erf` 复测，
+  折算到 gelu 输出上是 **2.1e-7**（出现在 `|x| ≈ 3.08`）；
+- 所以这个算子**不是"真 erf"**。要与 ggml 对齐请用 §2.8 的 `gelu_quick`；要"真 erf"得自己
+  实现（本库不承诺逐位等于 PyTorch）；
+- `|x|` 用 `max(x, −x)`（本机 stdarch 没有 LASX 的 `xvfabs_s`/按位 `and`）；
+- **不带 `copysign` 的写法**：`y = 0.5·x + 0.5·|x|·erf(|x|/√2)`，与
+  `0.5x(1 + sign(x)·erf(…))` 数学等价，但省掉"按符号选 lane"；
+- `exp` 复用 §2.6 那一串（`ops::nn_math`）。
+
+**3）由谁守**：逐位一致（`src/ops/gelu_erf.rs` 的标量模拟单测，`n` 1..=17 + 64/65/127/129；
+**注意模拟里必须显式写 `mul_add`**——第一版漏了，`x = −3` 立刻抓到 1 ulp 分歧）；
+数值（与**独立写的**高精度 f64 `erf`（Taylor + 连分式）对照，不是拿同一个式子自比）；
+边界（`x ≤ −5.6` ⇒ 精确 0、`x ≥ 6` ⇒ 位精确的恒等 `y = x`、正侧单调）；原地 == 异地（FFI 单测）。
+
+**4）实测精度**（与高精度 f64 参考比）：
+
+| `|x| ≤` | 1 | 4 | 16 | 40 |
+|---|---|---|---|---|---|
+| 最差绝对误差 | <6e-7 | <8e-7 | <1e-6 | <6e-6 |
+
+误差由两块构成：A&S 的 ~2.1e-7 + f32 舍入；`|x|` 大时又是**输入量化**主导（同 §2.8）。
+
+**5）两个实测出来的"非理想"行为（写出来而不是藏着）**：
+
+- **负侧尾部不单调**：真值从 `0⁻` 一侧趋于 0，而 `erf(|z|)` 在 `|x| ≈ 5.6` 处会**舍入到
+  恰好 1.0** ⇒ `1 − 1 = 0` 给出**精确 0**；再往右一点（`x = −5.5`）又给出 ~`−1.6e-7` 的小负数。
+  绝对幅度 ≤ A&S 的近似界，但"单调"这个直觉在 f32 下**不成立**，测试里只对 `x ≥ 0` 断言单调。
+- **`x = −inf` ⇒ NaN**（`0.5·inf + 0.5·(−inf)` 是未定式）。PyTorch 的 `gelu(−inf)` 同样是 NaN
+  （同一个代数式），所以这不是本库特有的缺陷；契约只覆盖**有限输入**。`x = +inf` ⇒ `+inf` ✓。
 
 
 ## 3. 指令集路径与降级覆盖
@@ -305,11 +354,11 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（51 个）
+## 4. 导出符号总表（53 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**26 个未带 `_checked`
-的 `lasx_*` + 25 个 `lasx_*_checked` = 51**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
-`lasx_silu`、`lasx_gelu_quick` 各与其 checked 变体）。
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**27 个未带 `_checked`
+的 `lasx_*` + 26 个 `lasx_*_checked` = 53**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
+`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf` 各与其 checked 变体）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -346,7 +395,7 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 | `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
 | `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
 
-### 4.3 `_checked` 变体 25 个
+### 4.3 `_checked` 变体 26 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -359,7 +408,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-25 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+26 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
@@ -369,7 +418,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quat_normalize_batch_checked`、`lasx_quat_mul_batch_checked`、
 `lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
 `lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
-`lasx_silu_checked`、`lasx_gelu_quick_checked`。
+`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -400,9 +449,10 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | 加 7 个姿态/几何 | 22 | 21 | 43 |
 | 加 1 个 NN（N1 首批） | 23 | 22 | 45 |
 | 加第 2 个 NN（`rms_norm`） | 24 | 23 | 47 |
-| 加 2 个激活（`silu`、`gelu_quick`） | 26 | 25 | **51** |
+| 加 2 个激活（`silu`、`gelu_quick`） | 26 | 25 | 51 |
+| 加第 3 个激活（`gelu_erf`） | 27 | 26 | **53** |
 
-原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 4 个与其 checked 变体。
+原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 5 个与其 checked 变体。
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
 
@@ -535,34 +585,44 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 - 与 softmax 的对比见 §2.7 末尾（两遍 vs 三遍访存）。
 
 
-### 5.11 `lasx_silu` / `lasx_gelu_quick` — 逐元素激活（LASX-only）
+### 5.11 `lasx_silu` / `lasx_gelu_quick` / `lasx_gelu_erf` — 逐元素激活（LASX-only）
 
 | 层 | 签名 |
 |---|---|
-| C（裸） | `void lasx_silu(const float *x, float *out, int n)`；`void lasx_gelu_quick(const float *x, float *out, int n)` |
+| C（裸） | `void lasx_silu(const float *x, float *out, int n)`；`void lasx_gelu_quick(const float *x, float *out, int n)`；`void lasx_gelu_erf(const float *x, float *out, int n)` |
 | C（`_checked`） | 同上 + 末尾 `int *status`；`n < 0` → `NegativeLength`，`n > 0` 时空指针 → `NullPointer` |
-| Rust | `api::silu(&[f32]) -> AlignedVec<f32>`；`api::gelu_quick(&[f32]) -> AlignedVec<f32>` |
+| Rust | `api::silu(&[f32]) -> AlignedVec<f32>`；`api::gelu_quick(&[f32])`；`api::gelu_erf(&[f32])` |
 
 ```rust
 use lasx_rs::api;
 let y = api::silu(&hidden);          // y[i] = x[i]/(1+exp(-x[i]))
-let g = api::gelu_quick(&hidden);    // y[i] = x[i]/(1+exp(-1.702*x[i]))
+let g = api::gelu_quick(&hidden);    // y[i] = x[i]/(1+exp(-1.702*x[i]))     —— ggml GELU_QUICK
+let e = api::gelu_erf(&hidden);      // y[i] = 0.5*x[i]*(1+erf(x[i]/√2))    —— PyTorch gelu（近似的 erf）
 ```
 
 ```c
 lasx_silu(x, out, n);                /* 允许 out == x（就地） */
 lasx_gelu_quick_checked(x, out, n, &status);
+lasx_gelu_erf_checked(x, out, n, &status);
 ```
 
 - **形状只是 `n`**（逐元素，不需要 rows/cols），**允许就地**（`out == x`）：内核每轮先读完
   8 个再写回同样位置；
-- **数值契约**（直接除法 `x/den`、共用 §2.6 的 `exp`、逐元素位精确）见 §2.8；
-- **实测**（单线程，2 条流口径）：`n = 1024` 8.9 / 8.0 GB/s、`n = 64K` 7.8 / 7.1 GB/s、
-  `n = 1M` 8.1 / 6.7 GB/s、`n = 8M` 4.5 / 4.6 GB/s（`silu` / `gelu_quick`），
-  朴素 Rust 循环的 **7.1–13.8×**；
-- **算力受限，不是带宽受限**：与 rms_norm 同为 2 条流，但 `|x| ≈ 1M`（工作集 8 MB，仍在
-  L3 内）时 rms_norm 17.2 GB/s vs `silu` 8.1 GB/s。瓶颈是 `exp`（每 8 元素 ~19 条向量指令
-  + 一次向量除法），见 §2.8 第 5 条。
+- **数值契约**：`silu`/`gelu_quick` 见 §2.8（直接除法 `x/den`、共用 §2.6 的 `exp`）；
+  `gelu_erf` 见 §2.9（A&S 7.1.26 的 `erf` 近似，**不是真 erf**）；
+- **实测**（单线程，2 条流口径，`n` = 1024 / 64K / 1M / 8M）：
+
+  | 算子 | n=1024 | n=64K | n=1M | n=8M | 相对朴素循环 |
+  |---|---|---|---|---|---|
+  | `silu` | 8.89 | 7.83 | 8.05 | 5.15 GB/s | 8.1–13.9× |
+  | `gelu_quick` | 8.03 | 7.09 | 7.19 | 4.23 GB/s | 6.7–12.6× |
+  | `gelu_erf` | 5.23 | 4.61 | 4.70 | 4.05 GB/s | 7.2–10.0× |
+
+  `gelu_erf` 小尺寸下比 `silu` 慢 ~1.7×（多 5 项 Horner + `erf` 的除法），8M 时三者接近
+  ——那里已经是 DRAM 受限；
+- **算力受限，不是带宽受限**：与 rms_norm 同为 2 条流，但 n ≈ 1M（工作集 8 MB，仍在 L3 内）
+  时 rms_norm 17.2 GB/s vs `silu` 8.1 GB/s。瓶颈是 `exp`（每 8 元素 ~19 条向量指令 + 一次
+  向量除法），见 §2.8 第 5 条。
 
 
 ## 6. 批量几何与物理算子
@@ -1117,7 +1177,7 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 | f16/bf16 GEMM（prefill） | 8.4 / 16.6 GFLOP/s | ~90（f32 实测） | ~11× / 5× |
 | f16/bf16 GEMV（decode） | 6.8 / 9.1 GB/s | ~25（DRAM） | ~3.7× |
 | `SOFT_MAX` | 典型 2.4–4 GB/s | ~~~25（DRAM）~~ | **已落地**：`lasx_softmax_rows` 实测 **5.7–7.3 GB/s**（§20/§12.4），朴素 Rust 循环的 4.9–5.9× |
-| `SILU`/`GELU`（激活） | 无 LoongArch 分支（`vec.cpp` 里 silu/gelu 有 AVX/NEON/SVE，没有 LASX） | ~25（DRAM，逐元素两遍） | **已落地**：`lasx_silu`/`lasx_gelu_quick` 实测 **4.5–8.9 GB/s**（§2.8/§5.11），朴素 Rust 的 7.1–13.8×。注意它是**算力受限**：同样的两遍访存下 rms_norm 能到 17.2 GB/s，激活只有一半——`exp` + 向量除法是瓶颈 |
+| `SILU`/`GELU`（激活） | 无 LoongArch 分支（`vec.cpp` 里 silu/gelu 有 AVX/NEON/SVE，没有 LASX） | ~25（DRAM，逐元素两遍） | **已落地**：`lasx_silu`/`lasx_gelu_quick`/`lasx_gelu_erf` 实测 **4.1–8.9 GB/s**（§2.8/§2.9/§5.11），朴素 Rust 的 6.7–13.9×。注意它是**算力受限**：同样的两遍访存下 rms_norm 能到 17.2 GB/s，激活只有一半——`exp` + 向量除法是瓶颈 |
 | `q6_K` | 9.8 GB/s | ~18（q4_K 实测） | ~1.8× |
 | `mxfp4`/`nvfp4` | 5.5 / 4.0 GB/s | ~18 | ~3–4.5× |
 | 没有缺口 | `q4_0`/`q4_K`/`q2_K`/`q3_K`/`q8_0`/`iq*`、`f32`、`ROPE`、`ADD` | — | ≈1× |
@@ -1137,7 +1197,7 @@ LASX）；对本库而言这批算子价值更高，因为 `api`/`pool`/`paralle
 | `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 | 待做 |
 | `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask | **已落地**（§2.6 契约、§5.9 用法） |
 | `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | **已落地**（§2.7 契约、§5.10 用法） |
-| `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | **部分落地**：`silu` + `gelu_quick` 已完成（§2.8 契约、§5.11 用法）；`gelu_erf`（A&S 7.1.26）设计已定、待做 |
+| `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | **已落地**（§2.8/§2.9 契约、§5.11 用法）：`silu`、`gelu_quick`、`gelu_erf` 三个入口 |
 | `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 | 待做 |
 
 **N2（GGML 格式互操作，按需）**：`quantize_rows_q8_0`（激活量化：Q8_0 块 + f16 scale）、

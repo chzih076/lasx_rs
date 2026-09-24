@@ -12,13 +12,14 @@
 //! void lasx_rms_norm(const float *x, const float *w, float *out, int n_rows, int n_cols, float eps);
 //! void lasx_silu(const float *x, float *out, int n);
 //! void lasx_gelu_quick(const float *x, float *out, int n);
+//! void lasx_gelu_erf(const float *x, float *out, int n);
 //! ```
 //!
 //! `mask` **可以为 NULL**（表示无加性 mask）；`checked` 变体对 NULL 与"x/out 为空指针"
 //! 分别处理：`mask == NULL` 是合法输入，`x`/`out` 在 `n_rows × n_cols > 0` 时为空则报
 //! [`crate::ffi::status::LasxStatus::NullPointer`]。
 //!
-//! `silu`/`gelu_quick` 是**逐元素**算子，形状只是 `n`（不需要 rows/cols），且允许
+//! `silu`/`gelu_*` 是**逐元素**算子，形状只是 `n`（不需要 rows/cols），且允许
 //! `out == x`（就地）：内核每轮先读完 8 个再写回同样的 8 个位置。
 //!
 //! 数值契约（**不是**"差不多"）：`out = e · (1/Σ)`，`e = exp(clamp(scale·x + mask − max))`，
@@ -151,6 +152,25 @@ pub extern "C" fn lasx_gelu_quick(x: *const f32, out: *mut f32, n: i32) {
     }
 }
 
+/// GELU 的 erf 形式（PyTorch `gelu` 默认）：`out[i] = 0.5·x[i]·(1 + erf(x[i]/√2))`。
+///
+/// C 签名：`void lasx_gelu_erf(const float *x, float *out, int n)`
+///
+/// 允许 `out == x`（就地）。`erf` 用 A&S 7.1.26（绝对误差 ≤1.5e-7），契约见 `docs/ops.md` §2.9。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gelu_erf(x: *const f32, out: *mut f32, n: i32) {
+    let n = n.max(0) as usize;
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `x`/`out` 各至少 n 个元素（允许同一块内存）。
+    unsafe {
+        let xs = std::slice::from_raw_parts(x, n);
+        let os = std::slice::from_raw_parts_mut(out, n);
+        crate::ops::gelu_erf::gelu_erf_f32(xs, os);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +206,28 @@ mod tests {
                 "gelu_quick",
                 lasx_gelu_quick as extern "C" fn(*const f32, *mut f32, i32),
                 (|v: f64| v / (1.0 + (-(1.702 * v)).exp())) as fn(f64) -> f64,
+            ),
+            (
+                "gelu_erf",
+                lasx_gelu_erf as extern "C" fn(*const f32, *mut f32, i32),
+                (|v: f64| {
+                    // 参考用同一近似式（f64 精度），只验"F32 实现 == 近似式"，不验近似质量
+                    // （近似质量由 `ops::gelu_erf` 的单测对高精度 erf 参考负责）
+                    let ax = v.abs();
+                    let z = ax * std::f64::consts::FRAC_1_SQRT_2;
+                    let t = 1.0 / (0.327_591_1f64).mul_add(z, 1.0);
+                    let mut p = 1.061_405_429f64;
+                    for c in [
+                        (-1.453_152_027f64),
+                        1.421_413_741,
+                        -0.284_496_736,
+                        0.254_829_592,
+                    ] {
+                        p = p.mul_add(t, c);
+                    }
+                    let erf_a = 1.0 - p * t * (-(z * z)).exp();
+                    (0.5 * ax).mul_add(erf_a, 0.5 * v)
+                }) as fn(f64) -> f64,
             ),
         ] {
             let mut out = vec![0f32; x.len()];

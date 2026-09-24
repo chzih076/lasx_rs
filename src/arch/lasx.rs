@@ -106,6 +106,16 @@ pub fn neg_f32x8(x: F32x8) -> F32x8 {
     unsafe { lasx_xvfsub_s(zero_f32x8(), x) }
 }
 
+/// lane-wise 绝对值（`max(x, −x)`）。
+///
+/// 为什么不是"清符号位"：本机 stdarch 快照既没有 LASX 的按位 `and`/`xor`，也没有
+/// `xvfabs_s`（只有 `xvfmaxa_s`，那是 `max(|a|,|b|)` 不是取绝对值）。`max(x, 0−x)` 对
+/// 有限值/`±inf`/NaN 都给出与 `abs` 相同的结果（`NaN` 传播为 NaN），代价是两条指令。
+#[inline]
+pub fn abs_f32x8(x: F32x8) -> F32x8 {
+    max_f32x8(x, neg_f32x8(x))
+}
+
 /// lane-wise 浮点 → 整数**截断**（向零取整）。
 ///
 /// # Safety

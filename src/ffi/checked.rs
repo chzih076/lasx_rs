@@ -823,6 +823,25 @@ pub extern "C" fn lasx_gelu_quick_checked(x: *const f32, out: *mut f32, n: i32, 
     }
 }
 
+/// 带错误通道的 GELU（erf 形式）：`out[..n] = 0.5·x[..n]·(1 + erf(x[..n]/√2))`。
+///
+/// C 签名：`void lasx_gelu_erf_checked(const float*, float*, int, int*)`
+///
+/// 校验语义与 [`lasx_silu_checked`] 完全一致（`erf` 用 A&S 7.1.26，见 `docs/ops.md` §2.9）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gelu_erf_checked(x: *const f32, out: *mut f32, n: i32, status: *mut i32) {
+    let n = or_fail!(checked_len(n), status, ());
+    // SAFETY: 调用方声明 `x` 可读、`out` 可写且各至少 n 个元素（`n == 0` 时允许任意指针）。
+    unsafe {
+        let (x, out) = (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        );
+        LasxStatus::Ok.write(status);
+        crate::ops::gelu_erf::gelu_erf_f32(x, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +886,7 @@ mod tests {
                 lasx_silu_checked as extern "C" fn(*const f32, *mut f32, i32, *mut i32),
             ),
             ("gelu_quick", lasx_gelu_quick_checked),
+            ("gelu_erf", lasx_gelu_erf_checked),
         ] {
             // 成功路径
             let mut st = 999;

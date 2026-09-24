@@ -26,6 +26,7 @@ pub mod dot;
 pub mod dot_f64;
 pub mod dot_i8;
 pub mod dot_q4;
+pub mod gelu_erf;
 pub mod gelu_quick;
 pub mod j2_accel_batch;
 pub mod mat3_mul_vec3_batch;

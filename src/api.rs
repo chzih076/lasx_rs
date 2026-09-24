@@ -388,6 +388,24 @@ pub fn gelu_quick(x: &[f32]) -> AlignedVec<f32> {
     out
 }
 
+/// GELU 的 erf 形式（PyTorch `gelu` 的默认定义）：
+/// `y[i] = 0.5·x[i]·(1 + erf(x[i]/√2))`。
+///
+/// `erf` 没有硬件指令，用 **Abramowitz & Stegun 7.1.26**（本身绝对误差 ≤1.5e-7；折算到
+/// 输出上最差 ≈2.1e-7，出现在 `|x| ≈ 3.08`）。所以这个入口是**近似**，不是"真 erf"——
+/// 需要与 ggml 对齐的场景请用 [`gelu_quick`]。契约见 `docs/ops.md` §2.9。
+///
+/// 常数契约同 [`silu`]：`|x|` 用 `max(x, −x)`、最终写成 `0.5x + 0.5|x|·erf(|x|/√2)`
+/// （避免 `copysign`）、`exp` 复用 `ops::nn_math`。
+pub fn gelu_erf(x: &[f32]) -> AlignedVec<f32> {
+    let mut out = AlignedVec::<f32>::new(x.len());
+    if x.is_empty() {
+        return out;
+    }
+    crate::ops::gelu_erf::gelu_erf_f32(x, out.as_mut_slice());
+    out
+}
+
 /* ==================== 矩阵乘 ==================== */
 
 /// `C[m×n] = A[m×k] · B[k×n]`（行主序），返回新分配的对齐缓冲。
@@ -1063,9 +1081,17 @@ mod tests {
             assert_eq!(g[i].to_bits(), want[i].to_bits(), "gelu_quick[{i}]");
         }
 
+        let e = gelu_erf(&x);
+        assert_eq!(e.as_ptr() as usize % ALIGN, 0, "gelu_erf 输出未对齐");
+        crate::lasx_gelu_erf(x.as_ptr(), want.as_mut_ptr(), n as i32);
+        for i in 0..n {
+            assert_eq!(e[i].to_bits(), want[i].to_bits(), "gelu_erf[{i}]");
+        }
+
         // 空输入：长度 0、不 panic
         assert!(silu(&[]).is_empty());
         assert!(gelu_quick(&[]).is_empty());
+        assert!(gelu_erf(&[]).is_empty());
     }
 
     /// 原地内核：结果与 C ABI 路径逐位一致，且原地语义正确（axpy 不改 x）。
