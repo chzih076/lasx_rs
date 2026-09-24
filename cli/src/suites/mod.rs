@@ -10,5 +10,6 @@ pub mod physics;
 pub mod plan;
 pub mod quant;
 pub mod reduce;
+pub mod rms_norm;
 pub mod scenario;
 pub mod softmax;

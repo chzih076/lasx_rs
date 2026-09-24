@@ -14,7 +14,7 @@
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（45 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（47 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -169,6 +169,38 @@ kk = clamp(trunc(n) + 127, 0, 254);  exp(x) = p · bitcast_f32(kk << 23)
 > **先在本节写死 op 序列与"谁守"，再写代码**。
 
 
+### 2.7 NN 侧：`lasx_rms_norm`
+
+与 §2.6 共用同一套"位精确骨架"（8 个 per-lane 累加器 + 固定次序两两归约 + 列尾填充），
+只列**不同**的部分：
+
+```text
+s   = Σ_j x[j]²                    // 每步一条 fma(x, x, s)：一次舍入（不是 acc + x*x 的两次）
+ms  = s / cols                     // 一次除法
+inv = 1 / sqrt(ms + eps)           // 一次 sqrt + 一次除法
+out = (x · inv) · w                // 次序固定：先 inv 再权重
+```
+
+- **列尾补 `0.0`**：`0² = 0`，对平方和**精确无贡献**（比 softmax 那边的 `−1e30` + 夹取更干净，
+  不需要任何夹取）；累加仍然是 `fma`，所以"同一条 op 序列"这条在填充 lane 上也成立。
+- **行级数学在标量域算完再广播**：每行一次 `s/cols`、一次 `sqrt`、一次 `1/x`。这既省指令，
+  也**天然位精确**——不存在"向量 `sqrt` 与标量 `sqrt` 是否逐位相同"这个问题。
+- **开方与倒数用精确指令**，不用 `frsqrte`/`frecipe` 估算 + 牛顿：`docs/dev.md` §13.1 已实测
+  本机估算指令比精确除法**更慢**（6.8 周期 vs 4.0），这条结论直接复用、不重测。
+- `w` 可选（C 侧空指针），**长度为 `cols`**（按列的权重），每行复用。
+- **不在契约内**：`eps = 0` 且整行全零 ⇒ `inv = +inf` ⇒ `out = 0·inf = NaN`。这是定义域
+  问题（`eps` 就是为此存在），`api` 与 `_checked` 都要求 `eps` 有限且 `> 0`。
+
+**由谁守**：逐位一致（标量模拟单测，覆盖 `cols` 1–17 的边界扫描与 1×1…6×257 多种形状）、
+`fma` 契约（同上，模拟用 `mul_add`）、`cols` 边界、f64 参考精度 <1e-5（相对）、
+`eps > 0`（`api`：`NotPositive`；`_checked`：`NonPositiveConstant`）。
+
+**实测**（`cargo run -p lasx_bench --release -- rms`，单线程）：**11.5–17.7 GB/s**，
+朴素 Rust 行循环的 **2.6–3.5×**。比 softmax 高一大截是**结构原因**：rms_norm 两遍
+（平方和、写回）＝ 2 条流；softmax 三遍（max、exp+sum、归一）＝ 3 条流。按每条流折算两者
+的单线程带宽一致（5–8 GB/s），都在本机单流只读锚点（7.5–8.9 GB/s，§7.1）附近。
+
+
 ## 3. 指令集路径与降级覆盖
 
 ### 3.1 `SimdPath::detect()`
@@ -221,10 +253,11 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（45 个）
+## 4. 导出符号总表（47 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**23 个未带 `_checked`
-的 `lasx_*` + 22 个 `lasx_*_checked` = 45**（N1 批次新加 `lasx_softmax_rows` 与其 checked）。
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**24 个未带 `_checked`
+的 `lasx_*` + 23 个 `lasx_*_checked` = 47**（N1 批次新加 `lasx_softmax_rows`、`lasx_rms_norm`
+各与其 checked 变体）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -311,9 +344,10 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 |---|---|---|---|
 | 历史 15 个 | 15 | 14（`lasx_alloc` 无 checked） | 29 |
 | 加 7 个姿态/几何 | 22 | 21 | 43 |
-| 加 1 个 NN（N1 首批） | 23 | 22 | **45** |
+| 加 1 个 NN（N1 首批） | 23 | 22 | 45 |
+| 加第 2 个 NN（`rms_norm`） | 24 | 23 | **47** |
 
-原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 1 个与其 checked 变体。
+原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 2 个与其 checked 变体。
 
 
 ## 5. 归约、稠密与量化算子
@@ -428,6 +462,21 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
   已在单线程带宽上限附近（推导见 `docs/dev.md` §20.1）；
 - **LASX-only**：无降级分支（未列在 §3.2 的降级表里，因为它是新增符号——新增即 LASX-only，
   这一点在 §12.3 的批次说明里也写着）。
+
+
+### 5.10 `lasx_rms_norm` — 行内 RMSNorm（LASX-only）
+
+| 层 | 签名 |
+|---|---|
+| C（裸） | `void lasx_rms_norm(const float *x, const float *w, float *out, int n_rows, int n_cols, float eps)` |
+| C（`_checked`） | 同上 + 末尾 `int *status`；`w` 允许 NULL（无权重），`eps` 要求有限且 > 0 |
+| Rust | `api::rms_norm(&[f32], Option<&[f32]>, rows, cols, eps) -> Result<AlignedVec<f32>>` |
+
+- **语义**：`out = x / √(mean(x²)+eps) · w`，`rows × cols` 行主序，`w` 按列（长度 `cols`）；
+- **数值契约**（`fma` 平方和、标量域行级数学、精确 sqrt、`eps > 0`）见 §2.7；
+- **实测**（单线程）：`128×128` 10.1 µs / 12.97 GB/s、`1024×1024` 487.5 µs / 17.21 GB/s、
+  `32×4096` 59.4 µs / 17.65 GB/s；朴素 Rust 行循环的 **2.6–3.5×**；
+- 与 softmax 的对比见 §2.7 末尾（两遍 vs 三遍访存）。
 
 
 ## 6. 批量几何与物理算子
@@ -1000,7 +1049,7 @@ LASX）；对本库而言这批算子价值更高，因为 `api`/`pool`/`paralle
 |---|---|---|
 | `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 | 待做 |
 | `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask | **已落地**（§2.6 契约、§5.9 用法） |
-| `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | 待做 |
+| `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | **已落地**（§2.7 契约、§5.10 用法） |
 | `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | 待做 |
 | `rope`（NeoX / GPT-J 两种 mode） | f32，支持 `n_dims`/`freq_base`，可逐位对照 | 待做 |
 
@@ -1121,7 +1170,7 @@ cp target/release/liblasx.so yll/
 `mt`、`align`、`dispatch`、`scenario`。方法学与全部读数详见 `docs/dev.md`。
 
 ```bash
-# 导出符号自检：期望 45 行（23 原始 + 22 checked）
+# 导出符号自检：期望 47 行（24 原始 + 23 checked）
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```

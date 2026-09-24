@@ -21,6 +21,8 @@ pub enum Group {
     Plan,
     /// 行内 softmax（NN 侧 N1）。
     Softmax,
+    /// 行内 RMSNorm（NN 侧 N1）。
+    RmsNorm,
     /// 批量 3 分量模长。
     Attitude,
     Large,
@@ -59,6 +61,7 @@ impl Group {
         Group::Matmul,
         Group::Plan,
         Group::Softmax,
+        Group::RmsNorm,
         Group::Attitude,
         Group::Large,
         Group::Norm3,
@@ -86,6 +89,7 @@ impl Group {
             Group::Matmul => "matmul",
             Group::Plan => "plan",
             Group::Softmax => "softmax",
+            Group::RmsNorm => "rms",
             Group::Attitude => "attitude",
             Group::Large => "large",
             Group::Norm3 => "norm3",

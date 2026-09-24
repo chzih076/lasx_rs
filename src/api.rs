@@ -302,6 +302,59 @@ pub fn softmax_rows(
     Ok(out)
 }
 
+/* ==================== NN：RMSNorm ==================== */
+
+/// 行内 RMSNorm：`out[i][j] = x[i][j] / √(mean_j(x[i][j]²) + eps) · w[j]`。
+///
+/// `w` 是**按列**的可选权重（`None` = 无权重）。返回值是新分配的对齐缓冲。
+///
+/// # 数值契约（见 `docs/ops.md` §2.7）
+/// - 平方和用**每个 k 步一条 `fma(x, x, acc)`**（一次舍入），再按固定次序两两归约；列尾补
+///   `0.0`（`0² = 0`，精确无贡献）；
+/// - 行级数学（`s/cols`、`+eps`、`sqrt`、`1/x`）在**标量域**算完再广播——省指令，而且
+///   天然让"标量模拟"与向量路径逐位相同；
+/// - 输出次序固定为 `(x · inv) · w`；
+/// - 开方与倒数用**精确指令**，不用 `frsqrte` 估算（`docs/dev.md` §13.1 实测估算更慢）。
+///
+/// # Errors
+/// - `eps` 非有限（[`Error::NotFinite`]）或 `≤ 0`（[`Error::NotPositive`]）；
+/// - `x.len() != rows × cols`（[`Error::Shape`]）；
+/// - `w` 给了但长度不等于 `cols`（[`Error::Shape`]）；
+/// - `rows × cols` 溢出 `usize`（[`Error::Overflow`]）。
+pub fn rms_norm(
+    x: &[f32],
+    w: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<AlignedVec<f32>> {
+    if !eps.is_finite() {
+        return Err(Error::NotFinite {
+            op: "rms_norm",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    if eps <= 0.0 {
+        return Err(Error::NotPositive {
+            op: "rms_norm",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    let n = checked_mul("rms_norm", "rows×cols", rows, cols)?;
+    expect_len("rms_norm", "x", x.len(), n)?;
+    if let Some(w) = w {
+        expect_len("rms_norm", "w", w.len(), cols)?;
+    }
+    let mut out = AlignedVec::<f32>::new(n);
+    if n == 0 {
+        return Ok(out);
+    }
+    crate::ops::rms_norm::rms_norm(x, w.unwrap_or(&[]), eps, rows, cols, out.as_mut_slice());
+    Ok(out)
+}
+
 /* ==================== 矩阵乘 ==================== */
 
 /// `C[m×n] = A[m×k] · B[k×n]`（行主序），返回新分配的对齐缓冲。

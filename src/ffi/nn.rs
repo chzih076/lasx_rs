@@ -69,6 +69,41 @@ fn softmax_shape(n_rows: i32, n_cols: i32) -> Option<(usize, usize, usize)> {
     Some((rows, cols, n))
 }
 
+/// 行内 RMSNorm（`out = x / √(mean(x²)+eps) · w`）。
+///
+/// C 签名：`void lasx_rms_norm(const float *x, const float *w, float *out, int n_rows, int n_cols, float eps)`
+///
+/// `w` 是按列的权重、**允许为 NULL**（无权重）；`eps` 的合法性由 `_checked` 变体与 `api`
+/// 层把关（`eps = 0` 且整行全零会得到 NaN，属定义域问题，数值契约见 `docs/ops.md` §2.7）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_rms_norm(
+    x: *const f32,
+    w: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    eps: f32,
+) {
+    let Some((rows, cols, n)) = softmax_shape(n_rows, n_cols) else {
+        return; // 原始符号零校验：形状不合法就地返回（误用即 UB 是历史约定）
+    };
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `x`/`out` 各至少 n 个元素、`w` 要么为 NULL 要么
+    // 有 `cols` 个可读元素。
+    unsafe {
+        let x = std::slice::from_raw_parts(x, n);
+        let out = std::slice::from_raw_parts_mut(out, n);
+        let w = if w.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(w, cols)
+        };
+        crate::ops::rms_norm::rms_norm(x, w, eps, rows, cols, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

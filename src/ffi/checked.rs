@@ -744,6 +744,46 @@ pub extern "C" fn lasx_softmax_rows_checked(
     crate::ops::softmax_rows::softmax_rows(x, mask, scale, rows, cols, out);
 }
 
+/// 带错误通道的行内 RMSNorm。
+///
+/// C 签名：`void lasx_rms_norm_checked(const float*, const float*, float*, int, int, float, int*)`
+///
+/// `w` 为 NULL 合法（无权重）。`eps` 要求**有限且 > 0**：`eps = 0` 且整行全零会得到 NaN，
+/// 那是定义域问题，与其让调用方拿到 NaN，不如在这里报 [`LasxStatus::NonPositiveConstant`]。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_rms_norm_checked(
+    x: *const f32,
+    w: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    eps: f32,
+    status: *mut i32,
+) {
+    if n_rows < 0 || n_cols < 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, cols) = (n_rows as usize, n_cols as usize);
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    or_fail!(checked_positive(eps as f64), status, ());
+    // SAFETY: 见上；`w` 允许 NULL（下面单独判）。
+    let (x, out) = unsafe {
+        (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        )
+    };
+    let w = if w.is_null() || n == 0 {
+        &[][..]
+    } else {
+        // SAFETY: 调用方声明 `w` 有 `cols` 个元素（按列的权重）。
+        or_fail!(unsafe { checked_slice(w, cols) }, status, ())
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::rms_norm::rms_norm(x, w, eps, rows, cols, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
