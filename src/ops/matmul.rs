@@ -500,7 +500,8 @@ pub(crate) fn pack_strips(k: usize) -> usize {
 ///
 /// 只在 **k 不分块**（f32 `k·32·4 ≤ L1_BUDGET`，即 `k ≤ 384`）时位精确：k 分块会把部分和
 /// 落进输出缓冲再读回，而输出正是 `C`，`C_old` 会被部分和覆盖——那样 `beta·C_old` 只能靠
-/// "给累加器播种"拿到，违反契约（§2.5）。不分块时累加器一直在寄存器里，收尾读 `C_old` 才安全。
+/// "给累加器播种"拿到，违反契约（`docs/ops.md` §2.5）。不分块时累加器一直在寄存器里，
+/// 收尾读 `C_old` 才安全。
 ///
 /// 数值：`C = fma(beta, C_old, alpha·acc)`，与契约的"两次舍入"一致。参考实现必须写成
 /// `beta.mul_add(C_old, alpha * acc)` 才逐位相同（普通 `alpha*acc + beta*C_old` 是三次舍入）。

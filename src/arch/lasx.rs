@@ -111,8 +111,8 @@ fn splat_bits_i32(bits: u32) -> m256i {
 /// 顺带把 `abs` 也改成一条 `and`（见下）。
 #[inline]
 pub fn neg_f32x8(x: F32x8) -> F32x8 {
-    // SAFETY: 纯寄存器操作，不碰内存；transmute 只在 m256/m256i 之间换名字（§1 的分层约定：
-    // 位型转换只出现在 arch）。
+    // SAFETY: 纯寄存器操作，不碰内存；transmute 只在 m256/m256i 之间换名字（`docs/dev.md` §1
+    // 的分层约定：位型转换只出现在 arch）。
     unsafe {
         let xi: m256i = std::mem::transmute(x);
         std::mem::transmute(lasx_xvxor_v(xi, splat_bits_i32(0x8000_0000)))
@@ -175,8 +175,8 @@ pub unsafe fn trunc_i32(v: F32x8) -> m256i {
 
 /// 由 8 个**偏置指数**构造 `2^n`（整数域左移 23 位后按位重解释成 `f32`）。
 ///
-/// 放在 `arch` 是因为这是内核里唯一需要 `m256i ↔ m256` 转换的地方——§1 的分层约定是
-/// "transmute 只在 `arch` 出现"，内核里只出现这种语义化调用。
+/// 放在 `arch` 是因为这是内核里唯一需要 `m256i ↔ m256` 转换的地方——`docs/dev.md` §1 的分层
+/// 约定是"transmute 只在 `arch` 出现"，内核里只出现这种语义化调用。
 #[inline]
 pub fn pow2_from_exponent(n: m256i) -> F32x8 {
     // SAFETY: 纯寄存器操作（整数移位 + 位型重解释），不碰内存，无前提。

@@ -214,7 +214,8 @@ mod tests {
     /// 逐位一致：向量路径 vs 标量模拟，覆盖 16 的边界与多种长度。
     ///
     /// 随机用的是**任意 f16 位型**（含次正规与 `±inf`），所以会撞上 NaN：这时只要求两边都是
-    /// NaN——`NaN` 的 payload 由硬件转换决定，**不在**逐位契约内（与 §2.11 的措辞一致）。
+    /// NaN——`NaN` 的 payload 由硬件转换决定，**不在**逐位契约内（与 `docs/ops.md` §2.11
+    /// 的措辞一致）。
     #[test]
     fn test_matches_scalar_emulation_bit_for_bit() {
         let mut seed = 12345u32;
