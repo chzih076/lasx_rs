@@ -142,7 +142,8 @@ impl Soa6 {
             self.vx.as_mut_slice(),
             self.vy.as_mut_slice(),
             self.vz.as_mut_slice(),
-        );
+        )
+        .unwrap();
     }
 
     pub fn step_scalar(&mut self) {

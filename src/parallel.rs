@@ -18,6 +18,7 @@
 //! 数值一致性：这些函数只把**行/下标区间**分给不同线程，每个输出元素的计算过程与
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
+use crate::api::{checked_mul, expect_len, Error};
 use crate::ops::matmul;
 use crate::ops::matmul_f64 as matmul64;
 use crate::pool::sched::Pick;
@@ -60,8 +61,9 @@ use crate::pool::WorkerPool;
 ///
 /// `B` 是只读的，闭包以 `&` 捕获即可——池的按行块接口正是为这种形状准备的。
 ///
-/// # Panics
-/// 数组长度与 `m/k/n` 不符时 panic。
+/// # Errors
+/// 数组长度与 `m/k/n` 不符（[`Error::Shape`]），或 `m×k`/`k×n`/`m×n` 溢出
+/// `usize`（[`Error::Overflow`]）——与 [`crate::api::matmul`] 同一套错误与消息口径。
 pub fn matmul_f32(
     pool: &WorkerPool,
     m: usize,
@@ -70,14 +72,17 @@ pub fn matmul_f32(
     a: &mut [f32],
     b: &[f32],
     c: &mut [f32],
-) {
+) -> Result<(), Error> {
     // 调度策略按形状选一次（穷尽枚举，见 `pool::sched`）：矩阵乘的行内核按 4 行复用 B，
     // 所以 `gran = 4`；块数/动态与否由 `pick_rows` 的工作量判据决定。
     let pick = crate::pool::pick_rows(m, pool.threads(), 4);
-    matmul_f32_with_pick(pool, m, k, n, a, b, c, pick);
+    matmul_f32_picked(pool, m, k, n, a, b, c, pick, "matmul_f32")
 }
 
 /// 与 [`matmul_f32`] 同，但**显式指定调度策略**（A/B 与调优用）。
+///
+/// # Errors
+/// 同 [`matmul_f32`]。
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_f32_with_pick(
     pool: &WorkerPool,
@@ -88,28 +93,32 @@ pub fn matmul_f32_with_pick(
     b: &[f32],
     c: &mut [f32],
     pick: Pick,
-) {
-    assert_eq!(
-        a.len(),
-        m.checked_mul(k).expect("m×k 溢出"),
-        "A 的长度应为 m×k"
-    );
-    assert_eq!(
-        b.len(),
-        k.checked_mul(n).expect("k×n 溢出"),
-        "B 的长度应为 k×n"
-    );
-    assert_eq!(
-        c.len(),
-        m.checked_mul(n).expect("m×n 溢出"),
-        "C 的长度应为 m×n"
-    );
+) -> Result<(), Error> {
+    matmul_f32_picked(pool, m, k, n, a, b, c, pick, "matmul_f32_with_pick")
+}
+
+/// 两个 f32 入口的公共实现；`op` 只用于错误信息里的算子名。
+#[allow(clippy::too_many_arguments)]
+fn matmul_f32_picked(
+    pool: &WorkerPool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &mut [f32],
+    b: &[f32],
+    c: &mut [f32],
+    pick: Pick,
+    op: &'static str,
+) -> Result<(), Error> {
+    expect_len(op, "a", a.len(), checked_mul(op, "m×k", m, k)?)?;
+    expect_len(op, "b", b.len(), checked_mul(op, "k×n", k, n)?)?;
+    expect_len(op, "c", c.len(), checked_mul(op, "m×n", m, n)?)?;
     if m == 0 || n == 0 {
-        return;
+        return Ok(());
     }
     if k == 0 {
         c.fill(0.0); // 空内积：结果是全零矩阵（内核的 k 循环走 0 次，不会写 C）
-        return;
+        return Ok(());
     }
     // ---- 打包分支：**打包一次、跨线程共享** ----
     //
@@ -224,7 +233,7 @@ pub fn matmul_f32_with_pick(
                 },
             );
         }
-        return;
+        return Ok(());
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
@@ -239,6 +248,7 @@ pub fn matmul_f32_with_pick(
             cb.as_mut_ptr(),
         );
     });
+    Ok(())
 }
 
 /// 多核 f64 版 [`matmul_f32`]。
@@ -253,29 +263,32 @@ pub fn matmul_f64(
     a: &mut [f64],
     b: &[f64],
     c: &mut [f64],
-) {
-    assert_eq!(
+) -> Result<(), Error> {
+    expect_len(
+        "matmul_f64",
+        "a",
         a.len(),
-        m.checked_mul(k).expect("m×k 溢出"),
-        "A 的长度应为 m×k"
-    );
-    assert_eq!(
+        checked_mul("matmul_f64", "m×k", m, k)?,
+    )?;
+    expect_len(
+        "matmul_f64",
+        "b",
         b.len(),
-        k.checked_mul(n).expect("k×n 溢出"),
-        "B 的长度应为 k×n"
-    );
-    assert_eq!(
+        checked_mul("matmul_f64", "k×n", k, n)?,
+    )?;
+    expect_len(
+        "matmul_f64",
+        "c",
         c.len(),
-        m.checked_mul(n).expect("m×n 溢出"),
-        "C 的长度应为 m×n"
-    );
+        checked_mul("matmul_f64", "m×n", m, n)?,
+    )?;
     if m == 0 || n == 0 {
-        return;
+        return Ok(());
     }
     let pick = crate::pool::pick_rows(m, pool.threads(), 4);
     if k == 0 {
         c.fill(0.0);
-        return;
+        return Ok(());
     }
     // ---- 打包分支：与 f32 侧同源（打包一次、跨线程共享 + 双缓冲流水）----
     //
@@ -375,7 +388,7 @@ pub fn matmul_f64(
                 },
             );
         }
-        return;
+        return Ok(());
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
@@ -390,6 +403,7 @@ pub fn matmul_f64(
             cb.as_mut_ptr(),
         );
     });
+    Ok(())
 }
 
 /// 多核批量 RK4 J2 单步（6 个 SOA 数组一次派活）。
@@ -417,15 +431,15 @@ pub fn rk4_j2_step_batch(
     vx: &mut [f64],
     vy: &mut [f64],
     vz: &mut [f64],
-) {
+) -> Result<(), Error> {
     let n = rx.len();
-    assert_eq!(ry.len(), n, "6 个分量数组必须等长（ry）");
-    assert_eq!(rz.len(), n, "6 个分量数组必须等长（rz）");
-    assert_eq!(vx.len(), n, "6 个分量数组必须等长（vx）");
-    assert_eq!(vy.len(), n, "6 个分量数组必须等长（vy）");
-    assert_eq!(vz.len(), n, "6 个分量数组必须等长（vz）");
+    expect_len("rk4_j2_step_batch", "ry", ry.len(), n)?;
+    expect_len("rk4_j2_step_batch", "rz", rz.len(), n)?;
+    expect_len("rk4_j2_step_batch", "vx", vx.len(), n)?;
+    expect_len("rk4_j2_step_batch", "vy", vy.len(), n)?;
+    expect_len("rk4_j2_step_batch", "vz", vz.len(), n)?;
     if n == 0 {
-        return;
+        return Ok(());
     }
     pool.for_each_chunks_mut([rx, ry, rz, vx, vy, vz], |[rx, ry, rz, vx, vy, vz]| {
         let m = rx.len() as i32;
@@ -444,6 +458,7 @@ pub fn rk4_j2_step_batch(
             m,
         );
     });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -489,7 +504,8 @@ mod tests {
                 a.as_mut_slice(),
                 b.as_slice(),
                 got.as_mut_slice(),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 want.as_slice(),
                 got.as_slice(),
@@ -533,7 +549,8 @@ mod tests {
                 a.as_mut_slice(),
                 b.as_slice(),
                 got.as_mut_slice(),
-            );
+            )
+            .unwrap();
             for i in 0..m * n {
                 // 逐位比较：f64 的 == 会把 -0.0/0.0 视为相等，也会漏掉 NaN 的位型差异
                 assert_eq!(
@@ -593,7 +610,8 @@ mod tests {
                 qx.as_mut_slice(),
                 qy.as_mut_slice(),
                 qz.as_mut_slice(),
-            );
+            )
+            .unwrap();
         }
 
         for i in 0..n {
@@ -602,15 +620,65 @@ mod tests {
         }
     }
 
-    /// 空内积（k = 0）与零维不应 panic。
+    /// 空内积（k = 0）与零维：返回 `Ok`，且 `k=0` 时结果是全零。
     #[test]
     fn test_degenerate_shapes() {
         let pool = WorkerPool::new(3);
         let mut a = vec![1.0f32; 0];
         let b = vec![1.0f32; 0];
         let mut c = vec![1.0f32; 4];
-        matmul_f32(&pool, 2, 0, 2, &mut a, &b, &mut c);
+        matmul_f32(&pool, 2, 0, 2, &mut a, &b, &mut c).unwrap();
         assert_eq!(c, vec![0.0f32; 4], "k=0 时结果应为全零");
-        matmul_f32(&pool, 0, 0, 0, &mut [], &[], &mut []);
+        matmul_f32(&pool, 0, 0, 0, &mut [], &[], &mut []).unwrap();
+    }
+
+    /// **形状不符返回 `Err` 而不是 panic**（这是本层接口债清掉的那一条）：
+    /// 错误口径与 `api::matmul` 一致（同样是 `Error::Shape`，带算子名/参数名/期望/实际）。
+    #[test]
+    fn test_shape_mismatch_returns_err_not_panic() {
+        let pool = WorkerPool::new(4);
+        let (mut a, b) = (vec![0f32; 6], vec![0f32; 6]);
+        let mut c = vec![0f32; 6];
+
+        // A 长度不对
+        match matmul_f32(&pool, 2, 3, 2, &mut a[..5], &b, &mut c) {
+            Err(crate::api::Error::Shape {
+                op,
+                what,
+                expected,
+                got,
+            }) => {
+                assert_eq!((op, what, expected, got), ("matmul_f32", "a", 6, 5));
+            }
+            other => panic!("期望 Shape 错误，得到 {other:?}"),
+        }
+        // B 长度不对
+        assert!(matmul_f32(&pool, 2, 3, 2, &mut a, &b[..5], &mut c).is_err());
+        // C 长度不对
+        assert!(matmul_f32(&pool, 2, 3, 2, &mut a, &b, &mut c[..5]).is_err());
+        // 溢出：`m×k` 超过 usize
+        assert!(matches!(
+            matmul_f32(&pool, usize::MAX, 2, 2, &mut a, &b, &mut c),
+            Err(crate::api::Error::Overflow { .. })
+        ));
+        // f64 与 rk4 同样返回 Err
+        let (mut a64, b64) = (vec![0f64; 6], vec![0f64; 6]);
+        let mut c64 = [0f64; 6];
+        assert!(matmul_f64(&pool, 2, 3, 2, &mut a64, &b64, &mut c64[..5]).is_err());
+
+        let mut r0 = vec![0f64; 8];
+        let mut r1 = vec![0f64; 7]; // ← 故意不等长
+        let mut r2 = vec![0f64; 8];
+        let mut v0 = vec![0f64; 8];
+        let mut v1 = vec![0f64; 8];
+        let mut v2 = vec![0f64; 8];
+        match rk4_j2_step_batch(
+            &pool, 1.0, 1e-3, 1.0, 1.0, &mut r0, &mut r1, &mut r2, &mut v0, &mut v1, &mut v2,
+        ) {
+            Err(crate::api::Error::Shape { op, what, .. }) => {
+                assert_eq!((op, what), ("rk4_j2_step_batch", "ry"));
+            }
+            other => panic!("期望 Shape 错误，得到 {other:?}"),
+        }
     }
 }

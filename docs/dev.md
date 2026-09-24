@@ -1774,3 +1774,33 @@ LASX 微内核里。
 它是这条结论的可复现凭据；哪天想出更好的收尾形态（例如只在 β=0 时走融合、或把收尾
 做成连续一遍的小 kernel），先跑这个示例。
 
+### 19.12 `parallel::*` 改返回 `Result`（接口债清理，2026-09-24）
+
+**动机**：`api` 层形状不符返回 `Err`，而 `parallel::*` 却 `assert_eq!` panic——同一类错误
+在两层有两种表现，调用方（cli、例子、`yll` 扩展）都得自己防。这是审查清单里记了很久的
+一条接口债。
+
+**改法**：`matmul_f32` / `matmul_f32_with_pick` / `matmul_f64` / `rk4_j2_step_batch` 都返回
+`Result<(), api::Error>`。校验**复用 `api` 的 `expect_len`/`checked_mul`**（把它们从
+`fn` 提成 `pub(crate)`），所以错误变体与算子名/参数名/期望值/实际值的口径与
+`api::matmul` **完全一致**，不会出现两套消息风格。两个 f32 入口的公共体抽成
+`matmul_f32_picked(..., op: &'static str)`，`op` 只用于错误信息里的算子名——从 `matmul_f32`
+报出来的是 `"matmul_f32"`、从 `_with_pick` 报出来的是 `"matmul_f32_with_pick"`。
+
+**边界（有意保留）**：池的低层 `for_each_*` **仍然 panic**。它是"调用方自己保证形状"的
+原语（切分是它的全部语义，校验塞进去只会让热路径多一遍检查），`parallel` 才是带校验的
+那一层。这条写进了 `docs/ops.md` §9。
+
+**接口冻结**：§19.7 冻结的三个接口（池的行块闭包、`shape::Prepared::apply*`、
+`Policy::threads`）**一处未动**，所以不需要走"改前先记录"；`api` 那两个 helper 从私有变
+`pub(crate)` 也不影响公开面。
+
+**回归测试**：`parallel::tests::test_shape_mismatch_returns_err_not_panic`——A/B/C 三个数组
+各来一个长度不符，逐字段核对 `Error::Shape`（`op`/`what`/`expected`/`got`）、一个
+`Error::Overflow`（`m×k` 传 `usize::MAX`）、以及 `rk4` 的 `ry` 不等长。另外
+`test_degenerate_shapes` 从"不应 panic"改成"返回 `Ok` 且 `k=0` 全零"。
+
+**调用方**：cli（`data.rs` 的 `step_pooled`、`scenario.rs`）与 `examples/*` 四处用 `.unwrap()`
+（那些基准里形状由构造保证）；`yll` 扩展用 `.map_err(|e| e.to_string())?` **上抛给脚本**——
+这正是当初"调用错误需要上抛"那条要求的落点，扩展里不再有"库 panic 打断解释器"的路径。
+

@@ -54,6 +54,7 @@ fn main() {
     let mut run = || match path.as_str() {
         "pool" => {
             lasx_rs::parallel::matmul_f32_with_pick(&pool, m, k, n, &mut a, &b, &mut c, pick())
+                .unwrap()
         }
         "packed" => lasx_rs::ops_bench_packed(m, k, n, &a, &b, &mut c),
         "stream" => lasx_rs::lasx_matmul(
@@ -67,7 +68,7 @@ fn main() {
         "cols" => lasx_rs::ops_bench_cols_f32(m, k, n, &a, &b, &mut c),
         "pool64" => {
             let p = lasx_rs::pool::WorkerPool::new(threads);
-            lasx_rs::parallel::matmul_f64(&p, m, k, n, &mut a64, &b64, &mut c64)
+            lasx_rs::parallel::matmul_f64(&p, m, k, n, &mut a64, &b64, &mut c64).unwrap()
         }
         "packed64" => lasx_rs::ops_bench_packed_f64(m, k, n, &a64, &b64, &mut c64),
         "stream64" => lasx_rs::ops_bench_stream_f64(m, k, n, &a64, &b64, &mut c64),

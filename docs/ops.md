@@ -737,11 +737,14 @@ wp.apply_dyn_into(&xd, &mut yd);
 
 | 函数 | 说明 |
 |---|---|
-| `parallel::matmul_f32(&pool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32])` | 多核矩阵乘（行粒度 4），B 只读共享；`&pool` 可直接给 `pool::global()` |
+| `parallel::matmul_f32(&pool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32]) -> Result<(), Error>` | 多核矩阵乘（行粒度 4），B 只读共享；`&pool` 可直接给 `pool::global()` |
 | `parallel::matmul_f64(...)` | 同上，f64 |
-| `parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt, 6×&mut [f64])` | 多核批量 RK4 J2 单步（6 数组一次派活） |
+| `parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt, 6×&mut [f64]) -> Result<(), Error>` | 多核批量 RK4 J2 单步（6 数组一次派活） |
 
-形状不符时 panic；`matmul_*` 对 `m==0 || n==0` 直接返回，`k==0` 时 `c.fill(0.0)`。
+**`parallel::*` 形状不符返回 `Err`**（与 [`api`](#8-rust-安全层-lasx_rsapi) 同一套
+`Error::Shape`/`Error::Overflow` 与消息口径）；`matmul_*` 对 `m==0 || n==0` 直接返回 `Ok`
+（不写 C），`k==0` 时 `c.fill(0.0)`。**池的低层 `for_each_*` 仍按契约 panic**——它是
+"调用方自己保证形状"的原语，`parallel` 才是带校验的那一层。
 数值与单线程**逐位一致**（只切行/下标区间），有逐位对照测试。
 `parallel::rk4_j2_step_batch` 的 worker 是复用线程，`lasx_force_lsx_thread` 对它无效。
 
@@ -755,17 +758,18 @@ pool.for_each_chunk_mut(x.as_mut_slice(), |chunk| { /* ... */ });          // �
 pool.for_each_chunks_mut([rx, ry, rz], |[rx, ry, rz]| { /* ... */ });      // SOA 等长数组
 
 let (bs, cs) = (b.as_slice(), c.as_mut_slice());                            // 行块
-pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |rows, [ab, cb]| {
+pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |_start, rows, [ab, cb]| {
     lasx_rs::lasx_matmul(rows as i32, k as i32, n as i32,
                          ab.as_ptr(), bs.as_ptr(), cb.as_mut_ptr());
 });
 
 lasx_rs::parallel::matmul_f32(&pool, m, k, n,
-                              a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
+                              a.as_mut_slice(), b.as_slice(), c.as_mut_slice())?;
 for _ in 0..steps {
     lasx_rs::parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt,
-                                         rx, ry, rz, vx, vy, vz);
+                                         rx, ry, rz, vx, vy, vz)?;
 }
+# Ok::<(), lasx_rs::api::Error>(())
 ```
 
 > 池是要复用的：把 `WorkerPool::new` 放进热路径等于退化成"每次新建线程"。

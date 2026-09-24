@@ -112,7 +112,14 @@ impl std::error::Error for Error {}
 type Result<T> = std::result::Result<T, Error>;
 
 /// 长度必须等于 `expected`。
-fn expect_len(op: &'static str, what: &'static str, got: usize, expected: usize) -> Result<()> {
+///
+/// `pub(crate)`：`parallel` 层复用同一套错误与消息口径，免得两条路径的报错风格不一致。
+pub(crate) fn expect_len(
+    op: &'static str,
+    what: &'static str,
+    got: usize,
+    expected: usize,
+) -> Result<()> {
     if got == expected {
         Ok(())
     } else {
@@ -155,7 +162,13 @@ fn expect_same_len(op: &'static str, lens: &[(&'static str, usize)]) -> Result<u
     Ok(n)
 }
 
-fn checked_mul(op: &'static str, what: &'static str, a: usize, b: usize) -> Result<usize> {
+/// 形状相乘溢出检查；`pub(crate)` 理由同 [`expect_len`]。
+pub(crate) fn checked_mul(
+    op: &'static str,
+    what: &'static str,
+    a: usize,
+    b: usize,
+) -> Result<usize> {
     a.checked_mul(b).ok_or(Error::Overflow { op, what })
 }
 
@@ -980,7 +993,8 @@ mod tests {
         for _ in 0..5 {
             crate::parallel::rk4_j2_step_batch(
                 &pool, mu, j2, re, dt, &mut px, &mut py, &mut pz, &mut qx, &mut qy, &mut qz,
-            );
+            )
+            .unwrap();
         }
 
         for i in 0..n {

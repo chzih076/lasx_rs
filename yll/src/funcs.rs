@@ -443,7 +443,9 @@ pub extern "C" fn fn_propagate(
                 qx.as_mut_slice(),
                 qy.as_mut_slice(),
                 qz.as_mut_slice(),
-            );
+            )
+            // 形状错误上抛给脚本（库里已经是 `Error`，这里转成解释器的字符串错误）
+            .map_err(|e| e.to_string())?;
         }
         Ok(push_f64_arrays(&[&px, &py, &pz, &qx, &qy, &qz]))
     })

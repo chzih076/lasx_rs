@@ -377,7 +377,8 @@ pub fn parallel_matmul() {
                 a.as_mut_slice(),
                 b.as_slice(),
                 c2.as_mut_slice(),
-            );
+            )
+            .unwrap();
             let _ = black_box(c2[0]);
         });
 

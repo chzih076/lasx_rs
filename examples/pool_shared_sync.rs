@@ -195,7 +195,7 @@ fn main() {
             black_box(c[0]);
         });
         let par = timeit(|| {
-            parallel::matmul_f32(&pool, m, k, n, &mut a_par, &b, &mut c_par);
+            parallel::matmul_f32(&pool, m, k, n, &mut a_par, &b, &mut c_par).unwrap();
             black_box(c_par[0]);
         });
         assert_eq!(

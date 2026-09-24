@@ -99,7 +99,8 @@ fn main() {
                     a.as_mut_slice(),
                     b.as_slice(),
                     got.as_mut_slice(),
-                );
+                )
+                .unwrap();
             },
             9,
         );
