@@ -45,6 +45,81 @@ pub fn run() {
     println!();
     println!("③/② 是「只把 `B` 的打包省掉」的收益：`k·n` 相对 `m·k·n` 越大越明显。");
     println!("小形状上计划固定走打包路径，而 `lasx_matmul` 会按形状走流式路径，两者可能持平。");
+    println!();
+    shape_layer();
+}
+
+/// `shape` 层自己的验收：**同一个 `Prepared` 类型、只换策略参数**（`Auto` vs `Single`）。
+///
+/// 它测的是"策略层有没有正确接线"（`Auto` 有没有真把活铺到多核、块切得对不对），
+/// 与上面那张表的"shape 层有没有正确复用底层"是两件事，两个都要。
+///
+/// 形状是 const 泛型，没法在运行期循环——所以每个形状一行显式 case（这本来就是这层
+/// 的用法：形状写死在类型里）。输入走 DYN 入口吃运行期行数，权重侧仍是全静态。
+fn shape_layer() {
+    use lasx_rs::shape::{Mat, MatBufDyn, MatDyn, Single};
+
+    println!("### `shape` 层验收：`Prepared<Auto>` vs `Prepared<Single>`（同一份打包权重）");
+    println!();
+    println!("| 形状 | `Single` | `Auto` | 加速 | Auto 线程数 |");
+    println!("|---|---|---|---|---|");
+
+    macro_rules! case {
+        ($m:expr, $k:expr, $n:expr) => {{
+            let (m, k, n) = ($m, $k, $n);
+            let mut rng = Lcg::new((m * 31 + k * 7 + n) as u64);
+            let weights = AlignedBuf::fill_with(k * n, |_| rng.f32());
+            let batch = AlignedBuf::fill_with(m * k, |_| rng.f32());
+            let w = Mat::<f32, $k, $n>::new(weights.as_slice()).unwrap();
+            let single = w.prepare_with::<Single>();
+            let auto = w.prepare();
+
+            let x = MatDyn::<f32, $k>::new(batch.as_slice()).unwrap();
+            let mut out = MatBufDyn::<f32, $n>::with_rows(m);
+            single.apply_dyn_into(&x, &mut out);
+            let mut out_auto = MatBufDyn::<f32, $n>::with_rows(m);
+            auto.apply_dyn_into(&x, &mut out_auto);
+            assert_eq!(
+                out.as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                out_auto
+                    .as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "{}×{}×{}: Auto 与 Single 不逐位一致",
+                m,
+                k,
+                n
+            );
+
+            let t_single = timeit(|| {
+                single.apply_dyn_into(&x, &mut out);
+                let _ = black_box(out.as_slice()[0]);
+            });
+            let t_auto = timeit(|| {
+                auto.apply_dyn_into(&x, &mut out_auto);
+                let _ = black_box(out_auto.as_slice()[0]);
+            });
+            println!(
+                "| f32 {m}×{k}×{n} | {}（{}） | {}（{}） | {:.2}× | {} |",
+                fmt_t(t_single),
+                gf(flops(m, k, n), t_single),
+                fmt_t(t_auto),
+                gf(flops(m, k, n), t_auto),
+                t_single.as_secs_f64() / t_auto.as_secs_f64(),
+                auto.threads::<{ $m }>(),
+            );
+        }};
+    }
+    case!(256, 256, 256);
+    case!(512, 512, 512);
+    case!(1024, 1024, 1024);
+    println!();
+    println!("（`Auto` 判据见 `shape::auto_threads`：每线程 ≥4 行 **且** 工作量 ≥4 M 乘加；");
+    println!("`Single` 恒 1、完全不碰池。两者逐位一致是本函数开头的断言。）");
 }
 
 fn flops(m: usize, k: usize, n: usize) -> f64 {
@@ -70,7 +145,7 @@ fn row_f32(m: usize, k: usize, n: usize) {
     let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
     let api_t = timeit(|| {
         let out = api::matmul(m, k, n, &a, &b).unwrap();
-        let _ = black_box(out[0]);
+        let _ = black_box(out.as_slice()[0]);
     });
     let ffi_t = timeit(|| {
         lasx_matmul(
@@ -113,7 +188,7 @@ fn row_f64(m: usize, k: usize, n: usize) {
     let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
     let api_t = timeit(|| {
         let out = api::matmul_f64(m, k, n, &a, &b).unwrap();
-        let _ = black_box(out[0]);
+        let _ = black_box(out.as_slice()[0]);
     });
     let ffi_t = timeit(|| {
         lasx_matmul_f64(

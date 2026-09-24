@@ -531,6 +531,14 @@ impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> Prepared<P, T, 
         if rows == 0 || N == 0 {
             return;
         }
+        // 契约（见 `pool` 模块头第 3 条）：输入与输出不能是同一块内存。用户 API 下写不出来
+        // （借用检查器按路径判断，`let xv = &x; apply(xv, &mut x)` 是 E0502），但**库内
+        // 生成代码**（宏、`unsafe`）可能把同一个矩阵既当输入又当输出——这条断言就是拦它的。
+        // 原地累加（`y = A·x + y`）需要另一套内核，现在没有。
+        debug_assert!(
+            a.as_ptr() as *const u8 != c.as_ptr() as *const u8,
+            "输入与输出指向同一块内存：宏/封装层必须保证输入输出是不同变量（契约 3）"
+        );
         let threads = P::threads(rows, K, N);
         if threads <= 1 {
             // 单线程：一行调度开销都不付
