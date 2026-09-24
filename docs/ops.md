@@ -362,6 +362,61 @@ y1 = fma(x1, c,  (x0·s))
 主导（1.04×）——那时瓶颈不是旋转而是复制，这一点和 softmax 的"遍数决定一切"是同一类结论。
 
 
+### 2.11 NN 侧：`lasx_dot_f16` / `lasx_gemv_f16`（f16 权重）
+
+**1）语义。** f16 权重以 **u16 位型**给出（本库零依赖，不引入 half crate）：
+
+```text
+dot_f16(a: &[u16], b: &[f32]) -> f32           // Σ f16_to_f32(a[i]) · b[i]
+gemv_f16(a: &[u16], x: &[f32], m, k) -> [f32]  // y[r] = dot_f16(a[r*k..(r+1)*k], x)
+```
+
+**2）f16 → f32 是精确的**：f16 的每个值（含次正规、`±inf`）都能被 f32 精确表示，这一步
+**不引入误差**——误差只来自"权重本来是 f16"这件事本身（相对 ~2^-11 ≈ 4.9e-4）。
+原语 `xvfcvtl.s.h`/`xvfcvth.s.h` 是**128 位 lane 内**操作（各转每个 lane 的低/高 4 个 f16），
+所以一次 256 位载入要再配两条 `xvpermi_q` 才拼回自然序（详见 `arch::lasx` 的文档）。
+
+**3）累加次序（契约本身）**：**4 条独立累加链**，每 32 个元素一轮（不足 32 走 16 元素轮、
+再不足走标量尾；尾部**延续同一 lane** `j % 8`）：
+
+```text
+c0 = fma(cvt(a[i..i+8]),   b[i..i+8],   c0)     // 元素 i+k → lane k
+c1 = fma(cvt(a[i+8..i+16]), b[i+8..i+16], c1)
+c2 / c3 同前，偏移 16..32
+最后：t = (c0 + c1) + (c2 + c3)（lane 内），再按固定次序两两归约 8 个 lane
+```
+
+**为什么是 4 条链而不是 1 条**（这条是**实测**改出来的，第一版就是 1 条）：
+1 条链时每 16 元素只有两条**互相依赖**的 FMA，把 ~4 周期的 FMA 延迟整段暴露出来——
+实测 `1×2048` 是 565 ns；改成 4 条链后同一形状 **190 ns（3.0×）**，`dot n=4096` 从 1.2 µs
+降到 359 ns。**"简单"的写法在这里慢了 3 倍，而只有测量才知道。**
+
+**4）由谁守**：**转换的精确性可以穷举**——f16 只有 65536 个位型，单测**遍历全部位型**把硬件
+`xvfcvtl/fcvth` 与手写 `f16_to_f32` 逐位比较（`NaN` 的 payload 由硬件定，只断言 `is_nan()`）；
+累加（向量 == 标量模拟，`n` 覆盖 0/1/7/8/15/16/17/31/32/33/63/64/1000）；数值（与 f64 参考
+相对误差 <1e-6）；`gemv` 逐行 == `dot_f16`（逐位）；形状（`api`/`_checked`；
+`k = 0 ⇒ y = 0`，空向量的点积是 0）。
+**只靠约定的一条**：C 侧调裸符号时 `a`/`x`/`y` 的长度自洽——违反是**读写越界**。
+
+**5）实测**（`cargo run -p lasx_bench --release -- f16`，单线程；口径 = 权重字节 `m×k×2`
++ 输入输出）：
+
+| 形状 | LASX | 吞吐 | 相对同口径标量 |
+|---|---|---|---|
+| `gemv` 1×2048 | 190 ns | 64.7 GB/s | 26.5× |
+| `gemv` 64×2048 | 18.0 µs | 15.0 GB/s | 17.9× |
+| `gemv` 1024×2048（4 MB） | 293.5 µs | 14.3 GB/s | 17.6× |
+| `gemv` 4096×4096（33.5 MB） | 7.60 ms | 4.42 GB/s | 5.6× |
+| `gemv` 32×8192 | 36.5 µs | 15.3 GB/s | 17.7× |
+| `dot` n=4096 | 359 ns | 68.5 GB/s | 27.2× |
+
+与 §12.2 的参照比：llama.cpp 的 f16 GEMV 实测 **6.8 GB/s**，本实现同量级形状（`1024×2048`）
+**14.3 GB/s**（2.1×）；L1 驻留的小形状 64.7 GB/s 说明瓶颈不在算力。
+**33.5 MB 那一行只有 4.42 GB/s**，低于 §7.1 的单流只读锚点（7.5–8.9 GB/s）——超出 L3 之后
+是什么在限制还没查清（候选：每行都要重读的 `x`、以及 L1 未命中延迟没被完全掩盖），
+**这条先按实测记下来，不编原因**。
+
+
 ## 3. 指令集路径与降级覆盖
 
 ### 3.1 `SimdPath::detect()`
@@ -414,11 +469,12 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（55 个）
+## 4. 导出符号总表（59 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**28 个未带 `_checked`
-的 `lasx_*` + 27 个 `lasx_*_checked` = 55**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
-`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope` 各与其 checked 变体）。
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**30 个未带 `_checked`
+的 `lasx_*` + 29 个 `lasx_*_checked` = 59**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
+`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
+各与其 checked 变体）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -455,7 +511,7 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 | `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
 | `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
 
-### 4.3 `_checked` 变体 27 个
+### 4.3 `_checked` 变体 29 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -468,7 +524,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-27 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+29 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
@@ -478,7 +534,8 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quat_normalize_batch_checked`、`lasx_quat_mul_batch_checked`、
 `lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
 `lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
-`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`。
+`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`、
+`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -511,9 +568,10 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | 加第 2 个 NN（`rms_norm`） | 24 | 23 | 47 |
 | 加 2 个激活（`silu`、`gelu_quick`） | 26 | 25 | 51 |
 | 加第 3 个激活（`gelu_erf`） | 27 | 26 | 53 |
-| 加 RoPE（`rope`） | 28 | 27 | **55** |
+| 加 RoPE（`rope`） | 28 | 27 | 55 |
+| 加 f16 点积/GEMV（`dot_f16`、`gemv_f16`） | 30 | 29 | **59** |
 
-原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 6 个与其 checked 变体。
+原始 15 个的名字与语义始终不变；新增的是姿态/几何 7 个、NN 8 个与其 checked 变体。
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
 
@@ -714,6 +772,43 @@ lasx_rope_checked(x, cos, sin, out, n_rows, n_cols, n_dims, 1, &status);
   4096×128 时 33.4 GB/s），是朴素标量循环的 **2.2–3.2×**；`GptJ` 10.8–12.9 GB/s
   （标量路径，见 §2.10 第 4 条）；部分旋转（`n_dims ≪ cols`，如 8×4096 只转 128 列）时两者都
   退化成 memcpy 主导（1.04×）。
+
+
+### 5.13 `lasx_dot_f16` / `lasx_gemv_f16` — f16 权重的点积与矩阵-向量
+
+| 层 | 签名 |
+|---|---|
+| C（裸） | `float lasx_dot_f16(const uint16_t *a, const float *b, int n)`；`void lasx_gemv_f16(const uint16_t *a, const float *x, float *y, int m, int k)` |
+| C（`_checked`） | 同上 + 末尾 `int *status`；负长度 → `NegativeLength`，空指针 → `NullPointer`，乘积溢出 → `SizeOverflow` |
+| Rust | `api::dot_f16(&[u16], &[f32]) -> Result<f32>`；`api::gemv_f16(m, k, &[u16], &[f32]) -> Result<AlignedVec<f32>>` |
+
+```rust
+use lasx_rs::api;
+let y = api::gemv_f16(4096, 2048, &w_f16, &x)?;   // w_f16 是 u16 位型（2 B/元素）
+```
+
+```c
+float d = lasx_dot_f16(a_f16, b_f32, n);
+lasx_gemv_f16_checked(a_f16, x, y, m, k, &status);
+```
+
+- **f16 以 `u16` 位型进出**（零依赖，不引入 half crate）；f16→f32 **精确**（单测穷举全部
+  65536 个位型对硬件验证），所以误差只来自"权重本来是 f16"（相对 ~4.9e-4）；
+- **累加次序**：4 条独立链、每 32 元素一轮、尾部延续 lane `j % 8`、固定次序两两归约
+  （契约见 §2.11；改成 1 条链会慢 3×——实测）；
+- `k = 0` ⇒ `y` 全 `0`（空向量的点积是 0）；`gemv` 每行与 `dot_f16` **逐位相同**；
+- **实测**（单线程，口径 = 权重字节 + 输入输出）：
+
+  | 形状 | LASX | 吞吐 | 相对标量 |
+  |---|---|---|---|
+  | `gemv` 1×2048 | 190 ns | 64.7 GB/s | 26.5× |
+  | `gemv` 1024×2048 | 293.5 µs | 14.3 GB/s | 17.6× |
+  | `gemv` 4096×4096 | 7.60 ms | 4.42 GB/s | 5.6× |
+  | `dot` n=4096 | 359 ns | 68.5 GB/s | 27.2× |
+
+  与 §12.2 的参照（llama.cpp f16 GEMV **6.8 GB/s**）比，同量级形状是 **2.1×**；
+  超出 L3 的 33.5 MB 形状只有 4.42 GB/s（低于 §7.1 的单流锚点），原因未查清、按实测记录。
+- **并行**：`gemv` 每行独立，可直接套 `parallel`/`pool` 的行块设施（本轮未做，见 §2.11 第 4 条）。
 
 
 ## 6. 批量几何与物理算子
@@ -1285,7 +1380,7 @@ LASX）；对本库而言这批算子价值更高，因为 `api`/`pool`/`paralle
 
 | 算子 | 说明 | 状态 |
 |---|---|---|
-| `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 | 待做 |
+| `dot_f16` / `gemv_f16` | f16×f32 点积与矩阵-向量，寄存器内 `xvfcvtl_s_h`/`xvfcvth_s_h` 转换 | **已落地**（§2.11 契约、§5.13 用法）：转换穷举验证、4 条累加链，`gemv 1024×2048` 实测 14.3 GB/s（llama.cpp 同量级 6.8 GB/s） |
 | `softmax_rows` | 行内 max→exp→sum→归一，支持 `scale` 与可选加性 mask | **已落地**（§2.6 契约、§5.9 用法） |
 | `rms_norm`（+权重） | 每层两次，行归约，与 softmax 共用 | **已落地**（§2.7 契约、§5.10 用法） |
 | `silu` / `gelu`（quick/erf） | FFN 激活，逐元素，与 softmax 共用 exp 近似 | **已落地**（§2.8/§2.9 契约、§5.11 用法）：`silu`、`gelu_quick`、`gelu_erf` 三个入口 |

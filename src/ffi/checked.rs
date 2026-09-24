@@ -890,6 +890,60 @@ pub extern "C" fn lasx_rope_checked(
     }
 }
 
+/// 带错误通道的 f16 点积。C 签名：
+/// `float lasx_dot_f16_checked(const uint16_t*, const float*, int, int*)`
+///
+/// `n < 0` → `NegativeLength`；`n > 0` 时空指针 → `NullPointer`；失败时返回 `0.0`。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_dot_f16_checked(
+    a: *const u16,
+    b: *const f32,
+    n: i32,
+    status: *mut i32,
+) -> f32 {
+    let n = or_fail!(checked_len(n), status, 0.0);
+    // SAFETY: 调用方声明 `a` 可读 n 个 u16、`b` 可读 n 个 f32（n = 0 时允许任意指针）。
+    unsafe {
+        let a = or_fail!(checked_slice(a, n), status, 0.0);
+        let b = or_fail!(checked_slice(b, n), status, 0.0);
+        LasxStatus::Ok.write(status);
+        crate::ops::dot_f16::dot_f16(a, b)
+    }
+}
+
+/// 带错误通道的 f16 GEMV。C 签名：
+/// `void lasx_gemv_f16_checked(const uint16_t*, const float*, float*, int, int, int*)`
+///
+/// 校验顺序：`m`/`k` 非负（否则 `NegativeLength`）→ 乘积不溢出（否则 `SizeOverflow`）→
+/// `m > 0` 时输出非空、`m*k > 0` 时输入非空（否则 `NullPointer`）。
+/// `k = 0` 合法：输出写 0（与 `lasx_gemv_f16` 同口径）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gemv_f16_checked(
+    a: *const u16,
+    x: *const f32,
+    y: *mut f32,
+    m: i32,
+    k: i32,
+    status: *mut i32,
+) {
+    let m = or_fail!(checked_len(m), status, ());
+    let k = or_fail!(checked_len(k), status, ());
+    let n = or_fail!(checked_mul(m, k), status, ());
+    // SAFETY: 调用方声明 `y` 可写 m 个；`n > 0` 时 `a` 可读 n 个 u16、`x` 可读 k 个 f32。
+    unsafe {
+        let y = or_fail!(checked_slice_mut(y, m), status, ());
+        if k == 0 {
+            LasxStatus::Ok.write(status);
+            y.fill(0.0);
+            return;
+        }
+        let a = or_fail!(checked_slice(a, n), status, ());
+        let x = or_fail!(checked_slice(x, k), status, ());
+        LasxStatus::Ok.write(status);
+        crate::ops::dot_f16::gemv_f16(a, x, m, k, y);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +975,83 @@ mod tests {
         let d = lasx_dot_checked(a.as_ptr(), a.as_ptr(), -1, &mut st);
         assert_eq!(st, LasxStatus::NegativeLength as i32);
         assert_eq!(d, 0.0);
+    }
+
+    /// f16 点积/GEMV 的 `_checked`：成功写 `Ok`、空指针/负长度被拦、`k = 0` 合法且写 0。
+    #[test]
+    fn test_dot_f16_checked_paths() {
+        let (m, k) = (3usize, 8usize);
+        let a: Vec<u16> = (0..m * k).map(|i| 0x3c00 + (i as u16 % 4)).collect();
+        let x = vec![1.0f32; k];
+        let mut y = vec![0f32; m];
+        let mut st = 999;
+        let d = lasx_dot_f16_checked(a.as_ptr(), x.as_ptr(), k as i32, &mut st);
+        assert_eq!(st, LasxStatus::Ok as i32);
+        assert!(d > 0.0);
+
+        let mut st = 999;
+        lasx_gemv_f16_checked(
+            a.as_ptr(),
+            x.as_ptr(),
+            y.as_mut_ptr(),
+            m as i32,
+            k as i32,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
+        for r in 0..m {
+            let want = lasx_dot_f16_checked(a[r * k..].as_ptr(), x.as_ptr(), k as i32, &mut st);
+            assert_eq!(y[r].to_bits(), want.to_bits(), "r={r}");
+        }
+
+        // 空指针 / 负长度
+        let mut st = 999;
+        assert_eq!(
+            lasx_dot_f16_checked(std::ptr::null(), x.as_ptr(), 4, &mut st).to_bits(),
+            0.0f32.to_bits()
+        );
+        assert_eq!(st, LasxStatus::NullPointer as i32);
+        let mut st = 999;
+        lasx_gemv_f16_checked(
+            a.as_ptr(),
+            x.as_ptr(),
+            std::ptr::null_mut(),
+            m as i32,
+            k as i32,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::NullPointer as i32);
+        let mut st = 999;
+        lasx_gemv_f16_checked(
+            a.as_ptr(),
+            x.as_ptr(),
+            y.as_mut_ptr(),
+            -1,
+            k as i32,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::NegativeLength as i32);
+
+        // k = 0：合法，输出写 0
+        let mut y0 = vec![7f32; m];
+        let mut st = 999;
+        lasx_gemv_f16_checked(
+            std::ptr::null(),
+            std::ptr::null(),
+            y0.as_mut_ptr(),
+            m as i32,
+            0,
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
+        assert!(y0.iter().all(|&v| v == 0.0));
+        // n = 0 的点积合法
+        let mut st = 999;
+        assert_eq!(
+            lasx_dot_f16_checked(std::ptr::null(), std::ptr::null(), 0, &mut st).to_bits(),
+            0.0f32.to_bits()
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
     }
 
     /// RoPE 的 `_checked`：形状/mode 非法报 `BadShape`、空指针报 `NullPointer`、成功写 `Ok`。

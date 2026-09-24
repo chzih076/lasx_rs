@@ -129,6 +129,40 @@ pub fn abs_f32x8(x: F32x8) -> F32x8 {
     }
 }
 
+/// 载入 16 个 `f16`（256 位）并转成两组 8×`f32`，**按自然序**返回 `(前 8 个, 后 8 个)`。
+///
+/// **转换是精确的**：f16 的每个值（含次正规、`±inf`）都能被 f32 精确表示，所以这一步不引入
+/// 误差；`NaN` 的 payload 由硬件决定（不在逐位契约内）。`ops::dot_f16` 的测试**穷举全部
+/// 65536 个 f16 位型**来钉死这一点。
+///
+/// 内部为什么要两条 `xvpermi_q`：`xvfcvtl.s.h`/`xvfcvth.s.h` 是**128 位 lane 内**操作
+/// ——`fcvtl` 转每个 128 位 lane 的**低 4 个** f16，`fcvth` 转**高 4 个**。所以对一次
+/// 256 位载入（16 个 f16 = 4 组）拿到的是：
+///
+/// ```text
+/// fcvtl → 元素 {0,1,2,3, 8,9,10,11}
+/// fcvth → 元素 {4,5,6,7, 12,13,14,15}
+/// ```
+///
+/// 两条 `xvpermi_q`（128 位 lane 选择）把 `lane0` / `lane1` 分别拼回去，于是调用方看到的是
+/// 自然序。**这是实测出来的**（探针打印了真实排布），不是照手册推的——手册只说"低半/高半"，
+/// 在 LASX 上"半"是**每个 128 位 lane 的半**。
+///
+/// # Safety
+/// `p` 必须指向至少 16 个可读的 `u16`。
+#[inline]
+pub unsafe fn load_f16x16_as_f32x8x2(p: *const u16) -> (F32x8, F32x8) {
+    let h: m256i = lasx_xvld(p as *const i8, 0);
+    let lo: m256i = std::mem::transmute(lasx_xvfcvtl_s_h(h));
+    let hi: m256i = std::mem::transmute(lasx_xvfcvth_s_h(h));
+    // imm 的 2 位/lane：0 = b.lane0、1 = b.lane1、2 = a.lane0、3 = a.lane1；
+    // 低 2 位选输出的 lane0，第 5:4 位选输出的 lane1（实测）。
+    // 0x02 → [lo.lane0, hi.lane0] = 元素 0..8；0x13 → [lo.lane1, hi.lane1] = 元素 8..16
+    let l: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x02>(lo, hi));
+    let u: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x13>(lo, hi));
+    (l, u)
+}
+
 /// lane-wise 浮点 → 整数**截断**（向零取整）。
 ///
 /// # Safety

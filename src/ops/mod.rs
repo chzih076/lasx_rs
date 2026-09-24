@@ -23,6 +23,7 @@ pub mod ballistic_step;
 pub mod batch_distance2d;
 pub mod cross3_batch;
 pub mod dot;
+pub mod dot_f16;
 pub mod dot_f64;
 pub mod dot_i8;
 pub mod dot_q4;

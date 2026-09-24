@@ -549,6 +549,53 @@ pub fn rope_at(
     rope(x, &cos, &sin, rows, cols, n_dims, mode)
 }
 
+/* ==================== NN：f16 权重 ==================== */
+
+/// f16 权重与 f32 向量的点积：`Σ f16_to_f32(a[i]) · b[i]`（`a` 是 **u16 位型**）。
+///
+/// # 数值契约（见 `docs/ops.md` §2.11）
+/// - f16→f32 是**精确**转换（测试穷举全部 65536 个 f16 位型对硬件验证）；误差只来自
+///   "权重本来是 f16"这件事本身（相对 ~4.9e-4）；
+/// - 单个 8 lane 累加器、每 16 元素块先低 8 后高 8 ⇒ 元素下标 `j` 落在 lane `j % 8`；
+///   尾部延续同一 lane，最后按**固定次序两两归约**；向量与标量模拟逐位相同；
+/// - `n = 0` ⇒ `0.0`；`NaN` 的 payload 不在逐位承诺内。
+///
+/// # Errors
+/// `a.len() != b.len()`（[`Error::Shape`]）。
+pub fn dot_f16(a: &[u16], b: &[f32]) -> Result<f32> {
+    expect_len("dot_f16", "b", b.len(), a.len())?;
+    // SAFETY: 上面刚校验等长。
+    Ok(unsafe { crate::ops::dot_f16::dot_f16(a, b) })
+}
+
+/// f16 权重矩阵（`m × k` 行主序）× f32 向量：`y[r] = dot_f16(a[r*k..(r+1)*k], x)`。
+///
+/// 每行独立 ⇒ `y[r]` 与单独调 [`dot_f16`] **逐位相同**；`k = 0` 时 `y` 全 `0`
+/// （空向量的点积是 0，不是"未定义"）。
+///
+/// # Errors
+/// `a.len() != m × k`、`x.len() != k`（[`Error::Shape`]）；`m × k` 溢出（[`Error::Overflow`]）。
+pub fn gemv_f16(m: usize, k: usize, a: &[u16], x: &[f32]) -> Result<AlignedVec<f32>> {
+    expect_len(
+        "gemv_f16",
+        "a",
+        a.len(),
+        checked_mul("gemv_f16", "m×k", m, k)?,
+    )?;
+    expect_len("gemv_f16", "x", x.len(), k)?;
+    let mut y = AlignedVec::<f32>::new(m);
+    if m == 0 {
+        return Ok(y);
+    }
+    if k == 0 {
+        y.as_mut_slice().fill(0.0);
+        return Ok(y);
+    }
+    // SAFETY: 长度自洽（m×k、k、m）。
+    unsafe { crate::ops::dot_f16::gemv_f16(a, x, m, k, y.as_mut_slice()) };
+    Ok(y)
+}
+
 /* ==================== 矩阵乘 ==================== */
 
 /// `C[m×n] = A[m×k] · B[k×n]`（行主序），返回新分配的对齐缓冲。
@@ -1309,6 +1356,51 @@ mod tests {
         assert!(rope(&[], &[], &[], 0, 8, 8, RopeMode::NeoX)
             .unwrap()
             .is_empty());
+    }
+
+    /// f16 点积/GEMV：与 C ABI 逐位一致、`gemv` 逐行等于 `dot_f16`、输出对齐、错误路径。
+    #[test]
+    fn test_f16_matches_c_abi_and_errors() {
+        let (m, k) = (6usize, 40usize);
+        // 用精确可表示的小值（0x3c00 = 1.0 起，每 4 个 +1/4）
+        let a: Vec<u16> = (0..m * k).map(|i| 0x3c00 + (i as u16 % 9)).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32).mul_add(0.03, 0.7)).collect();
+
+        let y = gemv_f16(m, k, &a, &x).unwrap();
+        assert_eq!(y.as_ptr() as usize % ALIGN, 0, "gemv_f16 输出未对齐");
+        assert_eq!(y.len(), m);
+        let mut want = vec![0f32; m];
+        crate::lasx_gemv_f16(
+            a.as_ptr(),
+            x.as_ptr(),
+            want.as_mut_ptr(),
+            m as i32,
+            k as i32,
+        );
+        for r in 0..m {
+            assert_eq!(y[r].to_bits(), want[r].to_bits(), "r={r}");
+            // 逐行等于 dot_f16（逐位）
+            let d = dot_f16(&a[r * k..(r + 1) * k], &x).unwrap();
+            assert_eq!(y[r].to_bits(), d.to_bits(), "r={r} 与 dot_f16 不一致");
+        }
+
+        // 错误路径
+        assert!(matches!(
+            dot_f16(&a, &x[..k - 1]),
+            Err(Error::Shape { what: "b", .. })
+        ));
+        assert!(matches!(
+            gemv_f16(m, k, &a[..m * k - 1], &x),
+            Err(Error::Shape { what: "a", .. })
+        ));
+        assert!(matches!(
+            gemv_f16(m, k, &a, &x[..1]),
+            Err(Error::Shape { what: "x", .. })
+        ));
+        // 退化：k = 0 ⇒ 全 0（空向量的点积是 0）；m = 0 ⇒ 空输出
+        assert!(gemv_f16(m, 0, &[], &[]).unwrap().iter().all(|&v| v == 0.0));
+        assert!(gemv_f16(0, k, &[], &x).unwrap().is_empty());
+        assert_eq!(dot_f16(&[], &[]).unwrap(), 0.0);
     }
 
     /// 原地内核：结果与 C ABI 路径逐位一致，且原地语义正确（axpy 不改 x）。

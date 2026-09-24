@@ -230,6 +230,64 @@ fn rope_shape(
     Some((rows, cols, n_dims, m))
 }
 
+/// f16 权重 × f32 向量的点积：`Σ f16_to_f32(a[i]) · b[i]`。
+///
+/// C 签名：`float lasx_dot_f16(const uint16_t *a, const float *b, int n)`
+///
+/// f16 以 **u16 位型**给出（本库零依赖，不引入 half crate）；`n = 0` 返回 `0.0`。
+/// 累加次序与位精确契约见 `docs/ops.md` §2.11。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_dot_f16(a: *const u16, b: *const f32, n: i32) -> f32 {
+    let n = n.max(0) as usize;
+    if n == 0 {
+        return 0.0;
+    }
+    // SAFETY: FFI 约定——调用方保证 `a` 可读 n 个 u16、`b` 可读 n 个 f32。
+    unsafe {
+        let a = std::slice::from_raw_parts(a, n);
+        let b = std::slice::from_raw_parts(b, n);
+        crate::ops::dot_f16::dot_f16(a, b)
+    }
+}
+
+/// f16 权重矩阵（`m × k` 行主序）× f32 向量：`y[r] = dot_f16(a[r*k..], x)`。
+///
+/// C 签名：`void lasx_gemv_f16(const uint16_t *a, const float *x, float *y, int m, int k)`
+///
+/// 每行独立、逐行等于 `lasx_dot_f16`（**逐位**）。`m`/`k` 为负或乘积溢出时就地返回。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gemv_f16(a: *const u16, x: *const f32, y: *mut f32, m: i32, k: i32) {
+    let Some((m, k, n)) = gemv_shape(m, k) else {
+        return; // 原始符号零校验：形状不合法就地返回（误用即 UB 是历史约定）
+    };
+    if m == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `y` 可写 m 个；`k > 0` 时还保证 `a` 可读 m*k 个 u16、
+    // `x` 可读 k 个 f32。
+    unsafe {
+        let y = std::slice::from_raw_parts_mut(y, m);
+        if k == 0 {
+            // 空向量的点积是 0（与 `lasx_dot_f16` 的 `n = 0 ⇒ 0.0` 同一口径），
+            // 而不是"什么都不写"——后者会让调用方拿到未初始化的输出。
+            y.fill(0.0);
+            return;
+        }
+        let a = std::slice::from_raw_parts(a, n);
+        let x = std::slice::from_raw_parts(x, k);
+        crate::ops::dot_f16::gemv_f16(a, x, m, k, y);
+    }
+}
+
+/// `gemv` 的形状解算：`(m, k, m×k)`；负值或乘积溢出返回 `None`。
+fn gemv_shape(m: i32, k: i32) -> Option<(usize, usize, usize)> {
+    if m < 0 || k < 0 {
+        return None;
+    }
+    let (m, k) = (m as usize, k as usize);
+    Some((m, k, m.checked_mul(k)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +307,93 @@ mod tests {
         // cols = 0：什么都不写、不崩
         let mut empty: Vec<f32> = Vec::new();
         lasx_softmax_rows(x.as_ptr(), std::ptr::null(), empty.as_mut_ptr(), 3, 0, 1.0);
+    }
+
+    /// f16 点积 / gemv 的 FFI 自检：与 f64 参考一致、每行等于 `lasx_dot_f16`（逐位）、
+    /// `n = 0` / `m = 0` / 负形状不崩。
+    #[test]
+    fn test_dot_f16_and_gemv_ffi() {
+        let (m, k) = (5usize, 40usize);
+        // 用精确可表示的 f16（小整数/半整数），这样参考值可以照抄
+        let a: Vec<u16> = (0..m * k)
+            .map(|i| {
+                let v = ((i % 17) as f32 - 8.0) * 0.25;
+                f32_to_f16_bits(v)
+            })
+            .collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32).mul_add(0.05, 0.25)).collect();
+
+        // dot：与 f64 参考比
+        for r in 0..m {
+            let row = &a[r * k..(r + 1) * k];
+            let got = lasx_dot_f16(row.as_ptr(), x.as_ptr(), k as i32);
+            let want: f64 = row
+                .iter()
+                .zip(&x)
+                .map(|(&h, &xb)| f16_to_f32_local(h) as f64 * xb as f64)
+                .sum();
+            assert!(
+                (got as f64 - want).abs() < 1e-4,
+                "r={r} got={got} want={want}"
+            );
+        }
+
+        // gemv：逐行与 lasx_dot_f16 逐位相同
+        let mut y = vec![0f32; m];
+        lasx_gemv_f16(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), m as i32, k as i32);
+        for r in 0..m {
+            let row = &a[r * k..(r + 1) * k];
+            let want = lasx_dot_f16(row.as_ptr(), x.as_ptr(), k as i32);
+            assert_eq!(y[r].to_bits(), want.to_bits(), "r={r}");
+        }
+
+        // n = 0 / m = 0 / k = 0
+        assert_eq!(lasx_dot_f16(a.as_ptr(), x.as_ptr(), 0), 0.0);
+        lasx_gemv_f16(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, k as i32);
+        let mut y0 = vec![7f32; 3];
+        lasx_gemv_f16(a.as_ptr(), x.as_ptr(), y0.as_mut_ptr(), 3, 0);
+        assert!(y0.iter().all(|&v| v == 0.0), "k=0 ⇒ 全 0");
+        // 负形状：就地返回，不写输出
+        let before = y0.clone();
+        lasx_gemv_f16(a.as_ptr(), x.as_ptr(), y0.as_mut_ptr(), -1, k as i32);
+        assert_eq!(y0, before);
+    }
+
+    /// 测试用：f32 → f16 位型（只用于构造精确可表示的值）。
+    fn f32_to_f16_bits(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let man = bits & 0x007f_ffff;
+        if x == 0.0 {
+            return sign;
+        }
+        let e16 = exp - 127 + 15;
+        assert!(
+            (1..=30).contains(&e16) && man & 0x1fff == 0,
+            "只支持精确值：{x}"
+        );
+        sign | ((e16 as u16) << 10) | ((man >> 13) as u16)
+    }
+
+    /// 测试用的 f16→f32（与内核同义的独立小实现）。
+    fn f16_to_f32_local(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exp = ((bits >> 10) & 0x1f) as u32;
+        let man = (bits & 0x03ff) as u32;
+        if exp == 0 {
+            if man == 0 {
+                return f32::from_bits(sign);
+            }
+            let mut m = man;
+            let mut e: i32 = -14;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            return f32::from_bits(sign | (((e + 127) as u32) << 23) | ((m & 0x03ff) << 13));
+        }
+        f32::from_bits(sign | ((exp + 127 - 15) << 23) | (man << 13))
     }
 
     /// RoPE 的 FFI 自检：**就地 == 异地**（这里才测得到真正的别名：同一个指针既当输入又当

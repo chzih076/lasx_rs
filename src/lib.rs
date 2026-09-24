@@ -137,5 +137,6 @@ pub use ffi::reduce::{lasx_axpy, lasx_dot, lasx_dot_f64, lasx_sum};
 // 上一轮加 `softmax_rows`/`rms_norm` 时漏了这行重新导出——只有 `lasx_rs::ffi::nn::*` 能用，
 // 这一轮补齐（`docs/ops.md` §4 的符号表列的是 C ABI 名，Rust 路径不该和它不一致）。
 pub use ffi::nn::{
-    lasx_gelu_erf, lasx_gelu_quick, lasx_rms_norm, lasx_rope, lasx_silu, lasx_softmax_rows,
+    lasx_dot_f16, lasx_gelu_erf, lasx_gelu_quick, lasx_gemv_f16, lasx_rms_norm, lasx_rope,
+    lasx_silu, lasx_softmax_rows,
 };
