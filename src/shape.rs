@@ -915,5 +915,20 @@ mod tests {
         // 不带输出的形态（新分配）：静态档生成 `x.mul(&w)`
         let expr = crate::matmul!(x[M, K] * w[K, N]);
         assert_eq!(bits_f32(expr.as_slice()), bits_f32(&want), "无输出公式");
+
+        // 「权重在左」读法：`w[K,N] * x[M,K]`（共享下标出现在左.i 与 右.j），
+        // 归一成同一套 input/weight 后生成同一段代码
+        let mut y_wl = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(y_wl[M, N] = w[K, N] * x[M, K]);
+        assert_eq!(bits_f32(y_wl.as_slice()), bits_f32(&want), "权重在左");
+
+        // 权重在左 + DYN 行数：归一后仍走 DYN 档
+        let mut yd_wl = MatBufDyn::<f32, { N }>::with_rows(M);
+        crate::matmul!(yd_wl[m, N] = w[K, N] * xd[m, K]);
+        assert_eq!(
+            bits_f32(yd_wl.as_slice()),
+            bits_f32(&want),
+            "权重在左 + DYN"
+        );
     }
 }

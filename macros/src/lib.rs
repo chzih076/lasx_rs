@@ -26,7 +26,7 @@
 //!
 //! 于是**一个宏同时覆盖静态与 DYN 两档**，不需要 `matmul!` / `matmul_dyn!` 两个宏。
 //!
-//! # v1 的文法与固定读法
+//! # 文法与两种读法
 //!
 //! ```text
 //! 公式   := 操作数 '=' 操作数 '*' 操作数
@@ -34,12 +34,19 @@
 //! 操作数 := ident '[' ident ',' ident ']'
 //! ```
 //!
-//! 两个操作数固定按 **`A·B`** 读：`a[am, ak] * b[bk, bn]`，`b` 是权重，输出 `[am, bn]`；
-//! 生成 `b.apply_into(&a, &mut y)`（DYN 档为 `b.apply_dyn_into`）。**同一维必须写同一个
-//! 下标**（见诊断第 1 条），所以 `am`/`bk` 这些名字在三处出现时是一致的。
+//! 两个操作数**按"共享下标出现在哪一侧"判角色**，两种读法都认：
 //!
-//! v1 **不做**：权重在左（`w[K,N] * x[M,K]`，需要先判"共享下标在哪一侧"）、`alpha`/`beta`
-//! 融合、`+` 多操作数、不带下标的简写里判静态/DYN 两档（`matmul!(x * w)` 只按全静态生成）。
+//! | 写法 | 判定 | 角色 |
+//! |---|---|---|
+//! | `x[M,K] * w[K,N]` | 左.j == 右.i | 左是输入、右是权重（`A·B`） |
+//! | `w[K,N] * x[M,K]` | 左.i == 右.j | 左是权重、右是输入（权重在左） |
+//!
+//! 归一之后只认角色，所以两种写法生成同一段代码：`weight.apply_into(&input, &mut y)`
+//! （DYN 档为 `apply_dyn_into`）。**同一维必须写同一个下标**（见诊断第 1 条），所以
+//! `M`/`K`/`N` 这些名字在三处出现时是一致的。
+//!
+//! 仍**不做**：`alpha`/`beta` 融合、`+` 多操作数、不带下标的简写里判静态/DYN 两档
+//! （`matmul!(x * w)` 按全静态生成）。
 //!
 //! # 诊断
 //!
@@ -399,8 +406,50 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
             trailing.span(),
         ));
     }
-    let (out, a, b) = parsed;
-    Ok(Formula { out, a, b })
+    let (out, left, right) = parsed;
+    normalize(out, left, right)
+}
+
+/// 角色归一（**纯名字层**：能单元测试）。
+///
+/// 两个操作数有两种合法读法，靠"共享下标出现在哪一侧"区分：
+///
+/// - `x[M,K] * w[K,N]`：左.j == 右.i → 左是**输入**、右是**权重**（= `A·B`）
+/// - `w[K,N] * x[M,K]`：左.i == 右.j → 左是**权重**、右是**输入**（权重在左）
+///
+/// 返回 `true` 表示需要交换（权重在左）。
+fn roles(left: (&str, &str), right: (&str, &str)) -> Result<bool, ()> {
+    if left.1 == right.0 {
+        Ok(false)
+    } else if left.0 == right.1 {
+        Ok(true)
+    } else {
+        Err(())
+    }
+}
+
+/// 按 [`roles`] 的判定把 `a`/`b` 归一成 **input / weight**，下游的检查与生成都只认角色。
+fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Formula, Diagnostic> {
+    let (li, lj) = left.shape();
+    let (ri, rj) = right.shape();
+    match roles((li.as_str(), lj.as_str()), (ri.as_str(), rj.as_str())) {
+        Ok(false) => Ok(Formula {
+            out,
+            a: left,
+            b: right,
+        }),
+        Ok(true) => Ok(Formula {
+            out,
+            a: right,
+            b: left,
+        }),
+        Err(()) => Err(Diagnostic::new(
+            format!("收缩维的下标不一致：左侧操作数写 `{lj}`，右侧操作数写 `{ri}`"),
+            left.j.span(),
+        )
+        .with_second(right.i.span())
+        .with_note("两种读法都对不上：`x[M,K] * w[K,N]`（A·B）或 `w[K,N] * x[M,K]`（权重在左）")),
+    }
 }
 
 /* ------------------------------ 语义检查 ------------------------------ */
@@ -616,6 +665,18 @@ mod tests {
             assert_eq!(Kind::of(name), Ok(Kind::Runtime), "{name}");
         }
         assert!(Kind::of("1m").is_err(), "首字符不是字母/下划线要报错");
+    }
+
+    /// 两种读法的角色判定：`A·B` 与"权重在左"都要认，且对不上要报错。
+    #[test]
+    fn roles_accept_both_readings() {
+        // A·B：左.j == 右.i
+        assert_eq!(roles(("M", "K"), ("K", "N")), Ok(false));
+        // 权重在左：左.i == 右.j
+        assert_eq!(roles(("K", "N"), ("M", "K")), Ok(true));
+        // 都对不上
+        assert_eq!(roles(("M", "K"), ("Q", "N")), Err(()));
+        assert_eq!(roles(("M", "K"), ("N", "K")), Err(()));
     }
 
     /// 同一维必须同名：三处（行、收缩、列）各一个反例 + 两个正例。
