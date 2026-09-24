@@ -47,11 +47,11 @@ pub fn propagate() {
     });
 
     // 池只建一次，跨 steps 步复用
-    let mut pool = WorkerPool::new(threads);
+    let pool = WorkerPool::new(threads);
     let mut b3 = base.clone();
     let t_pool = timeit(|| {
         for _ in 0..steps {
-            b3.step_pooled(&mut pool);
+            b3.step_pooled(&pool);
         }
         let _ = black_box(b3.rx[0]);
     });
@@ -343,7 +343,7 @@ impl Composed {
 /// 这里逐位对照单线程结果：切行不影响任何输出元素的计算过程。
 pub fn parallel_matmul() {
     let threads = 12usize;
-    let mut pool = WorkerPool::new(threads);
+    let pool = WorkerPool::new(threads);
 
     println!();
     println!("## 真实场景 4：大矩阵乘铺到多核（`parallel::matmul_f32`，{threads} 线程）");
@@ -370,7 +370,7 @@ pub fn parallel_matmul() {
         });
         let t2 = timeit(|| {
             lasx_rs::parallel::matmul_f32(
-                &mut pool,
+                &pool,
                 m,
                 k,
                 n,

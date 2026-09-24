@@ -96,7 +96,7 @@ pub fn thread_scaling() {
         let mut seq = base.clone();
         let mut par = base.clone();
         seq.step(false);
-        par.step_pooled(&mut WorkerPool::new(8));
+        par.step_pooled(&WorkerPool::new(8));
         for k in 0..n {
             assert_eq!(
                 seq.rx[k].to_bits(),
@@ -114,10 +114,10 @@ pub fn thread_scaling() {
             let _ = black_box(b.rx[0]);
         });
         // 池要建一次、复用多次，才能把"建池成本"摊掉（这才是常驻池的用法）
-        let mut pool = WorkerPool::new(th);
+        let pool = WorkerPool::new(th);
         let mut b2 = base.clone();
         let d_pool = timeit(|| {
-            b2.step_pooled(&mut pool);
+            b2.step_pooled(&pool);
             let _ = black_box(b2.rx[0]);
         });
         let sp = t1.as_secs_f64() / d_pool.as_secs_f64();

@@ -129,7 +129,7 @@ impl Soa6 {
     /// 用常驻池推进一步（转调库里的多核调用策略层，见 `lasx_rs::parallel`）。
     ///
     /// 与 [`Soa6::step`] 数值逐位一致（内核按元素独立计算，块边界不影响结果）。
-    pub fn step_pooled(&mut self, pool: &mut WorkerPool) {
+    pub fn step_pooled(&mut self, pool: &WorkerPool) {
         lasx_rs::parallel::rk4_j2_step_batch(
             pool,
             MU,

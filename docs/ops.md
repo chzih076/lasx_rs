@@ -17,7 +17,7 @@
 | `lasx_rs::ffi`（43 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
-| `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 独占派活（`&mut self`）、形状不符 panic |
+| `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
 
 四层走**同一段内核**：`api`/`view`/`plan`/`pool` 只是校验/调度薄包装，结果与直接调
 `lasx_*` 逐位一致（`api`、`plan`、`parallel` 都有逐位对照测试）。怎么选：
@@ -629,18 +629,24 @@ assert_eq!(&c2[..], &want[..]);
 | `WorkerPool::new` | `fn(threads: usize) -> Self` | 建池（≥1），**建一次、跨调用复用** |
 | `WorkerPool::auto` | `fn() -> Self` | 按 `available_parallelism()` 建池 |
 | `WorkerPool::threads` | `fn(&self) -> usize` | 池内线程数 |
-| `for_each_chunk_mut` | `fn(&mut self, data: &mut [T], f: F)` | 单数组按元素等分 |
-| `for_each_chunks_mut` | `fn(&mut self, arrays: [&mut [T]; N], f: F)` | N 个**等长**数组同步等分 |
-| `for_each_row_block_mut` | `fn(&mut self, rows, row_gran, arrays: [(&mut [T], usize); N], f: F)` | 按行块切分，行宽可不同；闭包首参为本块行数 |
+| `pool::global` | `fn() -> &'static WorkerPool` | **进程级共享池**（首次使用时就地建），多线程共用同一个 |
+| `pool::init_global` | `fn(threads) -> bool` | 首次使用前指定全局池线程数（已建好则返回 `false`） |
+| `for_each_chunk_mut` | `fn(&self, data: &mut [T], f: F)` | 单数组按元素等分 |
+| `for_each_chunks_mut` | `fn(&self, arrays: [&mut [T]; N], f: F)` | N 个**等长**数组同步等分 |
+| `for_each_row_block_mut` | `fn(&self, rows, row_gran, arrays: [(&mut [T], usize); N], f: F)` | 按行块切分，行宽可不同；闭包首参为本块行数 |
 
 约束与语义：
 
 - `MIN_PARALLEL_LEN = 4096`：一次调用涉及的元素总数低于该值时**自动原地串行**（单数组即
   长度；SOA 是各数组长度之和）。`MAX_ARRAYS = 16`：单次派活最多数组个数。
-- 三个 `for_each_*` 都取 `&mut self`：**独占派活**，并发调用在编译期被拒绝，不是静默数据
-  竞争。要在多线程间共享池，自行套 `Mutex`。
+- **派活接口取 `&self`**：池内部用一把互斥把派活者串行化，所以多个线程可以同时拿同一个池
+  派活（排队执行，结果各自正确），进程级共享池 [`pool::global`] 正是靠这条成立。代价是
+  重入派活（在 `during` 回调里再派活）不再被借用检查器挡住，改由运行期 panic 拒绝
+  （消息里带"重入"），而不是在锁上死等。
 - worker 里闭包 panic 会被 `catch_unwind` 拦下并计数，主线程等全部 worker 收工后
   `resume_unwind` **原样续抛**；池状态干净、可继续复用（否则主线程会永久自旋）。
+- **`during` 回调 panic 不会留下悬垂闭包**：发布之后挂析构守卫，展开路径也会先把 worker
+  收干净（详见 `docs/dev.md` §3.2）。
 - 每次调用**零分配**：作业槽是定长数组，只做指针算术。等待策略：先自旋 1024 次，仍无任务
   就 `Condvar` park（纯自旋在过订阅时会互相抢执行槽）。
 - `for_each_chunks_mut` 各数组长度不一致时 panic；`for_each_row_block_mut` 在
@@ -651,9 +657,9 @@ assert_eq!(&c2[..], &want[..]);
 
 | 函数 | 说明 |
 |---|---|
-| `parallel::matmul_f32(&mut pool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32])` | 多核矩阵乘（行粒度 4），B 只读共享 |
+| `parallel::matmul_f32(&pool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32])` | 多核矩阵乘（行粒度 4），B 只读共享；`&pool` 可直接给 `pool::global()` |
 | `parallel::matmul_f64(...)` | 同上，f64 |
-| `parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt, 6×&mut [f64])` | 多核批量 RK4 J2 单步（6 数组一次派活） |
+| `parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt, 6×&mut [f64])` | 多核批量 RK4 J2 单步（6 数组一次派活） |
 
 形状不符时 panic；`matmul_*` 对 `m==0 || n==0` 直接返回，`k==0` 时 `c.fill(0.0)`。
 数值与单线程**逐位一致**（只切行/下标区间），有逐位对照测试。
@@ -663,7 +669,7 @@ assert_eq!(&c2[..], &want[..]);
 use lasx_rs::aligned::AlignedVec;
 use lasx_rs::pool::WorkerPool;
 
-let mut pool = WorkerPool::new(12);            // 建一次，长期持有
+let pool = WorkerPool::new(12);            // 建一次，长期持有（也可以直接 `pool::global()`）
 
 pool.for_each_chunk_mut(x.as_mut_slice(), |chunk| { /* ... */ });          // 单数组
 pool.for_each_chunks_mut([rx, ry, rz], |[rx, ry, rz]| { /* ... */ });      // SOA 等长数组
@@ -674,17 +680,18 @@ pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |rows, [ab, cb]| {
                          ab.as_ptr(), bs.as_ptr(), cb.as_mut_ptr());
 });
 
-lasx_rs::parallel::matmul_f32(&mut pool, m, k, n,
+lasx_rs::parallel::matmul_f32(&pool, m, k, n,
                               a.as_mut_slice(), b.as_slice(), c.as_mut_slice());
 for _ in 0..steps {
-    lasx_rs::parallel::rk4_j2_step_batch(&mut pool, mu, j2, re, dt,
+    lasx_rs::parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt,
                                          rx, ry, rz, vx, vy, vz);
 }
 ```
 
-> 池是要复用的：把 `WorkerPool::new` 放进热路径等于退化成"每次新建线程"。完整可运行示例：
-> `cargo run --release --example pool_axpy`、`--example matmul_pooled`（都自带与单线程的
-> 逐位对照）。
+> 池是要复用的：把 `WorkerPool::new` 放进热路径等于退化成"每次新建线程"。
+> 拿不定主意就用 [`pool::global`]（一个进程一个池，多线程共用，见 §8.2 的 `Auto` 策略）。
+> 完整可运行示例：`cargo run --release --example pool_axpy`、`--example matmul_pooled`
+> （都自带与单线程的逐位对照）。
 
 
 ### 9.5 调度策略（`pool::sched`）：编译期选路 + 运行期穷尽枚举

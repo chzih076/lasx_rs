@@ -8,7 +8,6 @@
 //! 兜住结构性问题（空指针、负长度、溢出）。
 
 use std::ffi::c_int;
-use std::sync::{Mutex, OnceLock};
 
 use lasx_rs::ffi::checked::{
     lasx_batch_distance2d_checked, lasx_dot_checked, lasx_dot_i8_checked,
@@ -25,15 +24,10 @@ use crate::yll::{arg_f64, arg_int, error, yll_float, yll_int, YllContextC, YllVa
 /// 进程内唯一的常驻线程池：建一次，跨调用/跨步复用。
 ///
 /// 多步传播的收益几乎全在"池复用"上（每次新建线程要付约 0.5 ms/步，见
-/// `docs/dev.md` §7.6）。解释器不提供 GIL、可能并发调用本扩展，而池的派活
-/// 是**独占**的（`for_each_*` 取 `&mut self`），故用 `Mutex` 串行化两个脚本线程的调用。
-fn pool() -> std::sync::MutexGuard<'static, lasx_rs::pool::WorkerPool> {
-    static POOL: OnceLock<Mutex<lasx_rs::pool::WorkerPool>> = OnceLock::new();
-    // 中毒说明上一次调用在持锁时 panic（例如形状断言被绕过）；池在 panic 后状态是干净的
-    // （worker 已全部收工），故取回内部值继续用，而不是让整个扩展从此不可用。
-    POOL.get_or_init(|| Mutex::new(lasx_rs::pool::WorkerPool::auto()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// `docs/dev.md` §7.6）。解释器不提供 GIL、可能并发调用本扩展——池的派活接口取
+/// `&self` 并在内部把派活者串行化，所以这里**不需要再套一层 `Mutex`**：直接拿全局池。
+fn pool() -> &'static lasx_rs::pool::WorkerPool {
+    lasx_rs::pool::global()
 }
 
 /// 统一收口：把 `Result` 里的错误消息变成解释器会抛出的错误值。
@@ -435,10 +429,10 @@ pub extern "C" fn fn_propagate(
         // 解构出 6 个独立绑定：`p[0].as_mut_slice()` 这种索引写法过不了借用检查
         let [mut px, mut py, mut pz] = p;
         let [mut qx, mut qy, mut qz] = v;
-        let mut pool = pool();
+        let pool = pool();
         for _ in 0..steps as usize {
             lasx_rs::parallel::rk4_j2_step_batch(
-                &mut pool,
+                pool,
                 mu,
                 j2,
                 re,

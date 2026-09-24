@@ -117,11 +117,76 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 | 唤醒 | worker 先自旋一小会儿再休眠（本机实测这比每次都 futex 唤醒快得多，见 §3.1） |
 | 粒度 | 一次调用涉及的元素总数 < `MIN_PARALLEL_LEN = 4096` 时**原地串行**，不派活 |
 | 切块 API | `for_each_chunk_mut`（单数组）、`for_each_chunks_mut`（多数组同一范围）、`for_each_row_block_mut`（按行块，用于矩阵乘） |
-| 借用 | 派活接口取 `&mut self`，编译期保证不会重入 |
-| panic | worker 内 `catch_unwind`，主线程 `resume_unwind`，不吞异常 |
+| 借用 | 派活接口取 `&self`，内部 `Mutex` 把派活者串行化（多线程可共用一个池，见 §3.2） |
+| 重入 | 线程局部标志拦重入派活（`&self` 之后借用检查器不再能挡），当场 panic 而不是死锁 |
+| panic | worker 内 `catch_unwind`，主线程 `resume_unwind`，不吞异常；`during` panic 由析构守卫兜住 |
 
 `parallel.rs` 是"组合算子"层：`matmul_f32/f64` 按行块切（块粒度 4 行，与微内核的 4 行对齐）、
 `rk4_j2_step_batch` 按 6 个 SOA 数组切。切块只为并行，**不改变每个元素的运算次序**。
+
+### 3.2 `&mut self` → `&self`：为什么、代价多少（2026-09-24）
+
+**动机**：上层要有一个"进程级共享池"（`pool::global`）给 `Auto` 策略用——否则每次派活都要
+从调用点接一个 `&mut WorkerPool`，声明式接口就没了。一个进程一个池还顺带修掉"每个脚本
+线程各建一个池 → 线程数相乘"的超订。
+
+**做法**：`WorkerPool` 加一把 `busy: Mutex<()>`，派活入口（`dispatch_rows`/`dispatch_jobs`）
+从填槽一直持到 `wait()` 返回——这正是原来 `&mut self` 提供的那个保证，只是从编译期搬到
+运行期；`Shared` 的 `unsafe impl Sync` 论证跟着改成"派活互斥 + 代次发布 + done 计数"。
+`in_flight` 改成 `AtomicBool`。`parallel::*` 与所有调用方（cli / examples / yll）改成 `&pool`。
+
+代价有两处，都在 §3.2.1/§3.2.2 有实测：
+
+**§3.2.1 同步开销：45 ns，看不见。** `examples/pool_shared_sync.rs` 实测：
+
+| 同步动作 | 每次耗时 |
+|---|---|
+| `OnceLock::get_or_init`（已初始化） | 5.0 ns |
+| `AtomicUsize::fetch_add(Relaxed)` | 6.0 ns |
+| `Mutex::lock/unlock`（无竞争） | 34.0 ns |
+| 最坏合计（三样都付） | **45.0 ns** |
+
+把它加在 DYN 档最小的热路径上（`K=N=256`、`M=16`，单次 34.1 µs）：34.1 → 34.2 µs（**+0.1%**，
+落在噪声里）；`M=64/256/1024` 的变化在 −1.4%~+0.4% 之间，即噪声本身。
+
+**§3.2.2 端到端 A/B：无回归。** 用 `git worktree` 拉出改动前的 `577d5f8` 各建一份二进制，
+**进程级交替**跑（每轮 old/new 相邻），取中位数：
+
+| 负载 | 改动前 | 改动后 | 差 |
+|---|---|---|---|
+| `matmul_ab 512³ pool 12`（3 轮） | 1.14 ms | 1.14 ms | 0% |
+| `matmul_ab 512³ pool64 12`（3 轮） | 91.6 µs 组的均值 91.3 | 均值 92.4 | +1.2%（噪声） |
+| `matmul_ab 1024³ pool 12`（8 轮，均值） | 8.78 ms | 8.80 ms | +0.2% |
+| `lasx_bench mt` rk4 n=2^18 ×12 线程（3 轮，中位数） | 737.7 µs | 739.3 µs | +0.2%（噪声） |
+
+1024³ 这一档的**中位数**看着差 2.8%，但两组样本都明显双峰（8.0–9.4 ms），均值只差 0.2%，
+且 45 ns 的机制量级对 8.5 ms 的调用是 0.0005%——所以判定为背景负载噪声，不是回归。
+（这台机器当时 load average > 3，方法学见 §6.4。）
+
+**顺手修掉的一个真问题（`during` panic → 悬垂闭包）**：`dispatch_*` 的顺序是
+"发布 → `during()` → `wait()`"。`during` 是**用户代码**，它 panic 时展开会跳过 `wait()`，
+而 worker 此刻正在调用 `f` —— `f` 活在主线程栈帧上，栈一展开就是**悬垂闭包**（UB）。
+过去这个窗口之所以没暴露，是因为 `parallel` 里传进去的 `during` 只是打包循环，而
+`for_each_row_block_mut_picked_deferred` 的文档又强调"`during` 捕获不到 `arrays`"——
+它挡的是数据竞争，挡不住 panic 展开。现在发布之后立刻挂 `WaitGuard`：正常路径
+`disarm()` 交还给 `wait()`（保留"worker panic 续抛"的语义），展开路径由析构兜底、
+只收工不续抛（展开中再 panic 会 abort）。回归测试：
+`test_during_panic_leaves_pool_clean`、`test_reentrant_dispatch_panics_instead_of_deadlock`、
+`test_shared_pool_concurrent_dispatch`、`test_global_pool_is_a_singleton`。
+
+**顺带标定出的并行起效档位**（`examples/pool_shared_sync.rs`，`K=N=256`，12 线程，逐位对照过）：
+
+| M | 单线程 | 12 线程 | 池/单线程 |
+|---|---|---|---|
+| 16 | 34.2 µs | 67.6 µs | **1.98×（池更慢）** |
+| 32 | 66.1 µs | 66.0 µs | 1.00×（盈亏平衡） |
+| 64 | 131.6 µs | 104.4 µs | 0.79× |
+| 128 | 249.4 µs | 137.0 µs | 0.55× |
+| 256 | 506.0 µs | 234.6 µs | 0.46× |
+| 1024 | 2156.9 µs | 627.8 µs | 0.29× |
+
+这是上层 `Auto` 策略判据的输入：**行数不够就别并行**（M=16 派活比干活还贵，慢一倍），
+且判据得同时看"每线程行数 ≥ 4"（微内核按 4 行复用 B）与总工作量。
 
 ### 3.1 池的实测（`lasx_rk4_j2_step_batch`，n = 2^18，原地单步，2026-09-22）
 

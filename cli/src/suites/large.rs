@@ -108,7 +108,7 @@ fn anchors(n: usize, threads: usize) -> (f64, f64, f64, f64, f64, f64, f64) {
     if threads <= 1 {
         return (r1, r2, c1, rb, r1, c1, s6);
     }
-    let mut pool = WorkerPool::new(threads);
+    let pool = WorkerPool::new(threads);
     let t = timeit(|| {
         pool.for_each_chunks_mut([dst.as_mut_slice(), src_mut.as_mut_slice()], |[d, s]| {
             d.copy_from_slice(s)
@@ -265,7 +265,7 @@ pub fn run() {
         });
         push("dot_f64", n, 2.0 * n as f64 * 8.0, 0.0, false, t);
 
-        let mut pool = WorkerPool::new(12);
+        let pool = WorkerPool::new(12);
         let mut soa2 = Soa6::new(
             x.clone(),
             y.clone(),
@@ -275,7 +275,7 @@ pub fn run() {
             z.clone(),
         );
         let t = timeit(|| {
-            soa2.step_pooled(&mut pool);
+            soa2.step_pooled(&pool);
             let _ = black_box(soa2.rx[0]);
         });
         push(

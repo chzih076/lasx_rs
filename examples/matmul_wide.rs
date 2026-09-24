@@ -88,11 +88,11 @@ fn main() {
     println!("| 线程 | 多核（按行切，每线程跑同一个内核） | 加速比 |");
     println!("|---|---|---|");
     for &th in &[4usize, 8, 12, 16] {
-        let mut pool = WorkerPool::new(th);
+        let pool = WorkerPool::new(th);
         let t = bench(
             || {
                 lasx_rs::parallel::matmul_f32(
-                    &mut pool,
+                    &pool,
                     M,
                     K,
                     N,

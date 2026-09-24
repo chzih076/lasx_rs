@@ -22,7 +22,7 @@
 //! use lasx_rs::aligned::AlignedVec;
 //! use lasx_rs::pool::WorkerPool;
 //!
-//! let mut pool = WorkerPool::new(4);
+//! let pool = WorkerPool::new(4);
 //! let mut data = AlignedVec::<f64>::fill_with(10_000, |i| i as f64);
 //! pool.for_each_chunk_mut(data.as_mut_slice(), |chunk| {
 //!     for v in chunk.iter_mut() {
@@ -39,7 +39,7 @@
 //! # fn main() {
 //! # let (m, k, n) = (256usize, 256usize, 256usize);
 //! # let (mut a, b, mut c) = (vec![0f32; m * k], vec![0f32; k * n], vec![0f32; m * n]);
-//! let mut pool = WorkerPool::new(12);
+//! let pool = WorkerPool::new(12);
 //! let (bs, cs) = (b.as_slice(), c.as_mut_slice()); // 只读的 B 用 & 捕获即可
 //! pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |rows, [ab, cb]| {
 //!     lasx_rs::lasx_matmul(
@@ -56,11 +56,18 @@
 //! 与手工生命周期管理。本库同时提供 `rlib`，Rust 调用方（本仓库的基准、YouLiLong
 //! 原生扩展、loong-sci 等）直接 `use` 即可，**不新增任何导出符号**。
 //!
-//! # 派活是独占的（`&mut self`）
+//! # 派活接口取 `&self`，内部把派活者串行化
 //!
-//! 池只有一套作业槽与代次计数器，**同时只允许一个调用方派活**——所以三个 `for_each_*`
-//! 都取 `&mut self`：并发调用在编译期就被拒绝，而不是变成静默的数据竞争。要在多个
-//! 线程间共享一个池，自己套 `Mutex`（YouLiLong 扩展就是这么做的）。
+//! 池只有一套作业槽与代次计数器，**同时只允许一个调用方派活**。这个约束现在由池内部
+//! 一把 `Mutex` 在运行期保证（`WorkerPool::busy`）：多个线程可以同时持有 `&WorkerPool`
+//! 并发调用派活接口，它们会**排队**而不是变成静默的数据竞争；worker 的读写仍由
+//! "代次发布（Release）+ `done` 计数（Acquire）" 这对握手保护。
+//!
+//! 为什么要 `&self` 而不是 `&mut self`：要有一个**进程级共享池**（[`global`]），
+//! 让 `Auto` 策略不必每次派活都从调用点接一个 `&mut WorkerPool`。代价是重入派活
+//! （例如在 [`WorkerPool::for_each_row_block_mut_picked_deferred`] 的 `during` 回调里
+//! 再调派活接口）不再被借用检查器挡住 —— 池用一个**线程局部标志**把这种情况变成一条
+//! 明确的 panic，而不是在 `Mutex` 上死等。
 //!
 //! # panic 不会把池挂死
 //!
@@ -158,17 +165,67 @@ struct Shared {
     wake: Condvar,
 }
 
-// SAFETY: 数据竞争由"独占派活（`&mut self`）+ 代次发布 + done 计数"排除——
-// - 三个 `for_each_*` 都取 `&mut self`，故同一时刻只有一个调用方在写 `slots`/`call`；
+// SAFETY: 数据竞争由"派活互斥 + 代次发布 + done 计数"排除——
+// - `WorkerPool::busy` 这把 `Mutex` 把**派活者**串行化：同一时刻只有一个调用方在写
+//   `slots`/`call`/`jobs`（它覆盖了原来 `&mut self` 提供的那个保证）；
 // - `slots[i]` 只由第 i 个 worker 访问；
 // - `call` 与所有 `slots` 都在 `epoch` 递增（Release）**之前**由调用方写入，
 //   而调用方在 `done == threads`（Acquire）之后才返回，因此 worker 读取期间
 //   调用方不会改动它们；
+// - 串行快路径（不派活）只读不可变字段，与派活者并发是安全的；
 // - epoch/done/stop/panicked 都是原子量，payload 由 `Mutex` 保护。
-// SAFETY: 见上面那条不变量清单（独占派活 `&mut self` + 代次发布 + 原子计数）。
+// SAFETY: 见上面那条不变量清单（派活互斥 + 代次发布 + 原子计数）。
 unsafe impl Sync for Shared {}
 // SAFETY: 同上——`Shared` 只被 `Arc` 在线程间传递，内部可变状态由上面的规则保护。
 unsafe impl Send for Shared {}
+
+thread_local! {
+    /// 本线程是否**正在**某个池里派活。
+    ///
+    /// 取 `&self` 之后，借用检查器不再能阻止重入派活（例如在 `during` 回调里再调
+    /// 派活接口）。那种情况会在 `busy` 上死等，比崩溃更难查——所以用这个标志把它
+    /// 变成一条明确的 panic。
+    static DISPATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 派活令牌：先置线程局部标志（重入即 panic），再拿池的 `busy` 锁（跨线程排队）。
+///
+/// 字段顺序即释放顺序的反序：先建的先析构，所以 `busy` 的 `MutexGuard` 比标志后释放，
+/// 标志清零时锁已经确定会随后释放——两者都在本函数的调用栈上，不存在中间态。
+struct DispatchToken<'a> {
+    _busy: std::sync::MutexGuard<'a, ()>,
+    _reentry: ReentryCleared,
+}
+
+/// 析构时清掉线程局部标志。
+struct ReentryCleared;
+
+impl Drop for ReentryCleared {
+    fn drop(&mut self) {
+        DISPATCHING.with(|d| d.set(false));
+    }
+}
+
+impl<'a> DispatchToken<'a> {
+    /// 取令牌。**重入**（本线程已在派活）直接 panic；跨线程则排队等锁。
+    ///
+    /// `busy` 这把锁保护的是"同一时刻只有一个派活者"这条不变量，锁里的载荷是 `()`；
+    /// 因此中毒（上一次派活 panic 过）不影响正确性——panic 会被原样续抛给调用方，池
+    /// 状态在此之前已经收干净——所以这里忽略中毒，取回内部值即可。
+    fn acquire(pool: &'a WorkerPool) -> Self {
+        if DISPATCHING.with(|d| d.replace(true)) {
+            panic!("WorkerPool 不支持重入派活：在派活期间（含 during 回调）再次调用派活接口会死锁");
+        }
+        let busy = pool
+            .busy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        DispatchToken {
+            _busy: busy,
+            _reentry: ReentryCleared,
+        }
+    }
+}
 
 /// 常驻工作线程池。
 ///
@@ -177,8 +234,10 @@ pub struct WorkerPool {
     shared: Arc<Shared>,
     handles: Vec<std::thread::JoinHandle<()>>,
     threads: usize,
-    /// 是否有已发布但未 `wait()` 的作业（`submit`/`wait` 配对用）。
-    in_flight: bool,
+    /// 是否有已发布但未 `wait()` 的作业（`publish_no_wait`/`wait` 配对用）。
+    in_flight: AtomicBool,
+    /// 派活互斥：同一时刻只允许一个派活者写作业槽（见 [`DispatchToken`]）。
+    busy: Mutex<()>,
 }
 
 impl WorkerPool {
@@ -222,7 +281,8 @@ impl WorkerPool {
             shared,
             handles,
             threads,
-            in_flight: false,
+            in_flight: AtomicBool::new(false),
+            busy: Mutex::new(()),
         }
     }
 
@@ -244,7 +304,7 @@ impl WorkerPool {
     }
 
     /// 把 `data` 切成 `threads` 段并行处理，返回前保证全部完成。
-    pub fn for_each_chunk_mut<T: Send, F: Fn(&mut [T]) + Sync>(&mut self, data: &mut [T], f: F) {
+    pub fn for_each_chunk_mut<T: Send, F: Fn(&mut [T]) + Sync>(&self, data: &mut [T], f: F) {
         let len = data.len();
         if self.threads == 1 || len < MIN_PARALLEL_LEN {
             f(data);
@@ -260,7 +320,7 @@ impl WorkerPool {
     ///
     /// # Panics
     /// 各数组长度不一致时 panic。
-    pub fn for_each_chunks_mut<T: Send, const N: usize, F>(&mut self, arrays: [&mut [T]; N], f: F)
+    pub fn for_each_chunks_mut<T: Send, const N: usize, F>(&self, arrays: [&mut [T]; N], f: F)
     where
         F: Fn([&mut [T]; N]) + Sync,
     {
@@ -294,7 +354,7 @@ impl WorkerPool {
     /// # Panics
     /// `row_gran == 0`，或第 k 个数组的长度不等于 `rows × 行宽` 时 panic。
     pub fn for_each_row_block_mut<T: Send, const N: usize, F>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         arrays: [(&mut [T], usize); N],
@@ -342,7 +402,7 @@ impl WorkerPool {
     ///     m, 4, [(&mut a, k), (c, n)], |rows, [ab, cb]| { /* … */ });
     /// ```
     pub fn for_each_row_block_mut_with<S: Strategy, T: Send, const N: usize, F>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         arrays: [(&mut [T], usize); N],
@@ -357,7 +417,7 @@ impl WorkerPool {
     ///
     /// 适合负载不均或机器有后台抢占的场景（块足够碎时把线程间差异压到最小）。
     pub fn for_each_row_block_mut_dynamic<T: Send, const N: usize, F>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         block_rows: usize,
@@ -377,7 +437,7 @@ impl WorkerPool {
     }
 
     pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         arrays: [(&mut [T], usize); N],
@@ -398,7 +458,7 @@ impl WorkerPool {
     /// 而且 `during` 无法捕获 `arrays`（已被本调用移走）或 `&mut pool`（已借出），
     /// 借用检查器替我们挡掉了数据竞争。
     pub fn for_each_row_block_mut_picked_deferred<T: Send, const N: usize, F, D>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         arrays: [(&mut [T], usize); N],
@@ -416,7 +476,7 @@ impl WorkerPool {
     /// 的公共实现；`wait_now = false` 表示只发布不等（见 `publish_no_wait` 的 Safety）。
     #[allow(clippy::too_many_arguments)]
     fn row_block_run<T: Send, const N: usize, F, D>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         mut arrays: [(&mut [T], usize); N],
@@ -458,7 +518,7 @@ impl WorkerPool {
 
     /// 静态策略（`Chunk`/`RowBlock`）的公共实现。
     fn row_block_static<S: Strategy, T: Send, const N: usize, F, D>(
-        &mut self,
+        &self,
         rows: usize,
         row_gran: usize,
         mut arrays: [(&mut [T], usize); N],
@@ -512,7 +572,7 @@ impl WorkerPool {
     /// 各数组长度必须等于 `rows × widths[k]`（由上面的公开接口校验），
     /// 否则下面的指针算术就越界了。`rows_per` 是本轮的块大小（≥ 1）。
     fn dispatch_rows<T: Send, const N: usize, F, D>(
-        &mut self,
+        &self,
         bases: [*mut T; N],
         widths: [usize; N],
         rows: usize,
@@ -524,6 +584,9 @@ impl WorkerPool {
         D: FnOnce(),
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
+        // 派活令牌：串行化所有派活者（跨线程排队），并把重入派活变成明确 panic。
+        // 从填槽一直持到 `wait()` 返回——这正是 worker 读写这些槽的整个窗口。
+        let _token = DispatchToken::acquire(self);
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
         #[allow(clippy::needless_range_loop)]
         for w in 0..self.threads {
@@ -553,7 +616,11 @@ impl WorkerPool {
         // 行区间互不重叠；`f` 与 `during` 都在本函数栈帧上活到 `wait()` 之后。
         // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
         unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        // 发布之后立刻上守卫：`during` 是用户代码，panic 展开也必须先收工（否则 worker 在
+        // 调一个已经析构的栈上闭包）。正常路径下面 disarm，交给 `wait()` 收尾并续抛 panic。
+        let mut guard = WaitGuard::new(self);
         during();
+        guard.disarm();
         self.wait();
     }
 
@@ -570,7 +637,7 @@ impl WorkerPool {
     /// # Panics
     /// 各数组长度必须等于 `rows × 行宽`；`jobs` 必须恰好覆盖 `[0, rows)`。
     fn dispatch_jobs<T: Send, const N: usize, F, D>(
-        &mut self,
+        &self,
         bases: [*mut T; N],
         widths: [usize; N],
         jobs: sched::Jobs,
@@ -583,11 +650,13 @@ impl WorkerPool {
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
         let threads = self.threads;
-        // SAFETY: 调用方独占（`&mut self`），且写入发生在 epoch 递增之前。
+        // 派活令牌：从填槽一直持到 `wait()` 返回，替代原来 `&mut self` 提供的独占保证
+        let _token = DispatchToken::acquire(self);
+        // SAFETY: 令牌保证同一时刻只有一个派活者在写 `jobs`，且写入发生在 epoch 递增之前。
         unsafe { *self.shared.jobs.get() = jobs };
         self.shared.dynamic.store(dynamic, Ordering::Relaxed);
         self.shared.next_job.store(0, Ordering::Relaxed);
-        // SAFETY: `jobs` 刚由本函数写入（独占 `&mut self`，且在发布之前），本轮内无别名写入。
+        // SAFETY: `jobs` 刚由本函数写入（令牌在手，且在发布之前），本轮内无别名写入。
         let n_jobs = unsafe { (*self.shared.jobs.get()).len() };
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
         #[allow(clippy::needless_range_loop)]
@@ -614,7 +683,10 @@ impl WorkerPool {
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待
         // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
         unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        // 同上：`during` panic 时必须先收工，避免栈上闭包被 worker 继续调用
+        let mut guard = WaitGuard::new(self);
         during();
+        guard.disarm();
         self.wait();
     }
 
@@ -633,7 +705,7 @@ impl WorkerPool {
     /// # Safety
     /// 在 `wait()` 返回之前，调用方不得访问本次派活的数组或闭包捕获的数据（worker 正在
     /// 读写它们），也不得再次调用本池的派活接口（池只有一套作业槽与代次）。
-    unsafe fn publish_no_wait(&mut self, t: Thunk, func: *const ()) {
+    unsafe fn publish_no_wait(&self, t: Thunk, func: *const ()) {
         *self.shared.call.get() = (t, func);
         self.shared.done.store(0, Ordering::Relaxed);
         self.shared.panicked.store(false, Ordering::Relaxed);
@@ -642,25 +714,82 @@ impl WorkerPool {
             self.shared.epoch.fetch_add(1, Ordering::Release);
         }
         self.shared.wake.notify_all();
-        self.in_flight = true;
+        self.in_flight.store(true, Ordering::Relaxed);
     }
 
     /// 等到本轮全部 worker 完成（有 panic 则续抛）。没有在飞作业时直接返回。
-    pub fn wait(&mut self) {
-        if !self.in_flight {
+    ///
+    /// 取 `&self` 之后，这里只做"自己刚发布的那一轮"的收尾：调用方必须已经持有派活令牌
+    /// （[`DispatchToken`]），所以 `in_flight` 不会被另一个派活者中途改掉。
+    ///
+    /// **不对外**：它必须与私有的 [`Self::publish_no_wait`] 成对使用，单独调用没有意义
+    /// （还可能替别人收尾）。对外只需要三个 `for_each_*` 门面。
+    fn wait(&self) {
+        if !self.in_flight.load(Ordering::Relaxed) {
             return;
         }
-        self.in_flight = false;
+        let payload = self.finish_round();
+        if let Some(p) = payload {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// 等本轮收工并取走 worker 的 panic 载荷（**不续抛**）。没有在飞作业时返回 `None`。
+    ///
+    /// 与 [`Self::wait`] 的区别只有一个：不 panic。用于**已经在展开**的路径
+    /// （[`WaitGuard`] 的析构）——那里再 `resume_unwind` 会变成双重 panic 而 abort。
+    fn wait_quiet(&self) -> Option<Box<dyn Any + Send>> {
+        if !self.in_flight.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.finish_round()
+    }
+
+    /// 收尾内核：清 `in_flight`、等 `done` 到齐、取走（并清掉）panic 载荷。
+    fn finish_round(&self) -> Option<Box<dyn Any + Send>> {
+        self.in_flight.store(false, Ordering::Relaxed);
         while self.shared.done.load(Ordering::Acquire) < self.threads {
             std::hint::spin_loop();
         }
         if self.shared.panicked.load(Ordering::Acquire) {
             // 池已收工，状态是干净的：把 panic 交给调用方，池本身可继续复用。
             self.shared.panicked.store(false, Ordering::Relaxed);
-            let payload = self.shared.payload.lock().unwrap().take();
-            if let Some(p) = payload {
-                std::panic::resume_unwind(p);
-            }
+            return self.shared.payload.lock().unwrap().take();
+        }
+        None
+    }
+}
+
+/// "发布之后一定要收工"的析构守卫。
+///
+/// 为什么需要它：`during` 是**用户代码**，它 panic 时展开会跳过 `wait()`。而 worker 此刻
+/// 正在调用 `f`——`f` 活在本函数的栈帧上，栈一展开就是**悬垂闭包**，那是 UB，
+/// 比"池挂死"严重得多。所以发布之后立刻挂上这个守卫，任何路径（含 panic 展开）都会先
+/// 收工再走。
+///
+/// 正常路径由调用方 [`WaitGuard::disarm`] 交还给 `wait()`——那一步会**续抛** worker 的
+/// panic；守卫自己只在展开路径上兜底，且只收工、不续抛（展开中再 panic 会 abort）。
+struct WaitGuard<'a> {
+    pool: &'a WorkerPool,
+    armed: bool,
+}
+
+impl<'a> WaitGuard<'a> {
+    fn new(pool: &'a WorkerPool) -> Self {
+        WaitGuard { pool, armed: true }
+    }
+
+    /// 正常路径：把收尾交还给 `wait()`。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // 可能已经在展开中：只收工，绝不续抛 worker 的 panic。
+            drop(self.pool.wait_quiet());
         }
     }
 }
@@ -674,6 +803,34 @@ impl Drop for WorkerPool {
             let _ = h.join();
         }
     }
+}
+
+/// 进程级共享池的存储；[`global`] 与 [`init_global`] 共用同一个。
+static GLOBAL: std::sync::OnceLock<WorkerPool> = std::sync::OnceLock::new();
+
+/// 进程级共享池：首次使用时就地建一个按 `available_parallelism` 配线程数的池。
+///
+/// 这是"一个进程一个池"的默认入口，[`parallel`](crate::parallel) 与上层的 `Auto` 策略
+/// 都走它。多个线程可以同时拿 `&'static WorkerPool` 调用派活接口——池内部会把派活者
+/// 串行化（见模块头"派活接口取 `&self`"），所以同一个池可以被整进程共用，不会像
+/// "每个线程各建一个池"那样把线程数乘起来。
+///
+/// 想固定线程数就在**首次使用前**调 [`init_global`]。
+pub fn global() -> &'static WorkerPool {
+    GLOBAL.get_or_init(WorkerPool::auto)
+}
+
+/// 指定全局池的线程数；返回 `false` 表示全局池**已经**建好，本次调用无效。
+///
+/// 典型用法是在程序启动时按机器/配置定死：
+///
+/// ```
+/// // 已经建过就返回 false（测试进程里别的用例可能先用过），两种都正确
+/// let _ = lasx_rs::pool::init_global(4);
+/// assert!(lasx_rs::pool::global().threads() >= 1);
+/// ```
+pub fn init_global(threads: usize) -> bool {
+    GLOBAL.set(WorkerPool::new(threads)).is_ok()
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -836,7 +993,7 @@ mod tests {
                 10_000,
                 65_537,
             ] {
-                let mut pool = WorkerPool::new(threads);
+                let pool = WorkerPool::new(threads);
                 let mut data: Vec<u64> = vec![0; len];
                 let calls = AtomicCount::new(0);
                 pool.for_each_chunk_mut(data.as_mut_slice(), |chunk| {
@@ -860,7 +1017,7 @@ mod tests {
     /// 多数组版本：各数组的同一区间必须对齐、互不重叠。
     #[test]
     fn test_multi_array_chunks_are_aligned_and_disjoint() {
-        let mut pool = WorkerPool::new(4);
+        let pool = WorkerPool::new(4);
         let n = 50_000usize;
         let (mut a, mut b, mut c) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
         pool.for_each_chunks_mut(
@@ -883,7 +1040,7 @@ mod tests {
     /// 行块版本：行宽不同的两个数组必须切在**同一批行**上，且恰好覆盖每一行。
     #[test]
     fn test_row_blocks_pair_arrays_by_row_range() {
-        let mut pool = WorkerPool::new(5);
+        let pool = WorkerPool::new(5);
         let (m, k, n) = (1000usize, 7usize, 11usize);
         // 两个数组都用"行号"预填：行宽不同（k vs n），能对齐才说明切的是同一批行
         let mut a: Vec<u64> = (0..m * k).map(|i| (i / k) as u64).collect();
@@ -921,7 +1078,7 @@ mod tests {
     /// 求和结果必须与串行一致（验证数据确实被完整覆盖）。
     #[test]
     fn test_sum_matches_serial() {
-        let mut pool = WorkerPool::new(6);
+        let pool = WorkerPool::new(6);
         let n = 100_003usize;
         let mut data: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
         let want: f64 = data.iter().sum();
@@ -936,7 +1093,7 @@ mod tests {
 
     #[test]
     fn test_unequal_lengths_panic() {
-        let mut pool = WorkerPool::new(2);
+        let pool = WorkerPool::new(2);
         let mut a = vec![0u8; 10];
         let mut b = vec![0u8; 11];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -948,7 +1105,7 @@ mod tests {
     /// 行块接口也要拒绝"长度与 rows×行宽 不符"，不做静默截断。
     #[test]
     fn test_row_block_shape_mismatch_panics() {
-        let mut pool = WorkerPool::new(4);
+        let pool = WorkerPool::new(4);
         let mut a = vec![0f32; 100];
         let mut c = vec![0f32; 99];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -960,7 +1117,7 @@ mod tests {
     /// worker 里 panic 必须上抛给调用方，**不能让主线程永久自旋**。
     #[test]
     fn test_panic_in_closure_propagates_and_pool_survives() {
-        let mut pool = WorkerPool::new(4);
+        let pool = WorkerPool::new(4);
         let mut data = vec![0u32; 100_000];
         // 只让**一个** chunk panic：其余 worker 仍要正常收工，done 才能凑齐
         let calls = AtomicCount::new(0);
@@ -992,7 +1149,7 @@ mod tests {
 
     #[test]
     fn test_pool_is_reusable_across_many_calls() {
-        let mut pool = WorkerPool::new(4);
+        let pool = WorkerPool::new(4);
         let mut data = vec![0u64; 20_000];
         for round in 0..50 {
             pool.for_each_chunk_mut(data.as_mut_slice(), |chunk| {
@@ -1012,7 +1169,7 @@ mod tests {
     /// 这里管"派活 + 领取规则"真的按切分执行。
     #[test]
     fn row_block_strategies_visit_every_row_once() {
-        let mut pool = WorkerPool::new(5);
+        let pool = WorkerPool::new(5);
         let (rows, width) = (2000usize, 3usize);
         let picks = [
             Pick::Chunk,
@@ -1035,5 +1192,128 @@ mod tests {
                 pick.name()
             );
         }
+    }
+
+    /// `&self` 的核心承诺：多个线程可以**同时**拿同一个池派活——内部排队，结果各自正确。
+    ///
+    /// 这条测试覆盖的是"把 `&mut self` 换成 `&self` + 内部互斥"这件事本身：如果互斥漏了，
+    /// 两个派活者会同时写作业槽；如果排队写错了（例如 `in_flight` 被另一个线程清掉），
+    /// 就会出现少算/多算或提前返回。
+    #[test]
+    fn test_shared_pool_concurrent_dispatch() {
+        let pool = WorkerPool::new(4);
+        let mut bufs: Vec<Vec<u64>> = (0..4).map(|_| (0..20_000).collect()).collect();
+        std::thread::scope(|s| {
+            for buf in bufs.iter_mut() {
+                let pool = &pool;
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        pool.for_each_chunk_mut(buf.as_mut_slice(), |chunk| {
+                            for v in chunk.iter_mut() {
+                                *v += 1;
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        for (n, buf) in bufs.iter().enumerate() {
+            assert!(
+                buf.iter().enumerate().all(|(i, &v)| v == i as u64 + 20),
+                "第 {n} 个缓冲区结果不对——并发派活没有正确排队"
+            );
+        }
+    }
+
+    /// 重入派活必须在**当下** panic，而不是在 `busy` 上死等。
+    #[test]
+    fn test_reentrant_dispatch_panics_instead_of_deadlock() {
+        let pool = WorkerPool::new(2);
+        let mut data = vec![0u64; 64 * 128];
+        let mut other = vec![0u64; 20_000];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.for_each_row_block_mut_picked_deferred(
+                64,
+                1,
+                [(&mut data, 128)],
+                Pick::RowBlock,
+                |_rows, [d]| d[0] += 1,
+                || {
+                    // 派活期间（`during` 回调）再派活：过去是借用检查器拦，现在必须运行期拦
+                    pool.for_each_chunk_mut(other.as_mut_slice(), |c| c[0] += 1);
+                },
+            );
+        }));
+        let payload = r.unwrap_err();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("panic 载荷应当是字符串");
+        assert!(msg.contains("重入"), "panic 消息应说明是重入派活：{msg}");
+
+        // 池必须已经收工且可继续用（panic 展开路径由 WaitGuard 兜住，闭包不会悬垂）
+        let mut after = vec![0u64; 20_000];
+        pool.for_each_chunk_mut(after.as_mut_slice(), |chunk| {
+            for v in chunk.iter_mut() {
+                *v += 1;
+            }
+        });
+        assert!(
+            after.iter().all(|&v| v == 1),
+            "重入 panic 之后池应当照常可用"
+        );
+    }
+
+    /// `during` 在展开路径上必须先把 worker 收干净：否则 worker 会继续调用一个已经
+    /// 随着栈展开而析构的闭包（UB）。这里只验证"池没有挂死、下一轮结果正确"。
+    #[test]
+    fn test_during_panic_leaves_pool_clean() {
+        let pool = WorkerPool::new(4);
+        let mut data = vec![0u64; 64 * 128];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.for_each_row_block_mut_picked_deferred(
+                64,
+                1,
+                [(&mut data, 128)],
+                Pick::RowBlock,
+                |_rows, [d]| d[0] += 1,
+                || panic!("during 故意 panic"),
+            );
+        }));
+        assert!(r.is_err());
+
+        let mut after = vec![0u64; 20_000];
+        pool.for_each_chunk_mut(after.as_mut_slice(), |chunk| {
+            for v in chunk.iter_mut() {
+                *v += 1;
+            }
+        });
+        assert!(
+            after.iter().all(|&v| v == 1),
+            "during panic 之后池应当照常可用"
+        );
+    }
+
+    /// 全局池：同一个进程里拿到的必须是**同一个**池（不是每线程/每次各建一个）。
+    #[test]
+    fn test_global_pool_is_a_singleton() {
+        let a = global() as *const WorkerPool;
+        let b = global() as *const WorkerPool;
+        assert_eq!(a, b);
+        assert!(global().threads() >= 1);
+        std::thread::scope(|s| {
+            // 传 `usize` 而不是裸指针：裸指针不是 `Send`
+            let h = s.spawn(|| global() as *const WorkerPool as usize);
+            assert_eq!(
+                h.join().unwrap(),
+                a as usize,
+                "另一个线程必须拿到同一个全局池"
+            );
+        });
+        // 已经建过之后 `init_global` 必须无效（返回 false），线程数不变
+        let threads = global().threads();
+        assert!(!init_global(threads + 1));
+        assert_eq!(global().threads(), threads);
     }
 }

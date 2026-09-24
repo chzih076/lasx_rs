@@ -63,7 +63,7 @@ use crate::pool::WorkerPool;
 /// # Panics
 /// 数组长度与 `m/k/n` 不符时 panic。
 pub fn matmul_f32(
-    pool: &mut WorkerPool,
+    pool: &WorkerPool,
     m: usize,
     k: usize,
     n: usize,
@@ -80,7 +80,7 @@ pub fn matmul_f32(
 /// 与 [`matmul_f32`] 同，但**显式指定调度策略**（A/B 与调优用）。
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_f32_with_pick(
-    pool: &mut WorkerPool,
+    pool: &WorkerPool,
     m: usize,
     k: usize,
     n: usize,
@@ -240,7 +240,7 @@ pub fn matmul_f32_with_pick(
 /// # Panics
 /// 数组长度与 `m/k/n` 不符时 panic。
 pub fn matmul_f64(
-    pool: &mut WorkerPool,
+    pool: &WorkerPool,
     m: usize,
     k: usize,
     n: usize,
@@ -394,7 +394,7 @@ pub fn matmul_f64(
 /// 6 个数组长度不一致时 panic。
 #[allow(clippy::too_many_arguments)]
 pub fn rk4_j2_step_batch(
-    pool: &mut WorkerPool,
+    pool: &WorkerPool,
     mu: f64,
     j2: f64,
     re: f64,
@@ -444,7 +444,7 @@ mod tests {
     /// 以及 `m ≥ 512` 的**共享打包面板**分支（含行尾 513 = 128·4+1 与列尾 130 = 4·32+2）。
     #[test]
     fn test_matmul_f32_matches_serial_bit_for_bit() {
-        let mut pool = WorkerPool::new(7);
+        let pool = WorkerPool::new(7);
         for &(m, k, n) in &[
             (1usize, 1usize, 1usize),
             (13, 5, 3),
@@ -470,7 +470,7 @@ mod tests {
                 want.as_mut_ptr(),
             );
             matmul_f32(
-                &mut pool,
+                &pool,
                 m,
                 k,
                 n,
@@ -491,7 +491,7 @@ mod tests {
     /// ⇒ 8 个面板）与行尾/列尾。
     #[test]
     fn test_matmul_f64_matches_serial_bit_for_bit() {
-        let mut pool = WorkerPool::new(5);
+        let pool = WorkerPool::new(5);
         for &(m, k, n) in &[
             (100usize, 48usize, 37usize),
             (128, 256, 96),
@@ -514,7 +514,7 @@ mod tests {
                 want.as_mut_ptr(),
             );
             matmul_f64(
-                &mut pool,
+                &pool,
                 m,
                 k,
                 n,
@@ -536,7 +536,7 @@ mod tests {
     /// 池化 RK4 步必须与单线程逐位一致（切块边界不得影响结果）。
     #[test]
     fn test_rk4_pooled_matches_serial_bit_for_bit() {
-        let mut pool = WorkerPool::new(6);
+        let pool = WorkerPool::new(6);
         let n = 20_000usize;
         let make = || {
             (
@@ -570,7 +570,7 @@ mod tests {
         let (mut px, mut py, mut pz, mut qx, mut qy, mut qz) = make();
         for _ in 0..3 {
             rk4_j2_step_batch(
-                &mut pool,
+                &pool,
                 mu,
                 j2,
                 re,
@@ -593,12 +593,12 @@ mod tests {
     /// 空内积（k = 0）与零维不应 panic。
     #[test]
     fn test_degenerate_shapes() {
-        let mut pool = WorkerPool::new(3);
+        let pool = WorkerPool::new(3);
         let mut a = vec![1.0f32; 0];
         let b = vec![1.0f32; 0];
         let mut c = vec![1.0f32; 4];
-        matmul_f32(&mut pool, 2, 0, 2, &mut a, &b, &mut c);
+        matmul_f32(&pool, 2, 0, 2, &mut a, &b, &mut c);
         assert_eq!(c, vec![0.0f32; 4], "k=0 时结果应为全零");
-        matmul_f32(&mut pool, 0, 0, 0, &mut [], &[], &mut []);
+        matmul_f32(&pool, 0, 0, 0, &mut [], &[], &mut []);
     }
 }

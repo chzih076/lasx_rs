@@ -87,12 +87,12 @@ fn main() {
     );
 
     for &threads in &[2usize, 4, 8, 12, 16, 24] {
-        let mut pool = WorkerPool::new(threads);
+        let pool = WorkerPool::new(threads);
         let mut got = AlignedVec::<f32>::new(m * n);
         let t = bench(
             || {
                 lasx_rs::parallel::matmul_f32(
-                    &mut pool,
+                    &pool,
                     m,
                     k,
                     n,

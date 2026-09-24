@@ -976,10 +976,10 @@ mod tests {
         }
 
         let (mut px, mut py, mut pz, mut qx, mut qy, mut qz) = mk();
-        let mut pool = crate::pool::WorkerPool::new(6);
+        let pool = crate::pool::WorkerPool::new(6);
         for _ in 0..5 {
             crate::parallel::rk4_j2_step_batch(
-                &mut pool, mu, j2, re, dt, &mut px, &mut py, &mut pz, &mut qx, &mut qy, &mut qz,
+                &pool, mu, j2, re, dt, &mut px, &mut py, &mut pz, &mut qx, &mut qy, &mut qz,
             );
         }
 
