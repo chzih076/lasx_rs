@@ -393,16 +393,32 @@ pub trait Policy: Send + Sync {
     fn threads(rows: usize, k: usize, n: usize) -> usize;
 }
 
+/// 机器并行度（**缓存**）。
+///
+/// `std::thread::available_parallelism()` 在本机实测 **68.9 µs/次**——它是系统调用
+/// （`examples/pool_shared_sync.rs` 的单价表）。而 `Auto` 每次调用都要用它，于是
+/// `16×64×64` 这种 1.9 µs 的小形状会被这一次调用吃掉：实测 `Auto` 70.4 µs vs
+/// `Single` 1.9 µs（**37×**）。
+///
+/// 机器并行度在一个进程生命周期内不需要每次重问（`taskset`/cgroup 变了也不会自动重调度，
+/// 与 rayon 缓存线程数的做法一致），所以缓存到 `OnceLock`：`get` 几纳秒。
+fn machine_parallelism() -> usize {
+    static MACHINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MACHINE.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+    })
+}
+
 /// 自动：按形状与机器并行度决定（默认策略）。
 pub struct Auto;
 
 impl Policy for Auto {
     fn threads(rows: usize, k: usize, n: usize) -> usize {
-        // 只问"机器有几个核"，**不建池**——否则只用 `Single` 的程序也会被建出线程池
-        let machine = std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1);
-        auto_threads(rows, k, n, machine)
+        // 只问"机器有几个核"（**缓存**，不做每次调用的系统调用），**不建池**——否则只用
+        // `Single` 的程序也会被建出线程池
+        auto_threads(rows, k, n, machine_parallelism())
     }
 }
 

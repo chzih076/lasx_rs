@@ -106,6 +106,14 @@ fn main() {
     let t_worst = timeit(|| {
         black_box(sync_worst_case());
     });
+    // `Auto` 策略每次调用都会问一遍机器并行度——这是系统调用，必须量它的单价
+    let t_avail = timeit(|| {
+        black_box(
+            std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(1),
+        );
+    });
 
     println!("| 同步动作 | 每次耗时 |");
     println!("|---|---|");
@@ -118,6 +126,10 @@ fn main() {
         ns(t_atomic)
     );
     println!("| `Mutex::lock/unlock`（无竞争） | {:.1} ns |", ns(t_lock));
+    println!(
+        "| `thread::available_parallelism()`（**系统调用**） | {:.1} ns |",
+        ns(t_avail)
+    );
     println!(
         "| 合计：原子版（OnceLock+原子） | {:.1} ns |",
         ns(t_atomic_only)
