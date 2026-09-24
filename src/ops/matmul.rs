@@ -491,6 +491,162 @@ pub(crate) fn pack_strips(k: usize) -> usize {
     (L2_BUDGET / per_strip).clamp(1, 256)
 }
 
+/// **实验性**：`C = alpha·(A·B) + beta·C`（原地）。见 `docs/dev.md` §19.11。
+///
+/// 只在 **k 不分块**（f32 `k·32·4 ≤ L1_BUDGET`，即 `k ≤ 384`）时位精确：k 分块会把部分和
+/// 落进输出缓冲再读回，而输出正是 `C`，`C_old` 会被部分和覆盖——那样 `beta·C_old` 只能靠
+/// "给累加器播种"拿到，违反契约（§2.5）。不分块时累加器一直在寄存器里，收尾读 `C_old` 才安全。
+///
+/// 数值：`C = fma(beta, C_old, alpha·acc)`，与契约的"两次舍入"一致。参考实现必须写成
+/// `beta.mul_add(C_old, alpha * acc)` 才逐位相同（普通 `alpha*acc + beta*C_old` 是三次舍入）。
+///
+/// 实验范围：要求 `m % 4 == 0 && n % 32 == 0`（省掉行尾/列尾；生产化要把尾路径补齐）。
+///
+/// # Panics
+/// 上述条件不满足时 panic（实验代码，宁可炸也不要静默算错）。
+pub(crate) fn matmul_f32_scaled(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    assert!(
+        k * 32 * 4 <= L1_BUDGET,
+        "融合内核只支持 k 不分块（f32 k ≤ 384）"
+    );
+    assert_eq!(m % 4, 0, "实验内核要求 m 是 4 的倍数");
+    assert_eq!(n % 32, 0, "实验内核要求 n 是 32 的倍数");
+    if m == 0 || n == 0 {
+        return;
+    }
+    let nc_strips = pack_strips(k);
+    PACK_BUF.with(|buf| {
+        let mut packed = buf.borrow_mut();
+        packed.resize(k * nc_strips * 32, 0.0);
+        let mut s0 = 0;
+        while s0 < n / 32 {
+            let s1 = (s0 + nc_strips).min(n / 32);
+            let jb = s0 * 32;
+            let nc = (s1 - s0) * 32;
+            pack_b(k, n, jb, nc, b, &mut packed);
+            for s in 0..nc / 32 {
+                let strip = &packed[s * k * 32..(s + 1) * k * 32];
+                let j = jb + s * 32;
+                let mut i = 0;
+                while i < m {
+                    let ct = &mut c[i * n..(i + 4) * n];
+                    scaled_tile4x32(
+                        strip,
+                        &a[i * k..(i + 1) * k],
+                        &a[(i + 1) * k..(i + 2) * k],
+                        &a[(i + 2) * k..(i + 3) * k],
+                        &a[(i + 3) * k..(i + 4) * k],
+                        ct,
+                        n,
+                        j,
+                        alpha,
+                        beta,
+                    );
+                    i += 4;
+                }
+            }
+            s0 = s1;
+        }
+    });
+}
+
+/// [`tile4x32_chunk`] 的融合收尾版：k 步累加（累加器从 0 起，故不做 C 读回），
+/// 收尾做 `C = fma(beta, C_old, alpha·acc)` 再写回——每个 8 列组多 1 载入 + 1 乘 + 1 FMA。
+#[allow(clippy::too_many_arguments)]
+fn scaled_tile4x32(
+    strip: &[f32],
+    a0: &[f32],
+    a1: &[f32],
+    a2: &[f32],
+    a3: &[f32],
+    ct: &mut [f32],
+    n: usize,
+    j: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    let mut rows = ct.chunks_mut(n);
+    let c0 = rows.next().expect("4 行");
+    let c1 = rows.next().expect("4 行");
+    let c2 = rows.next().expect("4 行");
+    let c3 = rows.next().expect("4 行");
+
+    let (mut r0a, mut r0b, mut r0c, mut r0d) = z4();
+    let (mut r1a, mut r1b, mut r1c, mut r1d) = z4();
+    let (mut r2a, mut r2b, mut r2c, mut r2d) = z4();
+    let (mut r3a, mut r3b, mut r3c, mut r3d) = z4();
+    for p in 0..strip.len() / 32 {
+        let base = p * 32;
+        // SAFETY: `strip` 是完整条带（长度 k×32），`base + 24 + 8 ≤ k×32`。
+        let vb0 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base)) };
+        let vb1 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 8)) };
+        let vb2 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 16)) };
+        let vb3 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 24)) };
+        let s0 = lasx::splat_f32(a0[p]);
+        let s1 = lasx::splat_f32(a1[p]);
+        let s2 = lasx::splat_f32(a2[p]);
+        let s3 = lasx::splat_f32(a3[p]);
+        unsafe {
+            r0a = lasx_xvfmadd_s(vb0, s0, r0a);
+            r0b = lasx_xvfmadd_s(vb1, s0, r0b);
+            r0c = lasx_xvfmadd_s(vb2, s0, r0c);
+            r0d = lasx_xvfmadd_s(vb3, s0, r0d);
+            r1a = lasx_xvfmadd_s(vb0, s1, r1a);
+            r1b = lasx_xvfmadd_s(vb1, s1, r1b);
+            r1c = lasx_xvfmadd_s(vb2, s1, r1c);
+            r1d = lasx_xvfmadd_s(vb3, s1, r1d);
+            r2a = lasx_xvfmadd_s(vb0, s2, r2a);
+            r2b = lasx_xvfmadd_s(vb1, s2, r2b);
+            r2c = lasx_xvfmadd_s(vb2, s2, r2c);
+            r2d = lasx_xvfmadd_s(vb3, s2, r2d);
+            r3a = lasx_xvfmadd_s(vb0, s3, r3a);
+            r3b = lasx_xvfmadd_s(vb1, s3, r3b);
+            r3c = lasx_xvfmadd_s(vb2, s3, r3c);
+            r3d = lasx_xvfmadd_s(vb3, s3, r3d);
+        }
+    }
+    let va = lasx::splat_f32(alpha);
+    let vb = lasx::splat_f32(beta);
+    // SAFETY: `j..j+32` 在行内（条带完整，调用方保证 n 是 32 的倍数）。
+    unsafe {
+        scaled_store4(c0, [r0a, r0b, r0c, r0d], j, va, vb);
+        scaled_store4(c1, [r1a, r1b, r1c, r1d], j, va, vb);
+        scaled_store4(c2, [r2a, r2b, r2c, r2d], j, va, vb);
+        scaled_store4(c3, [r3a, r3b, r3c, r3d], j, va, vb);
+    }
+}
+
+/// 一行的 32 列（4 个 8 列组）融合写回。
+///
+/// # Safety
+/// `row` 至少有 `j + 32` 个元素。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn scaled_store4(
+    row: &mut [f32],
+    acc: [lasx::F32x8; 4],
+    j: usize,
+    va: lasx::F32x8,
+    vb: lasx::F32x8,
+) {
+    for (g, a) in acc.into_iter().enumerate() {
+        let p = row.as_mut_ptr().add(j + g * 8);
+        let old = lasx::load_f32x8(p);
+        // 契约的"两次舍入"：先 alpha·acc（一次），再 fma(beta, C_old, ·)（再一次）
+        let out = lasx_xvfmadd_s(old, vb, lasx_xvfmul_s(a, va));
+        lasx::store_f32x8(p, out);
+    }
+}
+
 /// 强制走"流式"次序（**测试对照用**；生产路径由 [`matmul_f32`] 按形状分派）。
 #[cfg(test)]
 pub(crate) fn matmul_f32_stream_ref(

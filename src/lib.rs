@@ -86,6 +86,23 @@ pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &
     ops::matmul::matmul_f32_packed(m, k, n, a, b, c);
 }
 
+/// **实验性**：`C = alpha·(A·B) + beta·C`（原地），只在 k 不分块、`m%4==0`、`n%32==0`
+/// 时成立。用于量"融合内核能不能保持非融合内核的速度"（`docs/dev.md` §19.11）。
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn ops_bench_scaled(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    ops::matmul::matmul_f32_scaled(m, k, n, alpha, beta, a, b, c);
+}
+
 /// 同上，f64 侧（`docs/dev.md` §8.5 的 A/B 用）。
 #[doc(hidden)]
 pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
