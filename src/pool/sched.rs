@@ -92,7 +92,8 @@ impl Strategy for Chunk {
 /// 行块（矩阵乘的现状）：与 [`Chunk`] 同形，但**必须**对齐行粒度。
 ///
 /// 单独列一个类型而不是给 `Chunk` 传参，是为了让调用点一眼看出"这里依赖行粒度"：
-/// 矩阵乘按 4 行微块复用 B，`row_gran = 1` 切出的退化尾块实测慢一倍（见 `docs/dev.md` §14.6）。
+/// 矩阵乘按 4 行微块复用 B，`row_gran = 1` 切出的退化尾块实测慢约一倍
+/// （2026-09-23 的扫描；决策见 `docs/dev.md` §14）。
 pub struct RowBlock;
 
 impl Strategy for RowBlock {
