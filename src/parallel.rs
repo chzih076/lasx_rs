@@ -161,7 +161,7 @@ pub fn matmul_f32_with_pick(
                         4,
                         [(a, k), (c, n)],
                         pick,
-                        |rows, [ab, cb]| {
+                        |_start, rows, [ab, cb]| {
                             let m4 = rows / 4 * 4;
                             matmul::matmul_f32_packed_rows(
                                 k,
@@ -186,7 +186,7 @@ pub fn matmul_f32_with_pick(
                         4,
                         [(a, k), (c, n)],
                         pick,
-                        |rows, [ab, cb]| {
+                        |_start, rows, [ab, cb]| {
                             let m4 = rows / 4 * 4;
                             matmul::matmul_f32_packed_rows(
                                 k,
@@ -210,20 +210,26 @@ pub fn matmul_f32_with_pick(
         });
         // 列尾 [n32, n)：每个线程处理自己那些行（与顺序路径同一函数 ⇒ 逐位一致）
         if n > n32 {
-            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
-                for i in 0..rows {
-                    let a_row = &ab[i * k..(i + 1) * k];
-                    let c_row = &mut cb[i * n..(i + 1) * n];
-                    matmul::row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
-                }
-            });
+            pool.for_each_row_block_mut_picked(
+                m,
+                4,
+                [(a, k), (c, n)],
+                pick,
+                |_start, rows, [ab, cb]| {
+                    for i in 0..rows {
+                        let a_row = &ab[i * k..(i + 1) * k];
+                        let c_row = &mut cb[i * n..(i + 1) * n];
+                        matmul::row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+                    }
+                },
+            );
         }
         return;
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
                 // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
-    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |_start, rows, [ab, cb]| {
         crate::lasx_matmul(
             rows as i32,
             k as i32,
@@ -307,7 +313,7 @@ pub fn matmul_f64(
                     4,
                     [(a, k), (c, n)],
                     pick,
-                    |rows, [ab, cb]| {
+                    |_start, rows, [ab, cb]| {
                         let m4 = rows / 4 * 4;
                         matmul64::matmul_f64_packed_rows(
                             k,
@@ -332,7 +338,7 @@ pub fn matmul_f64(
                     4,
                     [(a, k), (c, n)],
                     pick,
-                    |rows, [ab, cb]| {
+                    |_start, rows, [ab, cb]| {
                         let m4 = rows / 4 * 4;
                         matmul64::matmul_f64_packed_rows(
                             k,
@@ -355,20 +361,26 @@ pub fn matmul_f64(
         }
         // 列尾 [n16, n)：与顺序路径同一函数 ⇒ 逐位一致
         if n > n16 {
-            pool.for_each_row_block_mut_picked(m, 4, [(a, k), (c, n)], pick, |rows, [ab, cb]| {
-                for i in 0..rows {
-                    let a_row = &ab[i * k..(i + 1) * k];
-                    let c_row = &mut cb[i * n..(i + 1) * n];
-                    matmul64::row_tail_f64(a_row, c_row, b, k, n, n16);
-                }
-            });
+            pool.for_each_row_block_mut_picked(
+                m,
+                4,
+                [(a, k), (c, n)],
+                pick,
+                |_start, rows, [ab, cb]| {
+                    for i in 0..rows {
+                        let a_row = &ab[i * k..(i + 1) * k];
+                        let c_row = &mut cb[i * n..(i + 1) * n];
+                        matmul64::row_tail_f64(a_row, c_row, b, k, n, n16);
+                    }
+                },
+            );
         }
         return;
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
                 // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
-    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |rows, [ab, cb]| {
+    pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |_start, rows, [ab, cb]| {
         crate::lasx_matmul_f64(
             rows as i32,
             k as i32,
