@@ -1453,3 +1453,72 @@ crate，不发布，`lasx_rs` 依赖并 `pub use` 出来，用户视角仍是一
 `plan` 的实现，`Layout<K,N>` 里那些常量只是把 `MatmulPlan::new` 的运行期判据在编译期
 预先算了一遍（`debug_assert` 校验两者一致）。所以 §18.4 的位精确论证对本层**整体继承**，
 唯一新增的检查是"类型形状与运行期长度一致"，它在构造函数里做掉。
+
+### 19.7 接口冻结（第 2b 步产物；proc-macro 直接调这三个）
+
+第 3 步的宏要生成调这三个接口的代码，**它们从此不再改动**（要改就先改宏）。
+
+**(1) 池的行块闭包 —— `src/pool/mod.rs`**
+
+```rust
+pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
+    &self, rows: usize, row_gran: usize,
+    arrays: [(&mut [T], usize); N], pick: Pick, f: F,
+) where F: Fn(usize, usize, [&mut [T]; N]) + Sync;
+//            ^^^^^  ^^^^^  ^^^^^^^^^^^
+//            start  rows   本块的切片
+```
+
+`start` 是**本块起始行**（`Chunk`/`RowBlock`/`Blocked`/`Dynamic` 四种策略都保证
+"`start` 与切片一一对应、各块首尾相接覆盖 `[0, rows)`"，测试
+`pool::tests::test_row_block_start_matches_slice` 守着）。同一函数族还有
+`_mut` / `_mut_with::<S>` / `_mut_dynamic` / `_mut_picked_deferred`，闭包签名一致。
+
+**(2) 形状层 —— `src/shape.rs`**
+
+```rust
+let w  = Mat::<f32, K, N>::new(&weights)?;          // 权重：全静态
+let wp = w.prepare();                                // = prepare_with::<Auto>()
+let wq = w.prepare_with::<Exact<8>>();               // 策略是类型
+
+wp.apply::<M>(&x) -> MatBuf<T, M, N>                // 分配
+wp.apply_into::<M>(&x, &mut out)                    // 不分配
+wp.apply_pooled::<M>(&pool, &x, &mut out)           // 指定池
+wp.apply_dyn(&x_dyn) -> MatBufDyn<T, N>             // DYN 档
+wp.apply_dyn_into(&x_dyn, &mut out)
+wp.apply_dyn_pooled(&pool, &x_dyn, &mut out)
+wp.threads::<M>() -> usize                          // 诊断：这次会用几个线程
+```
+
+**(3) 策略 —— `src/shape.rs`**
+
+```rust
+pub trait Policy: Send + Sync {
+    fn threads(rows: usize, k: usize, n: usize) -> usize;   // 纯判据：不建池、不派活
+}
+pub struct Auto;            // auto_threads(rows, k, n, available_parallelism())
+pub struct Single;          // 恒 1，完全不碰池
+pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
+```
+
+**(4) 三条契约（`pool` 的文档里也写了）**
+
+1. 池作为 `&mut [T]` 传进来的数组：闭包只能读写**本块**（切片长度就是 `rows × 行宽`），
+   越界会 panic，不是 UB。
+2. 闭包**捕获**的只读数组：只能读 `[start, start+rows)`。**类型系统查不了**——写错是
+   静默的错误结果。宏生成闭包时**必须**用 `start` 切片，不许整体捕获后自己索引。
+3. "同一个数组既作只读捕获又作 `&mut` 输出"（原地 `y = α·A·x + y` 的 `y`）：安全 Rust
+   里**已被借用检查器拒绝**（不可能同时持有同一缓冲的 `&` 与 `&mut`），所以不需要额外
+   禁止；真要走 `unsafe`，契约是"该数组只能读写本块"。
+
+**(5) 接线方式与它为什么与 §13.7 兼容**
+
+并行 = "**同一份打包面板 + 按行切**"：`Prepared` 里的 `MatmulPlan` 在构造时打包一次，
+之后所有 worker 只读共享；每个 worker 拿到行区间后调 `MatmulPlan::run_rows_into`
+（新增的 `pub(crate)` 入口，`run_into` 也复用同一份实现，两者必然一致）。
+"想要几个线程"用**切几个块**表达（`Pick::Blocked { block_rows }`），池里多出来的 worker
+自然领不到块——于是 `Exact<8>` 在 24 线程的池上就是 8 个块。
+
+回归测试：`shape::tests::test_pooled_matches_serial_bit_for_bit`（静态 `Exact<4>` +
+`Auto`、DYN `Exact<8>` × 三种行数，全部与 `api::matmul` 逐位对照）、
+`test_policy_semantics`（`Auto` 小形状 = 1、`Single` 恒 1、`Exact<N>` 不设门限）。

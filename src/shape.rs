@@ -89,6 +89,7 @@
 use crate::aligned::AlignedVec;
 use crate::api::Error;
 use crate::plan::{MatmulPlan, PackedKernel};
+use crate::pool::WorkerPool;
 
 /* ==================== 1. 排版方案（编译期算完） ==================== */
 
@@ -300,11 +301,11 @@ impl<T: Copy + Default, const C: usize> MatBufDyn<T, C> {
     }
 }
 
-/* ==================== 3. `Auto` 判据（实测标定） ==================== */
+/* ==================== 3. 调度策略与 `Auto` 判据（实测标定） ==================== */
 
 /// `Auto` 决定并行前要求的最小工作量（**乘加次数** = `m × k × n`）。
 ///
-/// 实测（`K=N=256`、12 线程、与单线程逐位对照，见 `docs/dev.md` §3.2）：
+/// 实测（`K=N=256`、12 线程、与单线程逐位对照，见 `docs/dev.md` §19.2）：
 ///
 /// | 形状 | 工作量 | 池/单线程 |
 /// |---|---|---|
@@ -325,7 +326,8 @@ pub const AUTO_MIN_WORK: usize = 4_000_000;
 /// 1. **每线程至少 4 行**——微内核一次算 4 行、B 被复用 4 次，行数不够时并行只会
 ///    制造退化的尾块；
 /// 2. **总工作量 ≥ [`AUTO_MIN_WORK`]**——派活本身要几十微秒（worker 唤醒），
-///    小形状上它比干活还贵（实测 `64×64×64` 慢 4.11×）。
+///    小形状上它比干活还贵（实测 `64×64×64` 慢 4.11×、`1024×8×8` 慢 3.19×——
+///    后者行数有 1024，**证明只看行数不够**）。
 ///
 /// 另外一条与本节无关、但同样实测过的事实：`&self` 之后每次派活多一层同步，
 /// 单价 44 ns（最坏情况）。在 1.95 µs 的调用上占 **3.2%**，在 ≥10 µs 的调用上
@@ -346,14 +348,67 @@ pub fn auto_threads(rows: usize, k: usize, n: usize, machine: usize) -> usize {
     by_rows.min(machine).max(1)
 }
 
+/// 调度策略：决定"这次调用想要几个线程"。**策略是类型，不是运行期参数。**
+///
+/// | 策略 | 语义 |
+/// |---|---|
+/// | [`Auto`] | 按 [`auto_threads`] 的实测判据（默认） |
+/// | [`Single`] | 强制单线程：**完全不碰池**（不会因为用了一次 `Single` 就建出线程池） |
+/// | [`Exact<N>`] | 强制 `N` 个线程，**不设工作量门限**——这是显式选择，开销是真实开销（小形状上它可能比单线程慢几倍，见 `docs/dev.md` §19.2） |
+///
+/// 实现方式是"切几个行块"，而不是"池开几个线程"：块数 = 想要的线程数，池用自己
+/// 那批 worker 去领这些块，多出来的 worker 自然没活干。
+pub trait Policy: Send + Sync {
+    /// 这次调用想要几个线程（1 = 不派活）。**纯判据：不建池、不派活。**
+    fn threads(rows: usize, k: usize, n: usize) -> usize;
+}
+
+/// 自动：按形状与机器并行度决定（默认策略）。
+pub struct Auto;
+
+impl Policy for Auto {
+    fn threads(rows: usize, k: usize, n: usize) -> usize {
+        // 只问"机器有几个核"，**不建池**——否则只用 `Single` 的程序也会被建出线程池
+        let machine = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        auto_threads(rows, k, n, machine)
+    }
+}
+
+/// 强制单线程：不派活、不碰池。
+pub struct Single;
+
+impl Policy for Single {
+    fn threads(_rows: usize, _k: usize, _n: usize) -> usize {
+        1
+    }
+}
+
+/// 强制 `N` 个线程（提示：小形状上派活比干活贵，见 `docs/dev.md` §19.2）。
+pub struct Exact<const N: usize>;
+
+impl<const N: usize> Policy for Exact<N> {
+    fn threads(_rows: usize, _k: usize, _n: usize) -> usize {
+        N.max(1)
+    }
+}
+
 /* ==================== 4. 声明式调用 ==================== */
 
 /// "把权重打包好、以后反复用"的对象：形状在类型里，里面是 [`MatmulPlan`]。
 ///
-/// 构造见 [`Mat::prepare`]；之后 [`Prepared::apply`] / [`Prepared::apply_dyn`] 只算乘法，
+/// 构造见 [`Mat::prepare`] / [`Mat::prepare_with`]；之后 `apply*` 只算乘法，
 /// 零分配（`apply_into`）、零打包。
-pub struct Prepared<T: PackedKernel, const K: usize, const N: usize> {
+///
+/// # 并行
+///
+/// 策略由类型参数 `P` 决定（见 [`Policy`]）。并行走的是"**同一份打包面板 + 按行切**"：
+/// 面板在构造时打包一次、之后所有线程共享只读，**不重复打包**（这正是
+/// `docs/dev.md` §13.7 那个多核病理的正解）。想用自己管的池时走 `apply_pooled`。
+pub struct Prepared<P: Policy, T: PackedKernel, const K: usize, const N: usize> {
     plan: MatmulPlan<T>,
+    policy: std::marker::PhantomData<P>,
 }
 
 impl<'a, T: PackedKernel, const A: usize, const B: usize> Mat<'a, T, A, B> {
@@ -382,16 +437,22 @@ impl<'a, T: PackedKernel, const A: usize, const B: usize> Mat<'a, T, A, B> {
         self.prepare().apply_dyn_into(x, out);
     }
 
-    /// 声明"这是反复用的权重"：**打包一次**，之后每次只算乘法。
-    pub fn prepare(&self) -> Prepared<T, A, B> {
+    /// 声明"这是反复用的权重"：**打包一次**，之后每次只算乘法（默认 [`Auto`] 策略）。
+    pub fn prepare(&self) -> Prepared<Auto, T, A, B> {
+        self.prepare_with::<Auto>()
+    }
+
+    /// 带调度策略的 [`Mat::prepare`]。
+    pub fn prepare_with<P: Policy>(&self) -> Prepared<P, T, A, B> {
         Prepared {
             plan: MatmulPlan::from_row_major(self.data, A, B)
                 .expect("形状由 Mat 的构造保证：长度 = A×B"),
+            policy: std::marker::PhantomData,
         }
     }
 }
 
-impl<T: PackedKernel, const K: usize, const N: usize> Prepared<T, K, N> {
+impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> Prepared<P, T, K, N> {
     /// 权重行数（编译期已知）。
     pub fn k(&self) -> usize {
         K
@@ -407,6 +468,11 @@ impl<T: PackedKernel, const K: usize, const N: usize> Prepared<T, K, N> {
         self.plan.packed_bytes()
     }
 
+    /// 这次调用打算用几个线程（1 = 不派活）——判据的纯函数形式，便于诊断。
+    pub fn threads<const M: usize>(&self) -> usize {
+        P::threads(M, K, N)
+    }
+
     /// `C[M×N] = X[M×K] · self`，`M` 编译期已知；输出新分配。
     pub fn apply<const M: usize>(&self, x: &Mat<'_, T, M, K>) -> MatBuf<T, M, N> {
         let mut out = MatBuf::<T, M, N>::new();
@@ -416,10 +482,17 @@ impl<T: PackedKernel, const K: usize, const N: usize> Prepared<T, K, N> {
 
     /// 同上，写进调用方的缓冲（不分配）。
     pub fn apply_into<const M: usize>(&self, x: &Mat<'_, T, M, K>, out: &mut MatBuf<T, M, N>) {
-        // 形状已由 Mat/MatBuf 的构造保证，这里不可能失败
-        self.plan
-            .run_into(x.as_slice(), out.as_mut_slice())
-            .expect("形状由 Mat/MatBuf 的构造保证");
+        self.run_block_into(M, x.as_slice(), out.as_mut_slice(), None);
+    }
+
+    /// 用**指定**的池算（逃生口：池归调用方管时用它；否则用进程级共享池）。
+    pub fn apply_pooled<const M: usize>(
+        &self,
+        pool: &WorkerPool,
+        x: &Mat<'_, T, M, K>,
+        out: &mut MatBuf<T, M, N>,
+    ) {
+        self.run_block_into(M, x.as_slice(), out.as_mut_slice(), Some(pool));
     }
 
     /// DYN 档：行数运行时，`K/N` 仍 const；输出新分配。
@@ -436,17 +509,64 @@ impl<T: PackedKernel, const K: usize, const N: usize> Prepared<T, K, N> {
             x.rows(),
             "输出行数必须等于输入行数（DYN 档里这是运行时才知道的）"
         );
-        self.plan
-            .run_into(x.as_slice(), out.as_mut_slice())
-            .expect("行数一致时形状必然成立");
+        self.run_block_into(x.rows(), x.as_slice(), out.as_mut_slice(), None);
+    }
+
+    /// DYN 档 + 指定池。
+    pub fn apply_dyn_pooled(
+        &self,
+        pool: &WorkerPool,
+        x: &MatDyn<'_, T, K>,
+        out: &mut MatBufDyn<T, N>,
+    ) {
+        assert_eq!(out.rows(), x.rows(), "输出行数必须等于输入行数");
+        self.run_block_into(x.rows(), x.as_slice(), out.as_mut_slice(), Some(pool));
+    }
+
+    /// 串行/并行的公共实现。
+    ///
+    /// `rows × K` 的 `a` 与 `rows × N` 的 `c` 长度都已由类型层担保，所以这里不做形状检查；
+    /// `rows == 0` 或 `N == 0` 直接返回。
+    fn run_block_into(&self, rows: usize, a: &[T], c: &mut [T], pooled: Option<&WorkerPool>) {
+        if rows == 0 || N == 0 {
+            return;
+        }
+        let threads = P::threads(rows, K, N);
+        if threads <= 1 {
+            // 单线程：一行调度开销都不付
+            self.plan.run_rows_into(a, c);
+            return;
+        }
+        let pool = match pooled {
+            Some(p) => p,
+            None => crate::pool::global(),
+        };
+        // 用"切几个块"表达"用几个线程"：块大小向上取整到 4（微内核 4 行一块），
+        // 且每线程至少 4 行。池把自己那批 worker 铺到这些块上，多出来的没活干。
+        let per_thread = rows.div_ceil(threads).max(4);
+        let block_rows = per_thread.div_ceil(4) * 4;
+        // 只读的 `a` 由闭包捕获、按 `start` 切片（见 pool 模块头"行块闭包的契约"）
+        pool.for_each_row_block_mut_picked(
+            rows,
+            4,
+            [(c, N)],
+            crate::pool::Pick::Blocked { block_rows },
+            |start, block, [cb]| {
+                let ab = &a[start * K..(start + block) * K];
+                self.plan.run_rows_into(ab, cb);
+            },
+        );
     }
 }
 
-impl<T: PackedKernel, const K: usize, const N: usize> std::fmt::Debug for Prepared<T, K, N> {
+impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> std::fmt::Debug
+    for Prepared<P, T, K, N>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prepared")
             .field("K", &K)
             .field("N", &N)
+            .field("threads_at_256", &P::threads(256, K, N))
             .field("packed_bytes", &self.plan.packed_bytes())
             .finish()
     }
@@ -649,5 +769,81 @@ mod tests {
         assert_eq!(auto_threads(256, 256, 256, 2), 2);
         // machine = 0 视作 1
         assert_eq!(auto_threads(256, 256, 256, 0), 1);
+    }
+
+    /// 并行路径必须与单线程**逐位一致**，且要真的走过"一块算一段行"的分块逻辑
+    /// （行数多于块数时才有多个块）。这里用显式 `Exact<N>` + 指定池，避免依赖机器核数。
+    #[test]
+    fn test_pooled_matches_serial_bit_for_bit() {
+        const K: usize = 256;
+        const N: usize = 256;
+        let weights = f32s(K * N, 0x9e37);
+        let w = Mat::<f32, { K }, { N }>::new(&weights).unwrap();
+        let pool = crate::pool::WorkerPool::new(4);
+
+        // 静态形状：M = 256（16.7 M 乘加，量够）
+        {
+            const M: usize = 256;
+            let batch = f32s(M * K, 0x1234_5678);
+            let x = Mat::<f32, { M }, { K }>::new(&batch).unwrap();
+            let want = crate::api::matmul(M, K, N, &batch, &weights).unwrap();
+
+            let mut pooled = MatBuf::<f32, { M }, { N }>::new();
+            w.prepare_with::<Exact<4>>()
+                .apply_pooled(&pool, &x, &mut pooled);
+            assert_eq!(
+                bits_f32(pooled.as_slice()),
+                bits_f32(&want),
+                "静态 pooled Exact<4>"
+            );
+
+            // Auto 在同一个形状上给出的线程数应当 ≥ 1（多核机器上会 > 1）
+            let auto = w.prepare();
+            assert!(auto.threads::<M>() >= 1);
+            let mut via_auto = MatBuf::<f32, { M }, { N }>::new();
+            auto.apply_into(&x, &mut via_auto);
+            assert_eq!(bits_f32(via_auto.as_slice()), bits_f32(&want), "静态 Auto");
+        }
+
+        // DYN：行数运行时，多块 + 尾块都要正确
+        for rows in [37usize, 256, 513] {
+            let batch = f32s(rows * K, 0xfeed ^ rows as u64);
+            let want = crate::api::matmul(rows, K, N, &batch, &weights).unwrap();
+            let x = MatDyn::<f32, { K }>::new(&batch).unwrap();
+            let mut got = MatBufDyn::<f32, { N }>::with_rows(rows);
+            w.prepare_with::<Exact<8>>()
+                .apply_dyn_pooled(&pool, &x, &mut got);
+            assert_eq!(
+                bits_f32(got.as_slice()),
+                bits_f32(&want),
+                "DYN pooled rows={rows}"
+            );
+        }
+    }
+
+    /// 策略语义：`Auto` 按判据（小形状 = 1）、`Single` 恒 1、`Exact<N>` 不设门限。
+    #[test]
+    fn test_policy_semantics() {
+        let weights = f32s(64 * 64, 7);
+        let w = Mat::<f32, 64, 64>::new(&weights).unwrap();
+        // 小形状：Auto 因为工作量不足而选 1（不派活）
+        assert_eq!(w.prepare().threads::<64>(), 1);
+        // Single 恒为 1
+        assert_eq!(w.prepare_with::<Single>().threads::<4096>(), 1);
+        // Exact 是显式选择：不设门限、不受工作量影响
+        assert_eq!(w.prepare_with::<Exact<6>>().threads::<1>(), 6);
+        assert_eq!(w.prepare_with::<Exact<6>>().threads::<4096>(), 6);
+
+        // 单线程路径与"小形状强上并行"都要与 api::matmul 逐位一致
+        let batch = f32s(64 * 64, 11);
+        let x = Mat::<f32, 64, 64>::new(&batch).unwrap();
+        let want = crate::api::matmul(64, 64, 64, &batch, &weights).unwrap();
+        let pool = crate::pool::WorkerPool::new(4);
+        let mut out = MatBuf::<f32, 64, 64>::new();
+        w.prepare_with::<Single>().apply_pooled(&pool, &x, &mut out);
+        assert_eq!(bits_f32(out.as_slice()), bits_f32(&want), "Single");
+        w.prepare_with::<Exact<3>>()
+            .apply_pooled(&pool, &x, &mut out);
+        assert_eq!(bits_f32(out.as_slice()), bits_f32(&want), "Exact<3> 小形状");
     }
 }

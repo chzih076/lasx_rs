@@ -41,7 +41,7 @@
 //! # let (mut a, b, mut c) = (vec![0f32; m * k], vec![0f32; k * n], vec![0f32; m * n]);
 //! let pool = WorkerPool::new(12);
 //! let (bs, cs) = (b.as_slice(), c.as_mut_slice()); // 只读的 B 用 & 捕获即可
-//! pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |rows, [ab, cb]| {
+//! pool.for_each_row_block_mut(m, 4, [(&mut a, k), (cs, n)], |_start, rows, [ab, cb]| {
 //!     lasx_rs::lasx_matmul(
 //!         rows as i32, k as i32, n as i32,
 //!         ab.as_ptr(), bs.as_ptr(), cb.as_mut_ptr(),
@@ -49,6 +49,24 @@
 //! });
 //! # }
 //! ```
+//!
+//! # 行块闭包的契约（`start` 是干什么用的）
+//!
+//! 行块接口的闭包签名是 `f(start: usize, rows: usize, arrays)`：`start` 是**本块起始行**。
+//! 池只把"本块"的切片交给闭包，所以：
+//!
+//! | 数组怎么进来的 | 闭包能做什么 | 越界会怎样 |
+//! |---|---|---|
+//! | 作为 `arrays` 里的 `&mut [T]` | 读写**本块**（切片长度就是 `rows × 行宽`） | 下标越界 → `panic`（安全，不是 UB） |
+//! | 闭包**捕获**的 `&[T]`（如只读的 `A`） | **只读 `[start, start + rows)` 这一段** | 读错别的块 → **静默错误结果**（类型系统查不了） |
+//!
+//! 第二条是这套接口唯一"靠约定而不是靠编译器"的地方，所以 `start` 必须传出来：只读数组
+//! 可以整个捕获进闭包，**按 `start` 切片**即可，不需要 `unsafe`、也不需要"把只读入参
+//! 假装成 `&mut`"。上层（`shape::Prepared`）生成这个闭包时必须用 `start` 切片。
+//!
+//! 第三条相关约定（"同一个数组既作只读捕获又作 `&mut` 输出"，即 `y = a·x + y` 里的 `y`）：
+//! 在安全 Rust 里**已经被借用检查器拒绝**——不可能同时持有同一缓冲的 `&` 与 `&mut`。
+//! 真要走这条（比如原地累加）必须自己用 `unsafe`，那时契约是"该数组只能读写本块"。
 //!
 //! # 为什么是 Rust API 而不是 C ABI
 //!
@@ -132,13 +150,16 @@ struct Slot {
     widths: [usize; MAX_ARRAYS],
     /// 本轮作业表长度；`0` 表示"单块模式"（用 `ptrs`/`lens`/`rows`）。
     n_jobs: usize,
+    /// 本块起始行（多块模式下每个作业各自的起始行）——闭包拿它去索引自己捕获的只读数组。
+    start: usize,
 }
 
 /// 类型擦除的入口：把裸指针还原成 `[&mut [T]; N]` 并调用闭包。
 ///
 /// `ptrs[k]`/`lens[k]` 是第 k 个数组的起始地址与元素个数，`rows` 是本块行数
 /// （按元素切分时就是元素个数），`func` 指向调用方栈上的闭包。
-type Thunk = unsafe fn(rows: usize, ptrs: &[*mut u8], lens: &[usize], func: *const ());
+type Thunk =
+    unsafe fn(start: usize, rows: usize, ptrs: &[*mut u8], lens: &[usize], func: *const ());
 
 struct Shared {
     /// 递增表示"新一批作业已就位"。
@@ -264,6 +285,7 @@ impl WorkerPool {
                         row_bytes: [0; MAX_ARRAYS],
                         widths: [0; MAX_ARRAYS],
                         n_jobs: 0,
+                        start: 0,
                     })
                 })
                 .collect(),
@@ -312,7 +334,7 @@ impl WorkerPool {
         }
         let base = data.as_mut_ptr();
         let rows_per = len.div_ceil(self.threads).max(1);
-        self.dispatch_rows::<T, 1, _, _>([base], [1], len, rows_per, |_rows, [c]| f(c), || {});
+        self.dispatch_rows::<T, 1, _, _>([base], [1], len, rows_per, |_s, _rows, [c]| f(c), || {});
     }
 
     /// 把 `N` 个**等长**数组同步切段并行处理（SOA 批量内核的常见形状），
@@ -334,7 +356,7 @@ impl WorkerPool {
         }
         let bases = arrays.map(|a| a.as_mut_ptr());
         let rows_per = len.div_ceil(self.threads).max(1);
-        self.dispatch_rows::<T, N, _, _>(bases, [1; N], len, rows_per, |_rows, a| f(a), || {});
+        self.dispatch_rows::<T, N, _, _>(bases, [1; N], len, rows_per, |_s, _rows, a| f(a), || {});
     }
 
     /// 按**行块**切分：`arrays[k]` 是 `(行主序数组, 每行元素数)`，
@@ -343,7 +365,10 @@ impl WorkerPool {
     /// 这是矩阵乘的形状：`A` 每行 `k` 个元素、`C` 每行 `n` 个元素，但两者必须同步
     /// 切在同一批行上；`B` 只读共享，由闭包以 `&` 捕获即可。
     ///
-    /// 闭包第一个参数是**本块的行数**（`rows × 行宽` 反推会在行宽为 0 时除零）。
+    /// 闭包参数是 **`(start, rows, arrays)`**：`start` 是本块起始行、`rows` 是本块行数
+    /// （`rows × 行宽` 反推会在行宽为 0 时除零，所以直接给）。只读的输入数组（如 `A`）
+    /// 由闭包**按 `start` 切片**使用——这是本接口唯一靠约定的地方，见模块头
+    /// "行块闭包的契约"。
     ///
     /// `row_gran` 是内核一次处理的行数（如 `lasx_matmul` 为 4；没有行结构就传 1）：
     /// 块大小会**向上**取整到它的倍数，代价是块数可能少于线程数，换来的是块内没有
@@ -360,7 +385,7 @@ impl WorkerPool {
         arrays: [(&mut [T], usize); N],
         f: F,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
         assert!(row_gran > 0, "行粒度至少为 1");
         let mut total = 0usize;
@@ -375,7 +400,8 @@ impl WorkerPool {
             total = total.saturating_add(want);
         }
         if self.threads == 1 || rows < 2 || total < MIN_PARALLEL_LEN {
-            f(rows, arrays.map(|(s, _)| s));
+            // 原地串行：整段就是"一块"，起始行恒为 0
+            f(0, rows, arrays.map(|(s, _)| s));
             return;
         }
         let mut bases = [std::ptr::null_mut(); N];
@@ -408,7 +434,7 @@ impl WorkerPool {
         arrays: [(&mut [T], usize); N],
         f: F,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
         self.row_block_static::<S, T, N, F, fn()>(rows, row_gran, arrays, f, || {});
     }
@@ -424,7 +450,7 @@ impl WorkerPool {
         arrays: [(&mut [T], usize); N],
         f: F,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
         self.row_block_run(
             rows,
@@ -444,7 +470,7 @@ impl WorkerPool {
         pick: Pick,
         f: F,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
         self.row_block_run(rows, row_gran, arrays, pick, f, || {});
     }
@@ -466,7 +492,7 @@ impl WorkerPool {
         f: F,
         during: D,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
         self.row_block_run(rows, row_gran, arrays, pick, f, during);
@@ -484,7 +510,7 @@ impl WorkerPool {
         f: F,
         during: D,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
         match pick {
@@ -495,7 +521,8 @@ impl WorkerPool {
                 .row_block_static::<sched::RowBlock, T, N, F, D>(rows, row_gran, arrays, f, during),
             Pick::Blocked { block_rows } => {
                 if self.row_blocks_serial(rows, row_gran, &arrays) {
-                    f(rows, arrays.map(|(s, _)| s));
+                    // 原地串行：整段一块，起始行 0
+                    f(0, rows, arrays.map(|(s, _)| s));
                     during();
                     return;
                 }
@@ -505,7 +532,8 @@ impl WorkerPool {
             }
             Pick::Dynamic { block_rows } => {
                 if self.row_blocks_serial(rows, row_gran, &arrays) {
-                    f(rows, arrays.map(|(s, _)| s));
+                    // 原地串行：整段一块，起始行 0
+                    f(0, rows, arrays.map(|(s, _)| s));
                     during();
                     return;
                 }
@@ -525,11 +553,12 @@ impl WorkerPool {
         f: F,
         during: D,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
         if self.row_blocks_serial(rows, row_gran, &arrays) {
-            f(rows, arrays.map(|(s, _)| s));
+            // 原地串行：整段一块，起始行 0
+            f(0, rows, arrays.map(|(s, _)| s));
             during();
             return;
         }
@@ -580,7 +609,7 @@ impl WorkerPool {
         f: F,
         during: D,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
@@ -601,6 +630,7 @@ impl WorkerPool {
             }
             slot.n = N;
             slot.rows = r;
+            slot.start = start;
             slot.n_jobs = 0; // 单块模式
             for k in 0..N {
                 let off = start * widths[k];
@@ -645,7 +675,7 @@ impl WorkerPool {
         f: F,
         during: D,
     ) where
-        F: Fn(usize, [&mut [T]; N]) + Sync,
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
         const { assert!(N <= MAX_ARRAYS, "一次派活的数组个数超过 MAX_ARRAYS") };
@@ -672,6 +702,7 @@ impl WorkerPool {
             slot.n = N;
             slot.rows = 0;
             slot.n_jobs = n_jobs;
+            slot.start = 0; // 多块模式：起始行由每个作业带（worker 侧传）
             for k in 0..N {
                 slot.bases[k] = bases[k] as *mut u8;
                 // 行宽同时存"元素个数"（切片长度）与"字节数"（指针偏移）：
@@ -879,7 +910,7 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
                 // SAFETY: 入口与闭包指针由派活方在发布前写入；`ptrs`/`lens` 是本轮该 worker
                 // 自己那段（互不重叠），由派活方按 `rows × widths` 校验过。
                 let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    thunk(rows, ptrs, lens, func);
+                    thunk(start, rows, ptrs, lens, func);
                 }))
                 .err();
                 if let Some(p) = payload {
@@ -892,12 +923,11 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
                     sh.panicked.store(true, Ordering::Release);
                     return false;
                 }
-                let _ = start;
                 true
             };
             if slot.n_jobs == 0 {
                 run_block(
-                    slot.rows,
+                    slot.start,
                     slot.rows,
                     &slot.ptrs[..slot.n],
                     &slot.lens[..slot.n],
@@ -945,17 +975,18 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
 /// `ptrs`/`lens` 必须等长且为 `N` 个有效地址与元素个数（`N` 个数组互不重叠），
 /// `func` 必须指向一个 `F: Fn([&mut [T]; N])`，且两者在调用期间有效。
 unsafe fn thunk<T, const N: usize, F>(
+    start: usize,
     rows: usize,
     ptrs: &[*mut u8],
     lens: &[usize],
     func: *const (),
 ) where
-    F: Fn(usize, [&mut [T]; N]),
+    F: Fn(usize, usize, [&mut [T]; N]),
 {
     let arrays: [&mut [T]; N] =
         std::array::from_fn(|k| std::slice::from_raw_parts_mut(ptrs[k] as *mut T, lens[k]));
     let f = &*(func as *const F);
-    f(rows, arrays);
+    f(start, rows, arrays);
 }
 
 /// 从"行主序切片 + 行宽"取出基址与行宽（派活用）。
@@ -972,7 +1003,13 @@ fn row_block_ptrs<T, const N: usize>(
 }
 
 /// 初始占位入口（`call` 需要初值；任何真实调用都会覆盖它）。
-unsafe fn noop_thunk<T, const N: usize>(_rows: usize, _p: &[*mut u8], _l: &[usize], _f: *const ()) {
+unsafe fn noop_thunk<T, const N: usize>(
+    _start: usize,
+    _rows: usize,
+    _p: &[*mut u8],
+    _l: &[usize],
+    _f: *const (),
+) {
 }
 
 #[cfg(test)]
@@ -1047,7 +1084,7 @@ mod tests {
         let mut c: Vec<u64> = (0..m * n).map(|i| (i / n) as u64).collect();
         let seen = Mutex::new(Vec::new());
 
-        pool.for_each_row_block_mut(m, 4, [(&mut a, k), (&mut c, n)], |r, [ab, cb]| {
+        pool.for_each_row_block_mut(m, 4, [(&mut a, k), (&mut c, n)], |_s, r, [ab, cb]| {
             assert_eq!(ab.len(), r * k, "A 块长度与块内行数不符");
             assert_eq!(cb.len(), r * n, "C 块长度与块内行数不符");
             // 预填的值就是行号本身，所以块首元素即本块起始行
@@ -1109,7 +1146,7 @@ mod tests {
         let mut a = vec![0f32; 100];
         let mut c = vec![0f32; 99];
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool.for_each_row_block_mut(10, 4, [(&mut a, 10), (&mut c, 10)], |_, _| {});
+            pool.for_each_row_block_mut(10, 4, [(&mut a, 10), (&mut c, 10)], |_, _, _| {});
         }));
         assert!(r.is_err(), "形状不符应当 panic");
     }
@@ -1179,13 +1216,19 @@ mod tests {
         ];
         for pick in picks {
             let mut data = vec![0usize; rows * width];
-            pool.for_each_row_block_mut_picked(rows, 1, [(&mut data, width)], pick, |n, [d]| {
-                for i in 0..n {
-                    for k in 0..width {
-                        d[i * width + k] += 1;
+            pool.for_each_row_block_mut_picked(
+                rows,
+                1,
+                [(&mut data, width)],
+                pick,
+                |_s, n, [d]| {
+                    for i in 0..n {
+                        for k in 0..width {
+                            d[i * width + k] += 1;
+                        }
                     }
-                }
-            });
+                },
+            );
             assert!(
                 data.iter().all(|&v| v == 1),
                 "{}: 有行没跑到或跑了多次",
@@ -1237,7 +1280,7 @@ mod tests {
                 1,
                 [(&mut data, 128)],
                 Pick::RowBlock,
-                |_rows, [d]| d[0] += 1,
+                |_s, _rows, [d]| d[0] += 1,
                 || {
                     // 派活期间（`during` 回调）再派活：过去是借用检查器拦，现在必须运行期拦
                     pool.for_each_chunk_mut(other.as_mut_slice(), |c| c[0] += 1);
@@ -1278,7 +1321,7 @@ mod tests {
                 1,
                 [(&mut data, 128)],
                 Pick::RowBlock,
-                |_rows, [d]| d[0] += 1,
+                |_s, _rows, [d]| d[0] += 1,
                 || panic!("during 故意 panic"),
             );
         }));
@@ -1294,6 +1337,56 @@ mod tests {
             after.iter().all(|&v| v == 1),
             "during panic 之后池应当照常可用"
         );
+    }
+
+    /// `start` 必须与池交给闭包的那一段切片**一一对应**——上层（`shape::Prepared`）正是
+    /// 靠它去索引自己捕获的只读数组，错位就是静默的错误结果。这里让每个元素的初值等于
+    /// 它所在的行号，闭包就能自查"我拿到的块确实从 `start` 行开始"，并检查各块首尾相接、
+    /// 恰好覆盖 `[0, rows)`。
+    #[test]
+    fn test_row_block_start_matches_slice() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = WorkerPool::new(5);
+        let (rows, width) = (2048usize, 3usize);
+        let mut data: Vec<usize> = (0..rows * width).collect();
+        for pick in [
+            Pick::Chunk,
+            Pick::RowBlock,
+            Pick::Blocked { block_rows: 7 },
+            Pick::Dynamic { block_rows: 7 },
+        ] {
+            for (i, v) in data.iter_mut().enumerate() {
+                *v = i / width; // 每个元素记住自己的行号
+            }
+            let covered = AtomicUsize::new(0);
+            pool.for_each_row_block_mut_picked(
+                rows,
+                1,
+                [(&mut data, width)],
+                pick,
+                |start, n, [d]| {
+                    assert_eq!(
+                        d[0],
+                        start,
+                        "{}: 块的第一个元素不属于 start 行",
+                        pick.name()
+                    );
+                    assert_eq!(
+                        d[(n - 1) * width],
+                        start + n - 1,
+                        "{}: 块的最后一个元素不属于 start+n-1 行",
+                        pick.name()
+                    );
+                    covered.fetch_add(n, Ordering::Relaxed);
+                },
+            );
+            assert_eq!(
+                covered.load(Ordering::Relaxed),
+                rows,
+                "{}: 块没有恰好覆盖全部行",
+                pick.name()
+            );
+        }
     }
 
     /// 全局池：同一个进程里拿到的必须是**同一个**池（不是每线程/每次各建一个）。

@@ -110,7 +110,7 @@ use crate::view::MatRef;
 /// 这一层存在的意义是把"f32 = 32 列一条带 / f64 = 16 列一条带"这类差异收在一处，
 /// 于是 [`MatmulPlan`] 的构建与运行逻辑只写一遍。方法都是对算子层 `pub(crate)` 入口的
 /// 直接转发，没有自己的数值逻辑——**结果与顺序路径逐位一致**，理由见模块文档"数值保证"。
-pub trait PackedKernel: Copy + Default {
+pub trait PackedKernel: Copy + Default + Send + Sync {
     /// 一条带覆盖多少列（`f32` = 32，`f64` = 16）。
     const STRIP: usize;
 
@@ -383,23 +383,44 @@ impl<T: PackedKernel> MatmulPlan<T> {
         if m == 0 || self.n == 0 {
             return Ok(());
         }
+        // 校验完毕，交给"只算这些行"的内核（并行层用的是同一个入口）
+        self.run_rows_into(a, c);
+        Ok(())
+    }
 
-        // 主体列：每个面板一次调用，微内核自己处理"不足 4 行"的行尾
-        let m4 = m / 4 * 4;
+    /// 只算**给出的这些行**：`a`/`c` 已按行切好（长度分别是 `rows×k` / `rows×n`）。
+    ///
+    /// 面板与列尾都是计划里现成的，所以这里**零分配、零打包**——并行层用它把同一份打包好的
+    /// `B` 分给多个 worker（每行仍是沿 `k` 单累加器升序，与 [`Self::run_into`] 逐位一致）。
+    ///
+    /// `c` 会被**完全覆盖**（含 `k == 0`：微内核的累加器从 0 起，行尾内核也会写）。
+    ///
+    /// # Panics
+    /// `k == 0`，或 `c.len() != (a.len()/k) × n`。
+    pub(crate) fn run_rows_into(&self, a: &[T], c: &mut [T]) {
+        let rows = a.len() / self.k;
+        assert_eq!(
+            c.len(),
+            rows * self.n,
+            "块内 C 的长度应为 rows × n（{}×{}）",
+            rows,
+            self.n
+        );
+        if rows == 0 || self.n == 0 {
+            return;
+        }
+        let m4 = rows / 4 * 4;
         for panel in &self.panels {
             T::packed_rows(self.k, self.n, panel.jb, panel.nc, &panel.packed, a, c, m4);
         }
-
-        // 尾部列（不足一条带）：用算子层的尾部内核，逐行补上
         if let Some(tail) = &self.tail {
             let cols = self.n - self.n_strip;
-            for i in 0..m {
+            for i in 0..rows {
                 let a_row = &a[i * self.k..(i + 1) * self.k];
                 let c_row = &mut c[i * self.n + self.n_strip..(i + 1) * self.n];
                 T::row_tail(a_row, c_row, tail.as_slice(), self.k, cols);
             }
         }
-        Ok(())
     }
 
     /// 从 `a` 的长度推 `m`：必须是 `k` 的整数倍。
