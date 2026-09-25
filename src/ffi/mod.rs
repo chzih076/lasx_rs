@@ -3,7 +3,7 @@
 //! 这一层只做三件事——把裸指针 + 长度转成切片、调用 `ops` 里的算子、
 //! 把结果原样返回。**不含任何计算逻辑**，这样 ABI 约定与算法演进互不干扰。
 //!
-//! 导出符号（22 个：历史 15 个 + 批量姿态/几何 7 个，名称与语义与历史版本保持兼容）：
+//! 导出符号（59 个：30 个原始符号 + 29 个 `lasx_*_checked` 变体，名称与语义与历史版本保持兼容）：
 //!
 //! | 模块 | 符号 |
 //! |---|---|
@@ -14,7 +14,8 @@
 //! | [`physics`] | `lasx_ballistic_step`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch` |
 //! | [`memory`] | `lasx_alloc` |
 //! | [`attitude`] | 批量姿态/几何 7 个：叉积、单位化、3×3·向量、四元数四则/旋转/DCM |
-//! | [`checked`] | 21 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
+//! | [`nn`] | NN 侧 8 个：`lasx_softmax_rows`、`lasx_rms_norm`、`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16` |
+//! | [`checked`] | 29 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
 //! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助 |
 //!
 //! # 安全约定
@@ -24,7 +25,7 @@
 //!
 //! # 两种用法
 //!
-//! - **原始 15 个符号**（本模块各子模块）：不做任何校验，误用即 UB——适合已经
+//! - **原始 30 个符号**（本模块各子模块）：不做任何校验，误用即 UB——适合已经
 //!   自己保证前置条件的调用方，零开销；
 //! - **[`checked`] 的 `lasx_*_checked` 变体**：多一个 `int *status` 出参，先校验
 //!   指针/长度/形状/物理常数，失败时写入 [`status::LasxStatus`] 并返回安全中性值。

@@ -117,9 +117,9 @@ operator are in `docs/ops.md` (§4 symbol table, §2.x contracts, §5.x usage). 
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data (§7)**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 
 The division of labour between the two documents is a hard rule: **contracts and usage live in
-`ops.md`, performance data lives in `dev.md §7`, and any given number appears exactly once**.
-Cross-document references are always written as `docs/xxx.md §N`, which makes them mechanically
-checkable.
+`docs/ops.md`, performance data lives in `docs/dev.md` §7, and any given number appears exactly
+once**. Cross-document references are always written as `docs/xxx.md §N`, which makes them
+mechanically checkable.
 
 ## Repository
 

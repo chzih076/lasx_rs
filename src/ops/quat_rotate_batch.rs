@@ -305,7 +305,7 @@ mod tests {
         }
     }
 
-    /// 路径一致性：LASX vs LSX、向量体 vs 标量尾（本轮 4 次除法 → 1 次后的守护）。
+    /// 路径一致性：LASX vs LSX、向量体 vs 标量尾（4 次除法 → 1 次后的守护）。
     #[test]
     fn paths_bit_exact() {
         const N: usize = 261;
