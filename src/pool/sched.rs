@@ -4,7 +4,7 @@
 //!
 //! 原来 `dispatch_rows` 把"第 w 个 worker 拿 `[w·rows_per, …)`"写死了。但"怎么切"其实是
 //! 与负载相关的决策：均匀内核要**连续等分**（每线程一份，缓存友好），矩阵乘要**对齐行粒度**
-//! （尾块退化会让整块慢一倍），而负载不均或机器有后台抢占时要**多块 + 动态领取**。
+//! （与 4 行微块的边界对齐），而负载不均或机器有后台抢占时要**多块 + 动态领取**。
 //! 把策略独立出来的收益有三条：
 //!
 //! 1. **编译期确认路径**：策略是零尺寸类型（[`Chunk`]、[`RowBlock`]、[`Blocked`]），
@@ -72,7 +72,7 @@ impl Strategy for Chunk {
     const NAME: &'static str = "chunk";
     fn plan(rows: usize, threads: usize, gran: usize) -> Jobs {
         let per = rows.div_ceil(threads).max(1);
-        // 对齐到 gran 的倍数：块数只会变少，但不会出现"余数 + 退化尾块"
+        // 对齐到 gran 的倍数：块数只会变少，且块边界落在微块边界上（不留半块）
         let per = if gran > 1 {
             per.next_multiple_of(gran)
         } else {
@@ -92,8 +92,8 @@ impl Strategy for Chunk {
 /// 行块（矩阵乘的现状）：与 [`Chunk`] 同形，但**必须**对齐行粒度。
 ///
 /// 单独列一个类型而不是给 `Chunk` 传参，是为了让调用点一眼看出"这里依赖行粒度"：
-/// 矩阵乘按 4 行微块复用 B，`row_gran = 1` 切出的退化尾块实测慢约一倍
-/// （2026-09-23 的扫描；决策见 `docs/dev.md` §14）。
+/// 矩阵乘按 4 行微块复用 B，块边界对齐到 4 行更整齐。**注意"`row_gran=1` 慢一倍"那条旧理由
+/// 已被 2026-09-25 的复测推翻**（gran=1 从没更慢，256³ 上还快 8%；见 `docs/dev.md` §14）。
 pub struct RowBlock;
 
 impl Strategy for RowBlock {
@@ -194,7 +194,7 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
     // 块太粗（= per_thread）等于静态等分，抢不到均衡；太细则每块一次原子操作不划算。
     let quarter = |per: usize, g: usize| (per / 4).max(g).next_multiple_of(g.max(1));
     if gran >= 4 {
-        // 行结构内核（矩阵乘）：块必须对齐行粒度，否则退化尾块把整块拖慢。
+        // 行结构内核（矩阵乘）：块需对齐行粒度，让块边界落在微块边界上。
         //
         // 静态 vs 动态是**实测**定的（本机 12 物理核 / 24 逻辑核，`docs/dev.md` §14）：
         //   1024³ 24 线程：静态 345 → 动态 426 GFLOP/s（+23%）

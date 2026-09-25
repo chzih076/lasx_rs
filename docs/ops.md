@@ -1163,8 +1163,9 @@ wp.apply_dyn_into(&xd, &mut yd);
 - 每次调用**零分配**：作业槽是定长数组，只做指针算术。等待策略：先自旋 1024 次，仍无任务
   就 `Condvar` park（纯自旋在过订阅时会互相抢执行槽）。
 - `for_each_chunks_mut` 各数组长度不一致时 panic；`for_each_row_block_mut` 在
-  `row_gran == 0` 或第 k 个数组长度不等于 `rows × 行宽` 时 panic。`row_gran` 不能省：
-  块大小会**向上取整到它的倍数**，避免退化尾块把整块拖慢；传 1 表示没有行结构。
+  `row_gran == 0` 或第 k 个数组长度不等于 `rows × 行宽` 时 panic。`row_gran` 不要省：
+  块大小会**向上取整到它的倍数**，让块边界落在微块边界上；传 1 表示没有行结构
+  （实测 `row_gran=1` 并不更慢，见 `docs/dev.md` §14）。
 
 `parallel` 策略层把常见负载的切分形状固定下来：
 
