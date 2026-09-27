@@ -383,11 +383,9 @@ impl WorkerPool {
     ///
     /// `row_gran` 是内核一次处理的行数（如 `lasx_matmul` 为 4；没有行结构就传 1）：
     /// 块大小会**向上**取整到它的倍数，代价是块数可能少于线程数，换来的是块内没有
-    /// 退化的尾块。**取 4 的理由已经换过**：原来写的是"`row_gran=1` 的退化尾块慢约一倍"，
-    /// 2026-09-25 按 §6.4 的纪律复测（改常量重建、进程级交替）**推翻了这个理由**——
-    /// `row_gran=1` 从来没有更慢，256³/12 线程上还快 8%，512³/1024³ 持平。常量仍然保留 4，
-    /// 但理由是中性的一句：**与 4 行微内核的块边界对齐，实测不比 1 差**（数据见
-    /// `docs/dev.md` §14 开头）。
+    /// 退化的尾块。取 4 是为了让块边界落在 4 行微内核的边界上；`row_gran = 1` 实测
+    /// 并不更慢（256³/12 线程还快 8%，512³/1024³ 持平，见 `docs/dev.md` §14 开头），
+    /// 所以 4 是"对齐块边界、且不比 1 差"的选择，不是性能必需。
     ///
     /// # Panics
     /// `row_gran == 0`，或第 k 个数组的长度不等于 `rows × 行宽` 时 panic。
@@ -400,18 +398,7 @@ impl WorkerPool {
     ) where
         F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
-        assert!(row_gran > 0, "行粒度至少为 1");
-        let mut total = 0usize;
-        for (k, (s, w)) in arrays.iter().enumerate() {
-            let want = rows.checked_mul(*w).expect("rows × 行宽 溢出");
-            assert_eq!(
-                s.len(),
-                want,
-                "第 {k} 个数组长度 {} 与 rows × 行宽 = {want} 不符",
-                s.len()
-            );
-            total = total.saturating_add(want);
-        }
+        let total = check_row_blocks(rows, row_gran, &arrays);
         if self.threads == 1 || rows < 2 || total < MIN_PARALLEL_LEN {
             // 原地串行：整段就是"一块"，起始行恒为 0
             f(0, rows, arrays.map(|(s, _)| s));
@@ -449,7 +436,7 @@ impl WorkerPool {
     ) where
         F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
-        self.row_block_static::<S, T, N, F, fn()>(rows, row_gran, arrays, f, || {});
+        self.row_block_static::<S, T, N, F, fn()>(rows, row_gran, arrays, None, f, || {});
     }
 
     /// 与上面同，但**动态领取**：块长 `block_rows`，worker 用原子计数器抢块。
@@ -469,6 +456,7 @@ impl WorkerPool {
             rows,
             row_gran,
             arrays,
+            None,
             Pick::Dynamic { block_rows },
             f,
             || {},
@@ -485,7 +473,31 @@ impl WorkerPool {
     ) where
         F: Fn(usize, usize, [&mut [T]; N]) + Sync,
     {
-        self.row_block_run(rows, row_gran, arrays, pick, f, || {});
+        self.row_block_run(rows, row_gran, arrays, None, pick, f, || {});
+    }
+
+    /// 与 [`Self::for_each_row_block_mut_picked`] 同，但**并行门槛用显式 `work`**
+    /// （元素数）而不是各数组长度之和。
+    ///
+    /// 何时需要它：当"被切分的数组"与"真实工作量"不是同一个量时。`gemv_f16` 是例子——
+    /// 它按输出 `y` 的行切分（`y` 只有 `m` 个元素），真实工作量却是 `m·k` 个 f16 权重：
+    /// 若按 `y` 的长度判门槛，`m < MIN_PARALLEL_LEN` 的形状（如 `1024×2048`，权重 4 MiB）
+    /// 会被错误地串行化。只读输入（如权重 `a`）按行块闭包的约定由闭包按 `start` 切片使用。
+    ///
+    /// # Panics
+    /// 同 [`Self::for_each_row_block_mut`]（`row_gran == 0` 或数组长度不符）。
+    pub fn for_each_row_block_mut_picked_work<T: Send, const N: usize, F>(
+        &self,
+        rows: usize,
+        row_gran: usize,
+        arrays: [(&mut [T], usize); N],
+        work: usize,
+        pick: Pick,
+        f: F,
+    ) where
+        F: Fn(usize, usize, [&mut [T]; N]) + Sync,
+    {
+        self.row_block_run(rows, row_gran, arrays, Some(work), pick, f, || {});
     }
 
     /// 与上面同，但额外接受一个 **`during` 闭包**：它在本轮**已发布、尚未等待**时
@@ -508,7 +520,7 @@ impl WorkerPool {
         F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
-        self.row_block_run(rows, row_gran, arrays, pick, f, during);
+        self.row_block_run(rows, row_gran, arrays, None, pick, f, during);
     }
 
     /// [`Self::for_each_row_block_mut_picked`] 与 [`Self::submit_row_block_mut_picked`]
@@ -519,6 +531,7 @@ impl WorkerPool {
         rows: usize,
         row_gran: usize,
         mut arrays: [(&mut [T], usize); N],
+        work: Option<usize>,
         pick: Pick,
         f: F,
         during: D,
@@ -527,13 +540,14 @@ impl WorkerPool {
         D: FnOnce(),
     {
         match pick {
-            Pick::Chunk => {
-                self.row_block_static::<sched::Chunk, T, N, F, D>(rows, row_gran, arrays, f, during)
-            }
-            Pick::RowBlock => self
-                .row_block_static::<sched::RowBlock, T, N, F, D>(rows, row_gran, arrays, f, during),
+            Pick::Chunk => self.row_block_static::<sched::Chunk, T, N, F, D>(
+                rows, row_gran, arrays, work, f, during,
+            ),
+            Pick::RowBlock => self.row_block_static::<sched::RowBlock, T, N, F, D>(
+                rows, row_gran, arrays, work, f, during,
+            ),
             Pick::Blocked { block_rows } => {
-                if self.row_blocks_serial(rows, row_gran, &arrays) {
+                if self.row_blocks_serial(rows, row_gran, &arrays, work) {
                     // 原地串行：整段一块，起始行 0
                     f(0, rows, arrays.map(|(s, _)| s));
                     during();
@@ -544,7 +558,7 @@ impl WorkerPool {
                 self.dispatch_jobs::<T, N, _, _>(bases, widths, jobs, false, f, during);
             }
             Pick::Dynamic { block_rows } => {
-                if self.row_blocks_serial(rows, row_gran, &arrays) {
+                if self.row_blocks_serial(rows, row_gran, &arrays, work) {
                     // 原地串行：整段一块，起始行 0
                     f(0, rows, arrays.map(|(s, _)| s));
                     during();
@@ -558,18 +572,20 @@ impl WorkerPool {
     }
 
     /// 静态策略（`Chunk`/`RowBlock`）的公共实现。
+    #[allow(clippy::too_many_arguments)]
     fn row_block_static<S: Strategy, T: Send, const N: usize, F, D>(
         &self,
         rows: usize,
         row_gran: usize,
         mut arrays: [(&mut [T], usize); N],
+        work: Option<usize>,
         f: F,
         during: D,
     ) where
         F: Fn(usize, usize, [&mut [T]; N]) + Sync,
         D: FnOnce(),
     {
-        if self.row_blocks_serial(rows, row_gran, &arrays) {
+        if self.row_blocks_serial(rows, row_gran, &arrays, work) {
             // 原地串行：整段一块，起始行 0
             f(0, rows, arrays.map(|(s, _)| s));
             during();
@@ -586,27 +602,18 @@ impl WorkerPool {
 
     /// 行块接口的公共前置：校验各数组长度，并判断本次是否**原地串行**（不派活）。
     ///
-    /// 只借用切片（不取指针），这样串行分支可以直接把原切片交给闭包，
-    /// 不需要从裸指针重建、也就没有生命周期把戏。
+    /// `work` 为 `None` 时门槛用各数组元素数之和；`Some(w)` 时用它（见
+    /// [`Self::for_each_row_block_mut_picked_work`]）。
     fn row_blocks_serial<T, const N: usize>(
         &self,
         rows: usize,
         row_gran: usize,
         arrays: &[(&mut [T], usize); N],
+        work: Option<usize>,
     ) -> bool {
-        assert!(row_gran > 0, "行粒度至少为 1");
-        let mut total = 0usize;
-        for (k, (s, w)) in arrays.iter().enumerate() {
-            let want = rows.checked_mul(*w).expect("rows × 行宽 溢出");
-            assert_eq!(
-                s.len(),
-                want,
-                "第 {k} 个数组长度 {} 与 rows × 行宽 = {want} 不符",
-                s.len()
-            );
-            total = total.saturating_add(want);
-        }
-        self.threads == 1 || rows < 2 || total < MIN_PARALLEL_LEN
+        let total = check_row_blocks(rows, row_gran, arrays);
+        let work = work.unwrap_or(total);
+        self.threads == 1 || rows < 2 || work < MIN_PARALLEL_LEN
     }
 
     /// 派活内核：第 k 个数组按行宽 `widths[k]` 解释，共 `rows` 行；每个 worker 取一段连续行。
@@ -1013,6 +1020,28 @@ fn row_block_ptrs<T, const N: usize>(
         widths[k] = *w;
     }
     (bases, widths)
+}
+
+/// 行块接口的公共前置：校验"第 k 个数组长度 == `rows × 行宽`"，返回元素总数
+/// （饱和加法）。`row_gran == 0` 时 panic。
+fn check_row_blocks<T, const N: usize>(
+    rows: usize,
+    row_gran: usize,
+    arrays: &[(&mut [T], usize); N],
+) -> usize {
+    assert!(row_gran > 0, "行粒度至少为 1");
+    let mut total = 0usize;
+    for (k, (s, w)) in arrays.iter().enumerate() {
+        let want = rows.checked_mul(*w).expect("rows × 行宽 溢出");
+        assert_eq!(
+            s.len(),
+            want,
+            "第 {k} 个数组长度 {} 与 rows × 行宽 = {want} 不符",
+            s.len()
+        );
+        total = total.saturating_add(want);
+    }
+    total
 }
 
 /// 初始占位入口（`call` 需要初值；任何真实调用都会覆盖它）。

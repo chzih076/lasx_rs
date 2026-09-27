@@ -829,7 +829,11 @@ lasx_gemv_f16_checked(a_f16, x, y, m, k, &status);
   + 输入输出）。与 §12.2 的参照（llama.cpp f16 GEMV **6.8 GB/s**）比，同量级形状
   （`1024×2048`）是 **10.5 GB/s ≈ 1.5×**；超出 L3 的 33.5 MB 形状只有 3.75 GB/s，
   **瓶颈是 `f16→f32` 转换与 `permi_q` 重排（结构代价）**（控制变量探针见 `docs/dev.md` §20.7）。**完整表在 `docs/dev.md` §7.4**。
-- **并行**：`gemv` 每行独立，可直接套 `parallel`/`pool` 的行块设施（当前未实现，见 §2.11 第 4 条）。
+- **并行**：`parallel::gemv_f16(&pool, m, k, &[u16], &[f32], &mut [f32])`（多核）；每行独立，
+  按行块切分，与单线程**逐位一致**。实测（进程级交替 A/B）：`1024×2048` 单线程 14.0 GB/s →
+  12 线程 **110 GB/s（7.9×）**、`4096×4096` 5.2 → 31 GB/s、`11008×4096` 4.3 → 22 GB/s；
+  **线程数取物理核数**（本机 12），24 线程在中小形状反而更慢——依据见 §9 的"线程数怎么选"
+  与 `docs/dev.md` §20.7。
 
 
 ## 6. 批量几何与物理算子
@@ -1180,6 +1184,7 @@ wp.apply_dyn_into(&xd, &mut yd);
 | `for_each_chunk_mut` | `fn(&self, data: &mut [T], f: F)` | 单数组按元素等分 |
 | `for_each_chunks_mut` | `fn(&self, arrays: [&mut [T]; N], f: F)` | N 个**等长**数组同步等分 |
 | `for_each_row_block_mut` | `fn(&self, rows, row_gran, arrays: [(&mut [T], usize); N], f: F)` | 按行块切分，行宽可不同；闭包首参为本块行数 |
+| `for_each_row_block_mut_picked_work` | 同上 + `(work: usize, pick: Pick)` | **并行门槛用显式 `work`**（数组长度之和不代表工作量时用，如 `gemv_f16`） |
 
 约束与语义：
 
@@ -1206,6 +1211,7 @@ wp.apply_dyn_into(&xd, &mut yd);
 |---|---|
 | `parallel::matmul_f32(&pool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32]) -> Result<(), Error>` | 多核矩阵乘（行粒度 4），B 只读共享；`&pool` 可直接给 `pool::global()` |
 | `parallel::matmul_f64(...)` | 同上，f64 |
+| `parallel::gemv_f16(&pool, m, k, a: &[u16], x: &[f32], y: &mut [f32]) -> Result<(), Error>` | 多核 f16 权重 GEMV（行粒度 1）；只读权重由闭包按 `start` 切片，与单线程逐位一致 |
 | `parallel::rk4_j2_step_batch(&pool, mu, j2, re, dt, 6×&mut [f64]) -> Result<(), Error>` | 多核批量 RK4 J2 单步（6 数组一次派活） |
 
 **`parallel::*` 形状不符返回 `Err`**（与 [`api`](#8-rust-安全层-lasx_rsapi) 同一套
@@ -1214,6 +1220,13 @@ wp.apply_dyn_into(&xd, &mut yd);
 "调用方自己保证形状"的原语，`parallel` 才是带校验的那一层。
 数值与单线程**逐位一致**（只切行/下标区间），有逐位对照测试。
 `parallel::rk4_j2_step_batch` 的 worker 是复用线程，`lasx_force_lsx_thread` 对它无效。
+
+**线程数怎么选（实测）**：中小规模的 `gemv_f16` 取**物理核数**（本机 12）最好。本机
+`available_parallelism() = 24`，池的每次派活在 **≥23 线程**时固定成本从 1–2 µs 跳到 ~37 µs
+（纯派活探针 `m=2, k=2048`：22 线程 2 µs → 24 线程 38 µs；`m=1` 走不派活的串行分支，
+24 线程下仍是 63 GB/s ⇒ 台阶在派活/等待路径）。矩阵乘同样受影响：128×256×256 在 22 线程
+293 GF/s、24 线程 152 GF/s。**权重 ≥32 MiB 是例外**，24 线程仍更快（4096×4096：0.73 ms
+vs 12 线程 1.07 ms）。完整表、口径与机制证据见 `docs/dev.md` §20.7。
 
 ```rust
 use lasx_rs::aligned::AlignedVec;

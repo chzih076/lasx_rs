@@ -12,7 +12,7 @@
 //! | [`plan`] | [`plan::MatmulPlan`]：把 `B` 打包一次、反复算 `A·B`（`B` 固定时用它替代 [`api::matmul`]） |
 //! | [`shape`] | [`shape::Mat`] / [`shape::MatDyn`]：**形状进类型**（编译期排版 + 形状错误编译期报 + 声明式调用） |
 //! | [`pool`] | [`pool::WorkerPool`]：可选常驻线程池，把批量内核铺到多核且跨调用复用线程 |
-//! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`rk4_j2_step_batch`） |
+//! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`gemv_f16`、`rk4_j2_step_batch`） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
 //! | `ops` | **算子层**：一个内核一个模块，入口按 `match SimdPath::detect()` 分派；接收切片 |
 //! | [`ffi`] | **C ABI 导出层**：30 个原始 `lasx_*` 符号 + 29 个 `_checked` 变体，只做裸指针 → 切片 |

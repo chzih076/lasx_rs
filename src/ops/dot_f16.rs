@@ -128,8 +128,21 @@ pub(crate) unsafe fn gemv_f16(a: &[u16], x: &[f32], m: usize, k: usize, y: &mut 
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
+    gemv_f16_rows(a, x, k, y);
+}
+
+/// [`gemv_f16`] 的**行块**形式：算 `y.len()` 行、每行 `k` 个权重。
+///
+/// 单线程入口与 `parallel::gemv_f16` 的每个线程块都调这一个函数 ⇒ **怎么分块都不改变结果**
+/// （逐位一致）；并行层因此不需要第二份数值实现。
+///
+/// # Safety
+/// `a.len() == y.len() * k`、`x.len() == k`。
+pub(crate) unsafe fn gemv_f16_rows(a: &[u16], x: &[f32], k: usize, y: &mut [f32]) {
+    debug_assert_eq!(a.len(), y.len() * k, "gemv_f16_rows: 行块长度不符");
+    debug_assert_eq!(x.len(), k, "gemv_f16_rows: 向量长度不符");
     for (r, out) in y.iter_mut().enumerate() {
-        *out = dot_f16(std::slice::from_raw_parts(a.as_ptr().add(r * k), k), x);
+        *out = dot_f16(&a[r * k..(r + 1) * k], x);
     }
 }
 

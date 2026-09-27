@@ -406,6 +406,55 @@ pub fn matmul_f64(
     Ok(())
 }
 
+/// 多核 `y[m] = A[m×k] · x[k]`（`A` 是 **f16 权重**的行主序矩阵，`x`/`y` 是 f32）。
+///
+/// 对应单线程的 `lasx_gemv_f16` / [`crate::api::gemv_f16`]。每行独立，所以这里只按**行块**
+/// 切 `m`，每块调用同一个 `ops::dot_f16::gemv_f16_rows` ⇒ 与单线程**逐位一致**（有测试）。
+///
+/// 只读的权重 `a` 由闭包按 `start` 切片使用（行块闭包的约定），因此不参与派活的独占
+/// 借用；池的并行门槛也就不能用"数组元素数之和"（那只有 `m`），改用
+/// [`WorkerPool::for_each_row_block_mut_picked_work`] 显式传 `m·k + m`。
+///
+/// # Errors
+/// 长度与 `m/k` 不符（[`Error::Shape`]），或 `m×k` 溢出 `usize`（[`Error::Overflow`]）——
+/// 与 [`crate::api::gemv_f16`] 同一套错误与消息口径。
+pub fn gemv_f16(
+    pool: &WorkerPool,
+    m: usize,
+    k: usize,
+    a: &[u16],
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), Error> {
+    let mk = checked_mul("gemv_f16", "m×k", m, k)?;
+    expect_len("gemv_f16", "a", a.len(), mk)?;
+    expect_len("gemv_f16", "x", x.len(), k)?;
+    expect_len("gemv_f16", "y", y.len(), m)?;
+    if m == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        y.fill(0.0); // 空内积：与 `api::gemv_f16` 同口径（内核不写 y）
+        return Ok(());
+    }
+    // 行粒度 1：gemv 每行独立处理，没有"一次算 4 行"的微内核结构（与矩阵乘不同）。
+    let pick = crate::pool::pick_rows(m, pool.threads(), 1);
+    pool.for_each_row_block_mut_picked_work(
+        m,
+        1,
+        [(y, 1)],
+        mk.saturating_add(m),
+        pick,
+        |start, rows, [yb]| {
+            let a_rows = &a[start * k..(start + rows) * k];
+            // SAFETY: 池保证 `yb.len() == rows`；由 `a.len() == m·k` 与
+            // `start + rows <= m` 得 `a_rows.len() == rows·k`；`x.len() == k` 已在开头校验。
+            unsafe { crate::ops::dot_f16::gemv_f16_rows(a_rows, x, k, yb) };
+        },
+    );
+    Ok(())
+}
+
 /// 多核批量 RK4 J2 单步（6 个 SOA 数组一次派活）。
 ///
 /// 对应单线程的 `lasx_rk4_j2_step_batch`，数值**逐位一致**；多步传播时把池建在循环外面，
@@ -618,6 +667,72 @@ mod tests {
             assert_eq!(rx[i].to_bits(), px[i].to_bits(), "rx 不一致 @ {i}");
             assert_eq!(vz[i].to_bits(), qz[i].to_bits(), "vz 不一致 @ {i}");
         }
+    }
+
+    /// 池化 f16 GEMV 必须与单线程逐位一致。形状覆盖三种情形：`m·k` 低于
+    /// `MIN_PARALLEL_LEN`（池内原地串行）、真正按行块切（含 `m` 不是线程数整数倍的行尾）、
+    /// 以及 `k` 不整除 32/16 的标量尾。
+    #[test]
+    fn test_gemv_f16_pooled_matches_serial_bit_for_bit() {
+        let pool = WorkerPool::new(5);
+        for &(m, k) in &[
+            (1usize, 1usize),
+            (3, 40),
+            (13, 33),
+            (64, 96),
+            (129, 1000),
+            (513, 130),
+        ] {
+            let a: Vec<u16> = (0..m * k).map(|i| 0x3c00 + (i as u16 % 9)).collect();
+            let x: Vec<f32> = (0..k).map(|i| (i as f32).mul_add(0.03, 0.7)).collect();
+            let mut want = vec![0f32; m];
+            let mut got = vec![0f32; m];
+            crate::lasx_gemv_f16(
+                a.as_ptr(),
+                x.as_ptr(),
+                want.as_mut_ptr(),
+                m as i32,
+                k as i32,
+            );
+            gemv_f16(&pool, m, k, &a, &x, &mut got).unwrap();
+            for r in 0..m {
+                assert_eq!(got[r].to_bits(), want[r].to_bits(), "{m}×{k} 行 {r} 不一致");
+            }
+        }
+    }
+
+    /// `gemv_f16` 的形状错误与退化输入：与 `api::gemv_f16` 同一套 `Error` 口径；
+    /// `k = 0` 写全 0，`m = 0` 直接返回 `Ok`。
+    #[test]
+    fn test_gemv_f16_errors_and_degenerate() {
+        let pool = WorkerPool::new(4);
+        let (m, k) = (8usize, 40usize);
+        let a: Vec<u16> = vec![0x3c00; m * k];
+        let x: Vec<f32> = vec![1.0; k];
+        let mut y = vec![1.0f32; m];
+
+        match gemv_f16(&pool, m, k, &a[..m * k - 1], &x, &mut y) {
+            Err(Error::Shape { op, what, .. }) => assert_eq!((op, what), ("gemv_f16", "a")),
+            other => panic!("期望 Shape 错误，得到 {other:?}"),
+        }
+        assert!(matches!(
+            gemv_f16(&pool, m, k, &a, &x[..1], &mut y),
+            Err(Error::Shape { what: "x", .. })
+        ));
+        assert!(matches!(
+            gemv_f16(&pool, m, k, &a, &x, &mut y[..m - 1]),
+            Err(Error::Shape { what: "y", .. })
+        ));
+        assert!(matches!(
+            gemv_f16(&pool, usize::MAX, 2, &a, &x, &mut y),
+            Err(Error::Overflow { .. })
+        ));
+
+        // k = 0：空内积 ⇒ 全 0（`api` 同口径）；m = 0：`Ok`，不碰 y
+        let mut z = vec![1.0f32; m];
+        gemv_f16(&pool, m, 0, &[], &[], &mut z).unwrap();
+        assert!(z.iter().all(|&v| v == 0.0), "k=0 应写全 0");
+        gemv_f16(&pool, 0, k, &[], &x, &mut []).unwrap();
     }
 
     /// 空内积（k = 0）与零维：返回 `Ok`，且 `k=0` 时结果是全零。

@@ -5,6 +5,9 @@
 //! 对照行——**同一条 `k` 下 f16 应当接近 f32 的 2 倍吞吐**才算拿到好处。
 //!
 //! 标量参照用同一个累加口径（16 元素块 + lane = j%8 + 固定次序归约），所以列间可比。
+//!
+//! 本表是**单线程、绑核**口径（见 `docs/dev.md` §7 开头）。多核（`parallel::gemv_f16`）的
+//! A/B 不在这里——它在 `examples/gemv_pool_ab`，数据与线程数建议见 `docs/dev.md` §20.7。
 
 use crate::data::{AlignedBuf, Lcg};
 use crate::report::{row3, Row};
