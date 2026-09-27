@@ -44,7 +44,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 168 lib tests + 5 macro tests + 16 doc tests (2 ignored)
+cargo test --workspace --release         # 171 lib tests + 5 macro tests + 16 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 

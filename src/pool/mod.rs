@@ -114,6 +114,12 @@
 //! 先自旋 `SPIN_LIMIT` 次，仍无任务就 park（`Condvar`）。**纯自旋在线程数超过物理核时
 //! 会灾难性地互相抢执行槽**——24 逻辑核 /12 物理核上实测慢 10 倍（dev.md §3.1）。
 //!
+//! 收尾（主线程等本轮结束）**只等"分到活的那几个" worker**：每个槽带一个代次，没被写过的
+//! 槽 worker 直接跳过、也不计数。原协议要求全体 worker 签到，于是"没活的 worker 什么时候
+//! 被调度到 CPU"成了关键路径（`m=2` 的纯派活探针在 23/24 线程是 37/38 µs，改后 1 µs；
+//! dev.md §20.7）。**worker 全都有活且占满 CPU** 时仍有调度代价，那属于调用方线程数选择，
+//! 见 `docs/ops.md` §9 与 [`crate::arch::parallelism`]。
+//!
 //! # 什么时候不要用
 //!
 //! 一次调用涉及的元素总数小于 [`MIN_PARALLEL_LEN`] 时自动原地串行执行：派活/唤醒的
@@ -163,6 +169,13 @@ struct Slot {
     n_jobs: usize,
     /// 本块起始行（多块模式下每个作业各自的起始行）——闭包拿它去索引自己捕获的只读数组。
     start: usize,
+    /// **本槽是为哪一代写的**（Relaxed 原子量，只做过滤器，不承担内存序）。
+    ///
+    /// 主线程只写"本轮有活"的槽，并把 `gen` 设成本轮代次；worker 先看 `gen` 是否等于自己
+    /// 观察到的代次，不等就**直接跳过**（既不读其余字段、也不计数）。于是"没被写过的槽"
+    /// 永远不会被误读成上一轮的活，"被写过的槽"在改写前一定已经等到过它的确认——
+    /// 这是"只等有活的 worker"能成立的安全前提（见 `Shared` 的不变量清单）。
+    gen: AtomicUsize,
 }
 
 /// 类型擦除的入口：把裸指针还原成 `[&mut [T]; N]` 并调用闭包。
@@ -175,8 +188,14 @@ type Thunk =
 struct Shared {
     /// 递增表示"新一批作业已就位"。
     epoch: AtomicUsize,
-    /// 本轮已完成的 worker 数。
+    /// 本轮已完成的 worker 数（只统计**本轮写过的槽**）。
     done: AtomicUsize,
+    /// 本轮写了几个槽（= 分到活的 worker 数）。收尾等的是它，而不是 `slots.len()`。
+    ///
+    /// 为什么不能等全体：等 `threads` 个 worker 逐一轮流上 CPU 签到，会把"最后一个 worker
+    /// 什么时候被调度到"变成收尾的关键路径；本机 24 逻辑核上 `m=2` 的纯派活探针因此从
+    /// 1–2 µs 跳到 ~30 µs（`docs/dev.md` §20.7）。等"有活的那些"就没有这个依赖。
+    active: AtomicUsize,
     /// 退出标志。
     stop: AtomicBool,
     /// 是否有 worker 在闭包里 panic 了。
@@ -197,15 +216,18 @@ struct Shared {
     wake: Condvar,
 }
 
-// SAFETY: 数据竞争由"派活互斥 + 代次发布 + done 计数"排除——
+// SAFETY: 数据竞争由"派活互斥 + 代次发布 + **逐槽代次过滤** + done 计数"排除——
 // - `WorkerPool::busy` 这把 `Mutex` 把**派活者**串行化：同一时刻只有一个调用方在写
 //   `slots`/`call`/`jobs`（它覆盖了原来 `&mut self` 提供的那个保证）；
 // - `slots[i]` 只由第 i 个 worker 访问；
-// - `call` 与所有 `slots` 都在 `epoch` 递增（Release）**之前**由调用方写入，
-//   而调用方在 `done == threads`（Acquire）之后才返回，因此 worker 读取期间
-//   调用方不会改动它们；
+// - 调用方只为**本轮有活**的槽写字段，随后递增 `epoch`（Release）；worker 先 `epoch.load()`
+//   （Acquire）拿到本轮代次，再读 `slot.gen`：只有 `gen == 代次` 的槽才会被读取其余字段
+//   （`slot.gen` 的写在 epoch 递增之前，因此对 worker 可见），`gen` 不匹配的槽整轮不碰；
+// - 于是"调用方改写槽"只可能发生在该槽**本轮有活**的时候，而那种情况下调用方一定已经等到过
+//   它的确认（`done == active`，Acquire）——worker 确认之后不再读该槽（它读的是下一个代次）；
+// - 没写过的槽保留旧 `gen`，而代次单调递增 ⇒ 旧 `gen` 永远不等于新代次，不会被误读；
 // - 串行快路径（不派活）只读不可变字段，与派活者并发是安全的；
-// - epoch/done/stop/panicked 都是原子量，payload 由 `Mutex` 保护。
+// - epoch/done/active/stop/panicked/槽内 gen 都是原子量，payload 由 `Mutex` 保护。
 // SAFETY: 见上面那条不变量清单（派活互斥 + 代次发布 + 原子计数）。
 unsafe impl Sync for Shared {}
 // SAFETY: 同上——`Shared` 只被 `Arc` 在线程间传递，内部可变状态由上面的规则保护。
@@ -279,6 +301,7 @@ impl WorkerPool {
         let shared = Arc::new(Shared {
             epoch: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
             payload: Mutex::new(None),
@@ -297,6 +320,7 @@ impl WorkerPool {
                         widths: [0; MAX_ARRAYS],
                         n_jobs: 0,
                         start: 0,
+                        gen: AtomicUsize::new(0),
                     })
                 })
                 .collect(),
@@ -636,6 +660,10 @@ impl WorkerPool {
         // 派活令牌：串行化所有派活者（跨线程排队），并把重入派活变成明确 panic。
         // 从填槽一直持到 `wait()` 返回——这正是 worker 读写这些槽的整个窗口。
         let _token = DispatchToken::acquire(self);
+        // 本轮代次（令牌在手 ⇒ 没有别的派活者能同时推进 epoch）
+        let gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
+        // 本轮写了几个槽；收尾只等这些（见 `Shared::active`）
+        let mut active = 0usize;
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
         #[allow(clippy::needless_range_loop)]
         for w in 0..self.threads {
@@ -645,9 +673,11 @@ impl WorkerPool {
             // SAFETY: slots[w] 只由第 w 个 worker 访问，且它在 done 计数之前不会推进到下一轮
             let slot = unsafe { &mut *self.shared.slots[w].get() };
             if r == 0 {
-                slot.n = 0; // 无活：worker 见到 n==0 就不调用入口
+                // 无活：**不写这个槽**（保留旧 `gen`，worker 靠代次不匹配自行跳过），
+                // 也不把它算进 `active` —— 于是主线程不必等它被调度到 CPU。
                 continue;
             }
+            active += 1;
             slot.n = N;
             slot.rows = r;
             slot.start = start;
@@ -659,13 +689,15 @@ impl WorkerPool {
                 slot.ptrs[k] = unsafe { bases[k].add(off) } as *mut u8;
                 slot.lens[k] = r * widths[k];
             }
+            // `gen` 最后写：worker 只有在代次匹配后才读上面那些字段
+            slot.gen.store(gen, Ordering::Relaxed);
         }
 
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待。
         // SAFETY: 槽位覆盖本次调用的全部数据、各数组长度由公开接口校验为 `rows × widths[k]`、
         // 行区间互不重叠；`f` 与 `during` 都在本函数栈帧上活到 `wait()` 之后。
         // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
-        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const (), active) };
         // 发布之后立刻上守卫：`during` 是用户代码，panic 展开也必须先收工（否则 worker 在
         // 调一个已经析构的栈上闭包）。正常路径下面 disarm，交给 `wait()` 收尾并续抛 panic。
         let mut guard = WaitGuard::new(self);
@@ -702,12 +734,17 @@ impl WorkerPool {
         let threads = self.threads;
         // 派活令牌：从填槽一直持到 `wait()` 返回，替代原来 `&mut self` 提供的独占保证
         let _token = DispatchToken::acquire(self);
+        // 本轮代次（令牌在手 ⇒ 没有别的派活者能同时推进 epoch）
+        let gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
         // SAFETY: 令牌保证同一时刻只有一个派活者在写 `jobs`，且写入发生在 epoch 递增之前。
         unsafe { *self.shared.jobs.get() = jobs };
         self.shared.dynamic.store(dynamic, Ordering::Relaxed);
         self.shared.next_job.store(0, Ordering::Relaxed);
         // SAFETY: `jobs` 刚由本函数写入（令牌在手，且在发布之前），本轮内无别名写入。
         let n_jobs = unsafe { (*self.shared.jobs.get()).len() };
+        // 本轮写了几个槽（收尾只等这些）：静态轮转是 `min(n_jobs, threads)`；动态领取时
+        // 人人可能抢到，全部写槽。
+        let mut active = 0usize;
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
         #[allow(clippy::needless_range_loop)]
         for w in 0..threads {
@@ -716,9 +753,10 @@ impl WorkerPool {
             // 静态轮转下第 w 个 worker 至少有一个作业才要干活（动态模式则人人可能要抢）
             let has_work = dynamic || w < n_jobs;
             if !has_work {
-                slot.n = 0;
+                // 无活：不写槽、不计数（旧 `gen` 保证 worker 会跳过它）
                 continue;
             }
+            active += 1;
             slot.n = N;
             slot.rows = 0;
             slot.n_jobs = n_jobs;
@@ -730,10 +768,11 @@ impl WorkerPool {
                 slot.widths[k] = widths[k];
                 slot.row_bytes[k] = widths[k] * std::mem::size_of::<T>();
             }
+            slot.gen.store(gen, Ordering::Relaxed);
         }
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待
         // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
-        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const ()) };
+        unsafe { self.publish_no_wait(thunk::<T, N, F>, &f as *const F as *const (), active) };
         // 同上：`during` panic 时必须先收工，避免栈上闭包被 worker 继续调用
         let mut guard = WaitGuard::new(self);
         during();
@@ -756,9 +795,12 @@ impl WorkerPool {
     /// # Safety
     /// 在 `wait()` 返回之前，调用方不得访问本次派活的数组或闭包捕获的数据（worker 正在
     /// 读写它们），也不得再次调用本池的派活接口（池只有一套作业槽与代次）。
-    unsafe fn publish_no_wait(&self, t: Thunk, func: *const ()) {
+    /// `active` 是本轮**写了几个槽**（= 分到活的 worker 数，由
+    /// [`Self::dispatch_rows`]/[`Self::dispatch_jobs`] 数出来）；收尾只等这些。
+    unsafe fn publish_no_wait(&self, t: Thunk, func: *const (), active: usize) {
         *self.shared.call.get() = (t, func);
         self.shared.done.store(0, Ordering::Relaxed);
+        self.shared.active.store(active, Ordering::Relaxed);
         self.shared.panicked.store(false, Ordering::Relaxed);
         {
             let _g = self.shared.park.lock().unwrap();
@@ -797,9 +839,13 @@ impl WorkerPool {
     }
 
     /// 收尾内核：清 `in_flight`、等 `done` 到齐、取走（并清掉）panic 载荷。
+    ///
+    /// 等的是 `active`（**本轮有活的 worker 数**），不是 `threads`：没分到活的 worker 不需要
+    /// 在收尾的关键路径上被调度到 CPU（见 [`Shared::active`]）。
     fn finish_round(&self) -> Option<Box<dyn Any + Send>> {
         self.in_flight.store(false, Ordering::Relaxed);
-        while self.shared.done.load(Ordering::Acquire) < self.threads {
+        let active = self.shared.active.load(Ordering::Relaxed);
+        while self.shared.done.load(Ordering::Acquire) < active {
             std::hint::spin_loop();
         }
         if self.shared.panicked.load(Ordering::Acquire) {
@@ -923,7 +969,9 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
         let (thunk, func) = unsafe { *sh.call.get() };
         // SAFETY: 同上，且 `slots[i]` 只由第 i 个 worker 访问。
         let slot = unsafe { &*sh.slots[i].get() };
-        if slot.n > 0 {
+        // **代次过滤**：只有"本轮为这个槽写过"的才干活并计数；没写过的槽保留旧 `gen`，
+        // 整轮不碰（既不读其余字段、也不计数）——见 `Shared::active` 与不变量清单。
+        if slot.gen.load(Ordering::Relaxed) == seen {
             // 跑一块：多块模式下由 `bases`/`widths`/作业行区间现场派生指针；
             // 单块模式下 `ptrs`/`lens` 已经在派活时算好（热路径不变）。
             let run_block = |start: usize, rows: usize, ptrs: &[*mut u8], lens: &[usize]| {
@@ -984,8 +1032,9 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
                     }
                 }
             }
+            // 计数**在代次匹配的分支内**：没被写槽的 worker 不参与本轮收尾。
+            sh.done.fetch_add(1, Ordering::Release);
         }
-        sh.done.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1241,6 +1290,74 @@ mod tests {
                 "第 {round} 轮结果不对——池跨调用复用有问题"
             );
         }
+    }
+
+    /// **块数 < 线程数**的高频派活：绝大多数线程的槽本轮不会被写，靠"逐槽代次"过滤跳过。
+    ///
+    /// 这一条同时是**挂死看门狗**：池的派活/收尾是自旋 + 原子计数，出错的形式往往是"某个
+    /// worker 永远不计数 ⇒ 主线程永远自旋"（进程 100% CPU 卡住，比崩溃更难查）。所以这里挂一个
+    /// 60 s 的看门狗线程，超时直接 `abort` —— CI 上要一个明确的失败，而不是一次超时。
+    #[test]
+    fn test_dispatch_with_fewer_blocks_than_threads() {
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        std::thread::spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !DONE.load(O::Relaxed) {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("池压力测试超过 60 s：疑似派活/收尾挂死");
+                    std::process::abort();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let logical = crate::arch::parallelism().logical;
+        let width = 2048usize; // 3 行 × 2048 = 6144 > MIN_PARALLEL_LEN ⇒ 真的走派活
+        for &threads in &[2usize, 4, 8, logical, logical + 1, logical + 8] {
+            let pool = WorkerPool::new(threads);
+            for round in 0..200usize {
+                // 交替"极少块"（只有 3 个槽被写）与"多块"（人人有活）
+                let rows = if round % 2 == 0 { 3 } else { threads * 4 + 1 };
+                let mut data = vec![u64::MAX; rows * width];
+                pool.for_each_row_block_mut(rows, 1, [(&mut data, width)], |start, _n, [seg]| {
+                    for (k, v) in seg.iter_mut().enumerate() {
+                        *v = (start * width + k) as u64;
+                    }
+                });
+                assert!(
+                    data.iter().enumerate().all(|(i, &v)| v == i as u64),
+                    "threads={threads} rows={rows} round={round}: 结果被写错/漏写"
+                );
+            }
+        }
+        DONE.store(true, O::Relaxed);
+    }
+
+    /// 有"没写槽"的休眠 worker 时，某个有活的 worker panic：`done` 只等有活的那些，
+    /// panic 载荷必须照常续抛、池仍可复用——不能因为休眠 worker 不计数而挂死。
+    #[test]
+    fn test_panic_with_dormant_workers_does_not_hang() {
+        let threads = crate::arch::parallelism().logical + 4;
+        let pool = WorkerPool::new(threads);
+        let width = 2048usize;
+        let rows = 3usize; // 只有 3 个槽被写，其余 worker 本轮休眠
+        let mut data = vec![0u64; rows * width];
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.for_each_row_block_mut(rows, 1, [(&mut data, width)], |_s, _n, [_seg]| {
+                panic!("块内 panic");
+            });
+        }));
+        assert!(res.is_err(), "panic 必须续抛给调用方");
+
+        // 池仍可复用，且落回正常计数路径
+        let mut ok = vec![u64::MAX; 4 * width];
+        pool.for_each_row_block_mut(4, 1, [(&mut ok, width)], |start, _n, [seg]| {
+            for (k, v) in seg.iter_mut().enumerate() {
+                *v = (start + k / width) as u64;
+            }
+        });
+        assert!(ok.iter().enumerate().all(|(i, &v)| v == (i / width) as u64));
     }
 
     /// 每种调度策略都必须**恰好访问每一行一次**（不多、不少、不重）。
