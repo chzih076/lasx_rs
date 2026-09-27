@@ -834,6 +834,14 @@ lasx_gemv_f16_checked(a_f16, x, y, m, k, &status);
   12 线程 **110 GB/s（7.9×）**、`4096×4096` 5.2 → 31 GB/s、`11008×4096` 4.3 → 22 GB/s；
   **线程数取物理核数**（本机 12），24 线程在中小形状反而更慢——依据见 §9 的"线程数怎么选"
   与 `docs/dev.md` §20.7。
+- **声明式**：形状编译期已知时可以直接写公式（§8.3.1）：
+  ```rust
+  use lasx_rs::shape::{F16Mat, VecBuf, VecRef};
+  use lasx_rs::{dot, gemv};
+  let x = VecRef::<f32, K>::new(&act)?;
+  let y: VecBuf<f32, N> = gemv!(w_f16[N, K] * x[K]);   // 等价于 api::gemv_f16
+  let s: f32 = dot!(w_row[K] * x[K]);                  // 等价于 api::dot_f16
+  ```
 
 
 ## 6. 批量几何与物理算子
@@ -1168,6 +1176,42 @@ wp.apply_dyn_into(&xd, &mut yd);
 
 > 三层的分工：**`view` 管布局**（列主序/跨距/转置）、**`plan` 管复用**（打包一次）、
 > **`shape` 管形状**（进类型）。它们可以叠：`shape::Prepared` 内部就是 `plan::MatmulPlan`。
+
+#### 8.3.1 一维（向量）与 f16：`dot!` / `gemv!`
+
+矩阵之外，形状层还有两个子模块；`dot!` 与 `gemv!` 是 `matmul!` 的**一维形态**：
+
+| 类型 | 含义 | DSL |
+|---|---|---|
+| `VecRef<'a, T, N>` | `N` 长只读向量视图 | `dot!` 的操作数 |
+| `VecBuf<T, N>` | `N` 长拥有者（输出），32 字节对齐 | `gemv!(y[N] = …)` 的输出 |
+| `F16Vec<'a, N>` | f16（`u16` 位型）权重向量 | `dot!(w[K] * x[K])` |
+| `F16Mat<'a, N, K>` | f16 权重矩阵，**行主序 `[输出, 收缩]`** | `gemv!(y[N] = w[N, K] * x[K])` |
+| `DotPair` / `dot_of` | 点积按 dtype 分派（f32·f32、f64·f64、f16·f32 双向） | `dot!` 的落点 |
+
+```rust
+use lasx_rs::shape::{F16Mat, VecBuf, VecRef};
+use lasx_rs::{dot, gemv};
+
+const K: usize = 4096;
+const N: usize = 2;
+let x = VecRef::<f32, K>::new(&act)?;                 // f32 激活
+let y: VecBuf<f32, N> = gemv!(w_f16[N, K] * x[K]);    // 分配输出
+gemv!(y[N] = w_f16[N, K] * x[K]);                     // 或写进已有缓冲
+let s: f32 = dot!(act[K] * act[K]);                   // 点积（标量结果）
+assert_eq!(y.as_slice(), lasx_rs::api::gemv_f16(N, K, &w_bits, &act)?.as_slice());
+```
+
+- **只支持编译期长度**（v1）：`VecRef`/`F16Vec`/`F16Mat` 的 `N`/`K` 是常量，小写下标会得到
+  一条明确的诊断；运行期长度直接用 [`api::gemv_f16`](#513-lasx_dot_f16--lasx_gemv_f16--f16-权重的点积与矩阵-向量)
+  或 §9 的 `parallel::gemv_f16`；
+- **`gemv!` 只认一种读法**：权重在左、行主序 `[输出, 收缩]`（内核的布局）。写成
+  `x[K] * w[N, K]` 会在**编译期**报错并给出正确写法；
+- 数值与 `api`/`parallel` 对应函数**逐位一致**（同一后端；示例 `examples/formula_vec.rs`
+  内联断言，含池化路径）；
+- 生成代码用**绝对路径**（`lasx_rs::shape::…`），所以用户不必 `use` 类型或 trait——
+  只有构造视图时才需要类型名。
+- 覆盖缺口（`dot!`/`gemv!` 之外还有什么没有声明式写法）见 `docs/dev.md` §19.13。
 
 
 ## 9. 多核并行：`WorkerPool` 与 `parallel`

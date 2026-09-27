@@ -73,11 +73,13 @@
 
 extern crate proc_macro;
 
+mod vec;
+
 use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 
 /// 一个下标的档次：编译期维度还是运行期值。**按首字符判定**（见 crate 文档）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     /// 大写开头：编译期维度（`const`，进类型标注）
     Const,
     /// 小写或下划线开头：运行期值（`usize`，宏自己绑定 + 断言）
@@ -124,7 +126,7 @@ struct Formula {
 }
 
 /// 一条诊断：主锚点 + 可选第二锚点（双锚定）+ 可选 note。
-struct Diagnostic {
+pub(crate) struct Diagnostic {
     msg: String,
     span: Span,
     second: Option<Span>,
@@ -132,7 +134,7 @@ struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn new(msg: impl Into<String>, span: Span) -> Self {
+    pub(crate) fn new(msg: impl Into<String>, span: Span) -> Self {
         Diagnostic {
             msg: msg.into(),
             span,
@@ -141,12 +143,12 @@ impl Diagnostic {
         }
     }
 
-    fn with_second(mut self, span: Span) -> Self {
+    pub(crate) fn with_second(mut self, span: Span) -> Self {
         self.second = Some(span);
         self
     }
 
-    fn with_note(mut self, note: impl Into<String>) -> Self {
+    pub(crate) fn with_note(mut self, note: impl Into<String>) -> Self {
         self.note = Some(note.into());
         self
     }
@@ -160,7 +162,7 @@ impl Diagnostic {
     /// 也会出现在**表达式位置**（`let y = matmul!(..)`）。裸着两条 `compile_error!`
     /// 在表达式位置解析不了（实测报 "expected one of `.`, `;` … found compile_error"），
     /// 包成 block 两种位置都成立。
-    fn emit(self) -> TokenStream {
+    pub(crate) fn emit(self) -> TokenStream {
         let mut body = TokenStream::new();
         body.extend(compile_error(&self.msg, self.span));
         body.extend([p(';')]);
@@ -183,15 +185,15 @@ impl Diagnostic {
 
 /* ------------------------------ token 拼装 ------------------------------ */
 
-fn id(s: &str) -> TokenTree {
+pub(crate) fn id(s: &str) -> TokenTree {
     TokenTree::Ident(Ident::new(s, Span::call_site()))
 }
 
-fn p(c: char) -> TokenTree {
+pub(crate) fn p(c: char) -> TokenTree {
     TokenTree::Punct(Punct::new(c, Spacing::Alone))
 }
 
-fn group(delim: Delimiter, inner: TokenStream) -> TokenTree {
+pub(crate) fn group(delim: Delimiter, inner: TokenStream) -> TokenTree {
     TokenTree::Group(Group::new(delim, inner))
 }
 
@@ -221,7 +223,7 @@ fn compile_error(msg: &str, span: Span) -> TokenStream {
 }
 
 /// 样板 token 串：`a.b(&c, &mut d)` 这类调用（接收者与实参里的用户 token 单独传入）。
-fn method(recv: &Ident, name: &str, args: TokenStream) -> TokenStream {
+pub(crate) fn method(recv: &Ident, name: &str, args: TokenStream) -> TokenStream {
     let mut ts = TokenStream::new();
     ts.extend([
         TokenTree::Ident(recv.clone()),
@@ -232,7 +234,7 @@ fn method(recv: &Ident, name: &str, args: TokenStream) -> TokenStream {
     ts
 }
 
-fn amp(ident: &Ident) -> TokenStream {
+pub(crate) fn amp(ident: &Ident) -> TokenStream {
     let mut ts = TokenStream::new();
     ts.extend([p('&'), TokenTree::Ident(ident.clone())]);
     ts
@@ -289,7 +291,7 @@ fn annotate(ty: &str, view: bool, consts: Vec<TokenTree>, value: &Ident) -> Toke
 }
 
 /// `{ K }`：把用户的大写下标当 const 泛型实参（Span 保留，报错落在公式上）。
-fn const_arg(ident: &Ident) -> TokenTree {
+pub(crate) fn const_arg(ident: &Ident) -> TokenTree {
     let mut inner = TokenStream::new();
     inner.extend([TokenTree::Ident(ident.clone())]);
     group(Delimiter::Brace, inner)
@@ -649,6 +651,20 @@ pub fn matmul(input: TokenStream) -> TokenStream {
         Ok(f) => expand(&f),
         Err(d) => d.emit(),
     }
+}
+
+/// 向量点积：`dot!(x[K] * y[K])`（`f32`/`f64`/f16 权重·f32 三种 dtype）。
+///
+/// 接受什么、报错怎么锚，见 crate 文档；实现在 `macros/src/vec.rs`。
+#[proc_macro]
+pub fn dot(input: TokenStream) -> TokenStream {
+    vec::expand_dot(input)
+}
+
+/// 矩阵-向量乘：`gemv!(y[N] = w[N, K] * x[K])` / `gemv!(w[N, K] * x[K])`（f16 权重）。
+#[proc_macro]
+pub fn gemv(input: TokenStream) -> TokenStream {
+    vec::expand_gemv(input)
 }
 
 #[cfg(test)]

@@ -245,8 +245,8 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**157 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
-其中 27 个分布在 §20 的六个算子，2 个是 §20.7 的池化 `gemv_f16` 对照）。
+当前规模：**168 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，2 个是 §20.7 的池化 `gemv_f16`）。
 
 | 测试类型 | 目的 | 例子 |
 |---|---|---|
@@ -277,7 +277,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 157 单测（+ 3 个宏单测）
+cargo test --workspace --release        # 168 单测（+ 5 个宏单测）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -1806,8 +1806,9 @@ pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
 ### 19.8 公式 DSL v1：范围、诊断与验证方式
 
 实现在 `macros/`（`lasx_rs_macros`，proc-macro、`publish = false`、**零第三方依赖**），
-用户只看到 `lasx_rs::matmul!`。规则与设计见该 crate 的文档（`cargo doc -p lasx_rs_macros`），
-这里只记**这篇文档层面需要知道的东西**。
+用户看到 `lasx_rs::matmul!`（矩阵乘）与一维形态 `lasx_rs::dot!` / `lasx_rs::gemv!`
+（点积、矩阵-向量；范围与缺口见 §19.13）。规则与设计见该 crate 的文档
+（`cargo doc -p lasx_rs_macros`），这里只记**这篇文档层面需要知道的东西**。
 
 **v1 接受**：`操作数 '=' 操作数 '*' 操作数` 或 `操作数 '*' 操作数`，操作数形如 `x[M, K]`；
 两个操作数**按共享下标出现在哪一侧判角色**——`x[M,K] * w[K,N]`（左.j == 右.i，`A·B`）与
@@ -2039,6 +2040,78 @@ LASX 微内核里。
 **调用方**：cli（`data.rs` 的 `step_pooled`、`scenario.rs`）与 `examples/*` 四处用 `.unwrap()`
 （那些基准里形状由构造保证）；`yll` 扩展用 `.map_err(|e| e.to_string())?` **上抛给脚本**——
 这正是"调用错误需要上抛"那条要求的落点，扩展里不再有"库 panic 打断解释器"的路径。
+
+### 19.13 DSL 覆盖矩阵与缺口（现状 + 下一步）
+
+**现状**：`matmul!`（§19.8）之外，一维形态已落地（`dot!` / `gemv!`，见下表 ✅）。两者的分工是
+"矩阵 / 向量"两种句式，共用同一条下标规则（大写 = 编译期 const）与同一套双锚定诊断。
+
+**逐算子对照**（30 个原始符号；`lasx_alloc` 是设施，不进 DSL）：
+
+| 类别 | 算子 | DSL | 缺的语法原语 |
+|---|---|---|---|
+| 矩阵乘 | `matmul`(f32)、`matmul_f64` | ✅ `matmul!` | — |
+| 矩阵-向量 | `gemv_f16` | ✅ `gemv!`（f16 权重） | — |
+| 点积 | `dot_f16` | ✅ `dot!` | — |
+| 点积 | `dot`、`dot_f64`、`sum` | ❌ | 标量输出的**归约**（`s = sum(x[N])`）；`dot`/`dot_f64` 可直接用 `dot!`（已支持），但 `sum` 缺一个"单操作数归约"句式 |
+| 归约（量化） | `dot_i8`、`dot_q4` | ❌ | i8 / Q4 块的 dtype 视图（G7；也是 N2 批次的前置） |
+| 逐元素 | `axpy`、`silu`、`gelu_quick`、`gelu_erf` | ❌ | 无收缩维的逐元素 + 标量参数（`y[N] = axpy(a, x[N], y[N])`） |
+| 批量物理 | `norm3_batch`、`vec3_add_scaled_batch`、`batch_distance2d`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch` | ❌ | **批量样本维**（`Sample<N>`）+ 多数组同步 + 标量参数 |
+| 姿态/几何 | `cross3`、`unitize3`、`mat3_mul_vec3`、`quat_normalize`、`quat_mul`、`quat_rotate`、`quat_to_dcm` | ❌ | 批量样本维 + **定点小矩阵（3×3/4×4）展开后端**（这些不是 blocked/packed 内核的活） |
+| NN 行算子 | `softmax_rows`、`rms_norm` | ❌ | **行内归约 + 广播**（`w[C]` 广播到 `x[R,C]`）+ 参数（scale/mask/eps） |
+| NN 表算子 | `rope` | ❌ | 表输入 + 模式参数（NeoX/GptJ） |
+| 内存工具 | `lasx_alloc` / `AlignedVec` | — | 设施，**不该**进 DSL（`Prepared`/`VecBuf` 已在用） |
+
+统计：**30 → 4 个 ✅**（`matmul`/`matmul_f64`/`gemv_f16`/`dot_f16`），加 f32/f64 `dot` 也走
+`dot!` 之后是 6；其余 24 个仍无声明式写法（其中 `lasx_alloc` 不该有）。
+
+**缺的是 8 个语法/类型原语，不是 24 个宏**：
+
+| # | 原语 | 一次解锁 | 现成消费者 |
+|---|---|---|---|
+| G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（本轮的 `dot!`/`gemv!`） |
+| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | loong-llm 的激活路径 |
+| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | loong-sci（`space.rs`/`guidance.rs` 共 15 处调用点） |
+| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | loong-sci 的 3×3 求逆、惯量、6×6 协方差 |
+| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | loong-llm 自己的 `ops.rs` |
+| G6 | 表 / 模式参数 | `rope` | loong-llm `ops.rs` |
+| G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | loong-llm 的 8 处 `q8_matmul`（= `docs/ops.md` §12.3 的 N2 清单） |
+| G8 | 多操作数 / `alpha` / 转置 | attention 类多步表达式 | —（v1 有意延后，诊断里点名） |
+
+**优先级**（按"有真实消费者 + 已有功课"排）：**G7+G1** 是 loong-llm 的落点（G1 本轮已完成，
+G7 需要 N2 的 Q8_0 内核）→ **G2**（最小语法、无并行/计划问题）→ **G5**（NN 侧 4 个算子）→
+**G3/G4**（loong-sci；收益主要是类型/布局检查，不是速度——3×3 的活不该走 blocked 内核）。
+
+**生成代码的形态**（本轮定下的两条约定）：
+
+- **绝对路径**：生成 `lasx_rs::shape::F16Mat<'_, {N}, {K}>` / `lasx_rs::shape::vec::dot_of((&a, &b))`，
+  所以用户**不必** `use` 类型或 trait（`matmul!` 用裸类型名、需要 import——新形态没沿用这条）。
+- **不支持的一对 dtype 走 `on_unimplemented`**：`dot!` 经一个**元组参数**的泛型函数
+  `dot_of` 落点。早先版本直接生成 `Dot::dot_with(&a, &b)`，rustc 会拿第二个实参去凑第一个
+  类型的唯一 impl，报成"实参类型不符"；改成元组后约束是 `Pair: DotPair`，缺失 impl 时才会
+  打出我们写好的提示（实测见下）。
+
+**诊断核对**（§19.8 的老办法：写一个只含错误公式的临时 example，一次编译看全部输出，核对完删除）：
+9 条错误公式各给一条消息 + 双锚定，例如——
+
+```text
+error: 点积的收缩维下标不一致：左侧写 K，右侧写 Q
+  --> examples/dsl_diag_probe.rs:20:20
+error: 点积要求两侧等长，请把下标写成同一个名字
+  --> examples/dsl_diag_probe.rs:20:27
+error: `gemv!` 需要左侧是权重矩阵（2 下标），`a` 只写了 1 个下标
+  --> examples/dsl_diag_probe.rs:25:21
+  = note: 本库 gemv 的权重是行主序 `[输出, 收缩]`，权重必须在左：`w[K, N] * a[N]`
+error: `dot!` 只认受支持的 dtype 组合
+  = help: the trait `DotPair` is not implemented for `(&F16Vec<'_, 8>, &F16Vec<'_, 8>)`
+  = note: 支持：`VecRef<f32>·VecRef<f32>`、`VecRef<f64>·VecRef<f64>`、`F16Vec·VecRef<f32>（两个方向）`…
+```
+
+**测试与文件**：规则层是纯函数（`check_dot`/`check_gemv`，不碰 `Span`），单元测试直接打它
+（proc-macro 的类型在测试里用不了：`procedural macro API is used outside of a procedural macro`）；
+生成形态由 `src/shape/vec.rs` 的 doc test 与 `examples/formula_vec.rs` 覆盖。
+代码分布：`src/shape/vec.rs`（通用向量 + `DotPair`）、`src/shape/f16.rs`（f16 视图 + gemv）、
+`macros/src/vec.rs`（新宏的解析/规则/生成），`macros/src/lib.rs` 只留入口与共享件。
 
 ## 20. NN 侧 N1 批次：算子契约与依据
 

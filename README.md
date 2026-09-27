@@ -27,7 +27,8 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
   端到端比"每步新建线程"快 **2.55×**、比单线程快 **8.09×**。
 - **接口层**：`view::MatRef`/`MatMut` 把形状与跨距变成构造时校验一次的对象；
   `plan::MatmulPlan` 把 `B` 打包一次反复使用（只读、可 `Arc` 共享）；
-  `shape` 层把形状放进类型并在编译期校验；`lasx_rs_macros` 提供公式 DSL。
+  `shape` 层把形状放进类型并在编译期校验；`lasx_rs_macros` 提供公式 DSL
+  （`matmul!` 矩阵乘、`dot!` 点积、`gemv!` 矩阵-向量）。
 - **NN 侧算子按目标平台取舍**：N1 批次**不提供 LSX 降级**（目标平台 6000 系列均支持 LASX），
   在无 LASX 的 CPU 上执行 LASX 指令会产生 SIGILL，使用时需自行按 CPU 能力调度。
 
@@ -36,7 +37,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 157 库单测 + 3 宏单测 + 15 文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 168 库单测 + 5 宏单测 + 16 文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 

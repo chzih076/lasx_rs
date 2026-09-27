@@ -115,6 +115,26 @@
 //!
 //! - `K == 0` 无法从长度推出行数 → 构造直接报错（退化情形用 [`crate::api::matmul`]）。
 //! - 与 [`crate::ops::matmul`](crate) 同前提：**需要 LASX**。
+//!
+//! # 一维（向量）与 f16
+//!
+//! 二维之外还有两个子模块，承担"公式 DSL 不只管矩阵"这件事：
+//!
+//! | 模块 | 内容 | DSL |
+//! |---|---|---|
+//! | [`mod@vec`] | [`vec::VecRef`] / [`vec::VecBuf`]、按 dtype 分派的点积 [`vec::DotPair`] | `dot!(x[K] * y[K])` |
+//! | [`mod@f16`] | f16 权重视图 [`f16::F16Vec`] / [`f16::F16Mat`]（`u16` 位型） | `dot!`、`gemv!(y[N] = w[N, K] * x[K])` |
+//!
+//! 一维视图是**常量长度**的（`VecRef<'_, f32, N>`）：`matmul!` 那套"小写 = 运行期"的
+//! 双档在 v1 的一维形态里还不支持，`dot!` / `gemv!` 会给出明确诊断（而不是静默生成错代码）。
+
+pub mod f16;
+pub mod vec;
+
+// 与 `Mat` / `MatBuf` 同级再导出：`dot!` / `gemv!` 生成的代码用的是**裸类型名**
+// （`VecRef`、`F16Mat`…），用户一条 `use lasx_rs::shape::{…}` 就能全部带进作用域。
+pub use f16::{F16Mat, F16Vec};
+pub use vec::{DotPair, VecBuf, VecRef};
 
 use crate::aligned::AlignedVec;
 use crate::api::Error;

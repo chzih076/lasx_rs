@@ -33,7 +33,8 @@ Four workload classes are covered:
 - **Interface layers** — `view::MatRef`/`MatMut` turn shape and stride into objects validated once
   at construction; `plan::MatmulPlan` packs `B` once and reuses it (read-only, `Arc`-shareable);
   the `shape` layer encodes shapes in the type system with compile-time checks;
-  `lasx_rs_macros` provides a formula DSL.
+  `lasx_rs_macros` provides a formula DSL (`matmul!` for matrix products, `dot!` for dot
+  products, `gemv!` for matrix-vector products).
 - **NN operators are LASX-only by design** — the N1 batch deliberately omits an LSX fallback,
   because every target platform in the 6000 series supports LASX. On a CPU without LASX these
   kernels execute LASX instructions and raise SIGILL; callers must dispatch by CPU capability.
@@ -43,7 +44,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 157 lib tests + 3 macro tests + 15 doc tests (2 ignored)
+cargo test --workspace --release         # 168 lib tests + 5 macro tests + 16 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
