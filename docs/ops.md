@@ -1456,7 +1456,7 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 | 缺口 | llama.cpp 现状 | 本库现状 | 结论 |
 |---|---|---|---|
 | f16 GEMV（decode） | **6.8 GB/s** | `lasx_gemv_f16` **3.75–48.2 GB/s**（同量级形状 `1024×2048` = 10.5 GB/s ≈ 1.5×） | 小形状驻留缓存时领先明显；超出 L3 后回落到 3.75 GB/s，瓶颈是 `f16→f32` 转换与 `permi_q` 重排这两项结构代价（已查清，见 §5.13） |
-| f16/bf16 GEMM（prefill） | 8.4 / 16.6 GFLOP/s | f32 GEMM 60–67 GFLOP/s（`docs/dev.md` §7.3），**没有 f16 GEMM** | 仍是未做的缺口（N1 只做了 f16 的 GEMV/dot） |
+| f16/bf16 GEMM（prefill） | 8.4 / 16.6 GFLOP/s | f32 GEMM 60–68 GFLOP/s（`docs/dev.md` §8.5），**没有 f16 GEMM** | 仍是未做的缺口（N1 只做了 f16 的 GEMV/dot） |
 | `SOFT_MAX` | 典型 2.4–4 GB/s | **5.22–7.00 GB/s**（朴素 Rust 的 4.5–5.6×） | 已落地，1.3–2.9× |
 | `SILU`/`GELU`（激活） | 无 LoongArch 分支（`vec.cpp` 里 silu/gelu 有 AVX/NEON/SVE，唯独没有 LASX） | **4.55–9.20 GB/s**（朴素 Rust 的 4.1–7.9×） | 已落地三个入口；**算力受限**（同为 2 条流，rms_norm 到 18.0 GB/s，激活只有一半——`exp` + 向量除法是瓶颈） |
 | `RMS_NORM` / `ROPE` | llama.cpp 侧 ≈1×（没有缺口） | rms_norm **12.0–18.4 GB/s**、rope(NeoX) **28.6–71.9 GB/s** | 本库把这两者也 LASX 化了（llama.cpp 的 rope 两种 mode 都是标量） |

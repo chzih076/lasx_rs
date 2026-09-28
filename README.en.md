@@ -25,8 +25,9 @@ Four workload classes are covered:
   tests: `lasx_ballistic_step` uses different association orders in its vector and scalar branches,
   and `lasx_axpy` permits a difference of at most 1 ulp.
 - **Matrix multiplication** — three bitwise-identical paths (packed, column-block, streaming) with
-  packing and k-chunking; single-threaded f32 512³ reaches 60.1 GFLOP/s, which is **85%** of this
-  machine's microkernel ceiling (2.00 FMA/cycle with A-broadcast, i.e. 70.3 GFLOP/s).
+  packing and k-chunking; single-threaded f32 512³ reaches 60.9 GFLOP/s, which is **87%** of this
+  machine's microkernel ceiling (2.00 FMA/cycle with A-broadcast, i.e. 70.3 GFLOP/s), and 97% at
+  64³ (streaming, no packing). Same-day cross-section against OpenBLAS 0.3.34: `docs/dev.md` §8.5.
 - **Resident worker pool** — amortizes dispatch across calls: 8.15× on a 12-thread n = 2^18 step,
   and in a multi-satellite multi-step propagation it is **2.55×** faster than creating threads per
   step and **8.09×** faster than single-threaded.
@@ -75,8 +76,8 @@ live in the respective design sections.
 |---|---|
 | FMA throughput ceiling (16 independent chains, registers only) | **140.2 GFLOP/s** (3.98/cycle); LSX 69.3 (2.00×) |
 | Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s) |
-| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.8 / 62.2 / **60.1** GFLOP/s |
-| `lasx_matmul_f64` 128³ / 512³ | 31.0 / 29.0 GFLOP/s |
+| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s (same-day §8.5) |
+| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s (same-day §8.5) |
 | `lasx_matmul` via `parallel`, 12 threads | 5.06× / 5.34× at 128³ / 512³ (323.8 / 302.1 GFLOP/s) |
 | Single-stream / two-stream / 12-thread read (32 MiB) | 12.0 / 10.4 / 22.0 GB/s |
 | `lasx_softmax_rows` / `lasx_rms_norm` | 5.22–7.00 / 12.01–18.38 GB/s |

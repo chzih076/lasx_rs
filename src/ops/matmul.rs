@@ -333,17 +333,51 @@ pub(crate) fn matmul_f32_packed_rows(
 
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*32 + r]`。
 ///
-/// 外层走 `p`：这样读 B 是**顺序**的（每行 `nc×4` 字节连续），写是 128 B 连续小块。
+/// 布局决定了**只能让一侧顺序**：读是"每行 32 个 `f32`（128 B）、跨行跳 `n×4`"，
+/// 写是"每条带 `k×32` 个 `f32`（`k×128` B）连续"。这里两侧都按 4 条带一组走：
+/// 读侧每行取 512 B 连续（4 条带在同一行里是挨着的），写侧每条带仍连续。
+///
+/// **必须用向量拷贝**：`copy_from_slice` 在"切片对齐未知"时只生成标量 `fld/fst`
+/// 循环，实测打包吞吐只有 10–18 GB/s；换成 4 条 256 位载入/存储后是 18–28 GB/s
+/// （探针与端到端数据见 `docs/dev.md` §8.2.1）。循环顺序本身不是瓶颈——两种顺序都实测过。
 #[inline]
 pub(crate) fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
     let strips = nc / 32;
-    for p in 0..k {
-        let row = &b[p * n + jb..p * n + jb + nc];
-        for s in 0..strips {
-            let dst = (s * k + p) * 32;
-            packed[dst..dst + 32].copy_from_slice(&row[s * 32..s * 32 + 32]);
+    let mut s0 = 0;
+    while s0 < strips {
+        let g = (strips - s0).min(4);
+        for p in 0..k {
+            for t in 0..g {
+                let src = p * n + jb + (s0 + t) * 32;
+                let dst = (s0 + t) * k * 32 + p * 32;
+                // SAFETY: `strips = nc/32` 且 `jb + nc <= n`（三个调用点都按"完全覆盖的列面板"
+                // 调用，`nc` 是 32 的倍数），于是 `src + 31 <= (k-1)*n + jb + nc - 1 <= k*n - 1`；
+                // `packed` 的长度是 `k*nc`，`dst + 31 <= k*32*strips - 1 <= k*nc - 1`。
+                // 两块不重叠：`packed` 是本模块自己的缓冲，`b` 是调用方的只读矩阵，
+                // 由类型系统保证（安全代码里 `&[f32]` 与 `&mut [f32]` 不可能别名）。
+                unsafe {
+                    copy_block32(b.as_ptr().add(src), packed.as_mut_ptr().add(dst));
+                }
+            }
         }
+        s0 += g;
     }
+}
+
+/// 拷贝 32 个连续 `f32`（4 条 256 位向量）。
+///
+/// # Safety
+/// `src` 至少可读 32 个 `f32`，`dst` 至少可写 32 个 `f32`，且两者不重叠。
+#[inline]
+unsafe fn copy_block32(src: *const f32, dst: *mut f32) {
+    let v0 = lasx::load_f32x8(src);
+    let v1 = lasx::load_f32x8(src.add(8));
+    let v2 = lasx::load_f32x8(src.add(16));
+    let v3 = lasx::load_f32x8(src.add(24));
+    lasx::store_f32x8(dst, v0);
+    lasx::store_f32x8(dst.add(8), v1);
+    lasx::store_f32x8(dst.add(16), v2);
+    lasx::store_f32x8(dst.add(24), v3);
 }
 
 /// 微内核：4 行 × 32 列 × **kb 个 k 步**，B 从打包缓冲连续读。
@@ -484,12 +518,14 @@ fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], first: bool,
     }
 }
 
-/// 手写 8 行 × 16 列打包微内核（16 个累加器，2 个 B 向量 + 8 个 A 广播/轮）。
+/// 一个打包面板放几条 32 列条带：面板要能留在 L2（3 MiB/核）里被整轮行扫描复用，
+/// 预算取 2 MiB，所以 `nc_strips = 2 MiB / (k×32×4)`，上限 256 条（f32 = 8192 列）。
 ///
-/// 相比 4×32：B 的 L2 复用遍数从 25 降到 12.5（`m/MR`），且打包条带只有 `k×16×4`
-/// = 28 KB，能连带 A 行一起待在 L1（4×32 的条带是 57 KB，正好卡在 L1 边缘）。
+/// 注意条带宽度是 **32 列**（f64 侧是 16 列，见 [`crate::ops::matmul_f64::pack_strips`]）：
+/// 曾经考虑过 8 行 × 16 列的微内核（L2 复用遍数减半、条带 28 KB），但 4×32 的
+/// "16 累加器 + 4 载入 + 4 广播" 已经是寄存器可容纳的最优 ops/FMA 组合——
+/// `cRxC` 扫描里 `c8x16` 实测同样是 2.00 FMA/周期（§6.3），改 f64 内核形状的同类尝试见 §15.1。
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn pack_strips(k: usize) -> usize {
     const L2_BUDGET: usize = 2 * 1024 * 1024;
     let per_strip = (k * 32 * 4).max(1);

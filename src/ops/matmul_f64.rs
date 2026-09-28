@@ -311,16 +311,48 @@ pub(crate) fn matmul_f64_packed_rows(
 }
 
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*16 + r]`（16 列一条带）。
+///
+/// 与 f32 侧 [`crate::ops::matmul::pack_b`] 同构：4 条带一组、每条带 16 个 `f64`
+/// （128 B = 4 条 256 位向量）。用向量拷贝而不是 `copy_from_slice`——后者在切片对齐
+/// 未知时只生成标量循环，打包吞吐差约 1.6×（数据见 `docs/dev.md` §8.2.1）。
 #[inline]
 pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
     let strips = nc / 16;
-    for p in 0..k {
-        let row = &b[p * n + jb..p * n + jb + nc];
-        for s in 0..strips {
-            let dst = (s * k + p) * 16;
-            packed[dst..dst + 16].copy_from_slice(&row[s * 16..s * 16 + 16]);
+    let mut s0 = 0;
+    while s0 < strips {
+        let g = (strips - s0).min(4);
+        for p in 0..k {
+            for t in 0..g {
+                let src = p * n + jb + (s0 + t) * 16;
+                let dst = (s0 + t) * k * 16 + p * 16;
+                // SAFETY: `strips = nc/16` 且 `jb + nc <= n`，于是
+                // `src + 15 <= (k-1)*n + jb + nc - 1 <= k*n - 1`；`packed` 的长度是 `k*nc`，
+                // `dst + 15 <= k*16*strips - 1 <= k*nc - 1`；两块不重叠——`packed` 是
+                // `MatmulPlan` 自己的面板缓冲，由类型系统保证（`&[f64]` 与 `&mut [f64]`
+                // 在安全代码里不可能别名）。
+                unsafe {
+                    copy_block16_f64(b.as_ptr().add(src), packed.as_mut_ptr().add(dst));
+                }
+            }
         }
+        s0 += g;
     }
+}
+
+/// 拷贝 16 个连续 `f64`（4 条 256 位向量）。
+///
+/// # Safety
+/// `src` 至少可读 16 个 `f64`，`dst` 至少可写 16 个 `f64`，且两者不重叠。
+#[inline]
+unsafe fn copy_block16_f64(src: *const f64, dst: *mut f64) {
+    let v0 = lasx::load_f64x4(src);
+    let v1 = lasx::load_f64x4(src.add(4));
+    let v2 = lasx::load_f64x4(src.add(8));
+    let v3 = lasx::load_f64x4(src.add(12));
+    lasx::store_f64x4(dst, v0);
+    lasx::store_f64x4(dst.add(4), v1);
+    lasx::store_f64x4(dst.add(8), v2);
+    lasx::store_f64x4(dst.add(12), v3);
 }
 
 /// 微内核：4 行 × 16 列 × **kb 个 k 步**，B 从打包缓冲连续读。

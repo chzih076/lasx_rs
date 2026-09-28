@@ -31,6 +31,7 @@ use std::time::Instant;
 use lasx_rs::aligned::AlignedVec;
 use lasx_rs::arch::lasx::{
     load_f32x8, load_f64x4, splat_f32, splat_f64, store_f32x8, store_f64x4, zero_f32x8, zero_f64x4,
+    F32x8,
 };
 
 /// 访存型内核每样品的内层重复次数（把 L1 热的循环体跑到 ~100 ms 量级）。
@@ -380,6 +381,36 @@ unsafe fn probe_kernel(strip: &[f32], at: &[f32], k: usize) -> f64 {
     sink(&acc)
 }
 
+/// `kernel_lr`：与 `kernel` 同形，但 A 广播改用**载入-复制**（`xvldrepl.w`）从内存直接广播。
+///
+/// 动机：`kernel` 停在 2.00 FMA/周期（4 条 `xvreplgr2vr_w` 与 FMA 抢同一个向量端口）。如果
+/// 广播能走**载入端口**，FMA 就有机会回到 4/周期——这正是矩阵乘天花板 70.3 → ~140 GFLOP/s
+/// 的那一步。探针把两种广播放在同一指令配比下对比，先确认"广播走哪个端口"再改内核。
+#[inline(never)]
+unsafe fn probe_kernel_lr(strip: &[f32], at: &[f32], k: usize) -> f64 {
+    let mut acc = [zero_f32x8(); 16];
+    for _ in 0..ITERS {
+        for p in 0..k {
+            let ptr = strip.as_ptr().add(p * 32);
+            let b = [
+                load_f32x8(ptr),
+                load_f32x8(ptr.add(8)),
+                load_f32x8(ptr.add(16)),
+                load_f32x8(ptr.add(24)),
+            ];
+            for r in 0..4 {
+                let a: F32x8 = std::mem::transmute(lasx_xvldrepl_w::<0>(
+                    at.as_ptr().add(r * k + p) as *const i8,
+                ));
+                for i in 0..4 {
+                    acc[r * 4 + i] = lasx_xvfmadd_s(b[i], a, acc[r * 4 + i]);
+                }
+            }
+        }
+    }
+    sink(&acc)
+}
+
 /// `c<行>x<列>`：扫描 (R, C) 形状空间（累加器 = R·C/8，必须 ≤ 16 才放得进寄存器）。
 #[inline(never)]
 unsafe fn probe_rc<const R: usize, const NB: usize>(strip: &[f32], at: &[f32], k: usize) -> f64 {
@@ -443,6 +474,7 @@ fn main() {
                 "fma16" => probe_fma16(),
                 "norepl" => probe_norepl(&strip, k),
                 "kernel" => probe_kernel(&strip, &at, k),
+                "kernel_lr" => probe_kernel_lr(&strip, &at, k),
                 "dfma16" => probe_dfma16(),
                 "dfdiv" | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i"
                 | "dfsqrt_i" | "drecipe_i" | "drsqrte_i" | "dfma_i" => probe_special(&variant),
@@ -462,9 +494,9 @@ fn main() {
     };
 
     let per_iter = match variant.as_str() {
-        "fma16" | "norepl" | "kernel" | "dfma16" | "dkernel" | "dkernel2x32" | "dfdiv"
-        | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i" | "dfsqrt_i"
-        | "drecipe_i" | "drsqrte_i" | "dfma_i" => 16.0,
+        "fma16" | "norepl" | "kernel" | "kernel_lr" | "dfma16" | "dkernel" | "dkernel2x32"
+        | "dfdiv" | "dfsqrt" | "drecipe" | "drcp1" | "drsqrte" | "drsqrt1" | "dfdiv_i"
+        | "dfsqrt_i" | "drecipe_i" | "drsqrte_i" | "dfma_i" => 16.0,
         other => {
             let (rs, cs) = other
                 .trim_start_matches('c')
