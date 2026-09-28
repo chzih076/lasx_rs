@@ -313,8 +313,8 @@ pub(crate) fn matmul_f64_packed_rows(
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*16 + r]`（16 列一条带）。
 ///
 /// 与 f32 侧 [`crate::ops::matmul::pack_b`] 同构：4 条带一组、每条带 16 个 `f64`
-/// （128 B = 4 条 256 位向量）。用向量拷贝而不是 `copy_from_slice`——后者在切片对齐
-/// 未知时只生成标量循环，打包吞吐差约 1.6×（数据见 `docs/dev.md` §8.2.1）。
+/// （128 B = 4 条 256 位向量）。用向量拷贝而不是 `copy_from_slice`——后者落进通用
+/// memcpy（对齐剥离 + 分支），打包吞吐差约 1.6×（数据见 `docs/dev.md` §8.2.1）。
 #[inline]
 pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
     let strips = nc / 16;
