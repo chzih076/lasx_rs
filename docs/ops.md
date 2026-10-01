@@ -946,6 +946,46 @@ lasx_gemv_f16_checked(a_f16, x, y, m, k, &status);
   逐位一致。测试：50 步累积相对误差 <1e-9（dt=10）；另有 FMA vs 分离 mul+add 测试
   （单步 ≤1 ulp、50 步 <1e-9）。多核版本见 `parallel::rk4_j2_step_batch`。
 
+### 6.7 `shape::batch` — 批量算子的形状层视图（N 进类型）
+
+本节的算子都是"分量拆开的数组 + 一个 `n`"，长度只靠约定。形状层把这件事变成**构造时校验一次**：
+`V3Ref`/`V3Buf`（x/y/z 三条）、`RvMut`（rx…vz 六条，原地）、`V2Ref`（x/y 两条，f32）。
+
+```rust
+use lasx_rs::shape::batch::{RvMut, V3Buf, V3Ref};
+use lasx_rs::shape::{VecBuf, VecRef};
+
+const N: usize = 1024;
+let a = V3Ref::<f64, N>::new(&ax, &ay, &az)?;   // 三条不等长 ⇒ Err（点名是哪一条）
+let b = V3Ref::<f64, N>::new(&bx, &by, &bz)?;
+let mut mag = VecBuf::<f64, N>::new();
+a.norm3_into(&mut mag);                          // = lasx_norm3_batch
+let mut o = V3Buf::<f64, N>::new();
+a.cross_into(&b, &mut o);                        // = lasx_cross3_batch
+a.j2_accel_into(mu, j2, re, &mut o);             // = lasx_j2_accel_batch
+a.add_scaled_into(&b, 0.5, &mut o);              // = lasx_vec3_add_scaled_batch
+a.unitize3_into(&mut o);                         // = lasx_unitize3_batch
+
+let mut rv = RvMut::<f64, N>::new(&mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz)?;
+rv.rk4_j2_step(mu, j2, re, dt);                  // = lasx_rk4_j2_step_batch（原地）
+rv.position().at(0);                             // 取第 0 个样本的 (x, y, z)
+
+let k = VecRef::<f32, N>::new(&k_arr)?;
+let mut rv32 = RvMut::<f32, N>::new(&mut rx32, &mut ry32, &mut rz32,
+                                    &mut vx32, &mut vy32, &mut vz32)?;
+rv32.ballistic_step(&k, dt, g);                  // = lasx_ballistic_step（原地）
+```
+
+- **为什么要有这一层**：发布构建里长度不一致原本是 UB——内核用第一条数组的长度当 `n`
+  （`let n = xs.len();`），而 FFI 转发层只有 `debug_assert_eq!`（发布构建编译掉）。
+  三条/六条等长现在是 `new()` 的一次显式校验，**不等长就拿不到视图**，也就调不出内核。
+- **数值**：这一层只做视图与转发，直接调 6.1–6.6 的内核，逐位一致（每个方法都有
+  `to_bits()` 对照测试，覆盖 `N` 不是向量宽整数倍的尾部）。
+- **别名**：输入是 `&V3Ref`（共享借用）、输出是 `&mut V3Buf`（独占），重叠由**借用检查器**拒绝。
+- **不做的**：`quat_*` / `mat3_mul_vec3` / `cross3` 那一族（`docs/dev.md` §19.13 的 G4）
+  在唯一的下游里没有任何调用点，所以不做"定点 3×3/4×4 展开后端"（`cross3`/`unitize3`
+  是 3 分量视图的自然成员，顺手一起提供了）。
+
 
 ## 7. 批量姿态与几何算子（7 个）
 

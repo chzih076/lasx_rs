@@ -128,6 +128,7 @@
 //! 一维视图是**常量长度**的（`VecRef<'_, f32, N>`）：`matmul!` 那套"小写 = 运行期"的
 //! 双档在 v1 的一维形态里还不支持，`dot!` / `gemv!` 会给出明确诊断（而不是静默生成错代码）。
 
+pub mod batch;
 pub mod f16;
 pub mod vec;
 

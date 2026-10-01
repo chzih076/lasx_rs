@@ -245,9 +245,9 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**171 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
-其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，2 个是 §20.7 的池化 `gemv_f16`，
-2 个是 §20.7 池协议修复的回归（含 60 s 看门狗））。
+当前规模：**180 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，9 个是 §19.14 的批量样本视图，
+2 个是 §20.7 的池化 `gemv_f16`，2 个是 §20.7 池协议修复的回归（含 60 s 看门狗））。
 
 | 测试类型 | 目的 | 例子 |
 |---|---|---|
@@ -278,7 +278,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 171 单测（+ 5 个宏单测）
+cargo test --workspace --release        # 180 单测（+ 5 个宏单测 + 17 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -2193,23 +2193,24 @@ LASX 微内核里。
 | 点积 | `dot`、`dot_f64`、`sum` | ❌ | 标量输出的**归约**（`s = sum(x[N])`）；`dot`/`dot_f64` 可直接用 `dot!`（已支持），但 `sum` 缺一个"单操作数归约"句式 |
 | 归约（量化） | `dot_i8`、`dot_q4` | ❌（**G7 已否**） | i8 / Q4 块的 dtype 视图；唯一消费者 loong-llm 不再作为目标 ⇒ 不做（理由见下） |
 | 逐元素 | `axpy`、`silu`、`gelu_quick`、`gelu_erf` | ❌ | 无收缩维的逐元素 + 标量参数（`y[N] = axpy(a, x[N], y[N])`） |
-| 批量物理 | `norm3_batch`、`vec3_add_scaled_batch`、`batch_distance2d`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch` | ❌ | **批量样本维**（`Sample<N>`）+ 多数组同步 + 标量参数 |
-| 姿态/几何 | `cross3`、`unitize3`、`mat3_mul_vec3`、`quat_normalize`、`quat_mul`、`quat_rotate`、`quat_to_dcm` | ❌ | 批量样本维 + **定点小矩阵（3×3/4×4）展开后端**（这些不是 blocked/packed 内核的活） |
+| 批量物理 | `norm3_batch`、`vec3_add_scaled_batch`、`batch_distance2d`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch` | ◐ 形状层视图（`docs/ops.md` §6.7，**不是宏**） | 批量样本维已在 `shape::batch` 落地（`V3Ref`/`RvMut`/`V2Ref`）；宏（`batch!`）有意未做 |
+| 姿态/几何 | `cross3`、`unitize3`、`mat3_mul_vec3`、`quat_normalize`、`quat_mul`、`quat_rotate`、`quat_to_dcm` | ◐ 前两个有视图，其余**不做**（G4 已否） | `cross3`/`unitize3` 是 `V3Ref` 的自然成员；`quat_*`/`mat3_mul_vec3` 需要"定点小矩阵后端"，而没有消费者（见 G4） |
 | NN 行算子 | `softmax_rows`、`rms_norm` | ❌ | **行内归约 + 广播**（`w[C]` 广播到 `x[R,C]`）+ 参数（scale/mask/eps） |
 | NN 表算子 | `rope` | ❌ | 表输入 + 模式参数（NeoX/GptJ） |
 | 内存工具 | `lasx_alloc` / `AlignedVec` | — | 设施，**不该**进 DSL（`Prepared`/`VecBuf` 已在用） |
 
 统计：**30 → 4 个 ✅**（`matmul`/`matmul_f64`/`gemv_f16`/`dot_f16`），加 f32/f64 `dot` 也走
-`dot!` 之后是 6；其余 24 个仍无声明式写法（其中 `lasx_alloc` 不该有）。
+`dot!` 之后是 6；再有 8 个批量算子由**形状层视图**（不是宏）覆盖；其余仍无声明式写法
+（其中 `lasx_alloc` 不该有）。
 
 **缺的是 8 个语法/类型原语，不是 24 个宏**：
 
 | # | 原语 | 一次解锁 | 现成消费者 |
 |---|---|---|---|
-| G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（本轮的 `dot!`/`gemv!`） |
+| G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（`dot!`/`gemv!`） |
 | G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | 库内算子（**无外部消费者**） |
-| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | **loong-sci**（`space.rs`/`guidance.rs` 共 15 处调用点） |
-| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | **loong-sci** 的 3×3 求逆、惯量、6×6 协方差 |
+| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | ✅ **已落地**（`shape::batch`，`docs/ops.md` §6.7）：真实消费者只有 loong-sci 的 **5 个算子、14 处调用点**（`rk4_j2_step_batch`×1、`j2_accel_batch`×2、`vec3_add_scaled_batch`×4、`batch_distance2d`×5、`ballistic_step`×2）；宏未做 |
+| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | **否掉**：原以为消费者是"loong-sci 的 3×3 求逆、惯量、6×6 协方差"，实测这些算子（批量的与非批量的）在 loong-sci 里**一次都没被调用**（`lasx_mat3_mul_vec3*`/`lasx_quat_*`/`lasx_cross3*`/`lasx_unitize3*` 各 0 处） |
 | G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | 库内算子（**无外部消费者**） |
 | G6 | 表 / 模式参数 | `rope` | 库内算子（**无外部消费者**） |
 | G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | **否掉**（唯一消费者 loong-llm 不再作为目标，见下） |
@@ -2221,11 +2222,16 @@ loong-llm 不再作为下游目标后，G7 就是"为不存在的调用点加 dt
 所以**不是技术上做不到，而是没有消费者**——留着这条记录，避免以后有人按旧的优先级把它捡起来。
 `dot_i8`/`dot_q4` 本身仍在库里、有实测（§7），只是不进 DSL。
 
-**优先级**（按"有真实消费者 + 已有功课"排）：**G3/G4**（loong-sci 是唯一有真实调用点的下游，
-15 处批量物理 + 姿态/几何；收益主要是类型/布局检查与批量样本维表达，不是速度——3×3 的活不该
-走 blocked 内核）→ **G2**（最小语法、无并行/计划问题，即使没有外部消费者，也是库内 4 个算子的
-声明式写法）→ **G5**（NN 侧 4 个算子）→ G6（表/模式参数，`GptJ` 在 shuffle 受限时还有标量回退，
-语法要能表达两条后端）。G7 已否、G8 有意延后。
+**G4 否掉的理由**（与 G7 同型，但这次是**核查后发现消费者不存在**）：原表格写的是
+"loong-sci 的 3×3 求逆、惯量、6×6 协方差"，实测 `cross3_batch`/`unitize3_batch`/
+`mat3_mul_vec3_batch`/`quat_*_batch` 以及对应的非批量 `lasx_*` 入口在 loong-sci 里**全是 0 处调用**
+（那次推测没有落到代码上）。没有调用点就没有验收对象，做"定点小矩阵展开后端"等于自己造需求。
+**触发条件**：出现真实的批量姿态/3×3 需求（loong-sci 的 `attitude` 侧批量调用，或别的下游）时重开。
+
+**优先级**（按"有真实消费者 + 已有功课"排）：**G2**（最小语法、无并行/计划问题，即使没有外部
+消费者，也是库内 4 个算子的声明式写法）→ **G5**（NN 侧 4 个算子）→ G6（表/模式参数，`GptJ` 在
+shuffle 受限时还有标量回退，语法要能表达两条后端）。G3 的形状层视图已落地（宏待定，见下）、
+G4 与 G7 已否、G8 有意延后。
 
 **生成代码的形态**（本轮定下的两条约定）：
 
@@ -2257,6 +2263,41 @@ error: `dot!` 只认受支持的 dtype 组合
 生成形态由 `src/shape/vec.rs` 的 doc test 与 `examples/formula_vec.rs` 覆盖。
 代码分布：`src/shape/vec.rs`（通用向量 + `DotPair`）、`src/shape/f16.rs`（f16 视图 + gemv）、
 `macros/src/vec.rs`（新宏的解析/规则/生成），`macros/src/lib.rs` 只留入口与共享件。
+
+### 19.14 批量样本视图 `shape::batch`：修掉一个发布构建的 UB（2026-09-28）
+
+**这一轮做的是 G3 的**类型层**，不是宏。** 起因是核查 G3/G4 的消费者时发现的两件事：
+
+1. **发布构建里长度不一致是 UB**：批量内核用第一条数组的长度当 `n`
+   （`norm3_batch_lasx` 里 `let n = xs.len();` 之后按 `n` 读 `ys`/`zs`/`out` 的裸指针），
+   而转发层只有 `debug_assert_eq!`（发布构建编译掉）。`lasx_norm3_batch` 这类
+   **safe 的 `pub extern "C" fn` 内部却对调用方的裸指针做 `from_raw_parts`**，
+   所以从 Rust 侧安全调用、传错误长度就是 UB。
+2. **G4 的消费者不存在**（见 §19.13）：姿态/几何那 7 个批量算子（及它们的非批量入口）
+   在 loong-sci 里 0 处调用，"3×3 求逆/惯量"是当初的推测。所以 G4 否掉，
+   **不做**"定点小矩阵展开后端"。
+
+**落地的东西**（`src/shape/batch/{mod,v3,rv,dist2d}.rs`，每个文件一类视图）：
+
+| 视图 | 分量 | 覆盖的算子 |
+|---|---|---|
+| `V3Ref` / `V3Buf` | x、y、z | `norm3`、`unitize3`、`cross3`、`vec3_add_scaled`、`j2_accel` |
+| `RvMut`（`f64`） | rx…vz（6 条） | `rk4_j2_step`（原地） |
+| `RvMut`（`f32`） | rx…vz（6 条）+ `k` | `ballistic_step`（原地） |
+| `V2Ref`（`f32`） | x、y | `batch_distance2d` |
+
+`new()` 把"所有分量等长、长度是 `N`"校验一次，**不等长就拿不到视图**（`Error::Shape` 里
+`what` 点名是哪一条分量）；之后方法是 `*_into`，直接调 `docs/ops.md` §6 的同一批内核，所以位精确零成本成立
+（每个方法都有 `to_bits()` 对照测试，含 `N` 不是向量宽整数倍的尾部与 `N∈{0,1}`）。
+输入 `&V3Ref` / 输出 `&mut V3Buf` 让**借用检查器**守"输入输出不重叠"。
+
+**为什么不做 `batch!` 宏**（Stage 2 有意押后）：类型层的方法调用已经能表达这 14 处调用点，
+宏只买"公式像数学"和统一诊断，却要多养一个解析器/规则层/代码生成路径。等 loong-sci 的迁移
+落地、看过真实调用代码的可读性之后再决定——这也是 §19.13 那条"缺的是原语，不是 24 个宏"的
+同一条判断。
+
+**没做的（明确记为否）**：分量写进公式的定点轴（`o[X,N] = a[X,N] × b[X,N]`）需要"定点轴 +
+展开后端"，而内核已经手写好了；通用 map 后端重写内核会掉速（收益不是速度）。
 
 ## 20. NN 侧 N1 批次：算子契约与依据
 
