@@ -990,6 +990,20 @@ rv32.ballistic_step(&k, dt, g);                  // = lasx_ballistic_step（原�
 - **不做的**：`quat_*` / `mat3_mul_vec3` / `cross3` 那一族（`docs/dev.md` §19.13 的 G4）
   在唯一的下游里没有任何调用点，所以不做"定点 3×3/4×4 展开后端"（`cross3`/`unitize3`
   是 3 分量视图的自然成员，顺手一起提供了）。
+- **下游怎么用（推荐）**：自己的 SOA 缓冲类型上加一层访问器，把"三条字段 → 视图"收敛一次，
+  调用点就只剩算子本身。例如 loong-sci 的 `Buf3`：
+
+  ```rust
+  // 自己的类型里（一次性）
+  impl Buf3 {
+      fn as_v3(&self) -> V3Dyn<'_, f64> { /* v3_of(&self.x, &self.y, &self.z) */ }
+      fn as_v3_mut(&mut self) -> V3DynMut<'_, f64> { /* … */ }
+  }
+  // 调用点（每个算子一行）
+  a.as_v3().add_scaled_into(&b.as_v3(), s, &mut o.as_v3_mut())?;
+  ```
+
+  这样不必给每个算子写宏（`docs/dev.md` §19.14 记了否掉 `batch!` 的实测理由）。
 
 
 ## 7. 批量姿态与几何算子（7 个）
