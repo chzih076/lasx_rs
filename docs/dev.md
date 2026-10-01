@@ -2191,7 +2191,7 @@ LASX 微内核里。
 | 矩阵-向量 | `gemv_f16` | ✅ `gemv!`（f16 权重） | — |
 | 点积 | `dot_f16` | ✅ `dot!` | — |
 | 点积 | `dot`、`dot_f64`、`sum` | ❌ | 标量输出的**归约**（`s = sum(x[N])`）；`dot`/`dot_f64` 可直接用 `dot!`（已支持），但 `sum` 缺一个"单操作数归约"句式 |
-| 归约（量化） | `dot_i8`、`dot_q4` | ❌ | i8 / Q4 块的 dtype 视图（G7；也是 N2 批次的前置） |
+| 归约（量化） | `dot_i8`、`dot_q4` | ❌（**G7 已否**） | i8 / Q4 块的 dtype 视图；唯一消费者 loong-llm 不再作为目标 ⇒ 不做（理由见下） |
 | 逐元素 | `axpy`、`silu`、`gelu_quick`、`gelu_erf` | ❌ | 无收缩维的逐元素 + 标量参数（`y[N] = axpy(a, x[N], y[N])`） |
 | 批量物理 | `norm3_batch`、`vec3_add_scaled_batch`、`batch_distance2d`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch` | ❌ | **批量样本维**（`Sample<N>`）+ 多数组同步 + 标量参数 |
 | 姿态/几何 | `cross3`、`unitize3`、`mat3_mul_vec3`、`quat_normalize`、`quat_mul`、`quat_rotate`、`quat_to_dcm` | ❌ | 批量样本维 + **定点小矩阵（3×3/4×4）展开后端**（这些不是 blocked/packed 内核的活） |
@@ -2207,17 +2207,25 @@ LASX 微内核里。
 | # | 原语 | 一次解锁 | 现成消费者 |
 |---|---|---|---|
 | G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（本轮的 `dot!`/`gemv!`） |
-| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | loong-llm 的激活路径 |
-| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | loong-sci（`space.rs`/`guidance.rs` 共 15 处调用点） |
-| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | loong-sci 的 3×3 求逆、惯量、6×6 协方差 |
-| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | loong-llm 自己的 `ops.rs` |
-| G6 | 表 / 模式参数 | `rope` | loong-llm `ops.rs` |
-| G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | loong-llm 的 8 处 `q8_matmul`（= `docs/ops.md` §12.3 的 N2 清单） |
+| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | 库内算子（**无外部消费者**） |
+| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | **loong-sci**（`space.rs`/`guidance.rs` 共 15 处调用点） |
+| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | **loong-sci** 的 3×3 求逆、惯量、6×6 协方差 |
+| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | 库内算子（**无外部消费者**） |
+| G6 | 表 / 模式参数 | `rope` | 库内算子（**无外部消费者**） |
+| G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | **否掉**（唯一消费者 loong-llm 不再作为目标，见下） |
 | G8 | 多操作数 / `alpha` / 转置 | attention 类多步表达式 | —（v1 有意延后，诊断里点名） |
 
-**优先级**（按"有真实消费者 + 已有功课"排）：**G7+G1** 是 loong-llm 的落点（G1 本轮已完成，
-G7 需要 N2 的 Q8_0 内核）→ **G2**（最小语法、无并行/计划问题）→ **G5**（NN 侧 4 个算子）→
-**G3/G4**（loong-sci；收益主要是类型/布局检查，不是速度——3×3 的活不该走 blocked 内核）。
+**G7 否掉的理由**：这一项的动机**只有**"给 loong-llm 的 8 处 `q8_matmul` 提供块量化视图"；
+loong-llm 不再作为下游目标后，G7 就是"为不存在的调用点加 dtype 层 + 写 N2 的 Q8_0 内核"，
+而 `docs/ops.md` §12.3 早已写明 N2 只在"要跟 llama.cpp/GGUF 生态互通"时才值得做。
+所以**不是技术上做不到，而是没有消费者**——留着这条记录，避免以后有人按旧的优先级把它捡起来。
+`dot_i8`/`dot_q4` 本身仍在库里、有实测（§7），只是不进 DSL。
+
+**优先级**（按"有真实消费者 + 已有功课"排）：**G3/G4**（loong-sci 是唯一有真实调用点的下游，
+15 处批量物理 + 姿态/几何；收益主要是类型/布局检查与批量样本维表达，不是速度——3×3 的活不该
+走 blocked 内核）→ **G2**（最小语法、无并行/计划问题，即使没有外部消费者，也是库内 4 个算子的
+声明式写法）→ **G5**（NN 侧 4 个算子）→ G6（表/模式参数，`GptJ` 在 shuffle 受限时还有标量回退，
+语法要能表达两条后端）。G7 已否、G8 有意延后。
 
 **生成代码的形态**（本轮定下的两条约定）：
 

@@ -65,8 +65,8 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 |---|---|
 | FMA 吞吐上限（16 条独立链，纯寄存器） | **140.2 GFLOP/s**（3.98 条/周期）；LSX 69.3（2.00×） |
 | 微内核上限（含 A 标量广播） | **2.00 FMA/周期**（f32 70.3、f64 35.2 GFLOP/s） |
-| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s（同日 §8.5） |
-| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s（同日 §8.5） |
+| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s（同日见 `docs/dev.md` §8.5） |
+| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s（同日见 `docs/dev.md` §8.5） |
 | `lasx_matmul`（`parallel`，12 线程） | 128³ / 512³ 加速 5.06× / 5.34×（323.8 / 302.1 GFLOP/s） |
 | 单流只读 / 双流只读 / 12 线程只读（32 MiB） | 12.0 / 10.4 / 22.0 GB/s |
 | `lasx_softmax_rows` / `lasx_rms_norm` | 5.22–7.00 / 12.01–18.38 GB/s |
