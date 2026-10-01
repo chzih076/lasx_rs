@@ -976,6 +976,11 @@ let mut rv32 = RvMut::<f32, N>::new(&mut rx32, &mut ry32, &mut rz32,
 rv32.ballistic_step(&k, dt, g);                  // = lasx_ballistic_step（原地）
 ```
 
+- **两组视图（按"长度在哪"分）**：`V3Ref`/`V3Buf`/`RvMut`/`V2Ref` 的长度在**类型里**（const `N`，
+  适合形状编译期已知）；`V3Dyn`/`V3DynMut`/`RvDynMut`/`V2Dyn` 的长度是**运行期字段**
+  （适合批量大小是运行时参数——下游库里的常态）。分工同 `shape::Mat` 与 `shape::MatDyn`。
+  `*Dyn` 的构造以第一条分量为基准校验其余等长，输出数组在调用点再校验一次
+  （`norm3_into`/`cross_into`/`distance2d_into` 等返回 `Result`）。
 - **为什么要有这一层**：发布构建里长度不一致原本是 UB——内核用第一条数组的长度当 `n`
   （`let n = xs.len();`），而 FFI 转发层只有 `debug_assert_eq!`（发布构建编译掉）。
   三条/六条等长现在是 `new()` 的一次显式校验，**不等长就拿不到视图**，也就调不出内核。

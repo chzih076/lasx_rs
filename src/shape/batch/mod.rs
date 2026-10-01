@@ -4,11 +4,14 @@
 //! **分量拆开的数组**（x/y/z 或位置/速度各一条 `[f64]`），长度只通过一个 `n` 参数约定。
 //! 这一层把"所有分量等长、且长度是 `N`"搬进类型：**构造时校验一次**，之后内核不需要再查。
 //!
-//! | 视图 | 分量 | 典型算子 |
-//! |---|---|---|
-//! | [`V3Ref`] / [`V3Buf`] | x、y、z（3 条） | `norm3`、`unitize3`、`cross3`、`vec3_add_scaled`、`j2_accel` |
-//! | [`RvMut`] | rx…vz（位置+速度，6 条） | `rk4_j2_step`、`ballistic_step` |
-//! | [`V2Ref`] | x、y（2 条，f32） | `batch_distance2d` |
+//! | 视图 | 分量 | 长度在哪 | 典型算子 |
+//! |---|---|---|---|
+//! | [`V3Ref`] / [`V3Buf`] | x、y、z（3 条） | 类型里（const `N`） | `norm3`、`unitize3`、`cross3`、`vec3_add_scaled`、`j2_accel` |
+//! | [`RvMut`] | rx…vz（位置+速度，6 条） | 类型里 | `rk4_j2_step`、`ballistic_step` |
+//! | [`V2Ref`] | x、y（2 条，f32） | 类型里 | `batch_distance2d` |
+//! | [`V3Dyn`] / [`V3DynMut`] / [`RvDynMut`] / [`V2Dyn`] | 同上 | **运行时字段** | 同上（批量大小运行期才知道时用这一组） |//!
+//! 两组的分工同 [`crate::shape::Mat`] 与 [`crate::shape::MatDyn`]：形状编译期已知就用
+//! const 泛型那组（错误能编译期报），批量大小是运行时参数就用 `*Dyn` 那组（构造时校验一次）。
 //!
 //! # 为什么要有这一层
 //!
@@ -43,9 +46,11 @@
 //! ```
 
 pub mod dist2d;
+pub mod dynamic;
 pub mod rv;
 pub mod v3;
 
 pub use dist2d::V2Ref;
+pub use dynamic::{RvDynMut, V2Dyn, V3Dyn, V3DynMut};
 pub use rv::RvMut;
 pub use v3::{V3Buf, V3Ref};
