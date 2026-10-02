@@ -461,9 +461,9 @@ pub const GEMV_I8_K_BLOCK: usize = 1024;
 
 /// 多核 **k 方向切分**的 int8 GEMV：`y[o] = (Σ_i w[o,i]·x[i]) · (scale_w[o]·scale_x)`。
 ///
-/// # 为什么要它（与 [`gemv_i8`] 的分工）
+/// # 为什么要它（与 [`crate::api::gemv_i8`] 的分工）
 ///
-/// [`gemv_i8`] 按 **`m` 行**切分，行少（尤其 `m = 1`）就没有并行度；而 int8 唯一占优的档位
+/// [`crate::api::gemv_i8`] 按 **`m` 行**切分，行少（尤其 `m = 1`）就没有并行度；而 int8 唯一占优的档位
 /// 正是"单 token、权重流 DRAM"（`docs/ops.md` §5.15）——那一档 `m = 1`。本函数在 **`k` 方向**
 /// 切块，把"块"当"行"交给池派活，所以单 token 也能用上多核。**不需要给池加新派活原语**：
 /// `for_each_row_block_mut*` 对"块 = 行"一样成立（这也是 `docs/dev.md` §21.5 里那句
@@ -479,10 +479,10 @@ pub const GEMV_I8_K_BLOCK: usize = 1024;
 /// # 块粒度
 /// 每块至少 [`GEMV_I8_K_BLOCK`] 个元素，块数取 `4×线程数` 量级（与 `pick_rows` 同一判据）：
 /// 既有并行度，又不让每块的固定开销占比过大。单线程或切不动（`k` 很小）时**直接走
-/// [`gemv_i8`] 的内核**，连折叠都省掉。
+/// [`crate::api::gemv_i8`] 的内核**，连折叠都省掉。
 ///
 /// # Errors
-/// 与 [`gemv_i8`] 同一套（`w.len() != m×k` / `x.len() != k` / `scale_w.len() != m` /
+/// 与 [`crate::api::gemv_i8`] 同一套（`w.len() != m×k` / `x.len() != k` / `scale_w.len() != m` /
 /// `y.len() != m` → [`Error::Shape`]；`m×k` 溢出 → [`Error::Overflow`]）。
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_i8_k(
