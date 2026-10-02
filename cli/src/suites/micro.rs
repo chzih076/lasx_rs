@@ -404,13 +404,22 @@ pub fn pool_scaling() {
     println!("\n| 形状 (m×k×n) | 线程 | 时间 | 扩展 | 效率 |");
     println!("|---|---|---|---|---|");
     let tokens = 192usize;
+    // 线程数可用 `LASX_BENCH_THREADS=8`（或 `6,8`）覆盖：perf profile 要把样本集中在
+    // **一个**线程数上，扫 1..24 会把符号占比稀释掉（`docs/dev.md` §7.9 的归因步骤）。
+    let threads: Vec<usize> = match std::env::var("LASX_BENCH_THREADS") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|x| x.trim().parse::<usize>().ok())
+            .collect(),
+        Err(_) => vec![1, 2, 3, 4, 6, 8, 10, 12, 16, 24],
+    };
     for &(k, n) in &[(768usize, 3072usize), (3072, 768)] {
         let mut rng = crate::data::Lcg::new((k * 17 + n) as u64);
         let a: Vec<f32> = (0..tokens * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
         let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
         let mut c = vec![0f32; tokens * n];
         let mut base = Duration::ZERO;
-        for &th in &[1usize, 2, 3, 4, 6, 8, 10, 12, 16, 24] {
+        for &th in &threads {
             let pool = WorkerPool::new(th);
             let mut a = a.clone();
             let d = timeit(|| {
