@@ -17,6 +17,10 @@ pub enum Group {
     DotQ4,
     /// f16 权重的点积与矩阵-向量（NN 侧 N1）。
     F16Gemv,
+    /// int8 权重 × int8 激活的矩阵-向量（NN 侧 N3）。
+    Int8Gemv,
+    /// int8 量化生产端：逐张量 / 逐行（per-token、per-channel）（NN 侧 N3）。
+    Int8Quant,
     /// 矩阵乘（f32 + f64）。
     Matmul,
     /// 矩阵乘计划复用（`B` 固定时打包一次）。
@@ -65,6 +69,8 @@ impl Group {
         Group::DotI8,
         Group::DotQ4,
         Group::F16Gemv,
+        Group::Int8Gemv,
+        Group::Int8Quant,
         Group::Matmul,
         Group::Plan,
         Group::Softmax,
@@ -96,6 +102,8 @@ impl Group {
             Group::DotI8 => "dot_i8",
             Group::DotQ4 => "dot_q4",
             Group::F16Gemv => "f16",
+            Group::Int8Gemv => "int8_gemv",
+            Group::Int8Quant => "int8_quant",
             Group::Matmul => "matmul",
             Group::Plan => "plan",
             Group::Softmax => "softmax",
