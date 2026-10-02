@@ -9,13 +9,14 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 |---|---|
 | 归约与稠密线性代数 | `dot`、`sum`、`axpy`、`matmul`（f32 / f64） |
 | 量化点积 | int8、GGUF 风格 Q4 |
+| int8 推理（N3 批次） | 量化/反量化生产端（`amax`、per-tensor/per-row `quantize_i8`、`dequantize_i8`）+ `gemv_i8`/`matmul_i8`。**实测见下**：批量形态下 f32 GEMM 反而更快，判据在 [docs/ops.md](docs/ops.md) §5.15 |
 | 批量物理与姿态/几何 | J2 引力加速度、RK4 步、弹道、3 分量模长、四元数旋转/DCM 等 |
 | NN 侧算子（N1 批次） | 行内 softmax、RMSNorm、SiLU、GELU（sigmoid 近似 / erf 形式）、RoPE、f16 权重 GEMV |
 
 ## 特点
 
 - **零第三方依赖**：仅 `core::arch::loongarch64` 的 LASX/LSX intrinsic 与 std。
-- **59 个导出符号**（30 个裸版本 + 29 个带 `int *status` 的 `_checked` 版本）。
+- **75 个导出符号**（38 个裸版本 + 37 个带 `int *status` 的 `_checked` 版本）。
   最初的 15 个 `lasx_*` 符号签名与语义**永不改动**，新增能力一律追加；
   另有 `*_checked` 变体提供结构化错误码，两者走同一条内核实现。
 - **位精确**：同一算子的 LASX / LSX / 标量尾 / 打包 / k 分块 / 并行切块等全部路径，对同一输入
@@ -87,6 +88,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 |---|---|
 | 归约/稠密 | `lasx_dot`（f32，带 LSX 降级）、`lasx_sum`、`lasx_axpy`、`lasx_dot_f64`、`lasx_matmul`、`lasx_matmul_f64` |
 | 量化 | `lasx_dot_i8`（int8）、`lasx_dot_q4`（每 32 字节一组 scale） |
+| int8 推理 N3（8 个） | `lasx_amax`、`lasx_absmax_rows`、`lasx_quantize_i8_per_tensor`、`lasx_quantize_i8_per_row`、`lasx_dequantize_i8`、`lasx_dequantize_i8_rows`、`lasx_gemv_i8`、`lasx_matmul_i8` |
 | 批量几何 | `lasx_batch_distance2d`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch` |
 | 批量物理 | `lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch`、`lasx_ballistic_step` |
 | 批量姿态（7 个） | `lasx_cross3_batch`、`lasx_unitize3_batch`、`lasx_mat3_mul_vec3_batch`、`lasx_quat_normalize_batch`、`lasx_quat_mul_batch`、`lasx_quat_rotate_batch`、`lasx_quat_to_dcm_batch` |
@@ -101,7 +103,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **算子与用法**：59 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照 |
+| [docs/ops.md](docs/ops.md) | **算子与用法**：75 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据（§5.15） |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据（§7）**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 
 两份文档的分工是硬约定：**契约与用法在 `docs/ops.md`，性能数据在 `docs/dev.md` §7，

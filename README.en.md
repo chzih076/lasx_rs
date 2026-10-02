@@ -10,13 +10,14 @@ Four workload classes are covered:
 |---|---|
 | Reductions and dense linear algebra | `dot`, `sum`, `axpy`, `matmul` (f32 / f64) |
 | Quantized dot products | int8, GGUF-style Q4 |
+| int8 inference (N3 batch) | quantization/dequantization producers (`amax`, per-tensor/per-row `quantize_i8`, `dequantize_i8`) plus `gemv_i8`/`matmul_i8`. **Measured**: for batched shapes f32 GEMM is actually faster — decision rule in [docs/ops.md](docs/ops.md) §5.15 |
 | Batch physics and attitude/geometry | J2 gravity acceleration, RK4 step, ballistic step, 3-component norm, quaternion rotation/DCM, … |
 | NN operators (N1 batch) | row-wise softmax, RMSNorm, SiLU, GELU (sigmoid approximation and erf form), RoPE, f16-weight GEMV |
 
 ## Features
 
 - **Zero third-party dependencies** — only `core::arch::loongarch64` LASX/LSX intrinsics and std.
-- **59 exported symbols** (30 plain + 29 `_checked` variants taking a trailing `int *status`).
+- **75 exported symbols** (38 plain + 37 `_checked` variants taking a trailing `int *status`).
   The signatures and semantics of the original 15 `lasx_*` symbols are **frozen**; new capability
   is only ever appended. Both symbol families are backed by the same kernel implementations.
 - **Bitwise determinism** — for a given input, every path of an operator (LASX / LSX / scalar tail
@@ -100,6 +101,7 @@ per-shape root-cause analysis, are in `docs/dev.md` §8.5.
 |---|---|
 | Reduction / dense | `lasx_dot` (f32, with LSX fallback), `lasx_sum`, `lasx_axpy`, `lasx_dot_f64`, `lasx_matmul`, `lasx_matmul_f64` |
 | Quantized | `lasx_dot_i8` (int8), `lasx_dot_q4` (one scale per 32 bytes) |
+| int8 inference, N3 (8) | `lasx_amax`, `lasx_absmax_rows`, `lasx_quantize_i8_per_tensor`, `lasx_quantize_i8_per_row`, `lasx_dequantize_i8`, `lasx_dequantize_i8_rows`, `lasx_gemv_i8`, `lasx_matmul_i8` |
 | Batch geometry | `lasx_batch_distance2d`, `lasx_norm3_batch`, `lasx_vec3_add_scaled_batch` |
 | Batch physics | `lasx_j2_accel_batch`, `lasx_rk4_j2_step_batch`, `lasx_ballistic_step` |
 | Batch attitude (7) | `lasx_cross3_batch`, `lasx_unitize3_batch`, `lasx_mat3_mul_vec3_batch`, `lasx_quat_normalize_batch`, `lasx_quat_mul_batch`, `lasx_quat_rotate_batch`, `lasx_quat_to_dcm_batch` |
@@ -115,7 +117,7 @@ operator are in `docs/ops.md` (§4 symbol table, §2.x contracts, §5.x usage). 
 
 | Document | Contents |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 59-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison |
+| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 75-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule (§5.15) |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data (§7)**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 
 The division of labour between the two documents is a hard rule: **contracts and usage live in
