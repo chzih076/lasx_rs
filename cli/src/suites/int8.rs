@@ -18,8 +18,8 @@ use crate::report::{row3, Row};
 use crate::scalar_ref::scalar_dot_i8;
 use crate::timing::{time_mode, timeit, Mode};
 use lasx_rs::ffi::quant::{
-    lasx_absmax_rows, lasx_amax, lasx_gemv_i8, lasx_matmul_i8, lasx_quantize_i8_per_row,
-    lasx_quantize_i8_per_tensor,
+    lasx_absmax_rows, lasx_amax, lasx_dequantize_i8_rows, lasx_gemv_i8, lasx_matmul_i8,
+    lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,
 };
 use lasx_rs::lasx_matmul;
 use std::hint::black_box;
@@ -225,6 +225,98 @@ pub fn int8_matmul(rows: &mut Vec<Row>) {
             None,
             lasx_f32,
             rows,
+        );
+    }
+}
+
+/// int8 **保活胶水**的实测：反量化 → f32 归一化/softmax → 再量化，值不值一个"整数版"。
+///
+/// 动机（`docs/dev.md` §21.5 的两行"整数 softmax / int8 归一化"）：如果量化模型必须保留
+/// 注意力与归一化，有两条路——(a) 用现有算子拼**组合路径**（dequantize → `rms_norm` /
+/// `softmax_rows` → quantize），(b) 专门写整数/定点版。这张表量 (a) 的代价，
+/// 与同一层的 int8 GEMM（§7.9）比：**只有它占比可观，(b) 才值得做**。
+pub fn int8_keepalive(rows: &mut Vec<Row>) {
+    let tokens = 192usize;
+    for &hidden in &[768usize, 3072] {
+        let mut rng = Lcg::new((hidden * 13) as u64);
+        let xf = AlignedBuf::fill_with(tokens * hidden, |_| 4.0 * rng.f32() - 2.0);
+        let w = AlignedBuf::fill_with(hidden, |_| 0.9 + 0.2 * rng.f32());
+        let (q, scales) = lasx_rs::api::quantize_i8_per_token(&xf, tokens, hidden).unwrap();
+        let n = tokens * hidden;
+        let mut back = AlignedBuf::new(n);
+        let mut requant = AlignedBuf::fill_with(n, |_| 0i8);
+        let mut rscales = AlignedBuf::fill_with(tokens, |_| 0f32);
+        let tag = format!("{tokens}×{hidden}");
+
+        // (a1) 反量化（逐行，用 per-token scale）
+        let d_deq = timeit(|| {
+            lasx_dequantize_i8_rows(
+                q.as_ptr(),
+                scales.as_ptr(),
+                back.as_mut_ptr(),
+                tokens as i32,
+                hidden as i32,
+            );
+            let _ = black_box(back[0]);
+        });
+        // (a2) f32 RMSNorm（带权重）
+        let d_norm = timeit(|| {
+            lasx_rs::api::rms_norm(&back, Some(&w), tokens, hidden, 1e-5)
+                .unwrap()
+                .as_slice()
+                .iter()
+                .for_each(|&v| {
+                    black_box(v);
+                });
+        });
+        // (a3) 再量化（逐 token）
+        let d_requant = timeit(|| {
+            lasx_quantize_i8_per_row(
+                back.as_ptr(),
+                requant.as_mut_ptr(),
+                rscales.as_mut_ptr(),
+                tokens as i32,
+                hidden as i32,
+            );
+            let _ = black_box(requant[0]);
+        });
+        // 合计：一次"保活"往返（读 f32 + 写 int8 + 写 scale 的字节口径）
+        let total = d_deq + d_norm + d_requant;
+        let bytes = (2 * n * 4 + 2 * n + 2 * tokens * 4) as f64;
+        row3(
+            "int8 保活：反量化+RMSNorm+再量化",
+            tag.clone(),
+            bytes,
+            "B/s",
+            total,
+            None,
+            total,
+            rows,
+        );
+        println!(
+            "  ↳ {tag}: 反量化 {} + RMSNorm {} + 再量化 {} = {}",
+            crate::timing::fmt_t(d_deq),
+            crate::timing::fmt_t(d_norm),
+            crate::timing::fmt_t(d_requant),
+            crate::timing::fmt_t(total)
+        );
+
+        // 注意力 softmax：行数 = token 数、列数 = 序列长（即 [tokens, tokens]）
+        let att = AlignedBuf::fill_with(tokens * tokens, |_| 0.5 * rng.f32() - 0.25);
+        let d_soft = timeit(|| {
+            lasx_rs::api::softmax_rows(&att, None, tokens, tokens, 1.0)
+                .unwrap()
+                .as_slice()
+                .iter()
+                .for_each(|&v| {
+                    black_box(v);
+                });
+        });
+        println!(
+            "  ↳ 注意力 softmax {}×{} = {}",
+            tokens,
+            tokens,
+            crate::timing::fmt_t(d_soft)
         );
     }
 }

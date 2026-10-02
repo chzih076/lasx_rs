@@ -993,9 +993,9 @@ lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
   **不夹取**、出口**两个 scale 先乘成一个**；
 - **精度**：量化误差 ≤ `scale/2`；`dequantize` 的结果是 `scale` 的精确整数倍；GEMV 的整数
   累加**精确**（不引入额外舍入），出口只多一次乘法；
-- **未做**：整数/定点 softmax、int8 归一化（都没有调用点，理由见 §12.3 的两行）——
-  `docs/dev.md` §21.5 有同样的记录；**多核**用 `parallel::gemv_i8_k`（k 方向切分，
-  `m = 1` 也能用，12 线程实测 5.4–6.9×，见 §5.15 与 `docs/dev.md` §7.9）；
+- **未做**：整数/定点 softmax、int8 归一化——**已按实测否掉**（组合路径占该层 int8 GEMM
+  的 ~2%，见 `docs/dev.md` §7.9 末表）：要保活就 `dequantize_i8_rows` → `api::rms_norm`/`
+  softmax_rows` → `quantize_i8_per_token` 拼，别写定点版；
 - **实测**（2026-10-02）：`gemv_i8` 在 118M 模型的真实层形状上是 **10.7–12.4 GB/s（权重字节）**
   ——贴着单流只读锚点 12.0 GB/s，**已是带宽饱和**；同形状 f32 `lasx_matmul`(n=1) 只有
   2.94–2.97 GB/s，比值 **14.6–16.8×**（其中 4× 来自 int8 的 1 B/权重，其余来自 f32 对照的
@@ -1748,8 +1748,8 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 | `lasx_quantize_i8_per_row`（= per-token / per-channel） | 逐行各自求 scale：激活 `[token, hidden]` 是 per-token，权重 `[out, in]` 是 per-output-channel——**同一个内核**，`api` 层按意图分成 `quantize_i8_per_token` / `quantize_i8_per_channel` 两个名字 | **已落地**（§2.12；依据：per-tensor 使成对准确率 96.1% → 93.4%，per-token/per-channel 无损，`docs/dev.md` §21.3） |
 | `lasx_dequantize_i8` / `lasx_dequantize_i8_rows` | int8 + scale → f32（逐张量 / 逐行） | **已落地**（§2.12） |
 | `lasx_gemv_i8` | 权重 int8 × 激活 int8 → i32 精确累加；出口 `(acc as f32)·(sw[o]·sx)`——**两个 scale 先乘成一个**（权重 per-channel × 激活 per-token） | **已落地**（§2.13 契约、§5.14 用法） |
-| 整数 / 定点 softmax | 多项式或查表近似 `exp` | **未做**（仅当保留注意力路径才需要；现有 `lasx_softmax_rows` 是 f32 进 f32 出） |
-| int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | **未做**（低优先：参数量小、可不量化；亦可改用 ReLU，int8 精确可表示） |
+| 整数 / 定点 softmax | 多项式或查表近似 `exp` | **不做（实测）**：组合路径（反量化 → `softmax_rows` → 再量化）整层只占 int8 GEMM 的 **~2%**（`docs/dev.md` §7.9 末表）⇒ 省下的上限就是 2%，不值得引入定点 `exp` 的精度风险 |
+| int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | **不做（实测）**：`192×768` 的"反量化 + RMSNorm + 再量化"= 367.3 µs，占该层 GEMM 的 ~0.3%（同表）；**组合路径就是答案**（`dequantize_i8_rows` → `api::rms_norm` → `quantize_i8_per_token`），真要抠先做 `_into` 省分配 |
 | `parallel::gemv_i8`（行切分） | 多核 GEMV | **不做**：按 `m` 行切分对"单 token"（`m = 1`）零并行度；`m` 大的档位 f32 GEMM 已赢（§21.8） |
 | `parallel::gemv_i8_k`（**k 切分**） | 多核 GEMV，`m = 1` 也能用 | **已落地**（`src/parallel.rs`）：把"块"当"行"交给现有派活接口，整数截断同态 ⇒ 与单线程**逐位一致**（测试守着）。**实测 12 线程 5.4–6.9×**（`docs/dev.md` §7.9 末表）。门槛：每块 ≥1024 元素且 ≥4 块才并行（更小是负收益：派活固定开销 > 内核） |
 | `matmul_i8` | 批量 int8 矩阵乘（prefill：权重读一遍、token 复用） | **已落地**（§2.14 契约、§5.14 用法、`docs/dev.md` §7.9 的实测行），**但实测否掉了它的立项理由**（其 §21.8）：对"逐 token 跑 GEMV"是 **1.00×**、比 f32 `lasx_matmul`(n=192) **慢 2.5–2.7×** ⇒ 目标形态下应选 f32 GEMM；int8 只在"权重装不进缓存、必须流 DRAM"时占优（~4× 流量） |

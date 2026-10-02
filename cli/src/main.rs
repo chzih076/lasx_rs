@@ -95,7 +95,10 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
             suites::int8::int8_gemv(rows);
             suites::int8::int8_matmul(rows);
         }
-        Group::Int8Quant => suites::int8::int8_quant(rows),
+        Group::Int8Quant => {
+            suites::int8::int8_quant(rows);
+            suites::int8::int8_keepalive(rows);
+        }
         Group::Matmul => suites::matmul::matmul(rows),
         Group::Plan => suites::plan::run(),
         Group::Softmax => suites::softmax::softmax(rows),
