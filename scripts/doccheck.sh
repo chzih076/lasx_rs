@@ -91,8 +91,13 @@ for f in docs/dev.md docs/ops.md README.md README.en.md; do
 done
 
 # ---- ③ 导出符号数 vs 源码 ----
-actual=$(grep -h -c 'pub extern "C" fn lasx_' src/ffi/*.rs 2>/dev/null | paste -sd+ - | bc 2>/dev/null)
-if [ -n "${actual:-}" ]; then
+# 纯 shell 求和（不依赖 bc：CI runner 上缺它会让这一步**静默跳过**，等于白进 CI）
+actual=0
+for f in src/ffi/*.rs; do
+  [ -f "$f" ] || continue
+  actual=$((actual + $(grep -c 'pub extern "C" fn lasx_' "$f")))
+done
+if [ "$actual" -gt 0 ]; then
   # 只取"数字 个导出符号"这一小段（带行号会先把行号当成数字，踩过一次）
   while IFS= read -r hit; do
     f="${hit%%:*}"
