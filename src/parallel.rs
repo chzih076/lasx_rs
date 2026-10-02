@@ -54,6 +54,14 @@ thread_local! {
 fn need_shared_pack(m: usize, threads: usize, pack_min_m: usize) -> bool {
     threads > 1 && m / threads >= pack_min_m
 }
+// 【待改，已实测】上面这条判据只在"每线程行数"这一维上判，**缺了"B 有多大"**：
+// `192×768×3072`（B = 9.4 MB）在 8/12/24 线程上被它打到回退路径（每块各遍历一遍 B），
+// 而同线程数下共享打包快 **2.5×/1.8×/1.3×**（8 线程 7.31 → 2.92 ms）。文档里"per_thread < 32
+// 走回退"那条是在 `256³`（B = 256 KB）上定的——那里回退确实赢（327 vs 223 GF/s）。
+// 拟改规则（**先做形状扫再改**，见 `docs/dev.md` §7.9）：
+//     threads > 1 && (m / threads >= pack_min_m || k * n * 4 >= 1 MiB)
+// 阈值取 1 MiB（两个已知数据点之间：256 KB 回退赢、9.4 MB 共享赢），扫过 256³/512³/1024³
+// 与 `192×768×3072`/`192×3072×768` 再落地。
 
 use crate::pool::WorkerPool;
 
