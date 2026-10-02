@@ -28,7 +28,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 | §1 | 分层与调用方式（C ABI / Rust API / 池 / 对齐缓冲四层） |
 | §2 | 数值契约：逐位确定的含义、结合次序、精度一览、退化输入、冻结约定，以及 NN 侧 §2.6–§2.11 各算子契约 |
 | §3 | 指令集路径与降级覆盖（哪些符号可降级、哪些是 LASX-only） |
-| §4 | 导出符号总表（73 个）与 `_checked` 变体、状态码、清点方法 |
+| §4 | 导出符号总表（75 个）与 `_checked` 变体、状态码、清点方法 |
 | §5 | 归约、稠密与量化算子（§5.9–§5.13 为 NN 侧算子） |
 | §6 | 批量几何与物理算子 |
 | §7 | 批量姿态与几何算子（7 个） |
@@ -603,7 +603,7 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（73 个）
+## 4. 导出符号总表（75 个）
 
 权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**37 个未带 `_checked`
 的 `lasx_*` + 36 个 `lasx_*_checked` = 73**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
