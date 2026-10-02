@@ -19,6 +19,12 @@ jobs:
       - name: rustfmt --check
         run: |
           rustup run nightly cargo fmt --all -- --check
+      # 文档一致性（纯文本）：§ 引用能落到目标文档、表格列数一致、
+      # 文档里的"导出符号数"与源码 `extern "C" fn lasx_*` 数量一致。
+      # 这一类缺陷（陈旧计数、悬空/歧义引用）在本仓库真实发生过多次，所以进 CI。
+      - name: docs consistency
+        run: |
+          bash scripts/doccheck.sh
 
   # 2. 交叉编译检查（loongarch64 target；cargo check 无需链接器，
   #    验证源码在 loongarch64 nightly 下可编译——本库为 LoongArch 专用）
