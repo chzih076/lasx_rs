@@ -433,6 +433,77 @@ pub fn pool_scaling() {
 ///
 /// `parallel::gemv_i8_k`（**k 方向切分**，为 `m = 1` 的单 token 档位而做）的线程扩展。
 ///
+/// **判别实验**：8 线程处那次系统性下降，是"缓存/L3 争用"还是"调度/块粒度"？
+/// 两个只读对照（见 `docs/dev.md` §7.9）：① 换工作集（9.4 MB → 512 KB）；② 固定 8 线程换 `Pick`。
+pub fn pool_attribution() {
+    use lasx_rs::pool::Pick;
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!("\n## 8 线程下降的判别实验（loadavg = {}）", load.trim());
+    let tokens = 192usize;
+
+    println!("\n### ① 换工作集（默认 pick，线程 4/6/8/12）");
+    println!("\n| 形状 | 权重(B) | 4 | 6 | 8 | 12 |");
+    println!("|---|---|---|---|---|---|");
+    for &(k, n) in &[(256usize, 512usize), (768, 3072)] {
+        let mut rng = crate::data::Lcg::new((k * 23 + n) as u64);
+        let a0: Vec<f32> = (0..tokens * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let mut c = vec![0f32; tokens * n];
+        let mut cells = Vec::new();
+        for &th in &[4usize, 6, 8, 12] {
+            let pool = WorkerPool::new(th);
+            let mut a = a0.clone();
+            let d = timeit(|| {
+                parallel::matmul_f32(&pool, tokens, k, n, &mut a, &b, &mut c).unwrap();
+                let _ = black_box(c[0]);
+            });
+            cells.push(fmt_t(d));
+        }
+        println!(
+            "| {tokens}×{k}×{n} | {} KiB | {} |",
+            (k * n * 4) / 1024,
+            cells.join(" | ")
+        );
+    }
+
+    println!("\n### ② 换调度策略（固定 8 线程，`192×768×3072`）");
+    println!("\n| 策略 | 时间 | 相对默认 |");
+    println!("|---|---|---|");
+    let (k, n) = (768usize, 3072usize);
+    let mut rng = crate::data::Lcg::new(0xbeef);
+    let a0: Vec<f32> = (0..tokens * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+    let mut c = vec![0f32; tokens * n];
+    let pool = WorkerPool::new(8);
+    let mut base = Duration::ZERO;
+    for (name, pick) in [
+        ("默认 pick_rows", None),
+        ("RowBlock（每线程一块）", Some(Pick::RowBlock)),
+        ("Blocked{4}", Some(Pick::Blocked { block_rows: 4 })),
+        ("Dynamic{4}", Some(Pick::Dynamic { block_rows: 4 })),
+    ] {
+        let mut a = a0.clone();
+        let d = timeit(|| {
+            match pick {
+                None => parallel::matmul_f32(&pool, tokens, k, n, &mut a, &b, &mut c),
+                Some(p) => {
+                    parallel::matmul_f32_with_pick(&pool, tokens, k, n, &mut a, &b, &mut c, p)
+                }
+            }
+            .unwrap();
+            let _ = black_box(c[0]);
+        });
+        if base == Duration::ZERO {
+            base = d;
+        }
+        println!(
+            "| {name} | {} | {:.2}× |",
+            fmt_t(d),
+            base.as_secs_f64() / d.as_secs_f64()
+        );
+    }
+}
+
 /// 动机：int8 唯一占优的档位是"单 token、权重流 DRAM"（`docs/ops.md` §5.15），那一档 `m = 1`
 /// ⇒ 按行切分没有并行度；本函数量的是"按 `k` 切块"能拿回多少。
 /// 三个 `k` 分别代表：模型单层（3072，L2 内）、1 MiB（L2 边缘）、16 MiB（DRAM 流）。

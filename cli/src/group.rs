@@ -57,6 +57,8 @@ pub enum Group {
     DispatchOverhead,
     /// 池在核数附近的表现（记录 `loadavg` 的对照测量，见 `docs/dev.md` §7.9）。
     PoolScaling,
+    /// 8 线程下降的判别实验（换工作集 / 换调度策略）。
+    PoolAttribution,
     /// 真实调用场景（多步传播 / 高频小调用 / 融合 vs 拼接）。
     Scenario,
 }
@@ -92,6 +94,7 @@ impl Group {
         Group::Align,
         Group::DispatchOverhead,
         Group::PoolScaling,
+        Group::PoolAttribution,
         Group::Scenario,
     ];
 
@@ -126,6 +129,7 @@ impl Group {
             Group::Align => "align",
             Group::DispatchOverhead => "dispatch",
             Group::PoolScaling => "pool_scaling",
+            Group::PoolAttribution => "pool_attribution",
             Group::Scenario => "scenario",
         }
     }
