@@ -18,7 +18,7 @@ use crate::report::{row3, Row};
 use crate::scalar_ref::scalar_dot_i8;
 use crate::timing::{time_mode, timeit, Mode};
 use lasx_rs::ffi::quant::{
-    lasx_absmax_rows, lasx_amax, lasx_gemv_i8, lasx_quantize_i8_per_row,
+    lasx_absmax_rows, lasx_amax, lasx_gemv_i8, lasx_matmul_i8, lasx_quantize_i8_per_row,
     lasx_quantize_i8_per_tensor,
 };
 use lasx_rs::lasx_matmul;
@@ -138,6 +138,92 @@ pub fn int8_gemv(rows: &mut Vec<Row>) {
             lasx_f32,
             None,
             scalar_f32,
+            rows,
+        );
+    }
+}
+
+/// `lasx_matmul_i8`：批量（prefill 形态）与"逐 token 跑 GEMV"的对照。
+///
+/// 这两行是 §21.6 那笔账的实测：批量让权重在 L2 里被 `tokens` 个 token 复用，
+/// 把限制从**带宽**换成**算力**。f32 对照用**真正的 GEMM**（`lasx_matmul`，n = tokens），
+/// 不用 n=1 的打包路径——否则会重复 §7.9 第 2 条那个"对照选错"的坑。
+pub fn int8_matmul(rows: &mut Vec<Row>) {
+    let tokens = 192usize;
+    for &(k, n) in &[(768usize, 768usize), (768, 3072), (3072, 768)] {
+        let mut rng = Lcg::new((k * 7 + n) as u64);
+        let x = AlignedBuf::fill_with(tokens * k, |_| rng.i8());
+        let w = AlignedBuf::fill_with(n * k, |_| rng.i8());
+        let sw = AlignedBuf::fill_with(n, |_| 0.001 + 0.0005 * rng.f32().abs());
+        let sx = AlignedBuf::fill_with(tokens, |_| 0.002 + 0.0005 * rng.f32().abs());
+        let mut y = AlignedBuf::new(tokens * n);
+        let tag = format!("{tokens}×{k}×{n}");
+
+        let lasx = time_mode(Mode::Lasx, || {
+            lasx_matmul_i8(
+                x.as_ptr(),
+                w.as_ptr(),
+                sw.as_ptr(),
+                sx.as_ptr(),
+                y.as_mut_ptr(),
+                tokens as i32,
+                k as i32,
+                n as i32,
+            );
+            let _ = black_box(y[0]);
+        });
+        // 今天的路径：逐 token 调 `gemv_i8`（权重被重读 tokens 次）
+        let gemv_loop = timeit(|| {
+            for t in 0..tokens {
+                lasx_gemv_i8(
+                    w.as_ptr(),
+                    sw.as_ptr(),
+                    unsafe { x.as_ptr().add(t * k) },
+                    sx[t],
+                    unsafe { y.as_mut_ptr().add(t * n) },
+                    n as i32,
+                    k as i32,
+                );
+            }
+            let _ = black_box(y[0]);
+        });
+        // 口径 = 权重字节（1 B/元素）+ 激活 + 输出（批量的核心指标是"权重读了几遍"）
+        let bytes = (n * k + tokens * k + tokens * n * 4) as f64;
+        row3(
+            "lasx_matmul_i8(LASX-only)",
+            tag.clone(),
+            bytes,
+            "B/s",
+            lasx,
+            None,
+            gemv_loop,
+            rows,
+        );
+
+        // f32 对照：真正的 GEMM（`lasx_matmul`: C[m×n] = A[m×k]·B[k×n]）
+        let xf = AlignedBuf::fill_with(tokens * k, |_| rng.f32() * 2.0 - 1.0);
+        let wf = AlignedBuf::fill_with(k * n, |_| rng.f32() * 2.0 - 1.0);
+        let mut yf = AlignedBuf::new(tokens * n);
+        let lasx_f32 = time_mode(Mode::Lasx, || {
+            lasx_matmul(
+                tokens as i32,
+                k as i32,
+                n as i32,
+                xf.as_ptr(),
+                wf.as_ptr(),
+                yf.as_mut_ptr(),
+            );
+            let _ = black_box(yf[0]);
+        });
+        let bytes_f32 = ((n * k + tokens * k) * 4 + tokens * n * 4) as f64;
+        row3(
+            "lasx_matmul f32 GEMM(n=192)",
+            tag,
+            bytes_f32,
+            "B/s",
+            lasx_f32,
+            None,
+            lasx_f32,
             rows,
         );
     }

@@ -34,6 +34,7 @@ pub mod j2_accel_batch;
 pub mod mat3_mul_vec3_batch;
 pub mod matmul;
 pub mod matmul_f64;
+pub mod matmul_i8;
 pub mod nn_math;
 pub mod norm3_batch;
 pub mod quant_i8;

@@ -1194,6 +1194,45 @@ pub fn gemv_i8(
     Ok(y)
 }
 
+/// 批量 int8 矩阵乘（prefill 形态）：`y[t,o] = (Σ_i X[t,i]·W[o,i]) · (sw[o]·sx[t])`。
+///
+/// `x` 是 `m × k`（每 **token** 一个 scale，`scale_x` 长 `m`），`w` 是 `n × k`
+/// （每 **输出通道** 一个 scale，`scale_w` 长 `n`），`y` 是 `m × n`。
+///
+/// 契约（`docs/ops.md` §2.14）：每个输出元素是**一次 `dot_i8`**（整数精确、顺序无关），
+/// 出口与 `gemv_i8` 完全同口径——先把两个 scale 乘成一个（一次舍入）再乘 `acc as f32`。
+/// `m = 1` 时与 [`gemv_i8`] **逐位一致**（测试守着）。
+///
+/// 与 [`gemv_i8`] 的分工：`gemv_i8` 每算一个 token 重读一遍权重（带宽受限）；
+/// 本函数让权重在 L2 里被 `m` 个 token 复用（`m = 192` 时权重流量从 192×118 MB 降到 118 MB）。
+///
+/// # Errors
+/// - `x.len() != m × k`、`w.len() != n × k`、`scale_x.len() != m`、`scale_w.len() != n`
+///   （[`Error::Shape`]）；
+/// - `m × k` 或 `n × k` 溢出（[`Error::Overflow`]）。
+pub fn matmul_i8(
+    x: &[i8],
+    w: &[i8],
+    scale_w: &[f32],
+    scale_x: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<AlignedVec<f32>> {
+    let n_x = checked_mul("matmul_i8", "m×k", m, k)?;
+    let n_w = checked_mul("matmul_i8", "n×k", n, k)?;
+    expect_len("matmul_i8", "x", x.len(), n_x)?;
+    expect_len("matmul_i8", "w", w.len(), n_w)?;
+    expect_len("matmul_i8", "scale_x", scale_x.len(), m)?;
+    expect_len("matmul_i8", "scale_w", scale_w.len(), n)?;
+    let mut y = AlignedVec::<f32>::new(checked_mul("matmul_i8", "m×n", m, n)?);
+    if m == 0 || k == 0 || n == 0 {
+        return Ok(y);
+    }
+    crate::ops::matmul_i8::matmul_i8(x, w, scale_w, scale_x, m, k, n, y.as_mut_slice());
+    Ok(y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

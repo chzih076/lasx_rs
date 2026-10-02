@@ -91,7 +91,10 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::DotI8 => suites::quant::dot_i8(rows),
         Group::DotQ4 => suites::quant::dot_q4(rows),
         Group::F16Gemv => suites::f16::f16_gemv(rows),
-        Group::Int8Gemv => suites::int8::int8_gemv(rows),
+        Group::Int8Gemv => {
+            suites::int8::int8_gemv(rows);
+            suites::int8::int8_matmul(rows);
+        }
         Group::Int8Quant => suites::int8::int8_quant(rows),
         Group::Matmul => suites::matmul::matmul(rows),
         Group::Plan => suites::plan::run(),

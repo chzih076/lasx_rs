@@ -136,7 +136,7 @@ pub use ffi::quant::{lasx_dot_i8, lasx_dot_q4};
 // `lasx_*_checked` 变体在 `lasx_rs::ffi::checked`。
 pub use ffi::quant::{
     lasx_absmax_rows, lasx_amax, lasx_dequantize_i8, lasx_dequantize_i8_rows, lasx_gemv_i8,
-    lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,
+    lasx_matmul_i8, lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,
 };
 pub use ffi::reduce::{lasx_axpy, lasx_dot, lasx_dot_f64, lasx_sum};
 // NN 侧 N1 批次（`docs/dev.md` §20）：与上面的导出保持一致，Rust 侧可以直接 `lasx_rs::lasx_silu`。

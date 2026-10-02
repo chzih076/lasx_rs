@@ -7,7 +7,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，73 个导出符号（37 个裸版本 + 36 个 `_checked` 变体） |
+| 适用代码版本 | `master`，75 个导出符号（38 个裸版本 + 37 个 `_checked` 变体） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 目标读者 | 调用方（C / Rust / Dart），以及需要核对数值契约或边界行为的人 |
@@ -46,7 +46,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（73 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（75 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -515,6 +515,31 @@ y[o] = (Σ_i W[o,i]·x[i]) · (scale_w[o] · scale_x)
 **4）谁守什么。** 累加精确性由整数运算保证（无舍入）；出口次序由契约 + 单测（"两次舍入会不同"
 的样本）守；长度一致性由 Rust `api` 层守，C 侧只靠约定（越界同 §2.12）。
 
+### 2.14 N3 侧：`lasx_matmul_i8`（批量 int8 矩阵乘）
+
+**1）语义。** `X` 是 `m × k` 行主序 int8 激活（每 **token** 一个 scale，`scale_x` 长 `m`），
+`W` 是 `n × k` 行主序 int8 权重（每 **输出通道** 一个 scale，`scale_w` 长 `n`）：
+
+```text
+Y[t,o] = (Σ_i X[t,i]·W[o,i]) · (scale_w[o] · scale_x[t])       // 即 Y = X·Wᵀ
+```
+
+**2）数值契约。** 每个输出元素是**一次 `dot_i8`**（与 §2.13 同一个整数内核 ⇒ 整数精确、
+与顺序无关、`k > 133 000` 时按同一 mod 2³² 语义）；出口与 `gemv_i8` **完全同口径**
+（两个 scale 先乘成一个再乘 `acc as f32`）。**`m = 1` 时与 `gemv_i8` 逐位一致**（单测守着）。
+
+**3）实测结论（重要，与直觉相反）**：**批量没有收益，而且比 f32 GEMM 慢**——
+`docs/dev.md` §7.9 末尾与 §21.8：对"逐 token 跑 `gemv_i8`"是 **1.00×**（9.03 vs 9.06 ms
+@192×768×768），对 f32 `lasx_matmul`(n=192) 是 **0.4×（慢 2.5–2.7×）**。原因：本函数的复用
+发生在 L2 而不是寄存器（每个输出元素整条读一遍 W 行），而 L2 带宽也只有 ~12 GB/s；
+f32 一条 `xvfmadd.s` 是 16 FLOP/指令，本 ISA 的 int8 链只有 ~4–5 MAC/指令（没有融合 int8 点积）。
+
+> **该用哪个**：**权重装不进缓存、必须从 DRAM 流**（单 token，或更大的模型）⇒ int8
+> （每权重 1 B vs 4 B，省 4× 流量）；**批量且权重驻 L2/L3**（算力受限）⇒ **f32 `lasx_matmul`**。
+> 对 `docs/dev.md` §21.2 那个消费者（192 token、每层权重 2.36 MB、L2 = 3 MB），**f32 更快**。
+
+**4）谁守什么。** 与 §2.13 相同（整数内核 + 出口次序 + `api` 层长度校验；C 侧只靠约定）。
+
 
 ## 3. 指令集路径与降级覆盖
 
@@ -534,13 +559,13 @@ impl SimdPath {
 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`（少数内核的 `Lsx` 分支
 退化为纯标量）。
 
-### 3.2 降级覆盖分类（37 个原始符号）
+### 3.2 降级覆盖分类（38 个原始符号）
 
 | 类别 | 个数 | 内核 | 无 LASX 时 |
 |---|---|---|---|
 | LASX + LSX 双路径 | 11 | `lasx_dot`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_j2_accel_batch`，以及全部 7 个姿态/几何算子 | LSX 128 位向量路径 |
 | LASX + 标量降级 | 3 | `lasx_ballistic_step`、`lasx_batch_distance2d`、`lasx_rk4_j2_step_batch` | 全标量循环（无 LSX 向量路径） |
-| LASX-only（无降级分支） | 22 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 7 个**（§4.3） | 直接执行 LASX 指令 |
+| LASX-only（无降级分支） | 23 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 8 个**（§4.3） | 直接执行 LASX 指令 |
 | 内存工具（不涉及 SIMD） | 1 | `lasx_alloc` | 与路径无关 |
 
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全），6000 系列都支持 LASX，
@@ -630,6 +655,7 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 | `lasx_dequantize_i8` | `void(const int8_t*, float, float*, int)` | `out = (q as f32)·scale` | LASX-only |
 | `lasx_dequantize_i8_rows` | `void(const int8_t*, const float*, float*, int, int)` | 逐行反量化 | LASX-only |
 | `lasx_gemv_i8` | `void(const int8_t* w, const float* sw, const int8_t* x, float sx, float* y, int m, int k)` | `y[o] = Σ w[o,i]·x[i] · (sw[o]·sx)` | LASX-only |
+| `lasx_matmul_i8` | `void(const int8_t* x, const int8_t* w, const float* sw, const float* sx, float* y, int m, int k, int n)` | `Y[t,o] = Σ x[t,i]·w[o,i] · (sw[o]·sx[t])`（批量；§2.14 说明它何时不划算） | LASX-only |
 
 契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
 
@@ -690,8 +716,8 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | 历史内核（归约/稠密/量化/物理） | 15 | 14 | 29 | §4.1 |
 | 批量姿态/几何 | 7 | 7 | 14 | §4.2 |
 | NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.4 的名单、§5.9–§5.13 的用法 |
-| N3（int8 推理 7 个） | 7 | 7 | 14 | §4.3、§5.14 的用法 |
-| 合计 | **37** | **36** | **73** | — |
+| N3（int8 推理 8 个） | 8 | 8 | 16 | §4.3、§5.14 的用法 |
+| 合计 | **38** | **37** | **75** | — |
 
 `lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 36 个原始符号各有一个 checked 版本；
 原始 15 个的名字与语义始终不变。§3.2 给出 37 个原始符号的降级覆盖分类。
@@ -1701,7 +1727,7 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 | 整数 / 定点 softmax | 多项式或查表近似 `exp` | **未做**（仅当保留注意力路径才需要；现有 `lasx_softmax_rows` 是 f32 进 f32 出） |
 | int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | **未做**（低优先：参数量小、可不量化；亦可改用 ReLU，int8 精确可表示） |
 | `parallel::gemv_i8` | 多核 GEMV（逐行独立，按行块切分，与单线程逐位一致） | **未做**（`parallel::gemv_f16` 是现成骨架） |
-| `matmul_i8` | 批量 int8 矩阵乘（prefill：权重读一遍、token 复用） | **未做，但有量化依据**：今天的 GEMV 逐 token 路径是**带宽受限**（§2.13 的实测），批量把它换成算力受限 ⇒ 单核 ≈3× 收益（`docs/dev.md` §21.6/§21.7）。**不是"有调用点"，是"有账"**——做不做取决于目标档位 |
+| `matmul_i8` | 批量 int8 矩阵乘（prefill：权重读一遍、token 复用） | **已落地**（§2.14 契约、§5.14 用法、`docs/dev.md` §7.9 的实测行），**但实测否掉了它的立项理由**（其 §21.8）：对"逐 token 跑 GEMV"是 **1.00×**、比 f32 `lasx_matmul`(n=192) **慢 2.5–2.7×** ⇒ 目标形态下应选 f32 GEMM；int8 只在"权重装不进缓存、必须流 DRAM"时占优（~4× 流量） |
 
 **实现时定下的三条（都写进了 §2.12/§2.13 的契约）**：① 用**倒数乘**而不是除法
 （LASX 没有向量除法，与 `softmax_rows` 的 `e·(1/Σ)` 同一条约定）；② 取整 **ties-to-even**

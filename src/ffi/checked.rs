@@ -355,6 +355,36 @@ pub extern "C" fn lasx_gemv_i8_checked(
     crate::ops::gemv_i8::gemv_i8(w, scale_w, x, scale_x, m, k, y);
 }
 
+/// 带错误通道的批量 int8 矩阵乘。
+/// C 签名：`void lasx_matmul_i8_checked(const int8_t*, const int8_t*, const float*, const float*, float*, int, int, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_matmul_i8_checked(
+    x: *const i8,
+    w: *const i8,
+    scale_w: *const f32,
+    scale_x: *const f32,
+    y: *mut f32,
+    m: i32,
+    k: i32,
+    n: i32,
+    status: *mut i32,
+) {
+    let m = or_fail!(checked_len(m), status, ());
+    let k = or_fail!(checked_len(k), status, ());
+    let n = or_fail!(checked_len(n), status, ());
+    let n_x = or_fail!(checked_mul(m, k), status, ());
+    let n_w = or_fail!(checked_mul(n, k), status, ());
+    let n_y = or_fail!(checked_mul(m, n), status, ());
+    let x = unsafe { or_fail!(checked_slice(x, n_x), status, ()) };
+    let w = unsafe { or_fail!(checked_slice(w, n_w), status, ()) };
+    let scale_w = unsafe { or_fail!(checked_slice(scale_w, n), status, ()) };
+    let scale_x = unsafe { or_fail!(checked_slice(scale_x, m), status, ()) };
+    let y = unsafe { or_fail!(checked_slice_mut(y, n_y), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::matmul_i8::matmul_i8(x, w, scale_w, scale_x, m, k, n, y);
+}
+
 /* ==================== 批量几何 ==================== */
 
 /// 带错误通道的批量 3 分量模长。
