@@ -36,7 +36,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 | §9 | 多核并行：`WorkerPool` 与 `parallel`、调度策略 |
 | §10 | 对齐缓冲：`AlignedVec` 与 `lasx_alloc` |
 | §11 | FFI 用法（C / Dart） |
-| §12 | NN 算子：当前状态、缺口对照与候选批次 |
+| §12 | NN 算子：当前状态、缺口对照与候选批次（N1 已落地 / N2 按需 / **N3 int8 推理，消费者明确**） |
 | §13 | 无损压缩与带宽换算力：结论与路线 |
 | §14 | 构建、测试与常用命令 |
 | §15 | Caveats 与限制 |
@@ -1551,6 +1551,49 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 **N2 的唯一具体消费者（loong-llm 的 8 处 `q8_matmul`）已不再作为下游目标**，所以这一批维持
 "未做、按需"：没有调用点就没有验收对象，硬做等于自己给自己造需求。真要启动，触发条件是
 "要在龙芯上跑 GGUF 权重并与 llama.cpp 交叉验证"（见 `docs/dev.md` §19.13 的 G7 记录）。
+
+**N3（int8 推理，消费者明确，2026-10-02 立项）**
+
+消费者：一个 0.2B 量级的**判别式决策模型**（cross-encoder，非生成式，无 KV cache，
+序列 ≤192 token，端侧 CPU）。形态、实测依据与批次划分来源见 `docs/dev.md` §21。
+与 N1/N2 的关系：N1 是 f32/f16 且已落地；N2 是 **GGML 块格式互操作**（面向与 llama.cpp
+交叉验证），N3 是**自用 int8 推理路径**，两者格式与消费者都不同，互不替代。
+
+| 算子 | 说明 | 依据 | 优先级 |
+|---|---|---|---|
+| `amax` / `absmax_rows` | 最大绝对值（per-tensor / 逐行） | 下列量化算子的公共原语 | 高 |
+| `quantize_i8_per_tensor` | f32 → int8 + scale，对称 | 入口 | 高 |
+| **`quantize_i8_per_token`** | 按最后一维（每 token）各自求 amax 与 scale | 实测：per-tensor 使成对准确率 96.1% → 93.4%，**per-token 无损**（`docs/dev.md` §21.3） | **高** |
+| `dequantize_i8` | int8 + scale → f32 | 反量化、残差出口 | 高 |
+| **`gemv_i8`** | 权重 int8 × 激活 int8 → i32 累加，出口乘 scale | 消费主力是 GEMV；现有 `lasx_gemv_f16` 仅 f16 | **高** |
+| `quantize_i8_per_channel` | 按输出通道求 scale（权重侧） | 权重 per-channel 实测误差 0.86%，无损 | 中 |
+| 整数 / 定点 softmax | 多项式或查表近似 `exp` | 仅当保留注意力路径；现有 `lasx_softmax_rows` 是 f32 进 f32 出 | 中 |
+| int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | 参数量小，可不量化；亦可改用 ReLU（int8 精确可表示） | 低 |
+
+**可复用**：`lasx_dot_i8` 的 i16 乘积 → i32 累加 + 每 1024 字节落 i64 防溢出结构；
+`lasx_dot_q4` 的"组内整数点积 + 组 scale 乘"分层与 `xvhaddw` 水平加宽归约；
+`lasx_matmul` 的打包 + k 分块 + 列块三条路径骨架；`lasx_alloc`/`lasx_free` 对齐分配。
+
+**建议实现顺序**：`amax` → `quantize_i8_per_tensor` → **`quantize_i8_per_token`** →
+`dequantize_i8` → **`gemv_i8`** → `quantize_i8_per_channel` → 整数 softmax（按需）。
+前三项是"能跑起来"的最小集，`gemv_i8` 是"跑得快"的关键。
+
+**验收**（沿用 §2.5 与 `docs/dev.md` §6.4 的既有纪律）：
+
+1. 位精确：同一算子的 LASX / LSX / 标量尾 / 分块 / 并行各路径对同一输入**逐位一致**
+   （`to_bits()` 比对）；
+2. 量化算子的误差可解析界定（量化误差 ≤ scale/2），并与 f64 参考对照；
+3. **量化实现的正确性单独断言**——例如量化后取值必须是 `scale` 的整数倍。
+   这一条来自一次真实踩坑：漏除 `qmax` 会使权重退化为三值，而"指标看起来合理"不会暴露它
+   （`docs/dev.md` §21.4 末尾）；
+4. 性能结论按进程级交替 A/B、≥3 轮、丢弃首轮、取中位数；
+5. C ABI 只追加不修改（§2.1 的 15 个 `lasx_*` 符号签名与语义永不改动）；
+6. **给出 per-tensor / per-token / per-channel 三种模式的误差与速度对照**——决策模型侧实测
+   显示这个选择直接决定 int8 能否使用。
+
+**启动前应确认**（见 `docs/dev.md` §21.6）：`gemv_i8` 在真实形状上的倍数、per-token 量化的
+内核开销、端到端延迟——三项目前都只有推算，无实测。
+
 
 **不建议做**：q4_0/q4_K/q8_0/IQ* 的 vec_dot 重写（llama.cpp 已贴带宽/算力上限）；
 `GET_ROWS`/`VIEW`/`PERMUTE` 这类纯搬运算子（带宽决定，SIMD 无事可做）。
