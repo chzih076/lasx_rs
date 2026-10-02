@@ -383,6 +383,54 @@ pub fn dispatch_overhead() {
     );
 }
 
+/// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。
+///
+/// 为什么要单独一条：§7.9 那张 f32 GEMM 表在 `load ≈1.6–1.9` 的窗口里出现过"8/12 线程比
+/// 4 线程慢"，首轮复测却是单调的。要把它判成"池的缺陷"还是"邻居负载造成的超订"，
+/// 必须**记录负载**并做对照。所以本函数的输出**第一行就是 `/proc/loadavg`**，
+/// 线程数扫得比 §7.9 那张表更密（1,2,3,4,6,8,10,12,16,24）——判据是：
+/// **在"物理核数 − 邻居数"以内是否单调**。当前 12 物理核、load ≈2 ⇒ 10 是分界。
+///
+/// 用法：高负载窗口与低负载窗口各跑 ≥3 轮，两份输出对照。
+pub fn pool_scaling() {
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    println!(
+        "\n## 池在核数附近的表现（逻辑核 {cores}，loadavg = {}）",
+        load.trim()
+    );
+    println!("\n| 形状 (m×k×n) | 线程 | 时间 | 扩展 | 效率 |");
+    println!("|---|---|---|---|---|");
+    let tokens = 192usize;
+    for &(k, n) in &[(768usize, 3072usize), (3072, 768)] {
+        let mut rng = crate::data::Lcg::new((k * 17 + n) as u64);
+        let a: Vec<f32> = (0..tokens * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let mut c = vec![0f32; tokens * n];
+        let mut base = Duration::ZERO;
+        for &th in &[1usize, 2, 3, 4, 6, 8, 10, 12, 16, 24] {
+            let pool = WorkerPool::new(th);
+            let mut a = a.clone();
+            let d = timeit(|| {
+                parallel::matmul_f32(&pool, tokens, k, n, &mut a, &b, &mut c).unwrap();
+                let _ = black_box(c[0]);
+            });
+            if th == 1 {
+                base = d;
+            }
+            let sp = base.as_secs_f64() / d.as_secs_f64();
+            println!(
+                "| {tokens}×{k}×{n} | {th} | {} | {sp:.2}× | {:.0}% |",
+                fmt_t(d),
+                100.0 * sp / th as f64
+            );
+        }
+    }
+}
+
+///
 /// `parallel::gemv_i8_k`（**k 方向切分**，为 `m = 1` 的单 token 档位而做）的线程扩展。
 ///
 /// 动机：int8 唯一占优的档位是"单 token、权重流 DRAM"（`docs/ops.md` §5.15），那一档 `m = 1`

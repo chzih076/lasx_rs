@@ -55,6 +55,8 @@ pub enum Group {
     Align,
     /// 每次调用的分派/探测开销。
     DispatchOverhead,
+    /// 池在核数附近的表现（记录 `loadavg` 的对照测量，见 `docs/dev.md` §7.9）。
+    PoolScaling,
     /// 真实调用场景（多步传播 / 高频小调用 / 融合 vs 拼接）。
     Scenario,
 }
@@ -89,6 +91,7 @@ impl Group {
         Group::ThreadScaling,
         Group::Align,
         Group::DispatchOverhead,
+        Group::PoolScaling,
         Group::Scenario,
     ];
 
@@ -122,6 +125,7 @@ impl Group {
             Group::ThreadScaling => "mt",
             Group::Align => "align",
             Group::DispatchOverhead => "dispatch",
+            Group::PoolScaling => "pool_scaling",
             Group::Scenario => "scenario",
         }
     }
