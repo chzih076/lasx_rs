@@ -452,6 +452,69 @@ c2 / c3 同前，偏移 16..32
 lane `j%8`"的自然序，去掉即破坏位精确）。因此这是**结构代价，而非缺陷**；若要进一步提速，
 必须修改 §2.11 的契约。**完整表在 `docs/dev.md` §7.4**。
 
+### 2.12 N3 侧：int8 对称量化的生产端（`lasx_amax` / `lasx_absmax_rows` / `lasx_quantize_i8_*` / `lasx_dequantize_i8*`）
+
+**1）语义。** 对称 int8，`qmax = 127`（`q ∈ [−127, 127]`，**不使用 −128**）：
+
+```text
+amax      = max_i |x_i|                        // 逐张量（lasx_amax）或逐行（lasx_absmax_rows）
+scale     = amax / 127                         // amax == 0 ⇒ scale = 0
+q_i       = round_ties_even(x_i · (1/scale))   // 取整是 ties-to-even
+x̃_i       = (q_i as f32) · scale               // 反量化：一次乘法、一次舍入
+```
+
+**2）三条必须照抄的细节**（否则参考实现与内核不逐位一致）：
+
+| # | 约定 | 为什么 |
+|---|---|---|
+| 1 | **用倒数乘**，不写 `x / scale` | LASX **没有向量除法指令**；与 `softmax_rows` 的 `e·(1/Σ)` 是同一条约定 |
+| 2 | 取整是 **ties-to-even**（向量 `xvftintrne.w.s` / 标量 `round_ties_even()`） | 已实测两者一致：`0.5→0、1.5→2、2.5→2、−0.5→0、−1.5→−2、−2.5→−2` |
+| 3 | **不做夹取**（`|q| ≤ 127` 由 scale 定义保证） | `scale = amax/127` 且 `|x| ≤ amax` ⇒ `|x·(1/scale)| ≤ 127`；省夹取既少 2 条向量指令，也让含 NaN 的输入在向量/标量两条路径上给出同一结果 |
+
+**3）边界与退化。** `amax == 0`（全零或**全 NaN**）⇒ `scale = 0` 且 `q` 全 0（走显式分支，
+不出现 `0 × inf = NaN`）。空输入 ⇒ `amax = 0`。`NaN` **被忽略**（归约与 `f32::max` 同语义），
+`±inf` 不在契约内（`scale` 为 inf）。
+
+**4）谁守什么。**
+
+| 契约 | 由什么保证 |
+|---|---|
+| `|q| ≤ 127` | **scale 的定义**（`amax/127`）+ 取整；测试用"满量程数据 `max\|q\| ≥ 120`"与"边界样本打到 ±127"两条断言守 |
+| 量化误差 ≤ `scale/2` | 契约本身（`round` 的定义）；测试对 999 个随机样本实测最坏值 |
+| 反量化是 `scale` 的精确整数倍 | **一次乘法**；测试逐位比对 `(q as f32)·scale` |
+| 长度一致 | Rust `api` 层：`Error::Shape`；**C 侧只靠约定**（违反是读写越界，与 §2.1 的例外清单同级） |
+| 与 f64 参考的误差 | 本层是整数/量化运算，参考实现按上表照抄即逐位一致（不是"<1e-9"那种口径） |
+
+**5）实测与实现形态。** `amax`/量化是"向量主体 + 标量尾"，两条路径同一串运算、逐位一致
+（测试覆盖 `n = 0,1,2,3,7,8,9,15,16,17,31,33,64,127,128,1000` 与 NaN 混入）。
+`dequantize` 目前是**逐元素标量**（i8→f32 的加宽链出来是 even/odd 交织 lane，写回连续下标
+还需一次重排，未做向量化，也不声称它慢——没有实测就不写结论）。
+
+### 2.13 N3 侧：`lasx_gemv_i8`（int8 权重 × int8 激活）
+
+**1）语义。** `W` 是 `m × k` 行主序 int8 权重（**每输出通道一个 scale**），`x` 是 `k` 长 int8
+激活（**每 token 一个 scale**，调用方在量化时得到）：
+
+```text
+y[o] = (Σ_i W[o,i]·x[i]) · (scale_w[o] · scale_x)
+```
+
+**2）数值契约。**
+
+| 项 | 约定 |
+|---|---|
+| 累加 | **整数精确**：i16 乘积 → i32 累加 → 每 1024 字节落 i64（与 `lasx_dot_i8` **同一内核**，复用而非重写） |
+| 出口 | **一次乘法**：先把两个 scale 乘成一个（一次舍入）再乘 `acc as f32`。写成 `((acc as f32)·sw)·sx` 是两次舍入，不保证逐位一致（有断言锁住） |
+| 回绕 | `k ≤ 133 000` 时 `127²·k < 2³¹` 不回绕；更大 `k` 按 `dot_i8` 的 mod 2³² 语义（与 `lasx_dot_i8` 一致） |
+| 偏置/残差 | **不在本内核内**：调用方在 f32 域自己加（残差连接、LayerNorm 都是 f32） |
+
+**3）为什么复用 `dot_i8`。** GEMV 的每一行就是一次点积，而 `dot_i8` 已有"i16 乘积 → i32 累加、
+每 1024 字节落盘 i64、行尾标量尾"的成熟实现与测试。一致性因此是**复用**来的，
+不是两处各写一遍碰巧相同。
+
+**4）谁守什么。** 累加精确性由整数运算保证（无舍入）；出口次序由契约 + 单测（"两次舍入会不同"
+的样本）守；长度一致性由 Rust `api` 层守，C 侧只靠约定（越界同 §2.12）。
+
 
 ## 3. 指令集路径与降级覆盖
 
@@ -482,6 +545,12 @@ impl SimdPath {
 
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全），6000 系列都支持 LASX，
 不为 3000 及以下机型付这份复杂度（决策记录见 `docs/dev.md` §20.1）。
+
+**N3 批次（int8 推理，7 个新符号）同样 LASX-only**（`lasx_amax`、`lasx_absmax_rows`、
+`lasx_quantize_i8_per_tensor`、`lasx_quantize_i8_per_row`、`lasx_dequantize_i8`、
+`lasx_dequantize_i8_rows`、`lasx_gemv_i8`；契约见 §2.12/§2.13）：沿用 N1 的取舍，
+无 LASX 的 CPU 上会执行 LASX 指令（见 §15 Caveats 与 README 的同一条警告）。
+新符号一律**追加**，原始 15 个（§4.1）的签名与语义不变。
 
 `_checked` 变体与其原始符号走同一条路径、同一个算子实现，覆盖范围相同。
 
@@ -842,6 +911,47 @@ lasx_gemv_f16_checked(a_f16, x, y, m, k, &status);
   let y: VecBuf<f32, N> = gemv!(w_f16[N, K] * x[K]);   // 等价于 api::gemv_f16
   let s: f32 = dot!(w_row[K] * x[K]);                  // 等价于 api::dot_f16
   ```
+
+### 5.14 N3：int8 推理（量化 → `gemv_i8`）
+
+| 层 | 签名 |
+|---|---|
+| C | `float lasx_amax(const float *x, int n)`；`void lasx_absmax_rows(const float *x, int rows, int cols, float *out)`；`float lasx_quantize_i8_per_tensor(const float *x, int8_t *q, int n)`；`void lasx_quantize_i8_per_row(const float *x, int8_t *q, float *scales, int rows, int cols)`；`void lasx_dequantize_i8(const int8_t *q, float scale, float *out, int n)`；`void lasx_dequantize_i8_rows(const int8_t *q, const float *scales, float *out, int rows, int cols)`；`void lasx_gemv_i8(const int8_t *w, const float *scale_w, const int8_t *x, float scale_x, float *y, int m, int k)` |
+| C（`_checked`） | 同上 + 末尾 `int *status`；负长度 → `NegativeLength`，空指针 → `NullPointer`，尺寸相乘溢出 → `SizeOverflow`（**i32 长度下 64 位不会触发**，只有 Rust `api` 层的 `usize` 参数可达） |
+| Rust | `api::amax`、`api::absmax_rows`、`api::quantize_i8_per_tensor` → `(AlignedVec<i8>, f32)`、`api::quantize_i8_per_token` / `api::quantize_i8_per_channel` → `(AlignedVec<i8>, AlignedVec<f32>)`、`api::dequantize_i8` / `api::dequantize_i8_rows`、`api::gemv_i8` |
+
+一个判别式模型（cross-encoder，无 KV cache、无自回归解码）的 int8 前向就是
+"**激活按 token 量化 → 权重按输出通道量化 → GEMV → 残差/归一化留在 f32 域**"：
+
+```rust
+use lasx_rs::api;
+
+// 1) 权重侧（一次性）：按输出通道量化，每行一个 scale
+let (w_q, w_scale) = api::quantize_i8_per_channel(&w_f32, out_features, in_features)?;
+// 2) 激活侧（每层每次）：按 token 量化——per-tensor 会让准确率掉 2.7 个点（§12.3 N3）
+let (x_q, x_scale) = api::quantize_i8_per_token(&act, tokens, hidden)?;
+// 3) 线性层：y[o] = (Σ w[o,i]·x[i]) · (w_scale[o]·x_scale[token])
+let y = api::gemv_i8(
+    w_q.as_slice(), w_scale.as_slice(), x_q.as_slice(), x_scale[0], out_features, hidden,
+)?;
+// 4) 出口反量化（把 int8 结果送回 f32 域做残差/归一化）
+let y_f32 = api::dequantize_i8(&q_out, scale_out)?;
+```
+
+```c
+float s = lasx_quantize_i8_per_tensor(x, q, n);          /* 返回 scale */
+lasx_quantize_i8_per_row(x, q, scales, rows, cols);      /* per-token / per-channel */
+lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
+```
+
+- **契约**在 §2.12（量化/反量化）与 §2.13（GEMV）：用**倒数乘**、取整 **ties-to-even**、
+  **不夹取**、出口**两个 scale 先乘成一个**；
+- **精度**：量化误差 ≤ `scale/2`；`dequantize` 的结果是 `scale` 的精确整数倍；GEMV 的整数
+  累加**精确**（不引入额外舍入），出口只多一次乘法；
+- **未做**：整数/定点 softmax、int8 归一化、`parallel::gemv_i8`（逐行独立，骨架照
+  `parallel::gemv_f16`）——见 §12.3 的 N3 表；
+- **实测**：性能数据（`gemv_i8` 在真实形状上的倍数、per-token 量化的开销、端到端延迟）
+  **尚未做**，目前只有推算，启动前应先在真机验证（`docs/dev.md` §21.6）。
 
 
 ## 6. 批量几何与物理算子
@@ -1552,43 +1662,49 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 "未做、按需"：没有调用点就没有验收对象，硬做等于自己给自己造需求。真要启动，触发条件是
 "要在龙芯上跑 GGUF 权重并与 llama.cpp 交叉验证"（见 `docs/dev.md` §19.13 的 G7 记录）。
 
-**N3（int8 推理，消费者明确，2026-10-02 立项）**
+**N3（int8 推理，消费者明确）—— 2026-10-02 立项，工作区已落地**
 
 消费者：一个 0.2B 量级的**判别式决策模型**（cross-encoder，非生成式，无 KV cache，
 序列 ≤192 token，端侧 CPU）。形态、实测依据与批次划分来源见 `docs/dev.md` §21。
 与 N1/N2 的关系：N1 是 f32/f16 且已落地；N2 是 **GGML 块格式互操作**（面向与 llama.cpp
 交叉验证），N3 是**自用 int8 推理路径**，两者格式与消费者都不同，互不替代。
 
-| 算子 | 说明 | 依据 | 优先级 |
-|---|---|---|---|
-| `amax` / `absmax_rows` | 最大绝对值（per-tensor / 逐行） | 下列量化算子的公共原语 | 高 |
-| `quantize_i8_per_tensor` | f32 → int8 + scale，对称 | 入口 | 高 |
-| **`quantize_i8_per_token`** | 按最后一维（每 token）各自求 amax 与 scale | 实测：per-tensor 使成对准确率 96.1% → 93.4%，**per-token 无损**（`docs/dev.md` §21.3） | **高** |
-| `dequantize_i8` | int8 + scale → f32 | 反量化、残差出口 | 高 |
-| **`gemv_i8`** | 权重 int8 × 激活 int8 → i32 累加，出口乘 scale | 消费主力是 GEMV；现有 `lasx_gemv_f16` 仅 f16 | **高** |
-| `quantize_i8_per_channel` | 按输出通道求 scale（权重侧） | 权重 per-channel 实测误差 0.86%，无损 | 中 |
-| 整数 / 定点 softmax | 多项式或查表近似 `exp` | 仅当保留注意力路径；现有 `lasx_softmax_rows` 是 f32 进 f32 出 | 中 |
-| int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | 参数量小，可不量化；亦可改用 ReLU（int8 精确可表示） | 低 |
+| 算子 | 说明 | 状态 |
+|---|---|---|
+| `lasx_amax` / `lasx_absmax_rows` | 最大绝对值（逐张量 / 逐行） | **已落地**（§2.12 契约、§5.14 用法） |
+| `lasx_quantize_i8_per_tensor` | f32 → int8 + scale，对称（`qmax=127`） | **已落地**（§2.12） |
+| `lasx_quantize_i8_per_row`（= per-token / per-channel） | 逐行各自求 scale：激活 `[token, hidden]` 是 per-token，权重 `[out, in]` 是 per-output-channel——**同一个内核**，`api` 层按意图分成 `quantize_i8_per_token` / `quantize_i8_per_channel` 两个名字 | **已落地**（§2.12；依据：per-tensor 使成对准确率 96.1% → 93.4%，per-token/per-channel 无损，`docs/dev.md` §21.3） |
+| `lasx_dequantize_i8` / `lasx_dequantize_i8_rows` | int8 + scale → f32（逐张量 / 逐行） | **已落地**（§2.12） |
+| `lasx_gemv_i8` | 权重 int8 × 激活 int8 → i32 精确累加；出口 `(acc as f32)·(sw[o]·sx)`——**两个 scale 先乘成一个**（权重 per-channel × 激活 per-token） | **已落地**（§2.13 契约、§5.14 用法） |
+| 整数 / 定点 softmax | 多项式或查表近似 `exp` | **未做**（仅当保留注意力路径才需要；现有 `lasx_softmax_rows` 是 f32 进 f32 出） |
+| int8 `rms_norm` / 激活 | 归一化与激活的 int8 版本 | **未做**（低优先：参数量小、可不量化；亦可改用 ReLU，int8 精确可表示） |
+| `parallel::gemv_i8` | 多核 GEMV（逐行独立，按行块切分，与单线程逐位一致） | **未做**（`parallel::gemv_f16` 是现成骨架；消费侧目前是单 token 前向，未到瓶颈） |
 
-**可复用**：`lasx_dot_i8` 的 i16 乘积 → i32 累加 + 每 1024 字节落 i64 防溢出结构；
-`lasx_dot_q4` 的"组内整数点积 + 组 scale 乘"分层与 `xvhaddw` 水平加宽归约；
-`lasx_matmul` 的打包 + k 分块 + 列块三条路径骨架；`lasx_alloc`/`lasx_free` 对齐分配。
+**实现时定下的三条（都写进了 §2.12/§2.13 的契约）**：① 用**倒数乘**而不是除法
+（LASX 没有向量除法，与 `softmax_rows` 的 `e·(1/Σ)` 同一条约定）；② 取整 **ties-to-even**
+（`xvftintrne.w.s` 与 `f32::round_ties_even` 已实测一致）；③ **不夹取**——`|q| ≤ 127` 由
+`scale = amax/127` 保证，省两条向量指令，也让含 NaN 的输入在向量/标量两条路径上同结果。
 
-**建议实现顺序**：`amax` → `quantize_i8_per_tensor` → **`quantize_i8_per_token`** →
-`dequantize_i8` → **`gemv_i8`** → `quantize_i8_per_channel` → 整数 softmax（按需）。
-前三项是"能跑起来"的最小集，`gemv_i8` 是"跑得快"的关键。
+**可复用**：`lasx_dot_i8` 的 i16 乘积 → i32 累加 + 每 1024 字节落 i64 防溢出结构（`gemv_i8`
+**直接复用它**逐行求点积，所以一致性是复用来的）；`lasx_dot_q4` 的"组内整数点积 + 组 scale 乘"
+分层与 `xvhaddw` 水平加宽归约；`lasx_matmul` 的打包 + k 分块 + 列块三条路径骨架
+（若要给 118M 模型做 prefill 式的矩阵乘，这是起手式）；`lasx_alloc`/`lasx_free` 对齐分配。
 
-**验收**（沿用 §2.5 与 `docs/dev.md` §6.4 的既有纪律）：
+**验收**（沿用 §2.5 与 `docs/dev.md` §6.4 的既有纪律）——已落地的部分逐条对上：
 
-1. 位精确：同一算子的 LASX / LSX / 标量尾 / 分块 / 并行各路径对同一输入**逐位一致**
-   （`to_bits()` 比对）；
-2. 量化算子的误差可解析界定（量化误差 ≤ scale/2），并与 f64 参考对照；
-3. **量化实现的正确性单独断言**——例如量化后取值必须是 `scale` 的整数倍。
-   这一条来自一次真实踩坑：漏除 `qmax` 会使权重退化为三值，而"指标看起来合理"不会暴露它
-   （`docs/dev.md` §21.4 末尾）；
-4. 性能结论按进程级交替 A/B、≥3 轮、丢弃首轮、取中位数；
-5. C ABI 只追加不修改（§2.1 的 15 个 `lasx_*` 符号签名与语义永不改动）；
-6. **给出 per-tensor / per-token / per-channel 三种模式的误差与速度对照**——决策模型侧实测
+1. 位精确：同一算子的向量路径与标量参考对同一输入**逐位一致**（`to_bits()` 比对）：
+   已由 `ops::quant_i8` 的 7 个测试覆盖（含 `n` 取 `0,1,2,3,7,8,9,15,16,17,31,33,64,127,128,1000`、
+   NaN 混入、边界样本）；`gemv_i8` 与精确 i64 参考逐位一致（3 个测试）。
+   **LSX 路径不适用**（N3 沿用 N1 的 LASX-only 取舍，见 §3.2）；
+2. 量化误差可解析界定：实测最坏值 ≤ `scale/2`（999 个随机样本）；
+3. **量化实现的正确性单独断言**——满量程数据的 `max|q| ≥ 120`、边界样本打到 ±127、
+   反量化逐位等于 `(q as f32)·scale`（`scale` 的整数倍）。这一条来自一次真实踩坑：
+   漏除 `qmax` 会使权重退化为三值，而"指标看起来合理"不会暴露它（`docs/dev.md` §21.4 末尾）；
+4. 性能结论按进程级交替 A/B、≥3 轮、丢弃首轮、取中位数：**尚未做**——`docs/dev.md` §21.6 的三条
+   （`gemv_i8` 真实形状倍数、per-token 量化开销、端到端延迟）仍是推算，需要在真机跑；
+5. C ABI 只追加不修改（**§4.1** 的原始 15 个 `lasx_*` 符号签名与语义永不改动）：N3 的
+   7 个符号 + 7 个 `_checked` 变体都是**追加**，且测试断言 C 路径与 Rust `api` 路径逐位一致；
+6. **给出 per-tensor / per-token / per-channel 三种模式的误差对照**——决策模型侧实测
    显示这个选择直接决定 int8 能否使用。
 
 **启动前应确认**（见 `docs/dev.md` §21.6）：`gemv_i8` 在真实形状上的倍数、per-token 量化的

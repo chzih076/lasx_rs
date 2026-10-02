@@ -222,6 +222,139 @@ pub extern "C" fn lasx_dot_q4_checked(
     crate::ops::dot_q4::dot_q4(qa, sa, qb, sb)
 }
 
+/* ==================== N3：int8 推理（量化生产端 + GEMV） ==================== */
+//
+// 这些包装能查的是**结构**：负长度、尺寸相乘溢出、空指针。形状之间的真实关系
+// （`x` 的实际长度是否等于 rows×cols）只有知道长度语义的上层才判得了（§2.12 的约定）。
+
+/// 带错误通道的最大绝对值。C 签名：`float lasx_amax_checked(const float*, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_amax_checked(x: *const f32, n: i32, status: *mut i32) -> f32 {
+    let n = or_fail!(checked_len(n), status, 0.0);
+    let x = unsafe { or_fail!(checked_slice(x, n), status, 0.0) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::amax(x)
+}
+
+/// 带错误通道的逐行最大绝对值。
+/// C 签名：`void lasx_absmax_rows_checked(const float*, int, int, float*, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_absmax_rows_checked(
+    x: *const f32,
+    rows: i32,
+    cols: i32,
+    out: *mut f32,
+    status: *mut i32,
+) {
+    let rows = or_fail!(checked_len(rows), status, ());
+    let cols = or_fail!(checked_len(cols), status, ());
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    let x = unsafe { or_fail!(checked_slice(x, n), status, ()) };
+    let out = unsafe { or_fail!(checked_slice_mut(out, rows), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::absmax_rows(x, rows, cols, out);
+}
+
+/// 带错误通道的逐张量量化（返回 scale）。
+/// C 签名：`float lasx_quantize_i8_per_tensor_checked(const float*, int8_t*, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_quantize_i8_per_tensor_checked(
+    x: *const f32,
+    q: *mut i8,
+    n: i32,
+    status: *mut i32,
+) -> f32 {
+    let n = or_fail!(checked_len(n), status, 0.0);
+    let x = unsafe { or_fail!(checked_slice(x, n), status, 0.0) };
+    let q = unsafe { or_fail!(checked_slice_mut(q, n), status, 0.0) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::quantize_i8_per_tensor(x, q)
+}
+
+/// 带错误通道的逐行量化。
+/// C 签名：`void lasx_quantize_i8_per_row_checked(const float*, int8_t*, float*, int, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_quantize_i8_per_row_checked(
+    x: *const f32,
+    q: *mut i8,
+    scales: *mut f32,
+    rows: i32,
+    cols: i32,
+    status: *mut i32,
+) {
+    let rows = or_fail!(checked_len(rows), status, ());
+    let cols = or_fail!(checked_len(cols), status, ());
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    let x = unsafe { or_fail!(checked_slice(x, n), status, ()) };
+    let q = unsafe { or_fail!(checked_slice_mut(q, n), status, ()) };
+    let scales = unsafe { or_fail!(checked_slice_mut(scales, rows), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::quantize_i8_per_row(x, rows, cols, q, scales);
+}
+
+/// 带错误通道的逐张量反量化。
+/// C 签名：`void lasx_dequantize_i8_checked(const int8_t*, float, float*, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_dequantize_i8_checked(
+    q: *const i8,
+    scale: f32,
+    out: *mut f32,
+    n: i32,
+    status: *mut i32,
+) {
+    let n = or_fail!(checked_len(n), status, ());
+    let q = unsafe { or_fail!(checked_slice(q, n), status, ()) };
+    let out = unsafe { or_fail!(checked_slice_mut(out, n), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::dequantize_i8(q, scale, out);
+}
+
+/// 带错误通道的逐行反量化。
+/// C 签名：`void lasx_dequantize_i8_rows_checked(const int8_t*, const float*, float*, int, int, int*)`
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_dequantize_i8_rows_checked(
+    q: *const i8,
+    scales: *const f32,
+    out: *mut f32,
+    rows: i32,
+    cols: i32,
+    status: *mut i32,
+) {
+    let rows = or_fail!(checked_len(rows), status, ());
+    let cols = or_fail!(checked_len(cols), status, ());
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    let q = unsafe { or_fail!(checked_slice(q, n), status, ()) };
+    let scales = unsafe { or_fail!(checked_slice(scales, rows), status, ()) };
+    let out = unsafe { or_fail!(checked_slice_mut(out, n), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::quant_i8::dequantize_i8_per_row(q, rows, cols, scales, out);
+}
+
+/// 带错误通道的 int8 GEMV。
+/// C 签名：`void lasx_gemv_i8_checked(const int8_t*, const float*, const int8_t*, float, float*, int, int, int*)`
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_gemv_i8_checked(
+    w: *const i8,
+    scale_w: *const f32,
+    x: *const i8,
+    scale_x: f32,
+    y: *mut f32,
+    m: i32,
+    k: i32,
+    status: *mut i32,
+) {
+    let m = or_fail!(checked_len(m), status, ());
+    let k = or_fail!(checked_len(k), status, ());
+    let n = or_fail!(checked_mul(m, k), status, ());
+    let w = unsafe { or_fail!(checked_slice(w, n), status, ()) };
+    let x = unsafe { or_fail!(checked_slice(x, k), status, ()) };
+    let scale_w = unsafe { or_fail!(checked_slice(scale_w, m), status, ()) };
+    let y = unsafe { or_fail!(checked_slice_mut(y, m), status, ()) };
+    LasxStatus::Ok.write(status);
+    crate::ops::gemv_i8::gemv_i8(w, scale_w, x, scale_x, m, k, y);
+}
+
 /* ==================== 批量几何 ==================== */
 
 /// 带错误通道的批量 3 分量模长。

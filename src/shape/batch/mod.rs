@@ -9,7 +9,8 @@
 //! | [`V3Ref`] / [`V3Buf`] | x、y、z（3 条） | 类型里（const `N`） | `norm3`、`unitize3`、`cross3`、`vec3_add_scaled`、`j2_accel` |
 //! | [`RvMut`] | rx…vz（位置+速度，6 条） | 类型里 | `rk4_j2_step`、`ballistic_step` |
 //! | [`V2Ref`] | x、y（2 条，f32） | 类型里 | `batch_distance2d` |
-//! | [`V3Dyn`] / [`V3DynMut`] / [`RvDynMut`] / [`V2Dyn`] | 同上 | **运行时字段** | 同上（批量大小运行期才知道时用这一组） |//!
+//! | [`V3Dyn`] / [`V3DynMut`] / [`RvDynMut`] / [`V2Dyn`] | 同上 | **运行时字段** | 同上（批量大小运行期才知道时用这一组） |
+//!
 //! 两组的分工同 [`crate::shape::Mat`] 与 [`crate::shape::MatDyn`]：形状编译期已知就用
 //! const 泛型那组（错误能编译期报），批量大小是运行时参数就用 `*Dyn` 那组（构造时校验一次）。
 //!

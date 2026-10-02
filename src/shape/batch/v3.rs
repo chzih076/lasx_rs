@@ -1,7 +1,7 @@
 //! 三分量批量视图：`V3Ref`（借用）/ `V3Buf`（拥有）。
 //!
 //! 覆盖库里所有"逐样本三分量"的批量算子；方法名统一是 `*_into`（结果写进 `V3Buf` 或
-//! `VecBuf`），与 [`crate::shape::Mat::matmul_into`] 的命名一致。
+//! `VecBuf`），与 [`crate::shape::Prepared::apply_into`] 的命名一致。
 
 use crate::aligned::AlignedVec;
 use crate::api::{expect_len, Error};

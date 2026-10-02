@@ -132,6 +132,12 @@ pub use ffi::matmul::{lasx_matmul, lasx_matmul_f64};
 pub use ffi::memory::lasx_alloc;
 pub use ffi::physics::{lasx_ballistic_step, lasx_j2_accel_batch, lasx_rk4_j2_step_batch};
 pub use ffi::quant::{lasx_dot_i8, lasx_dot_q4};
+// N3 批次（int8 推理，`docs/dev.md` §21）：新增符号按 C ABI"只追加"的约定挂在这里，
+// `lasx_*_checked` 变体在 `lasx_rs::ffi::checked`。
+pub use ffi::quant::{
+    lasx_absmax_rows, lasx_amax, lasx_dequantize_i8, lasx_dequantize_i8_rows, lasx_gemv_i8,
+    lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,
+};
 pub use ffi::reduce::{lasx_axpy, lasx_dot, lasx_dot_f64, lasx_sum};
 // NN 侧 N1 批次（`docs/dev.md` §20）：与上面的导出保持一致，Rust 侧可以直接 `lasx_rs::lasx_silu`。
 // 上一轮加 `softmax_rows`/`rms_norm` 时漏了这行重新导出——只有 `lasx_rs::ffi::nn::*` 能用，

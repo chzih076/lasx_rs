@@ -1039,10 +1039,293 @@ fn alloc3(n: usize) -> (AlignedVec<f64>, AlignedVec<f64>, AlignedVec<f64>) {
     (AlignedVec::new(n), AlignedVec::new(n), AlignedVec::new(n))
 }
 
+/* ==================== N3：int8 推理（量化生产端 + GEMV） ==================== */
+
+/// 最大绝对值（逐张量）：`max_i |x_i|`。
+///
+/// 契约（`docs/ops.md` §2.12）：与 `f32::max` 折叠同语义——**NaN 被忽略**，全 NaN 输入得
+/// `0.0`；空输入得 `0.0`。`±inf` 不在契约内。
+pub fn amax(x: &[f32]) -> Result<f32> {
+    Ok(crate::ops::quant_i8::amax(x))
+}
+
+/// 逐行最大绝对值：`out[r] = max_j |x[r·cols + j]|`（`rows × cols` 行主序）。
+///
+/// per-token 激活量化与 per-channel 权重量化共用这一条（都是行主序按行归约）。
+///
+/// # Errors
+/// - `x.len() != rows × cols`（[`Error::Shape`]）；
+/// - `rows × cols` 溢出 `usize`（[`Error::Overflow`]）。
+pub fn absmax_rows(x: &[f32], rows: usize, cols: usize) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("absmax_rows", "rows×cols", rows, cols)?;
+    expect_len("absmax_rows", "x", x.len(), n)?;
+    let mut out = AlignedVec::<f32>::new(rows);
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    crate::ops::quant_i8::absmax_rows(x, rows, cols, out.as_mut_slice());
+    Ok(out)
+}
+
+/// 逐张量对称量化：`q = round_ties_even(x · (1/scale))`，返回 `(q, scale)`。
+///
+/// 契约（`docs/ops.md` §2.12）：`scale = max|x| / 127`；`q ∈ [−127, 127]`（**不使用 −128**）；
+/// 取整是 **ties-to-even**；用**倒数乘**而不是除法（LASX 无向量除法）；全零（或全 NaN）输入
+/// ⇒ `scale = 0` 且 `q` 全 0。
+///
+/// 量化误差 ≤ `scale/2`；`dequantize_i8` 的结果是 `scale` 的**精确整数倍**。
+pub fn quantize_i8_per_tensor(x: &[f32]) -> Result<(AlignedVec<i8>, f32)> {
+    let mut q = AlignedVec::<i8>::new(x.len());
+    let scale = crate::ops::quant_i8::quantize_i8_per_tensor(x, q.as_mut_slice());
+    Ok((q, scale))
+}
+
+/// 逐 **token** 激活量化（`[token, hidden]` 行主序）：每行一个 `scale`。
+///
+/// 与 [`quantize_i8_per_channel`] 是**同一个内核**、不同的语义名字——行主序下"按行归约"
+/// 对激活就是 per-token，对权重就是 per-output-channel。分开命名是为了让调用点自证意图。
+///
+/// # Errors
+/// - `x.len() != rows × cols`（[`Error::Shape`]）；
+/// - `rows × cols` 溢出（[`Error::Overflow`]）。
+pub fn quantize_i8_per_token(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(AlignedVec<i8>, AlignedVec<f32>)> {
+    quantize_i8_rows_impl("quantize_i8_per_token", x, rows, cols)
+}
+
+/// 逐**输出通道**权重量化（`[out_features, in_features]` 行主序）：每行一个 `scale`。
+///
+/// # Errors
+/// 同 [`quantize_i8_per_token`]。
+pub fn quantize_i8_per_channel(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(AlignedVec<i8>, AlignedVec<f32>)> {
+    quantize_i8_rows_impl("quantize_i8_per_channel", w, rows, cols)
+}
+
+/// [`quantize_i8_per_token`] / [`quantize_i8_per_channel`] 的公共实现（同一内核）。
+fn quantize_i8_rows_impl(
+    op: &'static str,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(AlignedVec<i8>, AlignedVec<f32>)> {
+    let n = checked_mul(op, "rows×cols", rows, cols)?;
+    expect_len(op, "x", x.len(), n)?;
+    let mut q = AlignedVec::<i8>::new(n);
+    let mut scales = AlignedVec::<f32>::new(rows);
+    if rows == 0 || cols == 0 {
+        return Ok((q, scales));
+    }
+    crate::ops::quant_i8::quantize_i8_per_row(
+        x,
+        rows,
+        cols,
+        q.as_mut_slice(),
+        scales.as_mut_slice(),
+    );
+    Ok((q, scales))
+}
+
+/// 逐张量反量化：`out[i] = (q[i] as f32) · scale`。
+///
+/// 与 [`quantize_i8_per_tensor`] 互为逆：结果逐位等于 `(q as f32) · scale`（一次舍入），
+/// 因而是 `scale` 的精确整数倍。
+pub fn dequantize_i8(q: &[i8], scale: f32) -> Result<AlignedVec<f32>> {
+    let mut out = AlignedVec::<f32>::new(q.len());
+    crate::ops::quant_i8::dequantize_i8(q, scale, out.as_mut_slice());
+    Ok(out)
+}
+
+/// 逐行反量化：每行用自己的 `scales[r]`。
+///
+/// # Errors
+/// - `q.len() != rows × cols` 或 `scales.len() != rows`（[`Error::Shape`]）；
+/// - `rows × cols` 溢出（[`Error::Overflow`]）。
+pub fn dequantize_i8_rows(
+    q: &[i8],
+    rows: usize,
+    cols: usize,
+    scales: &[f32],
+) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("dequantize_i8_rows", "rows×cols", rows, cols)?;
+    expect_len("dequantize_i8_rows", "q", q.len(), n)?;
+    expect_len("dequantize_i8_rows", "scales", scales.len(), rows)?;
+    let mut out = AlignedVec::<f32>::new(n);
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    crate::ops::quant_i8::dequantize_i8_per_row(q, rows, cols, scales, out.as_mut_slice());
+    Ok(out)
+}
+
+/// int8 权重 × int8 激活的矩阵-向量乘（N3 的消费主力）：
+/// `y[o] = (Σ_i W[o,i]·x[i]) · (scale_w[o] · scale_x)`。
+///
+/// 契约（`docs/ops.md` §2.13）：累加是**整数精确**的（i16 乘积 → i32 累加 → i64 落盘，
+/// 与 `dot_i8` 同一内核）；出口是**一次乘法**——先把两个 scale 乘成一个（一次舍入）再乘
+/// `acc`，写成 `((acc as f32)·sw)·sx` 是两次舍入、不保证逐位一致。
+///
+/// # Errors
+/// - `w.len() != m × k`、`x.len() != k`、`scale_w.len() != m`（[`Error::Shape`]）；
+/// - `m × k` 溢出（[`Error::Overflow`]）。
+pub fn gemv_i8(
+    w: &[i8],
+    scale_w: &[f32],
+    x: &[i8],
+    scale_x: f32,
+    m: usize,
+    k: usize,
+) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("gemv_i8", "m×k", m, k)?;
+    expect_len("gemv_i8", "w", w.len(), n)?;
+    expect_len("gemv_i8", "x", x.len(), k)?;
+    expect_len("gemv_i8", "scale_w", scale_w.len(), m)?;
+    let mut y = AlignedVec::<f32>::new(m);
+    if m == 0 || k == 0 {
+        return Ok(y);
+    }
+    crate::ops::gemv_i8::gemv_i8(w, scale_w, x, scale_x, m, k, y.as_mut_slice());
+    Ok(y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aligned::ALIGN;
+
+    /* ==================== N3：int8 推理 ==================== */
+
+    /// 端到端：f32 → per-token 量化 → `gemv_i8`，与 f32 参考的相对误差在有界范围内。
+    ///
+    /// 界怎么定：权重与激活各引入 ≤ `scale/2` 的绝对误差，累加 `k` 项后最坏
+    /// `≈ (k/2)·(sw·sx_max + sx·sw_max)`；随机数据的实测值远小于这个上界，这里按
+    /// **实测留 3 倍余量**断言（定量界见 `docs/ops.md` §2.12，绝对最坏界不写成断言，
+    /// 免得把"随机数据的实测"伪装成"理论保证"）。
+    #[test]
+    fn test_gemv_i8_pipeline_matches_f32_within_quantization_error() {
+        let m = 16usize;
+        let k = 64usize;
+        let mut rnd = crate::ops::testutil::Lcg(0x1234_5678);
+        let w_f32: Vec<f32> = (0..m * k).map(|_| rnd.f64() as f32).collect();
+        let x_f32: Vec<f32> = (0..k).map(|_| rnd.f64() as f32).collect();
+        // 权重按 per-channel（逐输出行）、激活按 per-tensor
+        let (w_q, sw) = quantize_i8_per_channel(&w_f32, m, k).unwrap();
+        let (x_q, sx) = quantize_i8_per_tensor(&x_f32).unwrap();
+        let got = gemv_i8(w_q.as_slice(), sw.as_slice(), x_q.as_slice(), sx, m, k).unwrap();
+
+        // f32 参考（原始数据）
+        let want: Vec<f32> = (0..m)
+            .map(|o| (0..k).map(|i| w_f32[o * k + i] * x_f32[i]).sum::<f32>())
+            .collect();
+        // 参考量级
+        let norm = want.iter().fold(0.0f32, |a, b| a.max(b.abs())).max(1e-3);
+        for o in 0..m {
+            let rel = (got[o] - want[o]).abs() / norm;
+            assert!(
+                rel < 0.05,
+                "o={o}: got={} want={} rel={rel}",
+                got[o],
+                want[o]
+            );
+        }
+        // 与"量化数据的整数参考"必须逐位一致（这是硬口径，不靠误差界）
+        for o in 0..m {
+            let acc: i64 = (0..k).map(|i| w_q[o * k + i] as i64 * x_q[i] as i64).sum();
+            let exact = (acc as i32 as f32) * (sw[o] * sx);
+            assert_eq!(got[o].to_bits(), exact.to_bits(), "o={o}");
+        }
+    }
+
+    /// 逐行量化 / 反量化的往返：误差 ≤ `scale/2`，且与逐张量版在同一行上一致。
+    #[test]
+    fn test_quantize_dequantize_roundtrip_error() {
+        let rows = 7usize;
+        let cols = 33usize;
+        let mut rnd = crate::ops::testutil::Lcg(0xfeed_beef);
+        let x: Vec<f32> = (0..rows * cols).map(|_| 5.0 * rnd.f64() as f32).collect();
+        let (q, scales) = quantize_i8_per_token(&x, rows, cols).unwrap();
+        let back = dequantize_i8_rows(q.as_slice(), rows, cols, scales.as_slice()).unwrap();
+        for r in 0..rows {
+            let s = scales[r];
+            for j in 0..cols {
+                let i = r * cols + j;
+                let e = (back[i] - x[i]).abs();
+                assert!(e <= 0.5 * s * (1.0 + 1e-6), "r={r} j={j} e={e} s={s}");
+            }
+        }
+        // `absmax_rows` 与量化内部用的 amax 一致
+        let am = absmax_rows(&x, rows, cols).unwrap();
+        for r in 0..rows {
+            let want = x[r * cols..(r + 1) * cols]
+                .iter()
+                .fold(0.0f32, |a, &b| a.max(b.abs()));
+            assert_eq!(am[r].to_bits(), want.to_bits(), "row {r}");
+            assert_eq!(scales[r].to_bits(), (want / 127.0).to_bits());
+        }
+    }
+
+    /// 形状/长度/溢出错误路径：逐条打准（错误口径与其它 api 一致）。
+    #[test]
+    fn test_int8_api_error_paths() {
+        // 长度不符
+        match absmax_rows(&[0.0; 10], 3, 4) {
+            Err(Error::Shape {
+                op,
+                what,
+                expected,
+                got,
+            }) => {
+                assert_eq!((op, what), ("absmax_rows", "x"));
+                assert_eq!((expected, got), (12, 10));
+            }
+            other => panic!("应报长度错误：{other:?}"),
+        }
+        match quantize_i8_per_token(&[0.0; 5], 2, 4) {
+            Err(Error::Shape { op, what, .. }) => {
+                assert_eq!((op, what), ("quantize_i8_per_token", "x"))
+            }
+            other => panic!("应报长度错误：{other:?}"),
+        }
+        match dequantize_i8_rows(&[0i8; 8], 2, 4, &[1.0]) {
+            Err(Error::Shape {
+                op,
+                what,
+                expected,
+                got,
+            }) => {
+                assert_eq!((op, what), ("dequantize_i8_rows", "scales"));
+                assert_eq!((expected, got), (2, 1));
+            }
+            other => panic!("应报长度错误：{other:?}"),
+        }
+        // gemv_i8 的三处长度 + 一处溢出
+        let w = [0i8; 12];
+        let sw = [1.0f32; 3];
+        let x = [0i8; 4];
+        assert!(gemv_i8(&w[..11], &sw, &x, 1.0, 3, 4).is_err(), "w 长度");
+        assert!(
+            gemv_i8(&w, &sw[..2], &x, 1.0, 3, 4).is_err(),
+            "scale_w 长度"
+        );
+        assert!(gemv_i8(&w, &sw, &x[..3], 1.0, 3, 4).is_err(), "x 长度");
+        match gemv_i8(&[], &[], &[], 1.0, usize::MAX, 2) {
+            Err(Error::Overflow { op, what }) => assert_eq!((op, what), ("gemv_i8", "m×k")),
+            other => panic!("应报溢出：{other:?}"),
+        }
+        // 退化形状不炸
+        assert!(absmax_rows(&[], 0, 4).unwrap().is_empty());
+        assert_eq!(quantize_i8_per_token(&[], 0, 0).unwrap().0.len(), 0);
+        assert_eq!(gemv_i8(&[], &[], &[], 1.0, 0, 0).unwrap().len(), 0);
+        // 空输入的 amax 与全零输入
+        assert_eq!(amax(&[]).unwrap(), 0.0);
+        assert_eq!(amax(&[0.0, -0.0]).unwrap(), 0.0);
+    }
 
     /// `api` 只是"切片 + 校验"的薄包装，数值必须与 C ABI 路径逐位一致。
     #[test]
