@@ -111,7 +111,10 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
         Group::Ballistic => suites::physics::ballistic(rows),
         Group::Rk4 => suites::physics::rk4(rows),
         Group::FmaPeak => suites::micro::fma_peak(),
-        Group::ThreadScaling => suites::micro::thread_scaling(),
+        Group::ThreadScaling => {
+            suites::micro::thread_scaling();
+            suites::micro::matmul_thread_scaling();
+        }
         Group::Align => suites::align::align(),
         Group::DispatchOverhead => suites::micro::dispatch_overhead(),
         Group::Scenario => suites::scenario::run_all(),

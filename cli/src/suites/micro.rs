@@ -137,6 +137,57 @@ pub fn thread_scaling() {
     );
 }
 
+/// f32 GEMM 的多线程扩展（`parallel::matmul_f32`，常驻池）。
+///
+/// 动机见 `docs/dev.md` §21.8：批量形态下 **f32 `lasx_matmul` 比 int8 快 2.5×**，
+/// 所以"端到端能不能进分档目标"要按 **f32 + 多核**来算——这张表就是那个乘数。
+/// 形状取 §21.2 消费者的三层形状（token = 192）。线程表**不绑核**（§7 开头口径）。
+pub fn matmul_thread_scaling() {
+    let tokens = 192usize;
+    println!();
+    println!("## 多线程扩展性：`parallel::matmul_f32`（token = {tokens}，f32 GEMM）");
+    println!();
+    println!("| 形状 (m×k×n) | 1 线程 | 2 | 4 | 8 | 12 | 24 | 12 线程扩展 | 12 线程效率 |");
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for &(k, n) in &[(768usize, 768usize), (768, 3072), (3072, 768)] {
+        let mut rng = crate::data::Lcg::new((k * 11 + n) as u64);
+        let mut a: Vec<f32> = (0..tokens * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let mut c = vec![0f32; tokens * n];
+        let t1 = timeit(|| {
+            lasx_matmul(
+                tokens as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+            );
+            let _ = black_box(c[0]);
+        });
+        let mut cells = Vec::new();
+        let mut t12 = Duration::ZERO;
+        for &th in &[2usize, 4, 8, 12, 24] {
+            let pool = WorkerPool::new(th);
+            let d = timeit(|| {
+                parallel::matmul_f32(&pool, tokens, k, n, &mut a, &b, &mut c).unwrap();
+                let _ = black_box(c[0]);
+            });
+            if th == 12 {
+                t12 = d;
+            }
+            cells.push(fmt_t(d));
+        }
+        let sp = t1.as_secs_f64() / t12.as_secs_f64();
+        println!(
+            "| {tokens}×{k}×{n} | {} | {} | {sp:.2}× | {:.0}% |",
+            fmt_t(t1),
+            cells.join(" | "),
+            100.0 * sp / 12.0
+        );
+    }
+}
+
 #[inline(never)]
 pub fn fma_peak_lasx() -> f64 {
     unsafe {
