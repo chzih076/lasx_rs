@@ -2286,13 +2286,20 @@ LASX 微内核里。
 | # | 原语 | 一次解锁 | 现成消费者 |
 |---|---|---|---|
 | G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（`dot!`/`gemv!`） |
-| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | 库内算子（**无外部消费者**） |
+| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | 库内算子（**已审计**：外部消费者 0 处，见下） |
 | G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | ✅ **已落地**（`shape::batch`，`docs/ops.md` §6.7）：真实消费者只有 loong-sci 的 **5 个算子、14 处调用点**（`rk4_j2_step_batch`×1、`j2_accel_batch`×2、`vec3_add_scaled_batch`×4、`batch_distance2d`×5、`ballistic_step`×2）；宏未做 |
 | G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | **否掉**：原以为消费者是"loong-sci 的 3×3 求逆、惯量、6×6 协方差"，实测这些算子（批量的与非批量的）在 loong-sci 里**一次都没被调用**（`lasx_mat3_mul_vec3*`/`lasx_quat_*`/`lasx_cross3*`/`lasx_unitize3*` 各 0 处） |
-| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | 库内算子（**无外部消费者**） |
-| G6 | 表 / 模式参数 | `rope` | 库内算子（**无外部消费者**） |
+| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | 库内算子（**已审计**：外部消费者 0 处，见下） |
+| G6 | 表 / 模式参数 | `rope` | 库内算子（**已审计**：外部消费者 0 处，见下） |
 | G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | **否掉**（唯一消费者 loong-llm 不再作为目标，见下） |
 | G8 | 多操作数 / `alpha` / 转置 | attention 类多步表达式 | —（v1 有意延后，诊断里点名） |
+
+**G2/G5/G6 的"无外部消费者"是实测的（与 G4 同一处理）**：对唯一的外部消费项目 loong-sci
+全库检索 **12 个算子名**——`axpy`、`silu`、`gelu`、`rope`、`softmax_rows`、`rms_norm`、
+`dot_f16`、`gemv_f16`、`amax`、`quantize`、`gemv_i8`、`matmul_i8`——**全部 0 处调用**。
+所以这三项和 G4/G7 一样是"查过的否"，不是"没查过的待办"：**没有调用点不可怕，
+可怕的是把"没查过"写成"没做过"。**（N3 的 8 个算子在 loong-sci 里同样是 0 处，
+与 `docs/ops.md` §12.3 的"无调用点"一致。）
 
 **G7 否掉的理由**：这一项的动机**只有**"给 loong-llm 的 8 处 `q8_matmul` 提供块量化视图"；
 loong-llm 不再作为下游目标后，G7 就是"为不存在的调用点加 dtype 层 + 写 N2 的 Q8_0 内核"，
