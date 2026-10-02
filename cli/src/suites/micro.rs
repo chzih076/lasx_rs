@@ -382,3 +382,51 @@ pub fn dispatch_overhead() {
          > 具体到 `lasx_dot` 的绝对值看 `dot` 套件（本页不再写死数字——写死过一次，很快就过期了）。"
     );
 }
+
+/// `parallel::gemv_i8_k`（**k 方向切分**，为 `m = 1` 的单 token 档位而做）的线程扩展。
+///
+/// 动机：int8 唯一占优的档位是"单 token、权重流 DRAM"（`docs/ops.md` §5.15），那一档 `m = 1`
+/// ⇒ 按行切分没有并行度；本函数量的是"按 `k` 切块"能拿回多少。
+/// 三个 `k` 分别代表：模型单层（3072，L2 内）、1 MiB（L2 边缘）、16 MiB（DRAM 流）。
+/// 线程表**不绑核**（§7 开头口径）。
+pub fn gemv_i8_k_thread_scaling() {
+    println!();
+    println!("## 多线程扩展性：`parallel::gemv_i8_k`（`m = 1`，k 方向切块，int8 GEMV）");
+    println!();
+    println!("| k（权重字节） | 1 线程 | 2 | 4 | 8 | 12 | 24 | 12 线程扩展 |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for &k in &[3072usize, 1 << 20, 1 << 24] {
+        let mut rng = crate::data::Lcg::new(k as u64);
+        let w: Vec<i8> = (0..k).map(|_| rng.i8()).collect();
+        let x: Vec<i8> = (0..k).map(|_| rng.i8()).collect();
+        let sw = [0.001f32];
+        let mut y = [0f32; 1];
+        // 池建在计时闭包**外面**：建池本身几十 µs，第一版把 `WorkerPool::new(1)` 写在闭包里，
+        // 于是"1 线程"那列混进了建池开销，跑出 200× 的假加速（探针要先证明自己在测什么）
+        let pool1 = WorkerPool::new(1);
+        let t1 = timeit(|| {
+            parallel::gemv_i8_k(&pool1, 1, k, &w, &sw, &x, 0.002, &mut y).unwrap();
+            let _ = black_box(y[0]);
+        });
+        let mut cells = Vec::new();
+        let mut t12 = Duration::ZERO;
+        for &th in &[2usize, 4, 8, 12, 24] {
+            let pool = WorkerPool::new(th);
+            let d = timeit(|| {
+                parallel::gemv_i8_k(&pool, 1, k, &w, &sw, &x, 0.002, &mut y).unwrap();
+                let _ = black_box(y[0]);
+            });
+            if th == 12 {
+                t12 = d;
+            }
+            cells.push(fmt_t(d));
+        }
+        println!(
+            "| {k}（{} KiB） | {} | {} | {:.2}× |",
+            k / 1024,
+            fmt_t(t1),
+            cells.join(" | "),
+            t1.as_secs_f64() / t12.as_secs_f64()
+        );
+    }
+}

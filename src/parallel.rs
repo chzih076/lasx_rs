@@ -455,6 +455,103 @@ pub fn gemv_f16(
     Ok(())
 }
 
+/// [`gemv_i8_k`] 的块长下限（元素数）。取 1024：与 `dot_i8` 内部"每 1024 字节落盘 i64"
+/// 的节奏同量级，让每块的向量主体足够长、固定开销摊得开。
+pub const GEMV_I8_K_BLOCK: usize = 1024;
+
+/// 多核 **k 方向切分**的 int8 GEMV：`y[o] = (Σ_i w[o,i]·x[i]) · (scale_w[o]·scale_x)`。
+///
+/// # 为什么要它（与 [`gemv_i8`] 的分工）
+///
+/// [`gemv_i8`] 按 **`m` 行**切分，行少（尤其 `m = 1`）就没有并行度；而 int8 唯一占优的档位
+/// 正是"单 token、权重流 DRAM"（`docs/ops.md` §5.15）——那一档 `m = 1`。本函数在 **`k` 方向**
+/// 切块，把"块"当"行"交给池派活，所以单 token 也能用上多核。**不需要给池加新派活原语**：
+/// `for_each_row_block_mut*` 对"块 = 行"一样成立（这也是 `docs/dev.md` §21.5 里那句
+/// "要新原语"的更正——查过之后发现不用）。
+///
+/// # 为什么可以逐位一致（不需要把内核拆出"块级入口"）
+///
+/// `dot_i8` 的契约是"i16 乘积 → i32 累加 → 每 1024 字节落 i64，最终**截断为 i32**"。
+/// 把 `k` 切成若干块分别求 `dot_i8`，再把这些 i32 部分和相加，等于在整数环 `Z/2³²` 里换一个
+/// 结合序——**截断是同态**（`(a+b) mod 2³²` 与"分别截断再相加"相同），所以与"一次算完整行"
+/// **逐位相同**。浮点那种"必须按原顺序折叠"的小心在这里不需要——这是整数归约特有的便利。
+///
+/// # 块粒度
+/// 每块至少 [`GEMV_I8_K_BLOCK`] 个元素，块数取 `4×线程数` 量级（与 `pick_rows` 同一判据）：
+/// 既有并行度，又不让每块的固定开销占比过大。单线程或切不动（`k` 很小）时**直接走
+/// [`gemv_i8`] 的内核**，连折叠都省掉。
+///
+/// # Errors
+/// 与 [`gemv_i8`] 同一套（`w.len() != m×k` / `x.len() != k` / `scale_w.len() != m` /
+/// `y.len() != m` → [`Error::Shape`]；`m×k` 溢出 → [`Error::Overflow`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_i8_k(
+    pool: &WorkerPool,
+    m: usize,
+    k: usize,
+    w: &[i8],
+    scale_w: &[f32],
+    x: &[i8],
+    scale_x: f32,
+    y: &mut [f32],
+) -> Result<(), Error> {
+    let mk = checked_mul("gemv_i8_k", "m×k", m, k)?;
+    expect_len("gemv_i8_k", "w", w.len(), mk)?;
+    expect_len("gemv_i8_k", "x", x.len(), k)?;
+    expect_len("gemv_i8_k", "scale_w", scale_w.len(), m)?;
+    expect_len("gemv_i8_k", "y", y.len(), m)?;
+    if m == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        y.fill(0.0);
+        return Ok(());
+    }
+    let want = pool.threads().saturating_mul(4).max(1);
+    let nb = want.min(k.div_ceil(GEMV_I8_K_BLOCK)).max(1);
+    // 门槛：**每块至少 `GEMV_I8_K_BLOCK` 且至少 4 块**才值得并行。实测依据（`docs/dev.md` §7.9
+    // 末表）：`k = 3 KiB`（L1 驻留）时并行版 254 ns vs 串行 190 ns —— **0.75×，更慢**
+    // （派活固定开销 ~64 ns 压过内核本身）；`k ≥ 1 MiB`（L2/DRAM 流）是 5.4–6.9×。
+    if pool.threads() <= 1 || nb < 4 {
+        crate::ops::gemv_i8::gemv_i8(w, scale_w, x, scale_x, m, k, y);
+        return Ok(());
+    }
+    let block = k.div_ceil(nb); // 向上取整：最后一块短
+    let rows_total = m * nb;
+
+    let mut partials = vec![0i32; rows_total];
+    let pick = crate::pool::pick_rows(rows_total, pool.threads(), 1);
+    // 工作量口径用 m·k（真实工作量），不是 rows_total
+    pool.for_each_row_block_mut_picked_work(
+        rows_total,
+        1,
+        [(&mut partials, 1)],
+        mk.saturating_add(rows_total),
+        pick,
+        |start, rows, [pb]| {
+            for (off, slot) in (start..start + rows).zip(pb.iter_mut()) {
+                let (o, b) = (off / nb, off % nb);
+                let (lo, hi) = (b * block, ((b + 1) * block).min(k));
+                *slot = if lo >= hi {
+                    0
+                } else {
+                    crate::ops::dot_i8::dot_i8(&w[o * k + lo..o * k + hi], &x[lo..hi])
+                };
+            }
+        },
+    );
+
+    // 折叠：按块下标升序做 wrapping i32 加（= Z/2³² 里的加法，与一次算完整行同值）
+    for o in 0..m {
+        let mut acc: i32 = 0;
+        for &p in &partials[o * nb..(o + 1) * nb] {
+            acc = acc.wrapping_add(p);
+        }
+        y[o] = (acc as f32) * (scale_w[o] * scale_x);
+    }
+    Ok(())
+}
+
 /// 多核批量 RK4 J2 单步（6 个 SOA 数组一次派活）。
 ///
 /// 对应单线程的 `lasx_rk4_j2_step_batch`，数值**逐位一致**；多步传播时把池建在循环外面，
@@ -699,6 +796,88 @@ mod tests {
                 assert_eq!(got[r].to_bits(), want[r].to_bits(), "{m}×{k} 行 {r} 不一致");
             }
         }
+    }
+
+    /// k 方向切分的 int8 GEMV 必须与单线程 `ops::gemv_i8` **逐位一致**（整数环同态的推论，
+    /// 见 `gemv_i8_k` 的文档）。形状覆盖：`m = 1`（它存在的理由）、块边界整/不整
+    /// （`k` 不被块长整除）、`k` 很小（切不动 ⇒ 直接走内核）、以及 `k` 大且块多。
+    #[test]
+    fn test_gemv_i8_k_matches_serial_bit_for_bit() {
+        for &threads in &[2usize, 5, 12] {
+            let pool = WorkerPool::new(threads);
+            for &(m, k) in &[
+                (1usize, 1usize),
+                (1, 1023),   // 切不动（< GEMV_I8_K_BLOCK）
+                (1, 1024),   // 恰好一块
+                (1, 1025),   // 两块，尾块 1
+                (1, 3072),   // 三块
+                (1, 40_000), // 多块 + 尾块
+                (3, 5000),
+                (17, 777),
+                (64, 2048),
+            ] {
+                let mut s = 0x9e37_79b9u64.wrapping_add((m * 31 + k) as u64);
+                let mut rnd = move || {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (s >> 33) as i32 as i8
+                };
+                let w: Vec<i8> = (0..m * k).map(|_| rnd()).collect();
+                let x: Vec<i8> = (0..k).map(|_| rnd()).collect();
+                let sw: Vec<f32> = (0..m).map(|o| 0.001 + 0.0003 * o as f32).collect();
+                let sx = 0.0025f32;
+                let mut want = vec![0f32; m];
+                crate::ops::gemv_i8::gemv_i8(&w, &sw, &x, sx, m, k, &mut want);
+                let mut got = vec![0f32; m];
+                gemv_i8_k(&pool, m, k, &w, &sw, &x, sx, &mut got).unwrap();
+                for o in 0..m {
+                    assert_eq!(
+                        got[o].to_bits(),
+                        want[o].to_bits(),
+                        "{threads} 线程 {m}×{k} 行 {o} 不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `gemv_i8_k` 的错误与退化：与 `api::gemv_i8` 同一套 `Error` 口径；`k = 0` 写全 0。
+    #[test]
+    fn test_gemv_i8_k_errors_and_degenerate() {
+        let pool = WorkerPool::new(4);
+        let (m, k) = (4usize, 100usize);
+        let w = vec![1i8; m * k];
+        let x = vec![1i8; k];
+        let sw = vec![1.0f32; m];
+        let mut y = vec![0f32; m];
+
+        let short_w = vec![1i8; m * k - 1];
+        assert!(matches!(
+            gemv_i8_k(&pool, m, k, &short_w, &sw, &x, 1.0, &mut y),
+            Err(Error::Shape { .. })
+        ));
+        assert!(matches!(
+            gemv_i8_k(&pool, m, k, &w, &sw[..m - 1], &x, 1.0, &mut y),
+            Err(Error::Shape { .. })
+        ));
+        // 借 `short_w` 的可变版走一遍 y 长度错误，避免多写一个数组
+        let mut short_y = vec![0f32; m - 1];
+        assert!(matches!(
+            gemv_i8_k(&pool, m, k, &w, &sw, &x, 1.0, &mut short_y),
+            Err(Error::Shape { .. })
+        ));
+        // m = 0：长度全空 ⇒ 自洽，返回 Ok（退化输入不是错误）
+        assert!(gemv_i8_k(&pool, 0, k, &[], &[], &x, 1.0, &mut []).is_ok());
+        // k = 0：写全 0（与 `api::gemv_i8` 同口径）
+        y.fill(7.0);
+        gemv_i8_k(&pool, m, 0, &[], &sw, &[], 1.0, &mut y).unwrap();
+        assert!(y.iter().all(|&v| v == 0.0));
+        // 溢出：m×k
+        assert!(matches!(
+            gemv_i8_k(&pool, usize::MAX, 2, &[], &[], &[], 1.0, &mut []),
+            Err(Error::Overflow { .. })
+        ));
     }
 
     /// `gemv_f16` 的形状错误与退化输入：与 `api::gemv_f16` 同一套 `Error` 口径；
