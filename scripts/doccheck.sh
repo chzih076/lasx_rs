@@ -49,14 +49,18 @@ check_refs() {
         README.md) target=root ;;
         AGENTS.md) target=agents ;;
       esac
-      case "$prefix" in
-        *本文* | *本节*)
-          case "$f" in
-            docs/ops.md) target=ops ;;
-            docs/dev.md) target=dev ;;
-          esac
-          ;;
-      esac
+      # "本文/本节 §x" 指当前文件——但**只在它比最后一个文档名更靠后时**才成立：
+      # 反例"判据不在本节（在 `docs/ops.md` §5.15）"里 §5.15 属于 ops（就近是 ops）。
+      # 用字节偏移比较"最后一次出现"的位置。
+      doc_off=$(printf '%s' "$prefix" |
+        grep -bo 'docs/dev\.md\|docs/ops\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
+      self_off=$(printf '%s' "$prefix" | grep -bo '本文\|本节' | tail -1 | cut -d: -f1)
+      if [ -n "${self_off:-}" ] && { [ -z "${doc_off:-}" ] || [ "$self_off" -gt "$doc_off" ]; }; then
+        case "$f" in
+          docs/ops.md) target=ops ;;
+          docs/dev.md) target=dev ;;
+        esac
+      fi
       if [ -z "$target" ]; then
         all_sections | grep -qx "$num" || note "MISS $f: $ref（裸引用，任何文档都没有该编号）"
       else
