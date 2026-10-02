@@ -1,7 +1,7 @@
 # lasx_rs 开发文档：架构与性能
 
 > 面向**维护者与二次开发者**：内部分层、不可破坏的约定、测试与 CI、性能方法学与实测数据。
-> **算子语义与调用方法**（FFI/Rust API/池用法、59 个导出符号）见 [`docs/ops.md`](ops.md)。
+> **算子语义与调用方法**（FFI/Rust API/池用法、73 个导出符号）见 [`docs/ops.md`](ops.md)。
 
 **文档信息**
 
@@ -72,7 +72,7 @@ lasx_rs/
 | 层 | 职责 | 不变量 |
 |---|---|---|
 | `ops/` | 纯计算，吃 `&[T]` / `&mut [T]`，不碰裸指针 | 每条向量路径必须与标量参考**逐位一致** |
-| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **59 个导出符号**中原始 15 个的签名与语义永不改动 |
+| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **73 个导出符号**中原始 15 个的签名与语义永不改动 |
 | `api.rs` | 安全 Rust 接口，做长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
 | `view.rs` + `plan.rs` | 形状/跨距对象化与打包复用（纯 Rust，不导出符号） | 视图/计划只做布局与打包，不引入新的累加次序（§18.4） |
 | `pool.rs` + `parallel.rs` | 并行派活，切块必须与串行结果逐位一致 | 切块边界不得改变每个元素的累加次序 |
@@ -118,7 +118,7 @@ lasx_rs/
 ```bash
 cargo build --release
 nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
-# 当前：59 个（30 个裸版本 + 29 个 _checked），与上一版比较应只有"新增"
+# 当前：73 个（37 个裸版本 + 36 个 _checked），与上一版比较应只有"新增"
 ```
 
 ### 2.3 数值约定（跨算子汇总）
@@ -2546,7 +2546,7 @@ exp(x) = p · 2ⁿ
 `src/ops/gelu_quick.rs` + `src/ffi/nn.rs`（2 个裸符号）+ `src/ffi/checked.rs`（2 个
 `_checked`）+ `src/api.rs`（`silu`/`gelu_quick`，直接返回对齐缓冲——**没有失败模式就不套
 `Result`**，与 `api::sum` 同例）+ `cli/src/suites/activation.rs`（组 `act`）。
-符号总数见 `docs/ops.md` §4.5 的清点表（当前 **59 = 30 裸 + 29 checked**）。
+符号总数见 `docs/ops.md` §4.6 的清点表（当前 **73 = 37 裸 + 36 checked**）。
 
 **重新导出**：`src/lib.rs` 里 `pub use ffi::nn::{…}`，符号在 crate 根可见
 （`lasx_rs::lasx_silu`），与 `docs/ops.md` §4 按 C ABI 名列的符号表一致；`ffi` 模块路径
@@ -2684,7 +2684,7 @@ y1 = fma(x1, c,  (x0·s))
 **代码位置**：`src/ops/rope.rs`（旋转 + 表生成 + 6 个单测）+ `src/ffi/nn.rs`（`lasx_rope`）+
 `src/ffi/checked.rs`（`lasx_rope_checked`）+ `src/api.rs`（`rope`/`rope_tables`/`rope_at`，
 并新增 `Error::BadValue` 变体表达"`n_dims` 必须是偶数"这类约束）+ `cli/src/suites/rope.rs`
-（组 `rope`）。符号总数见 `docs/ops.md` §4.5 的清点表。
+（组 `rope`）。符号总数见 `docs/ops.md` §4.6 的清点表。
 
 **被否掉的方案：`GptJ` 的 SIMD 交错**（原设计用 `xvpickev_w`/`xvpickod_w` 反交错，再
 `xvilvl_w`/`xvilvh_w` 交错回去）——**ISA 不允许**：
@@ -2874,7 +2874,7 @@ f32 累加误差，代价是复杂度；而 f16 的量化误差（4.9e-4）比 f
 **代码位置**：`src/ops/dot_f16.rs` + `src/arch/lasx.rs`（`load_f16x16_as_f32x8x2`）+
 `lasx_dot_f16`/`lasx_gemv_f16` + `_checked` + `api::dot_f16`/`api::gemv_f16` +
 `parallel::gemv_f16` + `cli/src/suites/f16.rs`（组 `f16`）+ `examples/gemv_pool_ab.rs`（A/B）。
-符号总数见 `docs/ops.md` §4.5 的清点表。
+符号总数见 `docs/ops.md` §4.6 的清点表。
 
 **两条 ISA/结构依据**：
 

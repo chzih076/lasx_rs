@@ -7,11 +7,11 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，59 个导出符号（30 个裸版本 + 29 个 `_checked` 变体） |
+| 适用代码版本 | `master`，73 个导出符号（37 个裸版本 + 36 个 `_checked` 变体） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 目标读者 | 调用方（C / Rust / Dart），以及需要核对数值契约或边界行为的人 |
-| 可复核项 | 符号总数可用 §4.5 的一行 `nm` 清点命令复核；跨文档引用一律写作 `docs/xxx.md §N`，可机械校验 |
+| 可复核项 | 符号总数可用 §4.6 的一行 `nm` 清点命令复核；跨文档引用一律写作 `docs/xxx.md §N`，可机械校验 |
 | 写作约定 | 数字的唯一来源、测量口径与引用格式见 §16.4 |
 
 **阅读路径**
@@ -28,7 +28,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 | §1 | 分层与调用方式（C ABI / Rust API / 池 / 对齐缓冲四层） |
 | §2 | 数值契约：逐位确定的含义、结合次序、精度一览、退化输入、冻结约定，以及 NN 侧 §2.6–§2.11 各算子契约 |
 | §3 | 指令集路径与降级覆盖（哪些符号可降级、哪些是 LASX-only） |
-| §4 | 导出符号总表（59 个）与 `_checked` 变体、状态码、清点方法 |
+| §4 | 导出符号总表（73 个）与 `_checked` 变体、状态码、清点方法 |
 | §5 | 归约、稠密与量化算子（§5.9–§5.13 为 NN 侧算子） |
 | §6 | 批量几何与物理算子 |
 | §7 | 批量姿态与几何算子（7 个） |
@@ -46,7 +46,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（59 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（73 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -534,13 +534,13 @@ impl SimdPath {
 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`（少数内核的 `Lsx` 分支
 退化为纯标量）。
 
-### 3.2 降级覆盖分类（30 个原始符号）
+### 3.2 降级覆盖分类（37 个原始符号）
 
 | 类别 | 个数 | 内核 | 无 LASX 时 |
 |---|---|---|---|
 | LASX + LSX 双路径 | 11 | `lasx_dot`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_j2_accel_batch`，以及全部 7 个姿态/几何算子 | LSX 128 位向量路径 |
 | LASX + 标量降级 | 3 | `lasx_ballistic_step`、`lasx_batch_distance2d`、`lasx_rk4_j2_step_batch` | 全标量循环（无 LSX 向量路径） |
-| LASX-only（无降级分支） | 15 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，以及 N1 全部 8 个（§2.6–§2.11） | 直接执行 LASX 指令 |
+| LASX-only（无降级分支） | 22 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 7 个**（§4.3） | 直接执行 LASX 指令 |
 | 内存工具（不涉及 SIMD） | 1 | `lasx_alloc` | 与路径无关 |
 
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全），6000 系列都支持 LASX，
@@ -577,12 +577,12 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（59 个）
+## 4. 导出符号总表（73 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**30 个未带 `_checked`
-的 `lasx_*` + 29 个 `lasx_*_checked` = 59**（N1 批次已加 `lasx_softmax_rows`、`lasx_rms_norm`、
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**37 个未带 `_checked`
+的 `lasx_*` + 36 个 `lasx_*_checked` = 73**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
 `lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
-各与其 checked 变体）。
+各与其 checked 变体；**N3 批次加了 int8 推理的 7 个**，见 §4.3）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -619,7 +619,21 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 | `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
 | `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
 
-### 4.3 `_checked` 变体 29 个
+### 4.3 N3：int8 推理 7 个（`docs/dev.md` §21）
+
+| 符号 | C 签名要点 | 语义 | 路径 |
+|---|---|---|---|
+| `lasx_amax` | `float(const float*, int)` | `max_i \|x_i\|`（空输入 0，NaN 忽略） | LASX-only |
+| `lasx_absmax_rows` | `void(const float*, int rows, int cols, float*)` | 逐行最大绝对值（per-token / per-channel 的公共原语） | LASX-only |
+| `lasx_quantize_i8_per_tensor` | `float(const float*, int8_t*, int)` | 对称量化，**返回 scale** | LASX-only |
+| `lasx_quantize_i8_per_row` | `void(const float*, int8_t*, float*, int, int)` | 逐行量化（每行一个 scale） | LASX-only |
+| `lasx_dequantize_i8` | `void(const int8_t*, float, float*, int)` | `out = (q as f32)·scale` | LASX-only |
+| `lasx_dequantize_i8_rows` | `void(const int8_t*, const float*, float*, int, int)` | 逐行反量化 | LASX-only |
+| `lasx_gemv_i8` | `void(const int8_t* w, const float* sw, const int8_t* x, float sx, float* y, int m, int k)` | `y[o] = Σ w[o,i]·x[i] · (sw[o]·sx)` | LASX-only |
+
+契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
+
+### 4.4 `_checked` 变体 36 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -632,7 +646,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-29 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+36 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
@@ -643,7 +657,10 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
 `lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
 `lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`、
-`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`。
+`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`，以及 N3 的 7 个：
+`lasx_amax_checked`、`lasx_absmax_rows_checked`、`lasx_quantize_i8_per_tensor_checked`、
+`lasx_quantize_i8_per_row_checked`、`lasx_dequantize_i8_checked`、
+`lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -652,7 +669,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 溢出、物理常数）；"数组真实长度是否与声明形状一致"只有知道长度的上层判得了，`BadShape`
 主要留给语言绑定。
 
-### 4.4 状态码（`LasxStatus`）
+### 4.5 状态码（`LasxStatus`）
 
 | 码 | 名称 | 含义 |
 |---|---|---|
@@ -666,17 +683,18 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 
 Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32()` 供绑定层还原。
 
-### 4.5 符号数清点
+### 4.6 符号数清点
 
 | 类别 | 原始符号 | `_checked` | 小计 | 逐个清单 |
 |---|---|---|---|---|
 | 历史内核（归约/稠密/量化/物理） | 15 | 14 | 29 | §4.1 |
 | 批量姿态/几何 | 7 | 7 | 14 | §4.2 |
-| NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.3 的名单、§5.9–§5.13 的用法 |
-| 合计 | **30** | **29** | **59** | — |
+| NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.4 的名单、§5.9–§5.13 的用法 |
+| N3（int8 推理 7 个） | 7 | 7 | 14 | §4.3、§5.14 的用法 |
+| 合计 | **37** | **36** | **73** | — |
 
-`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 29 个原始符号各有一个 checked 版本；
-原始 15 个的名字与语义始终不变。§3.2 给出 30 个原始符号的降级覆盖分类。
+`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 36 个原始符号各有一个 checked 版本；
+原始 15 个的名字与语义始终不变。§3.2 给出 37 个原始符号的降级覆盖分类。
 
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
