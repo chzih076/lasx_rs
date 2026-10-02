@@ -1889,11 +1889,22 @@ cp target/release/liblasx.so yll/
 ```
 
 基准套件组名（过滤子串）：`dot`、`sum`、`axpy`、`dot_f64`、`dot_i8`、`dot_q4`、`matmul`、
-`plan`、`attitude`、`large`、`norm3`、`vec3`、`distance2d`、`j2`、`ballistic`、`rk4`、`fma`、
+`plan`、`softmax`、`rms_norm`、`activation`、`rope`、`f16`、`int8_gemv`、`int8_quant`、
+`attitude`、`large`、`norm3`、`vec3`、`distance2d`、`j2`、`ballistic`、`rk4`、`fma`、
 `mt`、`align`、`dispatch`、`scenario`。方法学与全部读数详见 `docs/dev.md`。
 
+**`lasx_yll`（YouLiLong 原生扩展）的覆盖面——已审计**：它暴露的是**精选子集**，
+`yll/lib.ylh` + `yll/src/funcs.rs` 共 10 个脚本函数（`dot`、`sum`、`dot_i8`、`matmul`、
+`norm3`、`distance2d`、`vec3_add_scaled`、`j2_accel`、`rk4_step`、`propagate`），
+每个都走 `ffi::checked` + 参数级校验（`docs/dev.md` §19.12 那套"两层错误"的分工——
+本层判数组/形状/常数，库的 `*_checked` 兜结构性错误）。
+**N1 批次的 8 个与 N3 批次的 8 个都刻意没有进**——脚本语言的调用面由实际脚本需求驱动，
+不是"C 有就必须有"（这也是 §12.3 里"没有调用点就没有验收对象"的同一条判断）。
+要新增一个脚本函数：`funcs.rs` 写包装（参数校验 + `*_checked` + 返回值构造）、
+`lib.ylh` 补声明、`cargo build --release -p lasx_yll` 后拷 `liblasx.so`。
+
 ```bash
-# 导出符号自检：期望 59 行（30 原始 + 29 checked）
+# 导出符号自检：期望 75 行（38 原始 + 37 checked）= 75 个导出符号
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```
