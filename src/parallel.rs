@@ -983,4 +983,38 @@ mod tests {
             other => panic!("期望 Shape 错误，得到 {other:?}"),
         }
     }
+
+    /// **平台勘误回归**（`docs/platform.md` §1.3 措施③）：同一输入跑两次，输出必须**逐位相同**。
+    ///
+    /// 为什么要它：LA664 的原子操作丢失更新是**静默且不可复现**的——丢一次 `next_job` 自增
+    /// 只会让"同一块算两遍、另一块没算"，结果矩阵里有一块不对，不报错也不崩。
+    /// 对比两次运行是唯一能在 CI 里自动发现它的办法。
+    ///
+    /// 配置要能命中触发形态（见 `docs/platform.md` §1.1/§1.2）：**动态分块**（判据
+    /// `threads ≥ 20 && per_thread ≥ 32`，所以 `m = k = n = 768`、24 线程）+ 每次抢到块后
+    /// 立刻跑 LASX 内核。跑 3 组（勘误是概率性的：修复前报告 45/100 触发，多跑几组提高检出率）。
+    #[test]
+    fn test_dynamic_scheduling_is_bitwise_reproducible() {
+        let (m, k, n) = (768usize, 768usize, 768usize);
+        let pool = WorkerPool::new(24);
+        let mut rng = crate::ops::testutil::Lcg(0x4c41_3636_3400_0001);
+        let seed: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
+        for round in 0..3 {
+            let mut c1 = vec![0f32; m * n];
+            let mut c2 = vec![0f32; m * n];
+            let mut a1 = seed.clone();
+            let mut a2 = seed.clone();
+            // 自动 `pick_rows`：768/24 = 32 ⇒ 走 `Pick::Dynamic`（勘误的触发路径）
+            matmul_f32(&pool, m, k, n, &mut a1, &b, &mut c1).unwrap();
+            matmul_f32(&pool, m, k, n, &mut a2, &b, &mut c2).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    c1[i].to_bits(),
+                    c2[i].to_bits(),
+                    "第 {round} 组：两次运行的输出不一致 @ {i}（LA664 勘误会表现为这种静默错块）"
+                );
+            }
+        }
+    }
 }

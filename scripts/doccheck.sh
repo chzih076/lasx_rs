@@ -23,7 +23,7 @@ note() { echo "$1"; findings=$((findings + 1)); }
 
 # ---- 收集各文档的编号集合 ----
 sections() { grep -oE '^#{1,4} [0-9]+(\.[0-9]+)*' "$1" 2>/dev/null | sed 's/^#* //' | sort -u; }
-for pair in "docs/dev.md dev" "docs/ops.md ops" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
+for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/platform.md platform" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
   f="${pair%% *}"; k="${pair##* }"
   [ -f "$f" ] && sections "$f" > "$T/$k"
 done
@@ -41,10 +41,11 @@ check_refs() {
       target=""
       # 取**前缀里最后一次**出现的文档名（"就近"语义：一句里可以先提 dev 再提 ops）
       last_doc=$(printf '%s' "$prefix" |
-        grep -oE 'docs/dev\.md|docs/ops\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
+        grep -oE 'docs/dev\.md|docs/ops\.md|docs/platform\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
       case "$last_doc" in
         docs/dev.md) target=dev ;;
         docs/ops.md) target=ops ;;
+        docs/platform.md) target=platform ;;
         README.en.md) target=rooten ;;
         README.md) target=root ;;
         AGENTS.md) target=agents ;;
@@ -59,6 +60,7 @@ check_refs() {
         case "$f" in
           docs/ops.md) target=ops ;;
           docs/dev.md) target=dev ;;
+          docs/platform.md) target=platform ;;
         esac
       fi
       if [ -z "$target" ]; then
@@ -69,7 +71,7 @@ check_refs() {
     done
   done < "$f"
 }
-for f in docs/dev.md docs/ops.md README.md README.en.md AGENTS.md; do
+for f in docs/dev.md docs/ops.md docs/platform.md README.md README.en.md AGENTS.md; do
   [ -f "$f" ] && check_refs "$f"
 done
 

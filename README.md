@@ -39,7 +39,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 203 库单测 + 5 宏单测 + 17 文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 204 库单测 + 5 宏单测 + 17 文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -105,6 +105,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 |---|---|
 | [docs/ops.md](docs/ops.md) | **算子与用法**：75 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据（§5.15） |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据（§7）**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
+| [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |
 
 两份文档的分工是硬约定：**契约与用法在 `docs/ops.md`，性能数据在 `docs/dev.md` §7，
 同一份数字只存一处**。文档内所有跨文档引用都写成 `docs/xxx.md §N` 形式，可机械校验。

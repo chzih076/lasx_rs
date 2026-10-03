@@ -1017,7 +1017,11 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
                 };
                 if sh.dynamic.load(Ordering::Relaxed) {
                     loop {
-                        let idx = sh.next_job.fetch_add(1, Ordering::Relaxed);
+                        // `AcqRel` 而**不是** `Relaxed`：LA664（3A6000/3C6000/3B6000）的勘误会在
+                        // "跨物理核 + 同一地址无屏障 RMW + 两者之间插 LASX 向量读"时丢掉自增，
+                        // 表现为"同一块算两遍、另一块没算"（**静默错结果**）。`AcqRel` 生成
+                        // `amadd_db`（数据屏障变体），实测代价在噪声内。见 `docs/platform.md` §1。
+                        let idx = sh.next_job.fetch_add(1, Ordering::AcqRel);
                         if idx >= jobs.len() || !one(idx) {
                             break;
                         }

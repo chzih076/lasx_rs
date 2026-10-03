@@ -46,7 +46,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 203 lib tests + 5 macro tests + 17 doc tests (2 ignored)
+cargo test --workspace --release         # 204 lib tests + 5 macro tests + 17 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -119,6 +119,7 @@ operator are in `docs/ops.md` (§4 symbol table, §2.x contracts, §5.x usage). 
 |---|---|
 | [docs/ops.md](docs/ops.md) | **Operators and usage**: the 75-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule (§5.15) |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data (§7)**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
+| [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
 
 The division of labour between the two documents is a hard rule: **contracts and usage live in
 `docs/ops.md`, performance data lives in `docs/dev.md` §7, and any given number appears exactly
