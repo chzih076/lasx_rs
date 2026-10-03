@@ -986,6 +986,11 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 
 ### 5.11 `lasx_silu` / `lasx_gelu_quick` / `lasx_gelu_erf` — 逐元素激活（LASX-only）
 
+> **Rust 侧有免分配版**：`api::silu_into` / `api::gelu_quick_into` / `api::gelu_erf_into`
+> （写调用方缓冲，与分配版**逐位一致**）。**逐层激活每次都要调**，而实测分配占该调用的
+> **10–15%**（192×3072、589 824 个元素；`docs/dev.md` §7.9 ③ 有 A/B 表）。
+> C 侧本来就是调用方给 `out`（`lasx_silu` 等），没有这笔开销。
+
 | 层 | 签名 |
 |---|---|
 | C（裸） | `void lasx_silu(const float *x, float *out, int n)`；`void lasx_gelu_quick(const float *x, float *out, int n)`；`void lasx_gelu_erf(const float *x, float *out, int n)` |
@@ -1018,6 +1023,11 @@ lasx_gelu_erf_checked(x, out, n, &status);
 
 
 ### 5.12 `lasx_rope` — 旋转位置编码（NeoX 走 LASX，GptJ 走标量）
+
+> **Rust 侧有免分配版 `api::rope_into`**（与分配版逐位一致，两种 `RopeMode` 都测了）。
+> **这是全库分配占比最高的算子：实测 39–41%**（192×768、n_dims = 128：83.9 → 50.6 µs，
+> 内核只 ~51 µs 而输出 0.6 MiB 的分配约 33 µs），而 RoPE 在注意力里**每层都调**
+> ⇒ 热路径上应该用 `_into`（A/B 表见 `docs/dev.md` §7.9 ③）。
 
 | 层 | 签名 |
 |---|---|
