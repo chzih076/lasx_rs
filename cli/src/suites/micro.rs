@@ -381,6 +381,26 @@ pub fn dispatch_overhead() {
         "> 这三次取值的量级就是**每次内核调用都要付的固定开销**：规模越小，它占的比例越高。\n\
          > 具体到 `lasx_dot` 的绝对值看 `dot` 套件（本页不再写死数字——写死过一次，很快就过期了）。"
     );
+
+    // 分配的固定开销：`AlignedVec::new(n)` = 分配 + 清零（`vec![T::default(); n + 对齐余量]`）。
+    // 这就是"每次调用分配输出"的 api 在**调用方改用 `_into` 后能省掉的那笔**
+    // （对照数据与筛选结论见 `docs/dev.md` §7.9 的 `_into` 一节）。
+    println!("\n### 输出缓冲的分配成本（`AlignedVec::new`：分配 + 清零）");
+    println!("\n| 元素数（`f32`） | 字节 | 时间 | 等效带宽 |");
+    println!("|---|---|---|---|");
+    for &n in &[147_456usize, 589_824, 1_048_576, 4_194_304, 8_388_608] {
+        let d = timeit(|| {
+            let v = lasx_rs::aligned::AlignedVec::<f32>::new(n);
+            let _ = black_box(v[0]);
+        });
+        let bytes = (n * 4) as f64;
+        println!(
+            "| {n} | {:.1} MiB | {} | {:.1} GB/s |",
+            bytes / (1024.0 * 1024.0),
+            crate::timing::fmt_t(d),
+            bytes / d.as_secs_f64() / 1e9
+        );
+    }
 }
 
 /// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。
