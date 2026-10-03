@@ -756,7 +756,7 @@ checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
 | `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
 | `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
 
-### 4.3 N3：int8 推理 7 个（`docs/dev.md` §21）
+### 4.3 N3：int8 推理 8 个（`docs/dev.md` §21）
 
 | 符号 | C 签名要点 | 语义 | 路径 |
 |---|---|---|---|
@@ -771,7 +771,7 @@ checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
 
 契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
 
-### 4.4 `_checked` 变体 36 个
+### 4.4 `_checked` 变体 40 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -784,7 +784,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-36 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+40 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
@@ -798,7 +798,9 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_dot_f16_checked`、`lasx_gemv_f16_checked`，以及 N3 的 7 个：
 `lasx_amax_checked`、`lasx_absmax_rows_checked`、`lasx_quantize_i8_per_tensor_checked`、
 `lasx_quantize_i8_per_row_checked`、`lasx_dequantize_i8_checked`、
-`lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`。
+`lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`、`lasx_matmul_i8_checked`，
+以及 **ONNX 契约补充的 3 个**：`lasx_layer_norm_checked`、`lasx_gather_rows_checked`、
+`lasx_gather_rows_i8_checked`（共 **40 个**）。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -1147,7 +1149,29 @@ lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
   `docs/dev.md` §21.6 的分档表。
 
 
+### 5.16 `lasx_layer_norm` / `lasx_gather_rows` / `lasx_gather_rows_i8` — ONNX 契约补充（3 个）
+
+来源：外部契约（ONNX 图上 `LayerNormalization` 17 处、`Gather` 34 处），`docs/platform.md` §4。
+
+| 符号 | C 签名要点 | 语义 | 契约 |
+|---|---|---|---|
+| `lasx_layer_norm` | `void(const float* x, const float* w, const float* b, float* out, int rows, int cols, float eps)` | `out = (x − mean)/√(var+eps)·w + b`（`w`/`b` 可 NULL；方差**两遍法**） | §2.16 |
+| `lasx_gather_rows` | `void(const float* table, const int* ids, float* out, int n_ids, int row_len, int n_table_rows)` | `out[i] = table[ids[i]]`（纯行拷贝，**不用 LASX**） | §2.17 |
+| `lasx_gather_rows_i8` | `void(const int8_t* table, const float* scales, const int* ids, float* out, int n_ids, int row_len, int n_table_rows)` | 行拷贝 + 每行 scale 乘 | §2.17 |
+
+**Rust 侧同时有免分配版**：`api::layer_norm_into`、`api::gather_rows_into`、
+`api::gather_rows_i8_into`（以及对应的分配版）——**新算子一律给两个入口**，
+理由见 `docs/dev.md` §7.9 的 `_into` 实测（分配占 `rms_norm` 调用的 58–63%）。
+
+**"嵌入表存 f32 还是 int8"不是本库的决定**（`docs/platform.md` §4.2 的尺寸账）：库侧只保证
+两种口径都正确、边界责任清楚（id 越界在 C 侧是 `BadShape`(3)，在 Rust 侧是
+`Error::Shape { what: "ids" }`）。
+
+---
+
 ## 6. 批量几何与物理算子
+
+
 
 ### 6.1 `lasx_norm3_batch` — 批量 3 分量模长（LASX+LSX）
 
