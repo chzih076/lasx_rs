@@ -288,6 +288,122 @@ fn gemv_shape(m: i32, k: i32) -> Option<(usize, usize, usize)> {
     Some((m, k, m.checked_mul(k)?))
 }
 
+/// LayerNorm（行内）：`out[i][j] = (x[i][j] − mean_i)/√(var_i + eps) · w[j] + b[j]`。
+///
+/// C 签名：
+/// `void lasx_layer_norm(const float *x, const float *w, const float *b, float *out, int n_rows, int n_cols, float eps)`
+///
+/// `w`/`b` **允许为 NULL**（无权重 / 无偏置）；`eps` 的合法性由 `_checked` 变体与 `api`
+/// 层把关（数值契约与"无偏置是跳过加法"的理由见 `docs/ops.md` §2.16）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_layer_norm(
+    x: *const f32,
+    w: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    eps: f32,
+) {
+    let Some((rows, cols, n)) = softmax_shape(n_rows, n_cols) else {
+        return; // 原始符号零校验：形状不合法就地返回（与其它原始符号同一约定）
+    };
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——调用方保证 `x`/`out` 各至少 n 个元素、`w`/`b` 要么为 NULL
+    // 要么各有 `cols` 个可读元素。
+    unsafe {
+        let x = std::slice::from_raw_parts(x, n);
+        let out = std::slice::from_raw_parts_mut(out, n);
+        let w = if w.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(w, cols)
+        };
+        let b = if b.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(b, cols)
+        };
+        crate::ops::layer_norm::layer_norm(x, w, b, eps, rows, cols, out);
+    }
+}
+
+/// 按 id 取行（嵌入表查找，f32 表）：`out[i] = table[ids[i]]`，每行 `row_len` 个 f32。
+///
+/// C 签名：
+/// `void lasx_gather_rows(const float *table, const int *ids, float *out, int n_ids, int row_len, int n_table_rows)`
+///
+/// `n_table_rows` 供 `_checked` 变体判 id 越界；原始符号里**id 越界即 UB**（与其它原始符号
+/// "零校验"的约定一致）。契约见 `docs/ops.md` §2.17。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gather_rows(
+    table: *const f32,
+    ids: *const i32,
+    out: *mut f32,
+    n_ids: i32,
+    row_len: i32,
+    n_table_rows: i32,
+) {
+    if n_ids < 0 || row_len <= 0 || n_table_rows <= 0 {
+        return;
+    }
+    let rows = n_table_rows as usize;
+    let rl = row_len as usize;
+    let n = (n_ids as usize) * rl;
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——`table` 至少 `n_table_rows × row_len` 个元素、`ids` 至少 `n_ids` 个
+    // （且每个在 `[0, n_table_rows)`）、`out` 至少 `n_ids × row_len` 个。
+    unsafe {
+        let table = std::slice::from_raw_parts(table, rows * rl);
+        let ids_raw = std::slice::from_raw_parts(ids, n_ids as usize);
+        let out = std::slice::from_raw_parts_mut(out, n);
+        // `i32` → `usize`：越界检查交给 `_checked`；这里按约定直接转（负值即误用/UB）。
+        let ids: Vec<usize> = ids_raw.iter().map(|&v| v as usize).collect();
+        crate::ops::gather::gather_rows(table, &ids, rl, out);
+    }
+}
+
+/// 按 id 取行并反量化（int8 表 + **每行**一个 scale）。
+///
+/// C 签名：
+/// `void lasx_gather_rows_i8(const signed char *table, const float *scales, const int *ids, float *out, int n_ids, int row_len, int n_table_rows)`
+///
+/// 契约见 `docs/ops.md` §2.17；"表存 f32 还是 int8 由消费侧决定"见 `docs/platform.md` §4.2。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gather_rows_i8(
+    table: *const i8,
+    scales: *const f32,
+    ids: *const i32,
+    out: *mut f32,
+    n_ids: i32,
+    row_len: i32,
+    n_table_rows: i32,
+) {
+    if n_ids < 0 || row_len <= 0 || n_table_rows <= 0 {
+        return;
+    }
+    let rows = n_table_rows as usize;
+    let rl = row_len as usize;
+    let n = (n_ids as usize) * rl;
+    if n == 0 {
+        return;
+    }
+    // SAFETY: FFI 约定——`table` 至少 `n_table_rows × row_len` 个 i8、`scales` 至少
+    // `n_table_rows` 个、`ids` 至少 `n_ids` 个且每个在 `[0, n_table_rows)`、`out` 至少 n 个。
+    unsafe {
+        let table = std::slice::from_raw_parts(table, rows * rl);
+        let scales = std::slice::from_raw_parts(scales, rows);
+        let ids_raw = std::slice::from_raw_parts(ids, n_ids as usize);
+        let out = std::slice::from_raw_parts_mut(out, n);
+        let ids: Vec<usize> = ids_raw.iter().map(|&v| v as usize).collect();
+        crate::ops::gather::gather_rows_i8(table, scales, &ids, rl, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,7 +15,7 @@
 //! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`gemv_f16`、`rk4_j2_step_batch`） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
 //! | `ops` | **算子层**：一个内核一个模块，入口按 `match SimdPath::detect()` 分派；接收切片 |
-//! | [`ffi`] | **C ABI 导出层**：38 个原始 `lasx_*` 符号 + 37 个 `_checked` 变体，只做裸指针 → 切片 |
+//! | [`ffi`] | **C ABI 导出层**：41 个原始 `lasx_*` 符号 + 40 个 `_checked` 变体，只做裸指针 → 切片 |
 //!
 //! 分层的目的是让"算法"与"ABI 约定"互不干扰：算子只处理安全的切片，指针有效性与
 //! 长度约定收敛在 [`ffi`] 一层；新增内核时只需在 `ops` 下加一个文件、在 [`ffi`]
@@ -143,6 +143,6 @@ pub use ffi::reduce::{lasx_axpy, lasx_dot, lasx_dot_f64, lasx_sum};
 // 上一轮加 `softmax_rows`/`rms_norm` 时漏了这行重新导出——只有 `lasx_rs::ffi::nn::*` 能用，
 // 这一轮补齐（`docs/ops.md` §4 的符号表列的是 C ABI 名，Rust 路径不该和它不一致）。
 pub use ffi::nn::{
-    lasx_dot_f16, lasx_gelu_erf, lasx_gelu_quick, lasx_gemv_f16, lasx_rms_norm, lasx_rope,
-    lasx_silu, lasx_softmax_rows,
+    lasx_dot_f16, lasx_gather_rows, lasx_gather_rows_i8, lasx_gelu_erf, lasx_gelu_quick,
+    lasx_gemv_f16, lasx_layer_norm, lasx_rms_norm, lasx_rope, lasx_silu, lasx_softmax_rows,
 };

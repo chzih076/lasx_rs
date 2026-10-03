@@ -1107,6 +1107,150 @@ pub extern "C" fn lasx_gemv_f16_checked(
     }
 }
 
+/// 带错误通道的 LayerNorm。
+///
+/// C 签名：
+/// `void lasx_layer_norm_checked(const float*, const float*, const float*, float*, int, int, float, int*)`
+///
+/// `w`/`b` 为 NULL 合法（无权重 / 无偏置）。`eps` 要求**有限且 > 0**（同 `lasx_rms_norm_checked`）。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_layer_norm_checked(
+    x: *const f32,
+    w: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    n_rows: i32,
+    n_cols: i32,
+    eps: f32,
+    status: *mut i32,
+) {
+    if n_rows < 0 || n_cols < 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, cols) = (n_rows as usize, n_cols as usize);
+    let n = or_fail!(checked_mul(rows, cols), status, ());
+    or_fail!(checked_positive(eps as f64), status, ());
+    // SAFETY: 见 `lasx_layer_norm`；`w`/`b` 允许 NULL（下面单独判）。
+    let (x, out) = unsafe {
+        (
+            or_fail!(checked_slice(x, n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        )
+    };
+    let w = if w.is_null() || n == 0 {
+        &[][..]
+    } else {
+        // SAFETY: 调用方声明 `w` 有 `cols` 个元素（按列的权重）。
+        or_fail!(unsafe { checked_slice(w, cols) }, status, ())
+    };
+    let b = if b.is_null() || n == 0 {
+        &[][..]
+    } else {
+        // SAFETY: 调用方声明 `b` 有 `cols` 个元素（按列的偏置）。
+        or_fail!(unsafe { checked_slice(b, cols) }, status, ())
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::layer_norm::layer_norm(x, w, b, eps, rows, cols, out);
+}
+
+/// 带错误通道的按 id 取行（f32 表）。
+///
+/// C 签名：
+/// `void lasx_gather_rows_checked(const float*, const int*, float*, int, int, int, int*)`
+///
+/// 校验：`row_len`/`n_table_rows` 需 > 0、`n_ids >= 0`（否则 [`LasxStatus::BadShape`]）；
+/// **每个 id 必须在 `[0, n_table_rows)`**，越界同样报 [`LasxStatus::BadShape`]
+/// （契约 §2.17 里"复用 `Shape`"在 C 侧就映射到这一档）；`n_ids > 0` 时指针不可空
+/// （[`LasxStatus::NullPointer`]）。`n_ids == 0` 是合法空操作。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gather_rows_checked(
+    table: *const f32,
+    ids: *const i32,
+    out: *mut f32,
+    n_ids: i32,
+    row_len: i32,
+    n_table_rows: i32,
+    status: *mut i32,
+) {
+    if n_ids < 0 || row_len <= 0 || n_table_rows <= 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, rl, ids_n) = (n_table_rows as usize, row_len as usize, n_ids as usize);
+    let n = or_fail!(checked_mul(ids_n, rl), status, ());
+    if n == 0 {
+        LasxStatus::Ok.write(status);
+        return;
+    }
+    // SAFETY: 调用方声明各缓冲的长度（`table` = rows×rl、`ids` = ids_n、`out` = n）。
+    let (table, ids_raw, out) = unsafe {
+        (
+            or_fail!(checked_slice(table, rows * rl), status, ()),
+            or_fail!(checked_slice(ids, ids_n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        )
+    };
+    let mut ids = Vec::with_capacity(ids_n);
+    for &v in ids_raw {
+        if v < 0 || v as usize >= rows {
+            LasxStatus::BadShape.write(status);
+            return;
+        }
+        ids.push(v as usize);
+    }
+    LasxStatus::Ok.write(status);
+    crate::ops::gather::gather_rows(table, &ids, rl, out);
+}
+
+/// 带错误通道的按 id 取行并反量化（int8 表 + 每行 scale）。
+///
+/// C 签名：
+/// `void lasx_gather_rows_i8_checked(const signed char*, const float*, const int*, float*, int, int, int, int*)`
+///
+/// 校验同 [`lasx_gather_rows_checked`]，外加 `scales` 需有 `n_table_rows` 个元素。
+#[unsafe(no_mangle)]
+pub extern "C" fn lasx_gather_rows_i8_checked(
+    table: *const i8,
+    scales: *const f32,
+    ids: *const i32,
+    out: *mut f32,
+    n_ids: i32,
+    row_len: i32,
+    n_table_rows: i32,
+    status: *mut i32,
+) {
+    if n_ids < 0 || row_len <= 0 || n_table_rows <= 0 {
+        LasxStatus::BadShape.write(status);
+        return;
+    }
+    let (rows, rl, ids_n) = (n_table_rows as usize, row_len as usize, n_ids as usize);
+    let n = or_fail!(checked_mul(ids_n, rl), status, ());
+    if n == 0 {
+        LasxStatus::Ok.write(status);
+        return;
+    }
+    // SAFETY: 调用方声明各缓冲的长度（`table` = rows×rl、`scales` = rows、`ids` = ids_n、`out` = n）。
+    let (table, scales, ids_raw, out) = unsafe {
+        (
+            or_fail!(checked_slice(table, rows * rl), status, ()),
+            or_fail!(checked_slice(scales, rows), status, ()),
+            or_fail!(checked_slice(ids, ids_n), status, ()),
+            or_fail!(checked_slice_mut(out, n), status, ()),
+        )
+    };
+    let mut ids = Vec::with_capacity(ids_n);
+    for &v in ids_raw {
+        if v < 0 || v as usize >= rows {
+            LasxStatus::BadShape.write(status);
+            return;
+        }
+        ids.push(v as usize);
+    }
+    LasxStatus::Ok.write(status);
+    crate::ops::gather::gather_rows_i8(table, scales, &ids, rl, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 # lasx_rs 开发文档：架构与性能
 
 > 面向**维护者与二次开发者**：内部分层、不可破坏的约定、测试与 CI、性能方法学与实测数据。
-> **算子语义与调用方法**（FFI/Rust API/池用法、75 个导出符号）见 [`docs/ops.md`](ops.md)；
+> **算子语义与调用方法**（FFI/Rust API/池用法、81 个导出符号）见 [`docs/ops.md`](ops.md)；
 > **平台给的外部约束**（LA664 勘误、内核生命周期）与由外部契约派生的待补项见
 > [`docs/platform.md`](platform.md)。
 
@@ -74,7 +74,7 @@ lasx_rs/
 | 层 | 职责 | 不变量 |
 |---|---|---|
 | `ops/` | 纯计算，吃 `&[T]` / `&mut [T]`，不碰裸指针 | 每条向量路径必须与标量参考**逐位一致** |
-| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **75 个导出符号**中原始 15 个的签名与语义永不改动 |
+| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **81 个导出符号**中原始 15 个的签名与语义永不改动 |
 | `api.rs` | 安全 Rust 接口，做长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
 | `view.rs` + `plan.rs` | 形状/跨距对象化与打包复用（纯 Rust，不导出符号） | 视图/计划只做布局与打包，不引入新的累加次序（§18.4） |
 | `pool.rs` + `parallel.rs` | 并行派活，切块必须与串行结果逐位一致 | 切块边界不得改变每个元素的累加次序 |
@@ -3391,7 +3391,7 @@ f32 的 16 FLOP/指令——按 §21.7 的天花板（~40–50 MAC/指令·秒/�
 
 | 内容 | 位置 |
 |---|---|
-| 8 个 int8 算子 + 8 个 `_checked`（总 75 个导出符号） | `src/ops/quant_i8.rs`、`src/ops/gemv_i8.rs`、`src/ops/matmul_i8.rs`；契约 §2.12–§2.14；用法 §5.14 |
+| 8 个 int8 算子 + 8 个 `_checked`（总 81 个导出符号） | `src/ops/quant_i8.rs`、`src/ops/gemv_i8.rs`、`src/ops/matmul_i8.rs`；契约 §2.12–§2.14；用法 §5.14 |
 | 12 个新单测（位精确 / 误差界 / 满量程 / NaN / C ABI 逐位一致 / `_checked` 状态通道） | `cargo test`，总数 128 → **203** |
 | `parallel::gemv_i8_k`（k 方向切分，`m = 1` 可用）+ 2 个测试（逐位一致、错误/退化） | `src/parallel.rs`；数据 §7.9 末表 |
 | bench 套件 `int8_gemv` / `int8_quant`（含批量 GEMM、多核 GEMM、k 归约、保活胶水四组行） | `cli/src/suites/int8.rs` |

@@ -14,8 +14,8 @@
 //! | [`physics`] | `lasx_ballistic_step`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch` |
 //! | [`memory`] | `lasx_alloc` |
 //! | [`attitude`] | 批量姿态/几何 7 个：叉积、单位化、3×3·向量、四元数四则/旋转/DCM |
-//! | [`nn`] | NN 侧 8 个：`lasx_softmax_rows`、`lasx_rms_norm`、`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16` |
-//! | [`checked`] | 29 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
+//! | [`nn`] | NN 侧 11 个：`lasx_softmax_rows`、`lasx_rms_norm`、`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`、`lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` |
+//! | [`checked`] | 40 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
 //! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助 |
 //!
 //! # 安全约定

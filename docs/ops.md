@@ -7,7 +7,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，75 个导出符号（38 个裸版本 + 37 个 `_checked` 变体） |
+| 适用代码版本 | `master`，81 个导出符号（41 个裸版本 + 40 个 `_checked` 变体） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 平台约束的位置 | **不在本文档**：硬件勘误（LA664 原子操作丢失更新）、内核分支生命周期、消费 ONNX 契约引出的缺口与承诺边界，都在 [`docs/platform.md`](platform.md)——**调用方通常无需读它**（勘误的命中点在库内部，库侧已自带 `_db` 与回归测试） |
@@ -29,7 +29,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 | §1 | 分层与调用方式（C ABI / Rust API / 池 / 对齐缓冲四层） |
 | §2 | 数值契约：逐位确定的含义、结合次序、精度一览、退化输入、冻结约定，以及 NN 侧 §2.6–§2.11 各算子契约 |
 | §3 | 指令集路径与降级覆盖（哪些符号可降级、哪些是 LASX-only） |
-| §4 | 导出符号总表（75 个）与 `_checked` 变体、状态码、清点方法 |
+| §4 | 导出符号总表（81 个）与 `_checked` 变体、状态码、清点方法 |
 | §5 | 归约、稠密与量化算子（§5.9–§5.13 为 NN 侧算子） |
 | §6 | 批量几何与物理算子 |
 | §7 | 批量姿态与几何算子（7 个） |
@@ -47,7 +47,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（75 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（81 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -669,7 +669,7 @@ impl SimdPath {
 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`（少数内核的 `Lsx` 分支
 退化为纯标量）。
 
-### 3.2 降级覆盖分类（38 个原始符号）
+### 3.2 降级覆盖分类（41 个原始符号）
 
 | 类别 | 个数 | 内核 | 无 LASX 时 |
 |---|---|---|---|
@@ -712,12 +712,14 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 `FORCE_LSX` 无关（`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（75 个）
+## 4. 导出符号总表（81 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**37 个未带 `_checked`
-的 `lasx_*` + 36 个 `lasx_*_checked` = 73**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**41 个未带 `_checked`
+的 `lasx_*` + 40 个 `lasx_*_checked` = 81**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
 `lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
-各与其 checked 变体；**N3 批次加了 int8 推理的 7 个**，见 §4.3）。
+各与其 checked 变体；**N3 批次加了 int8 推理的 8 个**，见 §4.3；
+**ONNX 契约补充加了 `lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` 各与其
+checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
@@ -827,11 +829,12 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | 批量姿态/几何 | 7 | 7 | 14 | §4.2 |
 | NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.4 的名单、§5.9–§5.13 的用法 |
 | N3（int8 推理 8 个） | 8 | 8 | 16 | §4.3、§5.14 的用法 |
-| 合计 | **38** | **37** | **75** | — |
+| ONNX 契约补充（3 个：`layer_norm` + `gather_rows` + `gather_rows_i8`） | 3 | 3 | 6 | 契约 §2.16/§2.17，来源 `docs/platform.md` §4 |
+| 合计 | **41** | **40** | **81** | — |
 
-`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 37 个原始符号各有一个 checked 版本
-（38 − 1 = 37；上表"历史内核"行的 15 / 14 之差就是它）；
-原始 15 个的名字与语义始终不变。§3.2 给出 38 个原始符号的降级覆盖分类。
+`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 40 个原始符号各有一个 checked 版本
+（41 − 1 = 40；上表"历史内核"行的 15 / 14 之差就是它）；
+原始 15 个的名字与语义始终不变。§3.2 给出 41 个原始符号的降级覆盖分类。
 
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
@@ -2027,7 +2030,7 @@ cp target/release/liblasx.so yll/
 `lib.ylh` 补声明、`cargo build --release -p lasx_yll` 后拷 `liblasx.so`。
 
 ```bash
-# 导出符号自检：期望 75 行（38 原始 + 37 checked）= 75 个导出符号
+# 导出符号自检：期望 81 行（41 原始 + 40 checked）= 81 个导出符号
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```
