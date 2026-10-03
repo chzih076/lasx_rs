@@ -526,6 +526,122 @@ pub fn layer_norm_into(
     Ok(())
 }
 
+/// **按 id 取行**（嵌入表查找，f32 表）：`out[i] = table[ids[i]]`，行宽 `row_len`。
+///
+/// 契约见 `docs/ops.md` §2.17；"库侧为什么同时给 int8 口径、表存什么由谁决定"见
+/// `docs/platform.md` §4.2。纯行拷贝（无算术 ⇒ 无结合次序问题，输出逐位确定）。
+///
+/// # Errors
+/// - `row_len == 0`（[`Error::NotPositive`]）；
+/// - `table.len()` 不是 `row_len` 的整数倍（[`Error::Shape`]，`what = "table"`）；
+/// - 某个 `id >= table.len()/row_len`（[`Error::Shape`]，`what = "ids"`——`want` 是表行数、
+///   `got` 是越界的那个 id；**复用 `Shape` 而不新增错误变体**，理由见 §2.17）；
+/// - `out.len() != ids.len() × row_len`（[`Error::Shape`]，`what = "out"`，仅 `_into` 版）。
+pub fn gather_rows(table: &[f32], ids: &[usize], row_len: usize) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("gather_rows", "ids.len()×row_len", ids.len(), row_len)?;
+    let mut out = AlignedVec::<f32>::new(n);
+    gather_rows_into(table, ids, row_len, out.as_mut_slice())?;
+    Ok(out)
+}
+
+/// [`gather_rows`] 的**免分配**版本。
+///
+/// # Errors
+/// 同 [`gather_rows`]。
+pub fn gather_rows_into(
+    table: &[f32],
+    ids: &[usize],
+    row_len: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let (_table_rows, n) = gather_checks("gather_rows", table.len(), ids, row_len)?;
+    expect_len("gather_rows", "out", out.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::gather::gather_rows(table, ids, row_len, out);
+    Ok(())
+}
+
+/// **按 id 取行并反量化**（int8 表 + **每行**一个 scale）：
+/// `out[i][j] = table[ids[i]][j] as f32 * scales[ids[i]]`。
+///
+/// 见 `docs/ops.md` §2.17 与 `docs/platform.md` §4.2。
+///
+/// # Errors
+/// 同 [`gather_rows`]，外加 `scales.len() != table.len()/row_len`（[`Error::Shape`]，
+/// `what = "scales"`）。
+pub fn gather_rows_i8(
+    table: &[i8],
+    scales: &[f32],
+    ids: &[usize],
+    row_len: usize,
+) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("gather_rows_i8", "ids.len()×row_len", ids.len(), row_len)?;
+    let mut out = AlignedVec::<f32>::new(n);
+    gather_rows_i8_into(table, scales, ids, row_len, out.as_mut_slice())?;
+    Ok(out)
+}
+
+/// [`gather_rows_i8`] 的**免分配**版本。
+///
+/// # Errors
+/// 同 [`gather_rows_i8`]。
+pub fn gather_rows_i8_into(
+    table: &[i8],
+    scales: &[f32],
+    ids: &[usize],
+    row_len: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    let (table_rows, n) = gather_checks("gather_rows_i8", table.len(), ids, row_len)?;
+    expect_len("gather_rows_i8", "out", out.len(), n)?;
+    expect_len("gather_rows_i8", "scales", scales.len(), table_rows)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::gather::gather_rows_i8(table, scales, ids, row_len, out);
+    Ok(())
+}
+
+/// `gather_*` 的公共校验：`row_len > 0`、`table.len()` 整除 `row_len`、每个 id 在表内。
+/// 返回 `(表行数, 输出元素数)`。
+fn gather_checks(
+    op: &'static str,
+    table_len: usize,
+    ids: &[usize],
+    row_len: usize,
+) -> Result<(usize, usize)> {
+    if row_len == 0 {
+        return Err(Error::NotPositive {
+            op,
+            what: "row_len",
+            value: 0.0,
+        });
+    }
+    if !table_len.is_multiple_of(row_len) {
+        return Err(Error::Shape {
+            op,
+            what: "table",
+            expected: table_len / row_len * row_len,
+            got: table_len,
+        });
+    }
+    let table_rows = table_len / row_len;
+    for &id in ids {
+        if id >= table_rows {
+            return Err(Error::Shape {
+                op,
+                what: "ids",
+                expected: table_rows,
+                got: id,
+            });
+        }
+    }
+    let n = checked_mul(op, "ids.len()×row_len", ids.len(), row_len)?;
+    Ok((table_rows, n))
+}
+
 /* ==================== NN：逐元素激活 ==================== */
 
 /// SiLU（swish）：`y[i] = x[i] / (1 + exp(−x[i]))`，逐元素，返回新分配的对齐缓冲。
@@ -2105,5 +2221,64 @@ mod tests {
             assert_eq!(rx[i].to_bits(), px[i].to_bits(), "rx 不一致 @ {i}");
             assert_eq!(vz[i].to_bits(), qz[i].to_bits(), "vz 不一致 @ {i}");
         }
+    }
+
+    /// `gather_rows`/`gather_rows_i8`（`docs/ops.md` §2.17）：
+    /// `_into` 与分配版**逐位一致**；三条错误路径（`row_len = 0`、`table` 不整除、
+    /// **id 越界**）与 `scales` 长度不符都打准；空 `ids` 退化为空输出。
+    #[test]
+    fn test_gather_rows_and_i8_errors_and_into() {
+        let (rows, row_len) = (4usize, 5usize);
+        let mut rng = crate::ops::testutil::Lcg(0x6a7b);
+        let table: Vec<f32> = (0..rows * row_len).map(|_| rng.f64() as f32).collect();
+        let tq: Vec<i8> = (0..rows * row_len).map(|i| (i as i32 - 9) as i8).collect();
+        let scales = [0.5f32, 1.0, 0.25, 2.0];
+        let ids = [3usize, 0, 3];
+
+        let a = gather_rows(&table, &ids, row_len).unwrap();
+        let mut b = vec![0f32; ids.len() * row_len];
+        gather_rows_into(&table, &ids, row_len, &mut b).unwrap();
+        for i in 0..a.len() {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "gather_rows _into @ {i}");
+        }
+        let c = gather_rows_i8(&tq, &scales, &ids, row_len).unwrap();
+        let mut d = vec![0f32; ids.len() * row_len];
+        gather_rows_i8_into(&tq, &scales, &ids, row_len, &mut d).unwrap();
+        for i in 0..c.len() {
+            assert_eq!(c[i].to_bits(), d[i].to_bits(), "gather_rows_i8 _into @ {i}");
+            assert_eq!(
+                c[i].to_bits(),
+                (tq[ids[i / row_len] * row_len + i % row_len] as f32 * scales[ids[i / row_len]])
+                    .to_bits()
+            );
+        }
+        // 空 ids ⇒ 空输出，且不碰 out
+        assert!(gather_rows(&table, &[], row_len).unwrap().is_empty());
+        assert!(gather_rows_i8(&tq, &scales, &[], row_len)
+            .unwrap()
+            .is_empty());
+
+        // 错误路径
+        assert!(matches!(
+            gather_rows(&table, &ids, 0),
+            Err(Error::NotPositive { op, what, .. }) if op == "gather_rows" && what == "row_len"
+        ));
+        assert!(matches!(
+            gather_rows(&table[..table.len() - 1], &ids, row_len),
+            Err(Error::Shape { op, what, .. }) if op == "gather_rows" && what == "table"
+        ));
+        assert!(matches!(
+            gather_rows(&table, &[0, 4], row_len),
+            Err(Error::Shape { op, what, expected, got }) if op == "gather_rows" && what == "ids" && expected == rows && got == 4
+        ));
+        assert!(matches!(
+            gather_rows_i8(&tq, &scales[..3], &ids, row_len),
+            Err(Error::Shape { op, what, .. }) if op == "gather_rows_i8" && what == "scales"
+        ));
+        let mut short = vec![0f32; ids.len() * row_len - 1];
+        assert!(matches!(
+            gather_rows_into(&table, &ids, row_len, &mut short),
+            Err(Error::Shape { what, .. }) if what == "out"
+        ));
     }
 }

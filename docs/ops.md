@@ -611,7 +611,47 @@ out  = (x[j] − mean) · inv · w[j] + b[j]   // 次序是契约：先减、再
 （这类"实现退化成近邻算子"的错误，位精确测试抓不到——它只比两条路径，不比语义）。
 
 
-## 3. 指令集路径与降级覆盖
+### 2.17 NN 侧：`gather_rows` / `gather_rows_i8`（按 id 取行，嵌入表）
+
+**存在理由**：外部契约（ONNX 图上 `Gather` 34 处：词/段/位置嵌入），以及
+`docs/platform.md` §4.2 对"怎么取"的决策。
+
+**1）语义。** `ids` 是行号序列，`row_len` 是每行的元素数：
+
+```text
+out[i * row_len + j] = table[ids[i] * row_len + j]                              // gather_rows
+out[i * row_len + j] = table[ids[i] * row_len + j] as f32 * scales[ids[i]]      // gather_rows_i8
+```
+
+**两条都没有累加** ⇒ 不存在结合次序问题：输出是 `table`/`ids`/`scales` 的确定逐元素函数
+（int8 口径是"一次转换 + 一次乘法"）。所以它**不用 LASX 手写**——行拷贝（典型 384 个 f32 =
+1.5 KB）用 `copy_from_slice`（即 `memcpy`，LLVM 会向量化）**更快也更容易验证**：
+不需要列尾处理、不需要位精确论证。**这是有意的选择，不是漏写内核。**
+
+**2）两条口径的分工**（**这条属于承诺边界，别混**）：`row_len` 与"表存 f32 还是 int8"由
+**消费侧**决定；库侧只保证两种口径都正确。理由与尺寸账（fp32 表 384 MB vs int8 96 MB，
+而每前向只取用 288 KB = 表的 0.08%）见 `docs/platform.md` §4.2。
+
+**3）错误路径（都测了）**：
+
+| 条件 | 错误 |
+|---|---|
+| `row_len == 0` | `NotPositive { what: "row_len" }` |
+| `table.len()` 不是 `row_len` 的整数倍 | `Shape { what: "table" }`（`expected` = 向下取整到行） |
+| 某个 `id >= 表行数` | `Shape { what: "ids" }`（`expected` = 表行数、`got` = 越界的那个 id） |
+| `scales.len() != 表行数`（int8 口径） | `Shape { what: "scales" }` |
+| `out.len() != ids.len() × row_len`（`_into`） | `Shape { what: "out" }` |
+
+> **为什么 `id` 越界复用 `Shape` 而不新增错误变体**：`Error` 是 C ABI 的一部分
+> （`_checked` 变体按变体映射错误码），**加一个变体就要动错误码表与所有绑定**；
+> 而这里 `what = "ids"` + `expected`/`got` 已经把信息说全（消息里能看出是哪个 id 越界）。
+> 这是**有意的取舍**，不是遗漏——真要新增变体时，属 §19.7 的接口变更流程。
+
+**4）谁守什么。** 边界（`row_len`/整除/id 范围/`scales` 长度/`out` 长度）由 `api` 与
+`ffi` 的 `_checked` 守；**逐位一致**（`_into` vs 分配版、以及"与逐元素索引等价"）由
+`ops::gather` 与 `api` 的测试守；"嵌入表存什么"由消费侧负责。
+
+
 
 ### 3.1 `SimdPath::detect()`
 

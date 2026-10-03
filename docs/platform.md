@@ -179,7 +179,7 @@
 | `Erf`（GELU 的一部分） | 12 | ✅ `gelu_erf` | — |
 | `Pow`/`ReduceMean`/`Sqrt`（归一化的一部分） | 各 32 | ✅ `rms_norm` 一次调用覆盖 | — |
 | **`LayerNormalization`** | **17** | ✅ **已实现**（2026-10-03）：`api::layer_norm` / `layer_norm_into`、`ops::layer_norm`（契约 `docs/ops.md` §2.16；与 `rms_norm` 同一行归约骨架，差别是减均值 + 偏置 β） | — |
-| **`Gather`**（ONNX 算子：词/段/位置嵌入） | 34 | ⏳ **口径已定、实现待做**：库侧给两种取行口径（f32 行拷贝 + int8 行拷贝并乘每行 scale），**是否量化嵌入表由消费侧决定**——见 §4.2 | 触发条件与验收口径见 §4.2 |
+| **`Gather`**（ONNX 算子：词/段/位置嵌入） | 34 | ✅ **已实现**（2026-10-03）：`api::gather_rows` / `gather_rows_i8`（含 `_into`），契约 `docs/ops.md` §2.17 | **"表存 f32 还是 int8"由消费侧决定**（尺寸账见 §4.2） |
 
 **两个缺口的现状**：
 

@@ -27,6 +27,7 @@ pub mod dot_f16;
 pub mod dot_f64;
 pub mod dot_i8;
 pub mod dot_q4;
+pub mod gather;
 pub mod gelu_erf;
 pub mod gelu_quick;
 pub mod gemv_i8;
