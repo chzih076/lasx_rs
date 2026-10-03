@@ -1498,6 +1498,129 @@ pub fn matmul_i8(
     Ok(y)
 }
 
+/// [`absmax_rows`] 的**免分配**版本：逐行最大绝对值写进 `out`（长度必须 `rows`）。
+///
+/// 为什么有它：逐层保活路径上每次调用都分配一个 `AlignedVec`，而实测（`docs/dev.md` §7.9）
+/// 分配可占 `rms_norm` 调用的 **58–63%**。凡是"每层都要调一次"的算子都该有 `_into` 入口。
+///
+/// # Errors
+/// 同 [`absmax_rows`]，外加 `out.len() != rows`。
+pub fn absmax_rows_into(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) -> Result<()> {
+    let n = checked_mul("absmax_rows_into", "rows×cols", rows, cols)?;
+    expect_len("absmax_rows_into", "x", x.len(), n)?;
+    expect_len("absmax_rows_into", "out", out.len(), rows)?;
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    crate::ops::quant_i8::absmax_rows(x, rows, cols, out);
+    Ok(())
+}
+
+/// [`quantize_i8_per_tensor`] 的**免分配**版本：量化结果写进 `q`，**返回 `scale`**
+/// （与分配版同一套取整与倒数乘，见 §2.12）。
+///
+/// # Errors
+/// `q.len() != x.len()`（[`Error::Shape`]）。
+pub fn quantize_i8_per_tensor_into(x: &[f32], q: &mut [i8]) -> Result<f32> {
+    expect_len("quantize_i8_per_tensor_into", "q", q.len(), x.len())?;
+    Ok(crate::ops::quant_i8::quantize_i8_per_tensor(x, q))
+}
+
+/// [`quantize_i8_per_token`] / [`quantize_i8_per_channel`] 的**免分配**版本
+/// （同一个内核，只是 `op` 名不同；`q` 长度 `rows×cols`、`scales` 长度 `rows`）。
+///
+/// # Errors
+/// 同 [`quantize_i8_per_token`]，外加 `q.len()`/`scales.len()` 检查。
+pub fn quantize_i8_per_row_into(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    q: &mut [i8],
+    scales: &mut [f32],
+) -> Result<()> {
+    quantize_i8_rows_into_impl("quantize_i8_per_row_into", x, rows, cols, q, scales)
+}
+
+/// [`quantize_i8_per_token`] 的**免分配**版本。
+///
+/// # Errors
+/// 同 [`quantize_i8_per_token`]。
+pub fn quantize_i8_per_token_into(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    q: &mut [i8],
+    scales: &mut [f32],
+) -> Result<()> {
+    quantize_i8_rows_into_impl("quantize_i8_per_token_into", x, rows, cols, q, scales)
+}
+
+/// [`quantize_i8_per_channel`] 的**免分配**版本。
+///
+/// # Errors
+/// 同 [`quantize_i8_per_channel`]。
+pub fn quantize_i8_per_channel_into(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    q: &mut [i8],
+    scales: &mut [f32],
+) -> Result<()> {
+    quantize_i8_rows_into_impl("quantize_i8_per_channel_into", w, rows, cols, q, scales)
+}
+
+/// `quantize_i8_*_into` 的公共实现（只做校验，内核与分配版完全相同）。
+fn quantize_i8_rows_into_impl(
+    op: &'static str,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    q: &mut [i8],
+    scales: &mut [f32],
+) -> Result<()> {
+    let n = checked_mul(op, "rows×cols", rows, cols)?;
+    expect_len(op, "x", x.len(), n)?;
+    expect_len(op, "q", q.len(), n)?;
+    expect_len(op, "scales", scales.len(), rows)?;
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    crate::ops::quant_i8::quantize_i8_per_row(x, rows, cols, q, scales);
+    Ok(())
+}
+
+/// [`dequantize_i8`] 的**免分配**版本（`out[i] = (q[i] as f32) · scale`，一次舍入）。
+///
+/// # Errors
+/// `out.len() != q.len()`（[`Error::Shape`]）。
+pub fn dequantize_i8_into(q: &[i8], scale: f32, out: &mut [f32]) -> Result<()> {
+    expect_len("dequantize_i8_into", "out", out.len(), q.len())?;
+    crate::ops::quant_i8::dequantize_i8(q, scale, out);
+    Ok(())
+}
+
+/// [`dequantize_i8_rows`] 的**免分配**版本（每行用自己的 `scales[r]`）。
+///
+/// # Errors
+/// 同 [`dequantize_i8_rows`]，外加 `out.len() != rows × cols`。
+pub fn dequantize_i8_rows_into(
+    q: &[i8],
+    rows: usize,
+    cols: usize,
+    scales: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let n = checked_mul("dequantize_i8_rows_into", "rows×cols", rows, cols)?;
+    expect_len("dequantize_i8_rows_into", "q", q.len(), n)?;
+    expect_len("dequantize_i8_rows_into", "scales", scales.len(), rows)?;
+    expect_len("dequantize_i8_rows_into", "out", out.len(), n)?;
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    crate::ops::quant_i8::dequantize_i8_per_row(q, rows, cols, scales, out);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2280,5 +2403,97 @@ mod tests {
             gather_rows_into(&table, &ids, row_len, &mut short),
             Err(Error::Shape { what, .. }) if what == "out"
         ));
+    }
+
+    /// int8 家族的 `_into` 版与分配版**逐位一致**（同一个内核、只少一次分配），错误路径打准。
+    ///
+    /// 动机：逐层保活路径上每一步（量化 → 反量化 → 归一化 → 再量化）都在 api 层，
+    /// 而实测分配可占 `rms_norm` 调用的 58–63%（`docs/dev.md` §7.9）。
+    #[test]
+    fn test_int8_into_variants_match_allocating_bit_for_bit() {
+        let (rows, cols) = (5usize, 7usize);
+        let mut rng = crate::ops::testutil::Lcg(0x1_2_3_4);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|_| 4.0 * rng.f64() as f32 - 2.0)
+            .collect();
+
+        // per_tensor：scale 必须逐位相同、q 必须完全相同
+        let (q0, s0) = quantize_i8_per_tensor(&x).unwrap();
+        let mut q1 = vec![0i8; x.len()];
+        let s1 = quantize_i8_per_tensor_into(&x, &mut q1).unwrap();
+        assert_eq!(s0.to_bits(), s1.to_bits(), "scale 不一致");
+        assert_eq!(q0.as_slice(), &q1[..], "per_tensor q 不一致");
+
+        // per_token / per_row / per_channel：同一内核，三个入口都要与分配版一致
+        let (qt, st) = quantize_i8_per_token(&x, rows, cols).unwrap();
+        let mut qt2 = vec![0i8; rows * cols];
+        let mut st2 = vec![0f32; rows];
+        quantize_i8_per_token_into(&x, rows, cols, &mut qt2, &mut st2).unwrap();
+        assert_eq!(qt.as_slice(), &qt2[..], "per_token q 不一致");
+        assert_eq!(st.as_slice(), &st2[..], "per_token scales 不一致");
+        let mut q3 = vec![0i8; rows * cols];
+        let mut s3 = vec![0f32; rows];
+        quantize_i8_per_channel_into(&x, rows, cols, &mut q3, &mut s3).unwrap();
+        let (qc, sc) = quantize_i8_per_channel(&x, rows, cols).unwrap();
+        assert_eq!(qc.as_slice(), &q3[..], "per_channel q 不一致");
+        assert_eq!(sc.as_slice(), &s3[..], "per_channel scales 不一致");
+        let mut q4 = vec![0i8; rows * cols];
+        let mut s4 = vec![0f32; rows];
+        quantize_i8_per_row_into(&x, rows, cols, &mut q4, &mut s4).unwrap();
+        assert_eq!(qc.as_slice(), &q4[..], "per_row q 不一致");
+
+        // dequantize：逐位一致
+        let d0 = dequantize_i8(&q0, s0).unwrap();
+        let mut d1 = vec![0f32; x.len()];
+        dequantize_i8_into(&q0, s0, &mut d1).unwrap();
+        for i in 0..x.len() {
+            assert_eq!(d0[i].to_bits(), d1[i].to_bits(), "dequantize_i8 @ {i}");
+        }
+        let e0 = dequantize_i8_rows(&qt, rows, cols, &st).unwrap();
+        let mut e1 = vec![0f32; rows * cols];
+        dequantize_i8_rows_into(&qt, rows, cols, &st, &mut e1).unwrap();
+        for i in 0..rows * cols {
+            assert_eq!(e0[i].to_bits(), e1[i].to_bits(), "dequantize_i8_rows @ {i}");
+        }
+
+        // absmax_rows：逐位一致
+        let a0 = absmax_rows(&x, rows, cols).unwrap();
+        let mut a1 = vec![0f32; rows];
+        absmax_rows_into(&x, rows, cols, &mut a1).unwrap();
+        for i in 0..rows {
+            assert_eq!(a0[i].to_bits(), a1[i].to_bits(), "absmax_rows @ {i}");
+        }
+
+        // 错误路径（`out`/`q`/`scales` 长度）
+        assert!(matches!(
+            absmax_rows_into(&x, rows, cols, &mut vec![0f32; rows - 1]),
+            Err(Error::Shape { op, what, .. }) if op == "absmax_rows_into" && what == "out"
+        ));
+        assert!(matches!(
+            quantize_i8_per_tensor_into(&x, &mut vec![0i8; x.len() - 1]),
+            Err(Error::Shape { what, .. }) if what == "q"
+        ));
+        assert!(matches!(
+            quantize_i8_per_row_into(
+                &x,
+                rows,
+                cols,
+                &mut vec![0i8; rows * cols],
+                &mut vec![0f32; rows - 1]
+            ),
+            Err(Error::Shape { what, .. }) if what == "scales"
+        ));
+        assert!(matches!(
+            dequantize_i8_into(&q0, s0, &mut [0f32; 1]),
+            Err(Error::Shape { what, .. }) if what == "out"
+        ));
+        assert!(matches!(
+            dequantize_i8_rows_into(&qt, rows, cols, &st, &mut [0f32; 1]),
+            Err(Error::Shape { what, .. }) if what == "out"
+        ));
+        // 退化：rows = 0 / 空输入
+        assert!(absmax_rows_into(&[], 0, cols, &mut []).is_ok());
+        assert!(quantize_i8_per_tensor_into(&[], &mut []).is_ok());
+        assert!(dequantize_i8_into(&[], 0.0, &mut []).is_ok());
     }
 }
