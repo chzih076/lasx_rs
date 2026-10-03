@@ -248,7 +248,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**205 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+当前规模：**206 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
 其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，12 个是 §19.14 的批量样本视图，
 18 个是 §21 的 N3 批次（量化/反量化/GEMV/批量 GEMM/C ABI），2 个是 §21.9 里 k 方向归约那两项
 （逐位一致 + 错误/退化），2 个是 §20.7 的池化 `gemv_f16`，
@@ -285,7 +285,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 205 单测（+ 5 个宏单测 + 17 个文档测试）
+cargo test --workspace --release        # 206 单测（+ 5 个宏单测 + 17 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -891,6 +891,19 @@ int8 "乘 + 加宽 + 累加"链只有 ~4–5 MAC/指令**（§21.7 第 2 条：I
 `softmax_rows` → quantize）就是答案**，判据写进 `docs/ops.md` §5.15/§12.3。
 （口径说明：`api::rms_norm`/`softmax_rows` 每次调用会分配输出缓冲，**这两个数因此偏保守**；
 真要抠这 2%，先做的应该是 `_into` 版本省掉分配，而不是整数化。）
+
+**① `_into` 版已落地并实测（2026-10-03）——上面那句"先做 `_into`"被证实低估了收益**：
+分配不是零头，是**大头**（同内核、同数据，只少一次输出缓冲的分配+清零）：
+
+| 形状 | `api::rms_norm`（分配版） | `api::rms_norm_into` | 分配占调用 |
+|---|---|---|---|
+| `192×768` | 179.8 / 183.4 / 183.5 µs | **75.2 / 75.7 / 75.5 µs** | **58–59%** |
+| `192×3072` | 703.8 / 714.1 / 717.0 µs | **258.1 / 263.3 / 259.7 µs** | **62–63%** |
+
+⇒ `_into` 快 **2.4×**。整层保活胶水从 2.24 ms 降到 **≈1.31 ms**（占该层 GEMM 的 **1.1%**——
+比例仍小，但**每个前向省下 ~11 ms**，在"整序列 ≈150–210 ms"那个量级上是 5–7%）。
+**所以整数版仍然不做，而 `_into` 已经做了**（`softmax_rows_into` 同一机制；这条对**所有**
+"每次调用分配输出"的 api 都成立，只是归一化/softmax 在保活路径上被调得最频繁）。
 
 ---
 

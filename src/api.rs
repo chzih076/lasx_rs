@@ -377,6 +377,85 @@ pub fn rms_norm(
     Ok(out)
 }
 
+/// [`rms_norm`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须等于 `rows × cols`）。
+///
+/// 为什么有它：`rms_norm` 每次调用都分配一个 `AlignedVec`。对"逐层保活"这种调用
+/// （int8 模型每层都要"反量化 → 归一化 → 再量化"），分配会进到每层的关键路径上
+/// （`docs/dev.md` §7.9 末表的保活口径里，`192×768` 的 RMSNorm 是 181.0 µs，含分配）。
+/// 数值与 [`rms_norm`] **逐位一致**（同一个内核，只少一次分配；测试守着）。
+///
+/// # Errors
+/// 与 [`rms_norm`] 同一套，外加 `out.len() != rows × cols`。
+pub fn rms_norm_into(
+    x: &[f32],
+    w: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    if !eps.is_finite() {
+        return Err(Error::NotFinite {
+            op: "rms_norm_into",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    if eps <= 0.0 {
+        return Err(Error::NotPositive {
+            op: "rms_norm_into",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    let n = checked_mul("rms_norm_into", "rows×cols", rows, cols)?;
+    expect_len("rms_norm_into", "x", x.len(), n)?;
+    expect_len("rms_norm_into", "out", out.len(), n)?;
+    if let Some(w) = w {
+        expect_len("rms_norm_into", "w", w.len(), cols)?;
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::rms_norm::rms_norm(x, w.unwrap_or(&[]), eps, rows, cols, out);
+    Ok(())
+}
+
+/// [`softmax_rows`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须等于 `rows × cols`）。
+///
+/// 与 [`softmax_rows`] **逐位一致**（同一个内核，只少一次分配）；校验口径相同，
+/// 外加 `out.len() != rows × cols`。见 `docs/ops.md` §5.15 里"先做 `_into`"那条。
+///
+/// # Errors
+/// 与 [`softmax_rows`] 同一套，外加 `out.len() != rows × cols`。
+pub fn softmax_rows_into(
+    x: &[f32],
+    mask: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(Error::NotFinite {
+            op: "softmax_rows_into",
+            what: "scale",
+            value: scale as f64,
+        });
+    }
+    let n = checked_mul("softmax_rows_into", "rows×cols", rows, cols)?;
+    expect_len("softmax_rows_into", "x", x.len(), n)?;
+    expect_len("softmax_rows_into", "out", out.len(), n)?;
+    if let Some(m) = mask {
+        expect_len("softmax_rows_into", "mask", m.len(), n)?;
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::softmax_rows::softmax_rows(x, mask.unwrap_or(&[]), scale, rows, cols, out);
+    Ok(())
+}
+
 /* ==================== NN：逐元素激活 ==================== */
 
 /// SiLU（swish）：`y[i] = x[i] / (1 + exp(−x[i]))`，逐元素，返回新分配的对齐缓冲。
@@ -1246,6 +1325,68 @@ mod tests {
     /// 误差按 **∞-范数相对量** `max|Y_q − Y| / max|Y|` 报——这是"跨算子叠加后"的可复核口径。
     /// 同时报 f32 路径的同口径误差作对照（量化误差应当主导）。覆盖 per-token 激活 +
     /// per-channel 权重（`docs/dev.md` §21.3 的结论：这两个是前提而非优化项）。
+    /// `_into` 版与分配版**逐位一致**（同一个内核、只少一次分配），错误路径打准。
+    ///
+    /// 动机：`docs/dev.md` §7.9 末表的保活口径里 RMSNorm 占 181.0 µs（含每次调用的分配），
+    /// 而 `docs/ops.md` §5.15 指出的"要抠那 1.9% 先做 `_into`"就是这一条。
+    #[test]
+    fn test_nn_into_variants_match_allocating_bit_for_bit() {
+        let (rows, cols) = (7usize, 33usize);
+        let mut rng = crate::ops::testutil::Lcg(0x1111_2222);
+        let x: Vec<f32> = (0..rows * cols).map(|_| 2.0 * rng.f64() as f32).collect();
+        let w: Vec<f32> = (0..cols).map(|_| 0.5 + rng.f64() as f32).collect();
+        let mask: Vec<f32> = (0..rows * cols).map(|_| 0.1 * rng.f64() as f32).collect();
+
+        // rms_norm：带权重与不带权重两条
+        for wopt in [Some(&w[..]), None] {
+            let want = rms_norm(&x, wopt, rows, cols, 1e-5).unwrap();
+            let mut got = vec![0f32; rows * cols];
+            rms_norm_into(&x, wopt, rows, cols, 1e-5, &mut got).unwrap();
+            for i in 0..rows * cols {
+                assert_eq!(got[i].to_bits(), want[i].to_bits(), "rms_norm_into @ {i}");
+            }
+        }
+        // softmax_rows：带 mask 与不带 mask 两条
+        for mopt in [Some(&mask[..]), None] {
+            let want = softmax_rows(&x, mopt, rows, cols, 1.0).unwrap();
+            let mut got = vec![0f32; rows * cols];
+            softmax_rows_into(&x, mopt, rows, cols, 1.0, &mut got).unwrap();
+            for i in 0..rows * cols {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "softmax_rows_into @ {i}"
+                );
+            }
+        }
+        // 错误路径：out 长度不符 / x 长度不符 / eps 非法 / scale 非有限
+        let mut short = vec![0f32; rows * cols - 1];
+        assert!(matches!(
+            rms_norm_into(&x, None, rows, cols, 1e-5, &mut short),
+            Err(Error::Shape { op, what, .. }) if op == "rms_norm_into" && what == "out"
+        ));
+        assert!(matches!(
+            softmax_rows_into(&x, None, rows, cols, 1.0, &mut short),
+            Err(Error::Shape { op, what, .. }) if op == "softmax_rows_into" && what == "out"
+        ));
+        let mut full = vec![0f32; rows * cols];
+        assert!(matches!(
+            rms_norm_into(&x[..x.len() - 1], None, rows, cols, 1e-5, &mut full),
+            Err(Error::Shape { .. })
+        ));
+        assert!(matches!(
+            rms_norm_into(&x, None, rows, cols, 0.0, &mut full),
+            Err(Error::NotPositive { .. })
+        ));
+        assert!(matches!(
+            softmax_rows_into(&x, None, rows, cols, f32::NAN, &mut full),
+            Err(Error::NotFinite { .. })
+        ));
+        // 退化：n = 0
+        assert!(rms_norm_into(&[], None, 0, 33, 1e-5, &mut []).is_ok());
+        assert!(softmax_rows_into(&[], None, 0, 33, 1.0, &mut []).is_ok());
+    }
+
     #[test]
     fn test_int8_pipeline_relative_error_is_bounded() {
         let mut worst_q = 0.0f64;

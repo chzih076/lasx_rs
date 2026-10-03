@@ -269,6 +269,14 @@ pub fn int8_keepalive(rows: &mut Vec<Row>) {
                     black_box(v);
                 });
         });
+        // (a2') 免分配版（`docs/ops.md` §5.15 里"要抠那 1.9% 先做 `_into`"的那一条）：
+        // 同一份数据、同一个内核，只少一次输出缓冲分配 ⇒ 两者之差就是分配的成本。
+        let mut normed: Vec<f32> = vec![0.0; n];
+        let d_norm_into = timeit(|| {
+            lasx_rs::api::rms_norm_into(&back, Some(&w), tokens, hidden, 1e-5, &mut normed)
+                .unwrap();
+            let _ = black_box(normed[0]);
+        });
         // (a3) 再量化（逐 token）
         let d_requant = timeit(|| {
             lasx_quantize_i8_per_row(
@@ -299,6 +307,12 @@ pub fn int8_keepalive(rows: &mut Vec<Row>) {
             crate::timing::fmt_t(d_norm),
             crate::timing::fmt_t(d_requant),
             crate::timing::fmt_t(total)
+        );
+        println!(
+            "  ↳ {tag}: RMSNorm 分配版 {} vs `_into` {}（差 {}）",
+            crate::timing::fmt_t(d_norm),
+            crate::timing::fmt_t(d_norm_into),
+            crate::timing::fmt_t(d_norm.saturating_sub(d_norm_into))
         );
 
         // 注意力 softmax：行数 = token 数、列数 = 序列长（即 [tokens, tokens]）
