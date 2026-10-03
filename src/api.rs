@@ -456,6 +456,76 @@ pub fn softmax_rows_into(
     Ok(())
 }
 
+/// 行内 **LayerNorm**：`out[i][j] = (x[i][j] − mean_i)/√(var_i + eps) · w[j] + b[j]`（行主序）。
+///
+/// 与 [`rms_norm`] 的差别只有**减均值**与**偏置**：契约（`docs/ops.md` §2.16）要求方差用
+/// **两遍法**（先 mean、再 `Σ(x−mean)²`），不是 `E[x²] − mean²`；`w`/`b` 传 `None` 表示
+/// 无权重/无偏置（**无偏置是跳过加法**，不是加 `0.0`——那会翻 `−0.0` 的符号）。
+///
+/// 存在理由：外部契约（ONNX 图 17 处 `LayerNormalization`，见 `docs/platform.md` §4）。
+///
+/// # Errors
+/// - `x.len() != rows × cols` 或 `out.len() != rows × cols`（[`Error::Shape`]）；
+/// - `w`/`b` 给了但长度不是 `cols`（[`Error::Shape`]）；
+/// - `eps` 非有限（[`Error::NotFinite`]）或非正（[`Error::NotPositive`]）；
+/// - `rows × cols` 溢出（[`Error::Overflow`]）。
+pub fn layer_norm(
+    x: &[f32],
+    w: Option<&[f32]>,
+    b: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<AlignedVec<f32>> {
+    let n = checked_mul("layer_norm", "rows×cols", rows, cols)?;
+    let mut out = AlignedVec::<f32>::new(n);
+    layer_norm_into(x, w, b, rows, cols, eps, out.as_mut_slice())?;
+    Ok(out)
+}
+
+/// [`layer_norm`] 的**免分配**版本（与分配版**逐位一致**，见 `docs/dev.md` §7.9 的 `_into` 实测）。
+///
+/// # Errors
+/// 同 [`layer_norm`]。
+pub fn layer_norm_into(
+    x: &[f32],
+    w: Option<&[f32]>,
+    b: Option<&[f32]>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    if !eps.is_finite() {
+        return Err(Error::NotFinite {
+            op: "layer_norm",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    if eps <= 0.0 {
+        return Err(Error::NotPositive {
+            op: "layer_norm",
+            what: "eps",
+            value: eps as f64,
+        });
+    }
+    let n = checked_mul("layer_norm", "rows×cols", rows, cols)?;
+    expect_len("layer_norm", "x", x.len(), n)?;
+    expect_len("layer_norm", "out", out.len(), n)?;
+    if let Some(w) = w {
+        expect_len("layer_norm", "w", w.len(), cols)?;
+    }
+    if let Some(b) = b {
+        expect_len("layer_norm", "b", b.len(), cols)?;
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::layer_norm::layer_norm(x, w.unwrap_or(&[]), b.unwrap_or(&[]), eps, rows, cols, out);
+    Ok(())
+}
+
 /* ==================== NN：逐元素激活 ==================== */
 
 /// SiLU（swish）：`y[i] = x[i] / (1 + exp(−x[i]))`，逐元素，返回新分配的对齐缓冲。

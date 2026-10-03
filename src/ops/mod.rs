@@ -31,6 +31,7 @@ pub mod gelu_erf;
 pub mod gelu_quick;
 pub mod gemv_i8;
 pub mod j2_accel_batch;
+pub mod layer_norm;
 pub mod mat3_mul_vec3_batch;
 pub mod matmul;
 pub mod matmul_f64;

@@ -178,7 +178,7 @@
 | `Softmax` | 12 | ✅ `softmax_rows`（`mask` + `scale` 参数齐备） | — |
 | `Erf`（GELU 的一部分） | 12 | ✅ `gelu_erf` | — |
 | `Pow`/`ReduceMean`/`Sqrt`（归一化的一部分） | 各 32 | ✅ `rms_norm` 一次调用覆盖 | — |
-| **`LayerNormalization`** | **17** | ❌ **缺** | 需要实现（减均值 + β） |
+| **`LayerNormalization`** | **17** | ✅ **已实现**（2026-10-03）：`api::layer_norm` / `layer_norm_into`、`ops::layer_norm`（契约 `docs/ops.md` §2.16；与 `rms_norm` 同一行归约骨架，差别是减均值 + 偏置 β） | — |
 | **`Gather`**（ONNX 算子：词/段/位置嵌入） | 34 | ❌ **缺**（注意 `src/plan.rs` 有个私有 `gather_columns`，是矩阵列搬运、与本算子无关） | 需要实现（按 id 取行） |
 
 **两个缺口的现状**：
