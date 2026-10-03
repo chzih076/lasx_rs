@@ -462,6 +462,73 @@ pub fn dispatch_overhead() {
             100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
         );
     }
+    // `rope`：输出 = rows×cols（与激活同量级）；`gemv_f16`：输出只有 m 个 f32。
+    {
+        let (rows, cols, n_dims) = (192usize, 768usize, 128usize);
+        let mut rng = crate::data::Lcg::new(0x1234_5678_u64);
+        let xr: Vec<f32> = (0..rows * cols).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let half = rows * (n_dims / 2);
+        let cos: Vec<f32> = (0..half).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let sin: Vec<f32> = (0..half).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let mut out = vec![0f32; rows * cols];
+        let mode = lasx_rs::api::RopeMode::NeoX as i32;
+        let a = timeit(|| {
+            let v = lasx_rs::api::rope(
+                &xr,
+                &cos,
+                &sin,
+                rows,
+                cols,
+                n_dims,
+                lasx_rs::api::RopeMode::NeoX,
+            )
+            .unwrap();
+            let _ = black_box(v[0]);
+        });
+        let f = timeit(|| {
+            lasx_rope(
+                xr.as_ptr(),
+                cos.as_ptr(),
+                sin.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i32,
+                cols as i32,
+                n_dims as i32,
+                mode,
+            );
+            let _ = black_box(out[0]);
+        });
+        println!(
+            "| `rope` | {rows}×{cols}（n_dims={n_dims}） | {} | {} | **{:.0}%** |",
+            crate::timing::fmt_t(a),
+            crate::timing::fmt_t(f),
+            100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
+        );
+        let (m, k) = (4096usize, 4096usize);
+        let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
+        let xv: Vec<f32> = vec![0.25; k];
+        let mut yv = vec![0f32; m];
+        let a = timeit(|| {
+            let v = lasx_rs::api::gemv_f16(m, k, &aw, &xv).unwrap();
+            let _ = black_box(v[0]);
+        });
+        let f = timeit(|| {
+            lasx_gemv_f16(
+                aw.as_ptr(),
+                xv.as_ptr(),
+                yv.as_mut_ptr(),
+                m as i32,
+                k as i32,
+            );
+            let _ = black_box(yv[0]);
+        });
+        println!(
+            "| `gemv_f16` | m={m} k={k} | {} | {} | **{:.1}%** |",
+            crate::timing::fmt_t(a),
+            crate::timing::fmt_t(f),
+            100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
+        );
+    }
 }
 
 /// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。

@@ -738,6 +738,55 @@ pub fn gelu_erf_into(x: &[f32], out: &mut [f32]) -> Result<()> {
 
 /* ==================== NN：RoPE ==================== */
 
+/// [`rope`] 的**免分配**版本（输出写进 `out`，长度必须 `rows × cols`）。
+///
+/// 为什么有它：这是**全库分配占比最高的算子**——实测（`docs/dev.md` §7.9 ③）
+/// `192×768`（n_dims = 128）规模上分配占 `rope` 调用的 **39–41%**
+/// （83.9 → 50.6 µs，同一内核、只差一次分配；输出 0.6 MiB ⇒ 与直接量的 33 µs 一致），
+/// 而 RoPE 在注意力里**每层都要调**。
+///
+/// # Errors
+/// 同 [`rope`]，外加 `out.len() != rows × cols`。
+#[allow(clippy::too_many_arguments)] // 与分配版 `rope` 同形 + `out`
+pub fn rope_into(
+    x: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    rows: usize,
+    cols: usize,
+    n_dims: usize,
+    mode: RopeMode,
+    out: &mut [f32],
+) -> Result<()> {
+    let n = checked_mul("rope_into", "rows×cols", rows, cols)?;
+    expect_len("rope_into", "x", x.len(), n)?;
+    expect_len("rope_into", "out", out.len(), n)?;
+    if !n_dims.is_multiple_of(2) {
+        return Err(Error::BadValue {
+            op: "rope_into",
+            what: "n_dims",
+            requirement: "是偶数（元素两两成对）",
+        });
+    }
+    if n_dims > cols {
+        return Err(Error::Shape {
+            op: "rope_into",
+            what: "n_dims",
+            expected: cols,
+            got: n_dims,
+        });
+    }
+    let table_len = checked_mul("rope_into", "rows×(n_dims/2)", rows, n_dims / 2)?;
+    expect_len("rope_into", "cos", cos.len(), table_len)?;
+    expect_len("rope_into", "sin", sin.len(), table_len)?;
+    if n == 0 {
+        return Ok(());
+    }
+    // SAFETY: 与分配版同一组前提（长度、`n_dims` 偶数且 ≤ cols），已在上方校验。
+    unsafe { crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, mode, out) };
+    Ok(())
+}
+
 /// 旋转位置编码（RoPE）：`rows × cols` 行主序，每行**前 `n_dims` 列**参与旋转。
 ///
 /// `cos`/`sin` 各 `rows × (n_dims/2)`、行主序（第 `r` 行第 `i` 列 = `θ_i` 的余弦/正弦），
@@ -2802,5 +2851,35 @@ mod tests {
         assert!(silu_into(&[], &mut []).is_ok());
         assert!(gelu_quick_into(&[], &mut []).is_ok());
         assert!(gelu_erf_into(&[], &mut []).is_ok());
+
+        // `rope_into`（分配占比最高：39–41%）——与分配版逐位一致 + 错误路径
+        let (rows_r, cols_r, nd) = (4usize, 8usize, 4usize);
+        let xr: Vec<f32> = (0..rows_r * cols_r)
+            .map(|_| rng.f64() as f32 - 0.5)
+            .collect();
+        let half = rows_r * (nd / 2);
+        let cosr: Vec<f32> = (0..half).map(|_| rng.f64() as f32 - 0.5).collect();
+        let sinr: Vec<f32> = (0..half).map(|_| rng.f64() as f32 - 0.5).collect();
+        for mode in [RopeMode::NeoX, RopeMode::GptJ] {
+            let want = rope(&xr, &cosr, &sinr, rows_r, cols_r, nd, mode).unwrap();
+            let mut got = vec![0f32; rows_r * cols_r];
+            rope_into(&xr, &cosr, &sinr, rows_r, cols_r, nd, mode, &mut got).unwrap();
+            for i in 0..got.len() {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "rope_into {mode:?} @ {i}"
+                );
+            }
+        }
+        assert!(matches!(
+            rope_into(&xr, &cosr, &sinr, rows_r, cols_r, nd, RopeMode::NeoX, &mut [0f32; 1]),
+            Err(Error::Shape { op, what, .. }) if op == "rope_into" && what == "out"
+        ));
+        assert!(matches!(
+            rope_into(&xr, &cosr, &sinr, rows_r, cols_r, 3, RopeMode::NeoX, &mut [0f32; 32]),
+            Err(Error::BadValue { op, what, .. }) if op == "rope_into" && what == "n_dims"
+        ));
+        assert!(rope_into(&[], &[], &[], 0, cols_r, nd, RopeMode::NeoX, &mut []).is_ok());
     }
 }
