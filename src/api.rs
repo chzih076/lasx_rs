@@ -2594,4 +2594,130 @@ mod tests {
             Err(Error::Shape { what, .. }) if what == "y"
         ));
     }
+
+    /// **整模型级（合成 12 层栈）的 int8 端到端误差实测**（`docs/ops.md` §2.15 待定的那一格）。
+    ///
+    /// 结构：每层 = `matmul_i8`（per-token 激活 + per-channel 权重）→ f32 RMSNorm →
+    /// `matmul_i8` → **残差相加**；共 12 层（这就是 §5.15 说的"组合路径"：线性走 int8、
+    /// 归一化走 f32）。参考量 = **同一结构、f64 精确算术、权重不量化** ⇒ 量到的正是
+    /// "量化误差沿深度累积"。对照组 = 同 12 层但**不量化**的 f32 栈（应小三个数量级）。
+    ///
+    /// **诚实边界**：合成栈（随机权重、无注意力、无激活函数），**不是真模型**（真模型不在本
+    /// 仓库）⇒ 它给的是"深度累积量级"的证据，不是某个具体模型的验收值。
+    #[test]
+    fn test_int8_model_level_error_over_twelve_layers() {
+        const L: usize = 12;
+        const T: usize = 8;
+        const K: usize = 64;
+        const EPS: f32 = 1e-5;
+
+        let mut rng = crate::ops::testutil::Lcg(0x12_34_56_78);
+        // 权重按 [out, in] 行主序（per-channel 量化要求每行一个 scale）
+        let ws: Vec<Vec<f32>> = (0..2 * L)
+            .map(|_| {
+                (0..K * K)
+                    .map(|_| 1.0 / (K as f32).sqrt() * (2.0 * rng.f64() as f32 - 1.0))
+                    .collect()
+            })
+            .collect();
+        let x0: Vec<f32> = (0..T * K).map(|_| 2.0 * rng.f64() as f32 - 1.0).collect();
+
+        // f32 栈：`quant=false` 时完全不量化；`quant=true` 时两步线性走 `matmul_i8`
+        let run = |quant: bool| -> Vec<f32> {
+            let mut h = x0.clone();
+            for l in 0..L {
+                let (w1, w2) = (&ws[2 * l], &ws[2 * l + 1]);
+                let lin = |x: &[f32], w: &[f32]| -> Vec<f32> {
+                    if quant {
+                        let (xq, sx) = quantize_i8_per_token(x, T, K).unwrap();
+                        let (wq, sw) = quantize_i8_per_channel(w, K, K).unwrap();
+                        matmul_i8(&xq, &wq, &sw, &sx, T, K, K)
+                            .unwrap()
+                            .as_slice()
+                            .to_vec()
+                    } else {
+                        let mut y = vec![0f32; T * K];
+                        for t in 0..T {
+                            for o in 0..K {
+                                let mut acc = 0f32;
+                                for i in 0..K {
+                                    acc = x[t * K + i].mul_add(w[o * K + i], acc);
+                                }
+                                y[t * K + o] = acc;
+                            }
+                        }
+                        y
+                    }
+                };
+                let y1 = lin(&h, w1);
+                let n1 = rms_norm(&y1, None, T, K, EPS).unwrap();
+                let y2 = lin(&n1, w2);
+                // 残差相加（f32）
+                for i in 0..T * K {
+                    h[i] += y2[i];
+                }
+            }
+            h
+        };
+
+        // f64 参考：同结构、精确算术、权重不量化
+        let x0d: Vec<f64> = x0.iter().map(|&v| v as f64).collect();
+        let mut hd = x0d.clone();
+        for l in 0..L {
+            let (w1, w2) = (&ws[2 * l], &ws[2 * l + 1]);
+            let lin_d = |x: &[f64], w: &[f32]| -> Vec<f64> {
+                let mut y = vec![0f64; T * K];
+                for t in 0..T {
+                    for o in 0..K {
+                        let mut acc = 0f64;
+                        for i in 0..K {
+                            acc += x[t * K + i] * w[o * K + i] as f64;
+                        }
+                        y[t * K + o] = acc;
+                    }
+                }
+                y
+            };
+            let y1 = lin_d(&hd, w1);
+            let mut n1 = vec![0f64; T * K];
+            for t in 0..T {
+                let row = &y1[t * K..(t + 1) * K];
+                let ms: f64 = row.iter().map(|&v| v * v).sum::<f64>() / K as f64;
+                let inv = 1.0 / (ms + EPS as f64).sqrt();
+                for i in 0..K {
+                    n1[t * K + i] = row[i] * inv;
+                }
+            }
+            let y2 = lin_d(&n1, w2);
+            for i in 0..T * K {
+                hd[i] += y2[i];
+            }
+        }
+
+        // 累积误差：每层的 ∞-范数相对量（对 f64 参考）
+        let hq = run(true);
+        let hf = run(false);
+        let scale = hd.iter().fold(0f64, |a, &b| a.max(b.abs())).max(1e-30);
+        let rel = |v: &[f32]| {
+            v.iter()
+                .zip(&hd)
+                .fold(0f64, |a, (&q, &r)| a.max((q as f64 - r).abs()))
+                / scale
+        };
+        let (eq, ef) = (rel(&hq), rel(&hf));
+        println!("  合成 {L} 层栈：int8 ∞-相对 {eq:.3e} / 纯 f32 ∞-相对 {ef:.3e}");
+        println!(
+            "  （单层线性口径实测 6.05e-3；按层数开方推 √{L}×6.05e-3 ≈ {:.1e}）",
+            12f64.sqrt() * 6.047e-3
+        );
+        assert!(
+            eq.is_finite() && eq <= 5e-3,
+            "合成 {L} 层栈的 int8 ∞-相对误差 {eq:.3e} 超过 5e-3（见 docs/ops.md §2.15）"
+        );
+        assert!(ef <= 1e-4, "纯 f32 对照异常：{ef:.3e}");
+        assert!(
+            eq > ef * 100.0,
+            "量化误差应当主导：int8 {eq:.3e} vs f32 {ef:.3e}"
+        );
+    }
 }
