@@ -51,17 +51,22 @@ thread_local! {
 ///
 /// 实测交叉点与这条判据一致（12 线程）：384³（per_thread = 32）共享赢 287 vs 216；
 /// 256³（21）回退赢 327 vs 223；宽形状 m=300/100（25/8）回退赢；512³ 及以上两者持平偏共享。
-fn need_shared_pack(m: usize, threads: usize, pack_min_m: usize) -> bool {
-    threads > 1 && m / threads >= pack_min_m
+fn need_shared_pack(m: usize, threads: usize, pack_min_m: usize, k: usize, n: usize) -> bool {
+    threads > 1 && (m / threads >= pack_min_m || k.saturating_mul(n) >= SHARED_PACK_MIN_ELEMS)
 }
-// 【待改，已实测】上面这条判据只在"每线程行数"这一维上判，**缺了"B 有多大"**：
-// `192×768×3072`（B = 9.4 MB）在 8/12/24 线程上被它打到回退路径（每块各遍历一遍 B），
-// 而同线程数下共享打包快 **2.5×/1.8×/1.3×**（8 线程 7.31 → 2.92 ms）。文档里"per_thread < 32
-// 走回退"那条是在 `256³`（B = 256 KB）上定的——那里回退确实赢（327 vs 223 GF/s）。
-// 拟改规则（**先做形状扫再改**，见 `docs/dev.md` §7.9）：
-//     threads > 1 && (m / threads >= pack_min_m || k * n * 4 >= 1 MiB)
-// 阈值取 1 MiB（两个已知数据点之间：256 KB 回退赢、9.4 MB 共享赢），扫过 256³/512³/1024³
-// 与 `192×768×3072`/`192×3072×768` 再落地。
+
+/// 触发共享打包的 **B 规模**门槛（元素数；`1 << 18` = 1 MiB 的 f32）。
+///
+/// 为什么判据里要有这一维（2026-10-03 实测，`docs/dev.md` §7.9）：原判据只看"每线程行数"
+/// （`m / threads >= PACK_MIN_M`）。`192×768×3072` 在 8 线程时 `192/8 = 24 < 32` ⇒ 被判到
+/// 回退路径，而回退路径**每个块各自遍历一遍 B**（8 块 × 9.4 MB ≈ 75 MB）⇒ 7.31 ms；
+/// 同线程数下共享打包（只遍历两遍 B）是 **2.92 ms（2.5×）**。
+/// 文档里"`per_thread < 32` 走回退"那条是在 `256³`（B = 256 KB）上定的——那里回退确实赢
+/// （327 vs 223 GF/s），所以两维都要判：**行数够多（会让回退各自打包整份 B）**或
+/// **B 够大（回退的重复遍历不划算）**，任一成立就走共享打包。
+///
+/// 门槛取 1 MiB：两个已知数据点之间（256 KB 回退赢、9.4 MB 共享赢）。
+const SHARED_PACK_MIN_ELEMS: usize = 1 << 18;
 
 use crate::pool::WorkerPool;
 
@@ -135,7 +140,7 @@ fn matmul_f32_picked(
     // （实测 6 线程 274 GF/s → 12 线程 175 → 24 线程 93）。这里改成：并行层按面板
     // 打包一次，再把行块分给各线程，线程只读共享面板（面板本身留在共享 L3 里）。
     let work = (m as u128) * (k as u128) * (n as u128);
-    if need_shared_pack(m, pool.threads(), matmul::PACK_MIN_M)
+    if need_shared_pack(m, pool.threads(), matmul::PACK_MIN_M, k, n)
         && k >= matmul::PACK_MIN_K
         && n >= 32
         && work >= matmul::PACK_MIN_WORK
@@ -304,7 +309,7 @@ pub fn matmul_f64(
     // （f64 的 B 字节数是 f32 的两倍：1024³ 每份 8 MB），24 线程 = 192 MB ≫ L3（32 MB），
     // 实测线程越多越慢：6 线程 110 GF/s → 12 线程 77 → 16 线程 62 → 24 线程 46。
     let work = (m as u128) * (k as u128) * (n as u128);
-    if need_shared_pack(m, pool.threads(), matmul64::PACK_MIN_M)
+    if need_shared_pack(m, pool.threads(), matmul64::PACK_MIN_M, k, n)
         && k >= matmul64::PACK_MIN_K
         && n >= 16
         && work >= matmul64::PACK_MIN_WORK

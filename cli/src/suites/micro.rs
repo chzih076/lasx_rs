@@ -437,6 +437,33 @@ pub fn pool_scaling() {
             );
         }
     }
+    // 立方形状：文档里"回退赢/持平/共享赢"的**原始数据点**就在这些形状上（`docs/dev.md` §14.3
+    // 与 §7.9 的"待改"注记）⇒ 改 `need_shared_pack` 前必须在这里扫过，否则就是"只按一个形状改"。
+    for &s in &[256usize, 512, 1024] {
+        let (m, k, n) = (s, s, s);
+        let mut rng = crate::data::Lcg::new((s * 31) as u64);
+        let a: Vec<f32> = (0..m * k).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+        let mut c = vec![0f32; m * n];
+        let mut base = Duration::ZERO;
+        for &th in &threads {
+            let pool = WorkerPool::new(th);
+            let mut a = a.clone();
+            let d = timeit(|| {
+                parallel::matmul_f32(&pool, m, k, n, &mut a, &b, &mut c).unwrap();
+                let _ = black_box(c[0]);
+            });
+            if th == 1 {
+                base = d;
+            }
+            let sp = base.as_secs_f64() / d.as_secs_f64();
+            println!(
+                "| {m}×{k}×{n} | {th} | {} | {sp:.2}× | {:.0}% |",
+                fmt_t(d),
+                100.0 * sp / th as f64
+            );
+        }
+    }
 }
 
 ///
