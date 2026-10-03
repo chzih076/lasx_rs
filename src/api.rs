@@ -1240,6 +1240,77 @@ mod tests {
 
     /* ==================== N3：int8 推理 ==================== */
 
+    /// **int8 端到端口径的实测**（`docs/platform.md` §5.1：模型级验收标准还缺依据）。
+    ///
+    /// 口径：参考量用 **f64 累加**（既不是 f32 路径也不是 int8 路径）；
+    /// 误差按 **∞-范数相对量** `max|Y_q − Y| / max|Y|` 报——这是"跨算子叠加后"的可复核口径。
+    /// 同时报 f32 路径的同口径误差作对照（量化误差应当主导）。覆盖 per-token 激活 +
+    /// per-channel 权重（`docs/dev.md` §21.3 的结论：这两个是前提而非优化项）。
+    #[test]
+    fn test_int8_pipeline_relative_error_is_bounded() {
+        let mut worst_q = 0.0f64;
+        let mut worst_f32 = 0.0f64;
+        for &(m, k, n) in &[
+            (192usize, 768usize, 768usize),
+            (192, 768, 3072),
+            (32, 1024, 1024),
+        ] {
+            for seed in 0..3u64 {
+                let mut rng = crate::ops::testutil::Lcg(0x9e37_79b9 ^ seed);
+                // 真实量级：激活 ±2、权重 ±0.1
+                let x: Vec<f32> = (0..m * k).map(|_| 2.0 * rng.f64() as f32).collect();
+                let w: Vec<f32> = (0..n * k).map(|_| 0.1 * rng.f64() as f32).collect();
+                // f64 参考 + f32 对照（同一条 Σ X·W 的两种累加）
+                let mut yref = vec![0f64; m * n];
+                let mut yf32 = vec![0f32; m * n];
+                for t in 0..m {
+                    for o in 0..n {
+                        let (mut acc, mut accf) = (0f64, 0f32);
+                        for i in 0..k {
+                            acc += x[t * k + i] as f64 * w[o * k + i] as f64;
+                            accf = (x[t * k + i] as f32).mul_add(w[o * k + i], accf);
+                        }
+                        yref[t * n + o] = acc;
+                        yf32[t * n + o] = accf;
+                    }
+                }
+                // int8 管线（出口已带 scale ⇒ 输出的就是反量化值）
+                let (xq, sx) = quantize_i8_per_token(&x, m, k).unwrap();
+                let (wq, sw) = quantize_i8_per_channel(&w, n, k).unwrap();
+                let yq = matmul_i8(
+                    xq.as_slice(),
+                    wq.as_slice(),
+                    sw.as_slice(),
+                    sx.as_slice(),
+                    m,
+                    k,
+                    n,
+                )
+                .unwrap();
+                let scale = yref.iter().fold(0f64, |a, &b| a.max(b.abs())).max(1e-30);
+                let rel = |v: &[f32]| {
+                    v.iter()
+                        .zip(&yref)
+                        .fold(0f64, |a, (&q, &r)| a.max((q as f64 - r).abs()))
+                        / scale
+                };
+                let (eq, ef) = (rel(yq.as_slice()), rel(&yf32));
+                worst_q = worst_q.max(eq);
+                worst_f32 = worst_f32.max(ef);
+                println!("  m={m} k={k} n={n} seed={seed}: int8 {eq:.3e} / f32 {ef:.3e}");
+            }
+        }
+        println!("  ⇒ 最坏：int8 {worst_q:.3e} / f32 {worst_f32:.3e}（∞-范数相对 f64 参考）");
+        // **这就是 int8 端到端口径的验收界**（`docs/ops.md` §2.15）：实测最坏 6.05e-3，
+        // 界取 1e-2（1.65× 余量）。f32 路径同口径 ~1.4e-6 作对照，两者差三个数量级。
+        assert!(
+            worst_q <= 1e-2,
+            "int8 管线 ∞-相对误差 {worst_q:.3e} 超过标准 1e-2（见 docs/ops.md §2.15）"
+        );
+        assert!(worst_f32 <= 1e-5, "f32 对照路径异常：{worst_f32:.3e}");
+    }
+
+
     /// 端到端：f32 → per-token 量化 → `gemv_i8`，与 f32 参考的相对误差在有界范围内。
     ///
     /// 界怎么定：权重与激活各引入 ≤ `scale/2` 的绝对误差，累加 `k` 项后最坏

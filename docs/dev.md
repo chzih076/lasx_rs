@@ -248,12 +248,13 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**204 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+当前规模：**205 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
 其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，12 个是 §19.14 的批量样本视图，
 18 个是 §21 的 N3 批次（量化/反量化/GEMV/批量 GEMM/C ABI），2 个是 §21.9 里 k 方向归约那两项
 （逐位一致 + 错误/退化），2 个是 §20.7 的池化 `gemv_f16`，
 2 个是 §20.7 池协议修复的回归（含 60 s 看门狗），
-**1 个是 `docs/platform.md` §1 的 LA664 勘误回归**（动态分块跑两次逐位一致））。
+**1 个是 `docs/platform.md` §1 的 LA664 勘误回归**（动态分块跑两次逐位一致），
+**1 个是 int8 端到端口径的实测+守界**（`docs/ops.md` §2.15，最坏 6.05e-3 ≤ 1e-2））。
 
 | 测试类型 | 目的 | 例子 |
 |---|---|---|
@@ -284,7 +285,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 204 单测（+ 5 个宏单测 + 17 个文档测试）
+cargo test --workspace --release        # 205 单测（+ 5 个宏单测 + 17 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
