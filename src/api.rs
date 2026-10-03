@@ -1268,7 +1268,7 @@ mod tests {
                         let (mut acc, mut accf) = (0f64, 0f32);
                         for i in 0..k {
                             acc += x[t * k + i] as f64 * w[o * k + i] as f64;
-                            accf = (x[t * k + i] as f32).mul_add(w[o * k + i], accf);
+                            accf = x[t * k + i].mul_add(w[o * k + i], accf);
                         }
                         yref[t * n + o] = acc;
                         yf32[t * n + o] = accf;
@@ -1309,7 +1309,6 @@ mod tests {
         );
         assert!(worst_f32 <= 1e-5, "f32 对照路径异常：{worst_f32:.3e}");
     }
-
 
     /// 端到端：f32 → per-token 量化 → `gemv_i8`，与 f32 参考的相对误差在有界范围内。
     ///
