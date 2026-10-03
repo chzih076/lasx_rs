@@ -314,6 +314,45 @@ pub fn int8_keepalive(rows: &mut Vec<Row>) {
             crate::timing::fmt_t(d_norm_into),
             crate::timing::fmt_t(d_norm.saturating_sub(d_norm_into))
         );
+        // int8 族的两步（反量化 / 再量化）的分配成本：api 分配版 vs `_into`。
+        // 注意上面 (a1)/(a3) 走的是 **FFI 预分配**路径，所以这里量的是"Rust 调用方用 api 时"
+        // 的那笔分配——两套数不可混用（`docs/dev.md` §6.4 的口径）。
+        let d_deq_alloc = timeit(|| {
+            let v = lasx_rs::api::dequantize_i8_rows(&q, tokens, hidden, &scales).unwrap();
+            let _ = black_box(v[0]);
+        });
+        let mut deq_buf: Vec<f32> = vec![0.0; n];
+        let d_deq_into = timeit(|| {
+            lasx_rs::api::dequantize_i8_rows_into(&q, tokens, hidden, &scales, &mut deq_buf)
+                .unwrap();
+            let _ = black_box(deq_buf[0]);
+        });
+        let d_qt_alloc = timeit(|| {
+            let v = lasx_rs::api::quantize_i8_per_token(&back, tokens, hidden).unwrap();
+            let _ = black_box(v.0[0]);
+        });
+        let mut qt_buf: Vec<i8> = vec![0; n];
+        let mut qt_scales: Vec<f32> = vec![0.0; tokens];
+        let d_qt_into = timeit(|| {
+            lasx_rs::api::quantize_i8_per_token_into(
+                &back,
+                tokens,
+                hidden,
+                &mut qt_buf,
+                &mut qt_scales,
+            )
+            .unwrap();
+            let _ = black_box(qt_buf[0]);
+        });
+        println!(
+            "  ↳ {tag}: 反量化 分配 {} vs `_into` {}（差 {}）| 量化/行 分配 {} vs `_into` {}（差 {}）",
+            crate::timing::fmt_t(d_deq_alloc),
+            crate::timing::fmt_t(d_deq_into),
+            crate::timing::fmt_t(d_deq_alloc.saturating_sub(d_deq_into)),
+            crate::timing::fmt_t(d_qt_alloc),
+            crate::timing::fmt_t(d_qt_into),
+            crate::timing::fmt_t(d_qt_alloc.saturating_sub(d_qt_into))
+        );
 
         // 注意力 softmax：行数 = token 数、列数 = 序列长（即 [tokens, tokens]）
         let att = AlignedBuf::fill_with(tokens * tokens, |_| 0.5 * rng.f32() - 0.25);

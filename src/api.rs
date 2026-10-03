@@ -1621,6 +1621,67 @@ pub fn dequantize_i8_rows_into(
     Ok(())
 }
 
+/// [`gemv_i8`] 的**免分配**版本：`y` 长度必须 `m`。
+///
+/// 动机同 `dequantize_i8_into`（逐层保活路径上的分配可占调用的一半以上，`docs/dev.md` §7.9）。
+///
+/// # Errors
+/// 同 [`gemv_i8`]，外加 `y.len() != m`。
+pub fn gemv_i8_into(
+    w: &[i8],
+    scale_w: &[f32],
+    x: &[i8],
+    scale_x: f32,
+    m: usize,
+    k: usize,
+    y: &mut [f32],
+) -> Result<()> {
+    let n = checked_mul("gemv_i8_into", "m×k", m, k)?;
+    expect_len("gemv_i8_into", "w", w.len(), n)?;
+    expect_len("gemv_i8_into", "x", x.len(), k)?;
+    expect_len("gemv_i8_into", "scale_w", scale_w.len(), m)?;
+    expect_len("gemv_i8_into", "y", y.len(), m)?;
+    if m == 0 || k == 0 {
+        return Ok(());
+    }
+    crate::ops::gemv_i8::gemv_i8(w, scale_w, x, scale_x, m, k, y);
+    Ok(())
+}
+
+/// [`matmul_i8`] 的**免分配**版本：`y` 长度必须 `m × n`。
+///
+/// # Errors
+/// 同 [`matmul_i8`]，外加 `y.len() != m × n`。
+#[allow(clippy::too_many_arguments)] // 8 个参数：与分配版 `matmul_i8` 同形 + `y`（§19.7 口径）
+pub fn matmul_i8_into(
+    x: &[i8],
+    w: &[i8],
+    scale_w: &[f32],
+    scale_x: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    y: &mut [f32],
+) -> Result<()> {
+    let n_x = checked_mul("matmul_i8_into", "m×k", m, k)?;
+    let n_w = checked_mul("matmul_i8_into", "n×k", n, k)?;
+    expect_len("matmul_i8_into", "x", x.len(), n_x)?;
+    expect_len("matmul_i8_into", "w", w.len(), n_w)?;
+    expect_len("matmul_i8_into", "scale_x", scale_x.len(), m)?;
+    expect_len("matmul_i8_into", "scale_w", scale_w.len(), n)?;
+    expect_len(
+        "matmul_i8_into",
+        "y",
+        y.len(),
+        checked_mul("matmul_i8_into", "m×n", m, n)?,
+    )?;
+    if m == 0 || k == 0 || n == 0 {
+        return Ok(());
+    }
+    crate::ops::matmul_i8::matmul_i8(x, w, scale_w, scale_x, m, k, n, y);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2495,5 +2556,42 @@ mod tests {
         assert!(absmax_rows_into(&[], 0, cols, &mut []).is_ok());
         assert!(quantize_i8_per_tensor_into(&[], &mut []).is_ok());
         assert!(dequantize_i8_into(&[], 0.0, &mut []).is_ok());
+
+        // gemv_i8 / matmul_i8 的 `_into`：与分配版逐位一致（含出口 scale 次序）
+        let (k, m, nn) = (cols, rows, 3usize);
+        let wq: Vec<i8> = (0..m * k)
+            .map(|i| ((i as i32 * 13) % 127 - 63) as i8)
+            .collect();
+        let sw: Vec<f32> = (0..m).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+        let xq: Vec<i8> = (0..k).map(|i| ((i as i32 * 7) % 127 - 63) as i8).collect();
+        let g0 = gemv_i8(&wq, &sw, &xq, 0.5, m, k).unwrap();
+        let mut g1 = vec![0f32; m];
+        gemv_i8_into(&wq, &sw, &xq, 0.5, m, k, &mut g1).unwrap();
+        for i in 0..m {
+            assert_eq!(g0[i].to_bits(), g1[i].to_bits(), "gemv_i8_into @ {i}");
+        }
+        let xb: Vec<i8> = (0..m * k)
+            .map(|i| ((i as i32 * 5) % 127 - 63) as i8)
+            .collect();
+        let sx: Vec<f32> = (0..m).map(|i| 0.02 * (i as f32 + 1.0)).collect();
+        // matmul 的权重是 `[n, k]`（与 gemv 的 `[m, k]` 不是同一个形状）
+        let wq2: Vec<i8> = (0..nn * k)
+            .map(|i| ((i as i32 * 11) % 127 - 63) as i8)
+            .collect();
+        let sw2: Vec<f32> = (0..nn).map(|i| 0.03 * (i as f32 + 1.0)).collect();
+        let m0 = matmul_i8(&xb, &wq2, &sw2, &sx, m, k, nn).unwrap();
+        let mut m1 = vec![0f32; m * nn];
+        matmul_i8_into(&xb, &wq2, &sw2, &sx, m, k, nn, &mut m1).unwrap();
+        for i in 0..m * nn {
+            assert_eq!(m0[i].to_bits(), m1[i].to_bits(), "matmul_i8_into @ {i}");
+        }
+        assert!(matches!(
+            gemv_i8_into(&wq, &sw, &xq, 0.5, m, k, &mut vec![0f32; m - 1]),
+            Err(Error::Shape { what, .. }) if what == "y"
+        ));
+        assert!(matches!(
+            matmul_i8_into(&xb, &wq2, &sw2, &sx, m, k, nn, &mut vec![0f32; m * nn - 1]),
+            Err(Error::Shape { what, .. }) if what == "y"
+        ));
     }
 }
