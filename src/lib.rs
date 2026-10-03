@@ -76,7 +76,7 @@ pub use arch::lasx_force_lsx_thread;
 
 /// 公式 DSL：`matmul!(y[M, N] = x[M, K] * w[K, N])`。
 ///
-/// 实现在内部的 `lasx_rs_macros`（`publish = false`，零第三方依赖），这里重导出，
+/// 实现在 `lasx_rs_macros`（**随本 crate 一起发布到 crates.io**，零第三方依赖），这里重导出，
 /// 于是用户视角只有一个依赖 `lasx_rs`。规则与诊断见 [`shape`] 模块文档。
 pub use lasx_rs_macros::{dot, gemv, matmul};
 

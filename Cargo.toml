@@ -7,10 +7,18 @@ version = "0.1.0"
 edition = "2021"
 description = "lasx_rs 是为龙芯平台推出的向量库，支持调用龙芯架构里面的 LASX（256 位）与 LSX（128 位）向量指令集"
 license = "MIT"
+repository = "https://github.com/chzih076/lasx_rs"
+readme = "README.md"
+keywords = ["loongarch", "lasx", "lsx", "simd", "numerics"]
+categories = ["hardware-support", "mathematics", "science"]
+# 只收录要发出去的东西：文档/基准/脚本/下游样板都不进 crate（`docs/` 有 250 KB+）。
+exclude = ["/docs", "/scripts", "/cli", "/yll", "/AGENTS.md"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 公式 DSL 的宏实现：内部 crate、不发布、零第三方依赖（手写 TokenStream）
-lasx_rs_macros = { path = "macros" }
+# 公式 DSL 的宏实现：零第三方依赖（手写 TokenStream）。
+# `version` 供发布后从 crates.io 解析；`path` 供本地开发（cargo 发布时会去掉 path 字段，
+# 见 `docs/dev.md` §22.2）。
+lasx_rs_macros = { path = "macros", version = "0.1.0" }

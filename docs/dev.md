@@ -3524,6 +3524,27 @@ f32 的 16 FLOP/指令——按 §21.7 的天花板（~40–50 MAC/指令·秒/�
 | `Cargo.toml` 已有 | `name` / `version = 0.1.0` / `edition` / `description` / `license` |
 | `Cargo.toml` 缺 | `repository` / `readme` / `keywords` / `categories` / `rust-version` / `exclude` |
 
+**本轮（2026-10-04）已补**：两个 crate 都补上 `repository`（github 远端）
+/ `readme` / `keywords` / `categories`；根 crate 另加 `exclude = ["/docs", "/scripts",
+"/cli", "/yll", "/AGENTS.md"]`（打包实测：**90 个文件**，只有 `src/` 与元数据，
+`docs/` 那 250 KB+ 不进包）。
+
+**`rust-version` 故意不设**（这一条要记下来，免得下次又去补）：本 crate **只在 nightly 上编译**
+（`#![feature(stdarch_loongarch)]`），没有稳定的 MSRV 可写；`rust-version` 的语义是"最低
+**稳定**版本"，写一个 nightly 版本号是误导。**改用 crate 文档点名（见 §22.3）。**
+
+**两条新实测（都是这一轮踩出来的，会改变 §22.5 的门禁顺序）**：
+
+| 实测 | 结论 |
+|---|---|
+| `cargo publish --dry-run`（不干净的工作区） | cargo **拒绝**：`2 files … contain changes that were not yet committed`（要 `--allow-dirty`）⇒ **门禁必须在提交之后跑**，或者明写 `--allow-dirty` |
+| 本体 `cargo publish --dry-run --registry crates-io` | **在宏真发之前不可能通过**：`no matching package named lasx_rs_macros found / location searched: tuna-sparse index`——带 `version` 的依赖是从 **registry** 解析的，本地 path 不参与打包校验 |
+
+⇒ **§22.2 的"发布顺序（宏在前）"不只是"等索引一分钟"的礼节，而是门禁本身的前置条件**：
+宏**真发**之后，本体的 dry-run 才可能通过。替代的本地检查是
+`cargo package -p lasx_rs --registry crates-io --no-verify --list`（验文件清单与元数据，不做依赖解析）。
+
+
 ### 22.2 必须改的两处（不改就发不出去）
 
 `macros/Cargo.toml`：
@@ -3582,9 +3603,24 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 cargo publish --dry-run --registry crates-io     # 必须通过
 ```
 
+**这条门禁的正确执行顺序（2026-10-04 实测修正）**：
+
+```text
+1. 宏：cargo publish --dry-run --registry crates-io -p lasx_rs_macros   # 已通过（7 文件 / 60.6 KiB）
+2. 宏：真发（不可撤销）—— 之后等索引
+3. 本体：cargo publish --dry-run --registry crates-io -p lasx_rs       # 只有此时才可能通过
+4. 本体：真发
+```
+
+**为什么门禁不能提前**：带 `version` 的依赖从 registry 解析（实测报错见 §22.1），所以
+"宏没发 ⇒ 本体的 dry-run 必失败"。**在 2 之前能做的最强本地检查**是
+`cargo package -p lasx_rs --registry crates-io --no-verify --list`（文件清单 / 元数据）。
+另：**门禁要在提交之后跑**——cargo 拒绝含未提交改动的工作区。
+
 **`cargo publish` 本身不可撤销**（版本一旦上传，名字与内容永久存在于该命名空间，
 yank 只是从新解析中隐藏）。因此本节所记的两处 `Cargo.toml` 改动、两段 crate 文档、
 以及发布顺序，**都应在真正按下发布之前完成并复核**。
+
 
 
 
