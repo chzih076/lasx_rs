@@ -35,6 +35,7 @@
 | §18–§19 | 矩阵视图与打包计划；形状进类型与公式 DSL（契约、实测、决策、接口冻结） |
 | §20 | NN 侧 N1 批次：8 个算子的当前设计、依据与被否掉的方案 |
 | §21 | int8 推理的算子缺口：消费者形态、量化实测依据、与三项架构改动的交互（对应 `docs/ops.md` §12.3 的 N3 批次） |
+| §22 | crates.io 发布：决定、实测前置条件、被否掉的选项，以及两段 crate 文档义务 |
 
 **性能数据只有一份，在 §7**（2026-09-25 全量复测）。本文其余章节引用读数时都给指针，
 不复制表——**同一份数字存两处最终会漂移**，这条规矩由 2026-09-25 那次重写确定
@@ -248,7 +249,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**215 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+当前规模：**216 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
 其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，12 个是 §19.14 的批量样本视图，
 18 个是 §21 的 N3 批次（量化/反量化/GEMV/批量 GEMM/C ABI），2 个是 §21.9 里 k 方向归约那两项
 （逐位一致 + 错误/退化），2 个是 §20.7 的池化 `gemv_f16`，
@@ -258,7 +259,9 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 **3 个是 `layer_norm`**（`docs/ops.md` §2.16：逐位一致、平移不变性、空偏置保 `−0.0`），
 **4 个是 `gather_rows`/`gather_rows_i8`**（§2.17：逐位一致、int8 每行反量化、表尾贴边、api 错误路径），
 **1 个是 int8 家族的 `_into`**（量化/反量化/absmax/gemv/matmul 的免分配版与分配版逐位一致 + 错误路径），
-**1 个是 int8 的整模型级口径**（合成 12 层栈，实测 7.250e-4 ≤ 5e-3，见 `docs/ops.md` §2.15））。
+**1 个是 int8 的整模型级口径**（合成 12 层栈，实测 7.250e-4 ≤ 5e-3，见 `docs/ops.md` §2.15），
+**1 个是激活的 `_into`**（`silu`/`gelu_quick`/`gelu_erf` 免分配版逐位一致 + 错误路径，
+分配占比实测 10–15%，见 §7.9 ③））。
 
 | 测试类型 | 目的 | 例子 |
 |---|---|---|
@@ -289,7 +292,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 215 单测（+ 5 个宏单测 + 17 个文档测试）
+cargo test --workspace --release        # 216 单测（+ 5 个宏单测 + 17 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -944,13 +947,30 @@ FFI 消费方（C/Dart 绑定）**从来没有这笔分配开销**，这笔账�
 **所以筛选用 A/B（同内核 ±一次分配）为准，直接量只当"下界参考"**——本节的表格标的就是这个口径，
 不要把两者混着用。
 
-**筛出该铺的（按"逐层/逐步调用 + 输出缓冲大"）**：`silu`/`gelu_quick`/`gelu_erf`（逐层激活，
-输出就是整层激活：192×3072 ⇒ 2.2 MiB ≈133 µs，而该规模下激活本身约 1 ms 量级）、
-`matmul`/`matmul_f64`（§5.15 说批量 f32 GEMM 是最优可达路径 ⇒ 它的输出分配在关键路径上）。
-**明确不做的**：`gemv_f16`（输出只有 `m` 个 f32：`m = 4096` ⇒ 16 KiB ⇒ 分配 ~1 µs，
-而它本身 8.95 ms ⇒ 占比 ~0.01%，铺 `_into` 只增加 API 面积）；物理/几何批量算子
-（`norm3_batch`/`unitize3_batch`/`quat_*`：调用方是仿真循环，且它们一次返回 3–9 个缓冲，
-改 `_into` 要重新设计签名——**先记下来，等有消费侧实测需求再做**）。
+**A/B 实测（2026-10-03，`lasx_bench dispatch`：api 分配版 vs 同内核的 FFI 预分配版，3 轮）**——
+这条 A/B **不需要先写 `_into`**（FFI 符号本来就是"调用方给缓冲"），两者只差一次分配：
+
+| 算子 | 规模 | api（分配） | FFI（预分配） | 分配占比 |
+|---|---|---|---|---|
+| `silu` | 589 824（=192×3072） | 840.0 / 842.0 / 840.5 µs | 719.6 / 723.9 / 720.9 µs | **14–15%** |
+| `gelu_quick` | 同上 | 862.7 / 866.9 / 864.2 µs | 744.3 / 745.4 / 746.5 µs | **14%** |
+| `gelu_erf` | 同上 | 1.24 / 1.24 / 1.24 ms | 1.12 ms | **10%** |
+| `matmul`（串行） | 192×768×3072 | 15.27 / 15.76 / 15.59 ms | 15.29 / 15.26 / 15.42 ms | **0–3%（噪声内）** |
+| `matmul`（串行） | 192×768×768 | 3.66 / 3.67 / 3.66 ms | 3.65 ms | **0%** |
+
+**一个有用的对照**：这里 A/B 的差额（`silu` 119 µs、`gelu_quick` 118、`gelu_erf` 120 µs）
+与直接量的 589 824 个 f32 分配成本（132–134 µs）**量级一致** ⇒ ①里 `rms_norm` 那处
+"33 vs 104" 的不一致**是短内核特有的**（`rms_norm` 内核仅 ~75 µs，分配器/页错误路径的差异
+被放大），**不是所有算子都这样**。口径不变：**筛选以 A/B 为准**。
+
+**最终决定（"不为了铺满而铺"的落地）**：
+
+| 算子 | 分配占比 | 决定 |
+|---|---|---|
+| `silu` / `gelu_quick` / `gelu_erf` | **10–15%** | ✅ **做**（已加 `silu_into`/`gelu_quick_into`/`gelu_erf_into` + 逐位一致与错误路径测试） |
+| `matmul` / `matmul_f64` | **0–1%**（GEMM 本身 15.3 ms 主导，输出 2.2 MiB 的分配 ~133 µs ⇒ 差两个数量级） | ❌ **不做**：占比落在噪声内，铺了只增 API 面积 |
+| `gemv_f16` | ~0.01%（输出仅 `m` 个 f32） | ❌ **不做**（同上） |
+| 物理/几何批量（`norm3_batch`/`unitize3_batch`/`quat_*`） | 未测 | ⏸ **不做**：一次返回 3–9 个缓冲，改 `_into` 要重设签名 ⇒ **等消费侧实测需求**再动 |
 
 ---
 
@@ -3470,6 +3490,94 @@ f32 的 16 FLOP/指令——按 §21.7 的天花板（~40–50 MAC/指令·秒/�
 
 **收口时的门禁状态**：203 库 + 5 宏 + 17 文档测试全过；`clippy -D warnings`、`fmt --check`、
 `cargo doc -D warnings`（全 workspace）、`bash scripts/doccheck.sh` 全绿；三远端同步。
+
+---
+
+## 22. crates.io 发布：决定、实测前置条件与被否掉的选项（2026-10-03）
+
+**决定**：把 `lasx_rs` 与其宏 crate 发布到 crates.io。
+
+**触发条件**：库已到可用状态（`§21.9` 收口那一套全绿：203 库 + 5 宏 + 17 文档测试、
+位精确、零第三方依赖），而分发渠道目前只有源码仓库。crates.io 是 Rust 生态的默认入口，
+不上就没有"`cargo add` 得到"这条路径。
+
+**本节记的是"为什么冻结之后还要动"**（`AGENTS.md` 规则 3）：这次发布要改
+`src/lib.rs` 里"（`lasx_rs_macros`，`publish = false`）"这句**已写下的话**，
+以及 `Cargo.toml` 的依赖声明。**先记，再改。**
+
+### 22.1 实测确认的前置条件（2026-10-03）
+
+| 项 | 实测结果 |
+|---|---|
+| `cargo publish --dry-run`（不带 `--registry`） | `crates-io is replaced with non-remote-registry source registry 'tuna-sparse'` ⇒ 本机 crates.io 被换成了清华镜像，**必须显式带 `--registry crates-io`** |
+| `cargo publish --dry-run --registry crates-io` | **失败**：`all dependencies must have a version requirement specified when publishing. dependency 'lasx_rs_macros' does not specify a version` |
+| 名字 `lasx_rs` / `lasx_rs_macros` | crates.io API 均返回 **404 ⇒ 可用**（未占用） |
+| `src/` 的 `target_arch` 门控 | **0 处 / 66 个文件** ⇒ 本 crate **只在 loongarch64 上编译** |
+| `LICENSE` | 存在（MIT，21 行） |
+| `Cargo.toml` 已有 | `name` / `version = 0.1.0` / `edition` / `description` / `license` |
+| `Cargo.toml` 缺 | `repository` / `readme` / `keywords` / `categories` / `rust-version` / `exclude` |
+
+### 22.2 必须改的两处（不改就发不出去）
+
+`macros/Cargo.toml`：
+
+```toml
+- publish = false
+- description = "lasx_rs 的公式 DSL 宏实现（内部 crate，不发布）"
++ description = "…"                       # 改成对外口径
++ repository / readme / keywords / categories
+```
+
+`Cargo.toml`：
+
+```toml
+- lasx_rs_macros = { path = "macros" }
++ lasx_rs_macros = { path = "macros", version = "0.1.0" }
+```
+
+`path` 供本地开发用，`version` 供发布后从 crates.io 解析（cargo 的原话：
+*"The published dependency will use the version from crates.io, the `path` specification
+will be removed"*）。
+
+**发布顺序**：宏在前（它是 `lasx_rs` 的依赖），等索引约一分钟，再发本体。
+
+**注意一处重复事实**：`src/lib.rs` 里"（`publish = false`…）"那句与 `macros/Cargo.toml`
+的 `description` 是同一件事的两个副本 —— **同一次改动里一起更新**，否则又是一次漂移
+（同本文档开头"同一份数字存两处最终会漂移"那条规矩）。
+
+### 22.3 发布后产生的两段 crate 文档义务
+
+crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `docs/platform.md`**。
+所以下列两条必须进 crate 文档本身：
+
+| 事项 | 为什么必须在 crate 文档里 |
+|---|---|
+| **仅 loongarch64** | 其他平台编译不过；且依赖方**必须**写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会直接红（Cargo 为所有目标解析依赖，不按平台跳过） |
+| **LA664 勘误** | 受影响且未升级固件的机器上会**静默错结果**。当前 `master` 的生产路径已全部使用带屏障的序（见本文档的平台勘误记录），但用户需要知道这个平台风险的存在 |
+
+### 22.4 被否掉的选项
+
+| 选项 | 否掉的理由 |
+|---|---|
+| 把宏内联进 `lasx_rs` | proc-macro 必须是 `proc-macro = true` 的独立 crate，做不到 |
+| 只发 `lasx_rs`、不发宏 | crates.io 拒绝无 `version` 的 path 依赖；且 `publish = false` 的包无法被解析 |
+| 加 `target_arch` 门控 + 标量兜底，让它在 x86 上也能装 | **会把"用错平台"从编译期错误退化成运行期错结果**，与位精确承诺相悖。改为在 crate 文档里点名，让错误停在编译期 |
+| 只发 `lasx_rs_macros` 的二进制 / 不走 crates.io | 与"crates.io 是生态默认入口"这个触发条件互相抵消 |
+
+**"只在 loongarch64 上编译"这条契约的守卫是编译器（import 解析失败）—— 这是规则 5 里
+最强的一档。不要为了"能在 x86 上安装"把它换掉。**
+
+### 22.5 发布前的门禁
+
+`§21.9` 收口那套之外，再加一条：
+
+```
+cargo publish --dry-run --registry crates-io     # 必须通过
+```
+
+**`cargo publish` 本身不可撤销**（版本一旦上传，名字与内容永久存在于该命名空间，
+yank 只是从新解析中隐藏）。因此本节所记的两处 `Cargo.toml` 改动、两段 crate 文档、
+以及发布顺序，**都应在真正按下发布之前完成并复核**。
 
 
 

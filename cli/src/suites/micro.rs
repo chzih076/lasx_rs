@@ -401,6 +401,67 @@ pub fn dispatch_overhead() {
             bytes / d.as_secs_f64() / 1e9
         );
     }
+
+    // `_into` 候选的 A/B：**api（每次分配输出）vs 同内核的 FFI（调用方给缓冲）**。
+    // 两者是同一个内核，差的就是"分配 + 清零 + 释放" ⇒ 这条 A/B 直接给出分配占比，
+    // 不需要先写 `_into`（`docs/dev.md` §7.9 ③ 筛选口径：先测后铺）。
+    println!("\n### `_into` 候选：api（分配） vs FFI（预分配）");
+    println!("\n| 算子 | 规模 | api（分配） | FFI（预分配） | 分配占比 |");
+    println!("|---|---|---|---|---|");
+    let act_n = 192 * 3072;
+    let xa = vec![0.5f32; act_n];
+    let mut ya = vec![0f32; act_n];
+    let rows: [(&str, usize); 3] = [("`silu`", 0), ("`gelu_quick`", 1), ("`gelu_erf`", 2)];
+    for (name, which) in rows {
+        let a = timeit(|| {
+            let v = match which {
+                0 => lasx_rs::api::silu(&xa),
+                1 => lasx_rs::api::gelu_quick(&xa),
+                _ => lasx_rs::api::gelu_erf(&xa),
+            };
+            let _ = black_box(v[0]);
+        });
+        let f = timeit(|| {
+            match which {
+                0 => lasx_silu(xa.as_ptr(), ya.as_mut_ptr(), act_n as i32),
+                1 => lasx_gelu_quick(xa.as_ptr(), ya.as_mut_ptr(), act_n as i32),
+                _ => lasx_gelu_erf(xa.as_ptr(), ya.as_mut_ptr(), act_n as i32),
+            }
+            let _ = black_box(ya[0]);
+        });
+        println!(
+            "| {name} | {act_n} | {} | {} | **{:.0}%** |",
+            crate::timing::fmt_t(a),
+            crate::timing::fmt_t(f),
+            100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
+        );
+    }
+    for &(m, k, n) in &[(192usize, 768usize, 3072usize), (192, 768, 768)] {
+        let am = vec![0.01f32; m * k];
+        let bm = vec![0.01f32; k * n];
+        let mut cm = vec![0f32; m * n];
+        let a = timeit(|| {
+            let v = lasx_rs::api::matmul(m, k, n, &am, &bm).unwrap();
+            let _ = black_box(v[0]);
+        });
+        let f = timeit(|| {
+            lasx_matmul(
+                m as i32,
+                k as i32,
+                n as i32,
+                am.as_ptr(),
+                bm.as_ptr(),
+                cm.as_mut_ptr(),
+            );
+            let _ = black_box(cm[0]);
+        });
+        println!(
+            "| `matmul` | {m}×{k}×{n} | {} | {} | **{:.0}%** |",
+            crate::timing::fmt_t(a),
+            crate::timing::fmt_t(f),
+            100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
+        );
+    }
 }
 
 /// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。

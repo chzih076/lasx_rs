@@ -693,6 +693,49 @@ pub fn gelu_erf(x: &[f32]) -> AlignedVec<f32> {
     out
 }
 
+/// [`silu`] 的**免分配**版本：`out` 长度必须 `x.len()`。
+///
+/// 为什么有它：**逐层激活**在实际推理路径上每层都调一次，而实测（`docs/dev.md` §7.9 ③）
+/// 在 192×3072（589 824 个元素）规模上分配占 `silu` 调用的 **14–15%**
+/// （840 → 720 µs，同一内核、只差一次分配）。
+///
+/// # Errors
+/// `out.len() != x.len()`（[`Error::Shape`]）。
+pub fn silu_into(x: &[f32], out: &mut [f32]) -> Result<()> {
+    expect_len("silu_into", "out", out.len(), x.len())?;
+    if x.is_empty() {
+        return Ok(());
+    }
+    crate::ops::silu::silu_f32(x, out);
+    Ok(())
+}
+
+/// [`gelu_quick`] 的**免分配**版本（实测分配占比同 `silu`：**14%**）。
+///
+/// # Errors
+/// `out.len() != x.len()`（[`Error::Shape`]）。
+pub fn gelu_quick_into(x: &[f32], out: &mut [f32]) -> Result<()> {
+    expect_len("gelu_quick_into", "out", out.len(), x.len())?;
+    if x.is_empty() {
+        return Ok(());
+    }
+    crate::ops::gelu_quick::gelu_quick_f32(x, out);
+    Ok(())
+}
+
+/// [`gelu_erf`] 的**免分配**版本（实测分配占比 **10%**：它的内核比另两个重，分配占比反而小）。
+///
+/// # Errors
+/// `out.len() != x.len()`（[`Error::Shape`]）。
+pub fn gelu_erf_into(x: &[f32], out: &mut [f32]) -> Result<()> {
+    expect_len("gelu_erf_into", "out", out.len(), x.len())?;
+    if x.is_empty() {
+        return Ok(());
+    }
+    crate::ops::gelu_erf::gelu_erf_f32(x, out);
+    Ok(())
+}
+
 /* ==================== NN：RoPE ==================== */
 
 /// 旋转位置编码（RoPE）：`rows × cols` 行主序，每行**前 `n_dims` 列**参与旋转。
@@ -2719,5 +2762,45 @@ mod tests {
             eq > ef * 100.0,
             "量化误差应当主导：int8 {eq:.3e} vs f32 {ef:.3e}"
         );
+    }
+
+    /// 激活函数的 `_into` 与分配版**逐位一致** + 长度错误路径（`docs/dev.md` §7.9 ③：
+    /// 实测分配占 10–15%，所以这三个值得铺）。
+    #[test]
+    fn test_activation_into_variants_match_allocating_bit_for_bit() {
+        let mut rng = crate::ops::testutil::Lcg(0xa5a5);
+        let n = 4099usize; // 含非 8 倍数的尾巴
+        let x: Vec<f32> = (0..n).map(|_| 6.0 * rng.f64() as f32 - 3.0).collect();
+
+        let a = silu(&x);
+        let mut b = vec![0f32; n];
+        silu_into(&x, &mut b).unwrap();
+        let c = gelu_quick(&x);
+        let mut d = vec![0f32; n];
+        gelu_quick_into(&x, &mut d).unwrap();
+        let e = gelu_erf(&x);
+        let mut f = vec![0f32; n];
+        gelu_erf_into(&x, &mut f).unwrap();
+        for i in 0..n {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "silu_into @ {i}");
+            assert_eq!(c[i].to_bits(), d[i].to_bits(), "gelu_quick_into @ {i}");
+            assert_eq!(e[i].to_bits(), f[i].to_bits(), "gelu_erf_into @ {i}");
+        }
+        assert!(matches!(
+            silu_into(&x, &mut [0f32; 1]),
+            Err(Error::Shape { op, what, .. }) if op == "silu_into" && what == "out"
+        ));
+        assert!(matches!(
+            gelu_quick_into(&x, &mut [0f32; 1]),
+            Err(Error::Shape { op, what, .. }) if op == "gelu_quick_into" && what == "out"
+        ));
+        assert!(matches!(
+            gelu_erf_into(&x, &mut [0f32; 1]),
+            Err(Error::Shape { op, what, .. }) if op == "gelu_erf_into" && what == "out"
+        ));
+        // 空输入是合法空操作
+        assert!(silu_into(&[], &mut []).is_ok());
+        assert!(gelu_quick_into(&[], &mut []).is_ok());
+        assert!(gelu_erf_into(&[], &mut []).is_ok());
     }
 }
