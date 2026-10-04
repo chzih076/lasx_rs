@@ -156,15 +156,19 @@ pub fn abs_f32x8(x: F32x8) -> F32x8 {
 /// `p` 必须指向至少 16 个可读的 `u16`。
 #[inline]
 pub unsafe fn load_f16x16_as_f32x8x2(p: *const u16) -> (F32x8, F32x8) {
-    let h: m256i = lasx_xvld(p as *const i8, 0);
-    let lo: m256i = std::mem::transmute(lasx_xvfcvtl_s_h(h));
-    let hi: m256i = std::mem::transmute(lasx_xvfcvth_s_h(h));
-    // imm 的 2 位/lane：0 = b.lane0、1 = b.lane1、2 = a.lane0、3 = a.lane1；
-    // 低 2 位选输出的 lane0，第 5:4 位选输出的 lane1（实测）。
-    // 0x02 → [lo.lane0, hi.lane0] = 元素 0..8；0x13 → [lo.lane1, hi.lane1] = 元素 8..16
-    let l: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x02>(lo, hi));
-    let u: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x13>(lo, hi));
-    (l, u)
+    // SAFETY: 调用方保证 `p` 有 16 个可读 `u16`（见上面的 `# Safety`）；
+    // 下面全是纯寄存器操作（转换 / lane 选择 / transmute 换名字），无额外内存前提。
+    unsafe {
+        let h: m256i = lasx_xvld(p as *const i8, 0);
+        let lo: m256i = std::mem::transmute(lasx_xvfcvtl_s_h(h));
+        let hi: m256i = std::mem::transmute(lasx_xvfcvth_s_h(h));
+        // imm 的 2 位/lane：0 = b.lane0、1 = b.lane1、2 = a.lane0、3 = a.lane1；
+        // 低 2 位选输出的 lane0，第 5:4 位选输出的 lane1（实测）。
+        // 0x02 → [lo.lane0, hi.lane0] = 元素 0..8；0x13 → [lo.lane1, hi.lane1] = 元素 8..16
+        let l: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x02>(lo, hi));
+        let u: F32x8 = std::mem::transmute(lasx_xvpermi_q::<0x13>(lo, hi));
+        (l, u)
+    }
 }
 
 /// lane-wise 浮点 → 整数**截断**（向零取整）。
@@ -174,7 +178,8 @@ pub unsafe fn load_f16x16_as_f32x8x2(p: *const u16) -> (F32x8, F32x8) {
 /// 浮点转整型一致）。`ops::softmax_rows` 的 `exp` 里，输入由 magic 数技巧保证是整数值。
 #[inline]
 pub unsafe fn trunc_i32(v: F32x8) -> m256i {
-    lasx_xvftintrz_w_s(v)
+    // SAFETY: 纯寄存器操作（见上面的 `# Safety`：无内存前提，语义前提由调用方保证）。
+    unsafe { lasx_xvftintrz_w_s(v) }
 }
 
 /// 由 8 个**偏置指数**构造 `2^n`（整数域左移 23 位后按位重解释成 `f32`）。

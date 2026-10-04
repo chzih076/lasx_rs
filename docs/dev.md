@@ -3617,7 +3617,8 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 批次 | 文件 | 函数数 | 状态 |
 |---|---|---|---|
 | 1 | `src/arch/lsx.rs`（4）+ `src/arch/lasx.rs` 的 4 个 load/store | **8** | ✅ 已显式化（2026-10-04） |
-| — | 其余：`src/arch/lasx.rs` 剩 2、`src/ops/*` 若干、`src/pool/mod.rs` 4、`src/ffi/status.rs` 2、`src/lib.rs` 2、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **48** | ⏳ 待办 |
+| 2 | `src/arch/lasx.rs` 剩 2（`load_f16x16_as_f32x8x2`、`trunc_i32`）⇒ **`src/arch/*` 整块清零** | **2** | ✅ 已显式化（2026-10-04） |
+| — | 其余：`src/ops/*` 若干、`src/pool/mod.rs` 4、`src/ffi/status.rs` 2、`src/lib.rs` 2、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **46** | ⏳ 待办 |
 
 **总计 56 个函数**（`grep -rc "unsafe fn"`）。做法：**按文件成批显式化**（每个 `unsafe fn` 体
 包一层带 `// SAFETY:` 说明的 `unsafe { }`，说明指向该函数已有的 `# Safety` 段），每批都过全套
