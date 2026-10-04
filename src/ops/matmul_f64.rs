@@ -345,14 +345,18 @@ pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], pa
 /// `src` 至少可读 16 个 `f64`，`dst` 至少可写 16 个 `f64`，且两者不重叠。
 #[inline]
 unsafe fn copy_block16_f64(src: *const f64, dst: *mut f64) {
-    let v0 = lasx::load_f64x4(src);
-    let v1 = lasx::load_f64x4(src.add(4));
-    let v2 = lasx::load_f64x4(src.add(8));
-    let v3 = lasx::load_f64x4(src.add(12));
-    lasx::store_f64x4(dst, v0);
-    lasx::store_f64x4(dst.add(4), v1);
-    lasx::store_f64x4(dst.add(8), v2);
-    lasx::store_f64x4(dst.add(12), v3);
+    // SAFETY: 调用方保证 `src` 可读、`dst` 可写各 16 个 `f64` 且不重叠（见上面的 `# Safety`）；
+    // 8 次 `add` 的偏移都落在 0..16 内。
+    unsafe {
+        let v0 = lasx::load_f64x4(src);
+        let v1 = lasx::load_f64x4(src.add(4));
+        let v2 = lasx::load_f64x4(src.add(8));
+        let v3 = lasx::load_f64x4(src.add(12));
+        lasx::store_f64x4(dst, v0);
+        lasx::store_f64x4(dst.add(4), v1);
+        lasx::store_f64x4(dst.add(8), v2);
+        lasx::store_f64x4(dst.add(12), v3);
+    }
 }
 
 /// 微内核：4 行 × 16 列 × **kb 个 k 步**，B 从打包缓冲连续读。

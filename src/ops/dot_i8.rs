@@ -24,13 +24,16 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     /// 对**已经载入**的一对 32 字节向量做"乘 → 拓宽 → 累加"。
     #[inline(always)]
     unsafe fn step_pair(va: m256i, vb: m256i, z: m256i, acc0: &mut m256i, acc1: &mut m256i) {
-        let lo16 = lasx_xvmulwev_h_b(va, vb);
-        let hi16 = lasx_xvmulwod_h_b(va, vb);
-        // 拓宽到 i32 再累加（不能链式用 xvaddwev/xvaddwod 当累加器）
-        *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(lo16, z));
-        *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(lo16, z));
-        *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(hi16, z));
-        *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(hi16, z));
+        // SAFETY: 纯寄存器操作（点积的 4 位组解包 / 拓宽 / 累加），无内存前提。
+        unsafe {
+            let lo16 = lasx_xvmulwev_h_b(va, vb);
+            let hi16 = lasx_xvmulwod_h_b(va, vb);
+            // 拓宽到 i32 再累加（不能链式用 xvaddwev/xvaddwod 当累加器）
+            *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(lo16, z));
+            *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(lo16, z));
+            *acc0 = lasx_xvadd_w(*acc0, lasx_xvaddwev_w_h(hi16, z));
+            *acc1 = lasx_xvadd_w(*acc1, lasx_xvaddwod_w_h(hi16, z));
+        }
     }
 
     // 主循环：每批次读出 128 字节（4 对向量）**先把 8 个载入都发出去**再算。
