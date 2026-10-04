@@ -104,7 +104,8 @@ pub unsafe fn read_f64_soa<const N: usize>(
     argv: *mut *mut YllValueWrapper,
     names: [&str; N],
 ) -> Result<[AlignedVec<f64>; N], String> {
-    read_f64_soa_at(argv, names, 0)
+    // SAFETY: 见 [`read_array`]。
+    unsafe { read_f64_soa_at(argv, names, 0) }
 }
 
 /// 同 [`read_f64_soa`]，但从第 `offset` 个参数开始读。
@@ -116,21 +117,24 @@ pub unsafe fn read_f64_soa_at<const N: usize>(
     names: [&str; N],
     offset: usize,
 ) -> Result<[AlignedVec<f64>; N], String> {
-    let mut out: [AlignedVec<f64>; N] = std::array::from_fn(|_| AlignedVec::new(0));
-    for (k, name) in names.iter().enumerate() {
-        out[k] = read_f64(argv, offset + k, name)?;
+    // SAFETY: 见 [`read_array`]（每个 `names[k]` 对应第 `offset + k` 个有效参数）。
+    unsafe {
+        let mut out: [AlignedVec<f64>; N] = std::array::from_fn(|_| AlignedVec::new(0));
+        for (k, name) in names.iter().enumerate() {
+            out[k] = read_f64(argv, offset + k, name)?;
+        }
+        let len = out[0].len();
+        if let Some(bad) = (0..N).find(|&k| out[k].len() != len) {
+            return Err(format!(
+                "数组长度不一致：`{}` 有 {} 个元素，`{}` 有 {} 个",
+                names[0],
+                len,
+                names[bad],
+                out[bad].len()
+            ));
+        }
+        Ok(out)
     }
-    let len = out[0].len();
-    if let Some(bad) = (0..N).find(|&k| out[k].len() != len) {
-        return Err(format!(
-            "数组长度不一致：`{}` 有 {} 个元素，`{}` 有 {} 个",
-            names[0],
-            len,
-            names[bad],
-            out[bad].len()
-        ));
-    }
-    Ok(out)
 }
 
 /// 把一组 `f64` 值变成 YouLiLong 数组。
