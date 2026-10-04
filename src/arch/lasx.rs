@@ -16,7 +16,8 @@ pub type F64x4 = m256d;
 /// `p` 必须指向至少 8 个可读的 `f32`。
 #[inline]
 pub unsafe fn load_f32x8(p: *const f32) -> F32x8 {
-    std::mem::transmute(lasx_xvld(p as *const i8, 0))
+    // SAFETY: 调用方保证 `p` 有 8 个可读 `f32`（见上面的 `# Safety`）。
+    unsafe { std::mem::transmute(lasx_xvld(p as *const i8, 0)) }
 }
 
 /// 写回 8 个连续 `f32`。
@@ -25,7 +26,8 @@ pub unsafe fn load_f32x8(p: *const f32) -> F32x8 {
 /// `p` 必须指向至少 8 个可写的 `f32`。
 #[inline]
 pub unsafe fn store_f32x8(p: *mut f32, v: F32x8) {
-    lasx_xvst(std::mem::transmute(v), p as *mut i8, 0);
+    // SAFETY: 调用方保证 `p` 有 8 个可写 `f32`（见上面的 `# Safety`）。
+    unsafe { lasx_xvst(std::mem::transmute(v), p as *mut i8, 0) };
 }
 
 /// 载入 4 个连续 `f64`。
@@ -34,7 +36,8 @@ pub unsafe fn store_f32x8(p: *mut f32, v: F32x8) {
 /// `p` 必须指向至少 4 个可读的 `f64`。
 #[inline]
 pub unsafe fn load_f64x4(p: *const f64) -> F64x4 {
-    std::mem::transmute(lasx_xvld(p as *const i8, 0))
+    // SAFETY: 调用方保证 `p` 有 4 个可读 `f64`（见上面的 `# Safety`）。
+    unsafe { std::mem::transmute(lasx_xvld(p as *const i8, 0)) }
 }
 
 /// 写回 4 个连续 `f64`。
@@ -43,7 +46,8 @@ pub unsafe fn load_f64x4(p: *const f64) -> F64x4 {
 /// `p` 必须指向至少 4 个可写的 `f64`。
 #[inline]
 pub unsafe fn store_f64x4(p: *mut f64, v: F64x4) {
-    lasx_xvst(std::mem::transmute(v), p as *mut i8, 0);
+    // SAFETY: 调用方保证 `p` 有 4 个可写 `f64`（见上面的 `# Safety`）。
+    unsafe { lasx_xvst(std::mem::transmute(v), p as *mut i8, 0) };
 }
 
 /// 全零 `f32` 向量。

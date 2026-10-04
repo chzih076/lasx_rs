@@ -16,7 +16,9 @@ pub type F64x2 = m128d;
 /// `p` 必须指向至少 4 个可读的 `f32`。
 #[inline]
 pub unsafe fn load_f32x4(p: *const f32) -> F32x4 {
-    std::mem::transmute(lsx_vld(p as *const i8, 0))
+    // SAFETY: 调用方保证 `p` 有 4 个可读 `f32`（见上面的 `# Safety`）；
+    // `transmute` 只在 `m128i`/`m128` 之间换名字，无额外前提。
+    unsafe { std::mem::transmute(lsx_vld(p as *const i8, 0)) }
 }
 
 /// 写回 4 个连续 `f32`。
@@ -25,7 +27,8 @@ pub unsafe fn load_f32x4(p: *const f32) -> F32x4 {
 /// `p` 必须指向至少 4 个可写的 `f32`。
 #[inline]
 pub unsafe fn store_f32x4(p: *mut f32, v: F32x4) {
-    lsx_vst(std::mem::transmute(v), p as *mut i8, 0);
+    // SAFETY: 调用方保证 `p` 有 4 个可写 `f32`（见上面的 `# Safety`）。
+    unsafe { lsx_vst(std::mem::transmute(v), p as *mut i8, 0) };
 }
 
 /// 全零 `f32` 向量。
@@ -41,7 +44,8 @@ pub fn zero_f32x4() -> F32x4 {
 /// `p` 必须指向至少 2 个可读的 `f64`。
 #[inline]
 pub unsafe fn load_f64x2(p: *const f64) -> F64x2 {
-    std::mem::transmute(lsx_vld(p as *const i8, 0))
+    // SAFETY: 调用方保证 `p` 有 2 个可读 `f64`（见上面的 `# Safety`）。
+    unsafe { std::mem::transmute(lsx_vld(p as *const i8, 0)) }
 }
 
 /// 写回 2 个连续 `f64`。
@@ -50,7 +54,8 @@ pub unsafe fn load_f64x2(p: *const f64) -> F64x2 {
 /// `p` 必须指向至少 2 个可写的 `f64`。
 #[inline]
 pub unsafe fn store_f64x2(p: *mut f64, v: F64x2) {
-    lsx_vst(std::mem::transmute(v), p as *mut i8, 0);
+    // SAFETY: 调用方保证 `p` 有 2 个可写 `f64`（见上面的 `# Safety`）。
+    unsafe { lsx_vst(std::mem::transmute(v), p as *mut i8, 0) };
 }
 
 /// 将标量广播到 2 个 `f64` 通道。

@@ -3612,6 +3612,17 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 **为什么允许而不是逐处改**：允许是**可见的债**（一行 + 计数 + 触发条件），而 149 条警告会被
 习惯性忽略。这条取舍写在这里，免得后来人以为是漏改。
 
+**还债进度（口径 = `unsafe fn` 的个数，因为一个函数体里常有多个 unsafe 操作）**：
+
+| 批次 | 文件 | 函数数 | 状态 |
+|---|---|---|---|
+| 1 | `src/arch/lsx.rs`（4）+ `src/arch/lasx.rs` 的 4 个 load/store | **8** | ✅ 已显式化（2026-10-04） |
+| — | 其余：`src/arch/lasx.rs` 剩 2、`src/ops/*` 若干、`src/pool/mod.rs` 4、`src/ffi/status.rs` 2、`src/lib.rs` 2、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **48** | ⏳ 待办 |
+
+**总计 56 个函数**（`grep -rc "unsafe fn"`）。做法：**按文件成批显式化**（每个 `unsafe fn` 体
+包一层带 `// SAFETY:` 说明的 `unsafe { }`，说明指向该函数已有的 `# Safety` 段），每批都过全套
+门禁；**全部完成后才删掉那 4 处 `#![allow(unsafe_op_in_unsafe_fn)]`** 并删掉本段。
+
 **验证**：216 + 5 + 17 全过；`cargo fmt --all`（2024 风格，改了若干文件）/ `clippy -D warnings` /
 `doccheck` 全绿；`cargo build --workspace --release` **0 警告 0 错误**。
 
