@@ -83,39 +83,43 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
 /// # Safety
 /// 无额外前提：循环只在 `i + 16 <= n` 时载入 16 个 `u16`，标量尾只在 `i < n` 时下标访问。
 pub(crate) unsafe fn dot_f16(a: &[u16], b: &[f32]) -> f32 {
-    let n = a.len();
-    debug_assert_eq!(n, b.len(), "dot_f16: 两个输入长度必须相等");
-    // 4 条独立累加链（32 元素/轮）：单链会被 FMA 延迟卡住——实测 1×2048 时
-    // 每 16 元素只有两条**互相依赖**的 FMA，等于把 4 周期延迟暴露出来。
-    let mut c0 = lasx::zero_f32x8();
-    let mut c1 = lasx::zero_f32x8();
-    let mut c2 = lasx::zero_f32x8();
-    let mut c3 = lasx::zero_f32x8();
-    let mut i = 0;
-    while i + 32 <= n {
-        let (a0, a1) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i));
-        let (a2, a3) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i + 16));
-        c0 = lasx_xvfmadd_s(a0, lasx::load_f32x8(b.as_ptr().add(i)), c0);
-        c1 = lasx_xvfmadd_s(a1, lasx::load_f32x8(b.as_ptr().add(i + 8)), c1);
-        c2 = lasx_xvfmadd_s(a2, lasx::load_f32x8(b.as_ptr().add(i + 16)), c2);
-        c3 = lasx_xvfmadd_s(a3, lasx::load_f32x8(b.as_ptr().add(i + 24)), c3);
-        i += 32;
+    // SAFETY: 调用方保证 `a.len() == b.len()`（下面还有一条 debug 断言）；函数体里所有
+    // `load/store` 都落在 `[0, n)` 内（`i + 32 <= n` 由循环条件保证，尾部循环用 `j % 8` 聚合）。
+    unsafe {
+        let n = a.len();
+        debug_assert_eq!(n, b.len(), "dot_f16: 两个输入长度必须相等");
+        // 4 条独立累加链（32 元素/轮）：单链会被 FMA 延迟卡住——实测 1×2048 时
+        // 每 16 元素只有两条**互相依赖**的 FMA，等于把 4 周期延迟暴露出来。
+        let mut c0 = lasx::zero_f32x8();
+        let mut c1 = lasx::zero_f32x8();
+        let mut c2 = lasx::zero_f32x8();
+        let mut c3 = lasx::zero_f32x8();
+        let mut i = 0;
+        while i + 32 <= n {
+            let (a0, a1) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i));
+            let (a2, a3) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i + 16));
+            c0 = lasx_xvfmadd_s(a0, lasx::load_f32x8(b.as_ptr().add(i)), c0);
+            c1 = lasx_xvfmadd_s(a1, lasx::load_f32x8(b.as_ptr().add(i + 8)), c1);
+            c2 = lasx_xvfmadd_s(a2, lasx::load_f32x8(b.as_ptr().add(i + 16)), c2);
+            c3 = lasx_xvfmadd_s(a3, lasx::load_f32x8(b.as_ptr().add(i + 24)), c3);
+            i += 32;
+        }
+        if i + 16 <= n {
+            let (a0, a1) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i));
+            c0 = lasx_xvfmadd_s(a0, lasx::load_f32x8(b.as_ptr().add(i)), c0);
+            c1 = lasx_xvfmadd_s(a1, lasx::load_f32x8(b.as_ptr().add(i + 8)), c1);
+            i += 16;
+        }
+        // 归约：链内先按固定次序合并（(c0+c1) + (c2+c3)），再两两归约 8 个 lane
+        let s = lasx_xvfadd_s(lasx_xvfadd_s(c0, c1), lasx_xvfadd_s(c2, c3));
+        let mut t = [0f32; 8];
+        lasx::store_f32x8(t.as_mut_ptr(), s);
+        // 尾部：延续同一 lane（`i` 是 16 的倍数 ⇒ lane = j % 8）
+        for j in i..n {
+            t[j % 8] += f16_to_f32(a[j]) * b[j];
+        }
+        ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]))
     }
-    if i + 16 <= n {
-        let (a0, a1) = lasx::load_f16x16_as_f32x8x2(a.as_ptr().add(i));
-        c0 = lasx_xvfmadd_s(a0, lasx::load_f32x8(b.as_ptr().add(i)), c0);
-        c1 = lasx_xvfmadd_s(a1, lasx::load_f32x8(b.as_ptr().add(i + 8)), c1);
-        i += 16;
-    }
-    // 归约：链内先按固定次序合并（(c0+c1) + (c2+c3)），再两两归约 8 个 lane
-    let s = lasx_xvfadd_s(lasx_xvfadd_s(c0, c1), lasx_xvfadd_s(c2, c3));
-    let mut t = [0f32; 8];
-    lasx::store_f32x8(t.as_mut_ptr(), s);
-    // 尾部：延续同一 lane（`i` 是 16 的倍数 ⇒ lane = j % 8）
-    for j in i..n {
-        t[j % 8] += f16_to_f32(a[j]) * b[j];
-    }
-    ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]))
 }
 
 /// f16 权重矩阵（`m × k` 行主序）× f32 向量：`y[r] = dot_f16(a[r*k..(r+1)*k], x)`。
