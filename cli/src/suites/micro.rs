@@ -1,6 +1,6 @@
 //! 微基准：纯寄存器 FMA 吞吐与多线程扩展性。
 
-use crate::data::{states, velocities, Soa6, J2, MU, RE};
+use crate::data::{J2, MU, RE, Soa6, states, velocities};
 use crate::timing::{fmt_t, timeit};
 use lasx_rs::lasx_force_lsx_thread;
 use lasx_rs::pool::WorkerPool;
@@ -85,7 +85,9 @@ pub fn thread_scaling() {
     println!("## 多线程扩展性：`lasx_rk4_j2_step_batch`（n = 2^18 = {n}，原地单步）");
     println!();
     println!("两种派活方式对比：**每次调用新建线程**（`std::thread::scope`）与");
-    println!("**库内常驻池**（`lasx_rs::pool::WorkerPool`：原子代次派活，worker 自适应自旋/休眠，无系统调用）。");
+    println!(
+        "**库内常驻池**（`lasx_rs::pool::WorkerPool`：原子代次派活，worker 自适应自旋/休眠，无系统调用）。"
+    );
     println!();
     println!("| 线程数 | 每次新建线程 | 库内常驻池 | 池相对 1 线程 | 池效率 |");
     println!("|---|---|---|---|---|");
@@ -341,7 +343,7 @@ pub fn spawn_overhead(threads: usize) -> Duration {
 /// lasx_rs 是**无状态**计算库，热路径上唯一的共享状态就是这两个；这里单独量它们，
 /// 用来判断值不值得换成自旋/无锁读。
 pub fn dispatch_overhead() {
-    use lasx_rs::arch::{hardware, SimdPath};
+    use lasx_rs::arch::{SimdPath, hardware};
 
     let n = 4_000_000usize;
     let per = |f: &mut dyn FnMut()| {

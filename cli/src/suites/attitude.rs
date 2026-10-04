@@ -5,8 +5,8 @@
 //! 因此每行都跑两个规模：4 Ki（L1/L2 驻留）与 256 Ki（DRAM 流式）。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
-use crate::timing::{time_mode, timeit, Mode};
+use crate::report::{Row, row3};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::*;
 use std::hint::black_box;
 

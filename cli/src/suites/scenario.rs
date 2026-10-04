@@ -10,7 +10,7 @@
 //! 2. [`hotloop`]：小数组高频调用——暴露"每次调用的固定开销"占比；
 //! 3. [`fused_vs_composed`]：用融合内核 vs 用原语拼出同一个 RK4 步。
 
-use crate::data::{states, velocities, AlignedBuf, Lcg, Soa6, J2, MU, RE};
+use crate::data::{AlignedBuf, J2, Lcg, MU, RE, Soa6, states, velocities};
 use crate::suites::micro::rk4_parallel_scope;
 use crate::timing::{fmt_t, timeit};
 use lasx_rs::pool::WorkerPool;
@@ -396,9 +396,13 @@ pub fn parallel_matmul() {
     }
     println!();
     println!();
-    println!("> 加速比到不了 12×：这是 B 的流量在压共享缓存，不是派活。lasx_matmul 一次算 4 行 × 32 列，每个 4 行块都要重读整个 B，故 B 流量 = (m/4)·k·n·4 字节（256³ = 16 MB/次调用）。parallel::matmul_f32 已把块大小取整到行粒度 4 的倍数，避免退化的尾块再多送 28% 流量。");
+    println!(
+        "> 加速比到不了 12×：这是 B 的流量在压共享缓存，不是派活。lasx_matmul 一次算 4 行 × 32 列，每个 4 行块都要重读整个 B，故 B 流量 = (m/4)·k·n·4 字节（256³ = 16 MB/次调用）。parallel::matmul_f32 已把块大小取整到行粒度 4 的倍数，避免退化的尾块再多送 28% 流量。"
+    );
     println!();
-    println!("> 线程数不是越多越好：见 `cargo run --release --example matmul_pooled` 的扫描（本机有后台负载，绝对值要看当次）。小规模（本表 64³ 行）则受派活开销限制。");
+    println!(
+        "> 线程数不是越多越好：见 `cargo run --release --example matmul_pooled` 的扫描（本机有后台负载，绝对值要看当次）。小规模（本表 64³ 行）则受派活开销限制。"
+    );
 }
 
 /// 依次跑四个真实场景（各自打印自己的表）。

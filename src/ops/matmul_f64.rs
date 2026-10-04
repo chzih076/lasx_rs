@@ -511,7 +511,7 @@ fn z4() -> (lasx::F64x4, lasx::F64x4, lasx::F64x4, lasx::F64x4) {
 mod tests {
     use super::{matmul_f64_packed, matmul_f64_stream};
     use crate::ffi::matmul::lasx_matmul_f64;
-    use crate::ops::testutil::{reference, rel, Lcg};
+    use crate::ops::testutil::{Lcg, reference, rel};
 
     #[test]
     fn test_matmul_f64_matches_reference() {

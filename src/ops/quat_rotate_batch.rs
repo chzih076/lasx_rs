@@ -217,7 +217,7 @@ fn tail(
 #[cfg(test)]
 mod tests {
     use crate::ffi::attitude::lasx_quat_rotate_batch;
-    use crate::ops::testutil::{rel_err, Lcg};
+    use crate::ops::testutil::{Lcg, rel_err};
 
     /// 与 loong-sci `quat_rotate` 的标量公式逐位一致。
     #[test]

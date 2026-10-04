@@ -14,8 +14,8 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use super::status::{
-    checked_finite, checked_len, checked_mul, checked_positive, checked_slice, checked_slice_mut,
-    LasxStatus,
+    LasxStatus, checked_finite, checked_len, checked_mul, checked_positive, checked_slice,
+    checked_slice_mut,
 };
 
 /// 校验失败即写状态并提前返回。把各包装里重复的样板收敛到一处。

@@ -58,7 +58,7 @@ pub(crate) fn sum(x: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use crate::ffi::reduce::lasx_sum;
-    use crate::ops::testutil::{both_paths, data, rel, NS};
+    use crate::ops::testutil::{NS, both_paths, data, rel};
 
     #[test]
     fn test_sum_matches_f64_reference() {

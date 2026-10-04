@@ -3595,6 +3595,32 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 **"只在 loongarch64 上编译"这条契约的守卫是编译器（import 解析失败）—— 这是规则 5 里
 最强的一档。不要为了"能在 x86 上安装"把它换掉。**
 
+### 22.6 edition 2024 迁移（2026-10-04）
+
+**决定**：四个 crate（`lasx_rs`、`lasx_rs_macros`、`lasx_bench`、`lasx_yll`）的
+`edition` 从 **2021 升到 2024**（工具链 `nightly-1.100.0`，stable 是 1.98.1）。
+
+**四个破坏点（全部实测，不是推测）**：
+
+| # | 破坏点 | 命中 | 处理 |
+|---|---|---|---|
+| 1 | `gen` 在 2024 成为**保留字** | **9 处编译错误**（`src/pool/mod.rs` 的逐槽代次字段与局部量） | 用**原始标识符 `r#gen`**：字段名与文档都不用改（改名的 9 处注释会漂移），只在代码里写 `slot.r#gen` |
+| 2 | `extern "C" {}` 块必须写 `unsafe extern "C" {}` | 1 处（`yll/src/yll.rs:27`） | 直接加 `unsafe` |
+| 3 | `unsafe_op_in_unsafe_fn` 默认警告 | **~149 处**：`src/arch/*` 的 intrinsic 包装、`src/ops/*` 对它们的调用、`examples/kernel_probe.rs`（该文件 155 处 —— 探针整文件都在 `unsafe fn` 里） | **显式允许**（4 个 crate 根 + 那个 example，各一行带理由）——**这是记在案的迁移债**，理由：这些函数的 SAFETY 契约本来就写在模块/函数级（各文件顶部的 SAFETY 段），逐处包块是纯机械改动；**触发条件：下次动 `src/arch` 或 `src/ops` 时按文件就地显式化** |
+| 4 | clippy 因 2024 的 `if let` 链而要求合并嵌套 `if let` | 1 处（`macros/src/lib.rs:321`） | 改成 let-chain（`if let Some(..) = .. && ..`） |
+
+**为什么允许而不是逐处改**：允许是**可见的债**（一行 + 计数 + 触发条件），而 149 条警告会被
+习惯性忽略。这条取舍写在这里，免得后来人以为是漏改。
+
+**验证**：216 + 5 + 17 全过；`cargo fmt --all`（2024 风格，改了若干文件）/ `clippy -D warnings` /
+`doccheck` 全绿；`cargo build --workspace --release` **0 警告 0 错误**。
+
+**与发布的关系**：edition 2024 的最低编译器是 **1.85**，但本 crate 因
+`#![feature(stdarch_loongarch)]`（issue #117427）**仍然只有 nightly 能编** ⇒ §22.1 里
+"`rust-version` 故意不设"的结论**不变**。
+
+
+
 ### 22.5 发布前的门禁
 
 `§21.9` 收口那套之外，再加一条：

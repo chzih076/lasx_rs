@@ -5,8 +5,8 @@
 //! 相邻配对的自然序反交错要跨 128 位 lane），所以两行的对比本身就是结论。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
-use crate::timing::{time_mode, timeit, Mode};
+use crate::report::{Row, row3};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::ffi::nn::lasx_rope;
 use std::hint::black_box;
 

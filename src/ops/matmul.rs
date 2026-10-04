@@ -883,7 +883,7 @@ fn z4() -> (lasx::F32x8, lasx::F32x8, lasx::F32x8, lasx::F32x8) {
 #[cfg(test)]
 mod tests {
     use crate::ffi::matmul::lasx_matmul;
-    use crate::ops::testutil::{reference, rel, Lcg};
+    use crate::ops::testutil::{Lcg, reference, rel};
 
     #[test]
     fn test_matmul_f32_matches_reference() {

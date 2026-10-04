@@ -97,11 +97,7 @@ pub(crate) fn amax(x: &[f32]) -> f32 {
         best = best.max(x[i].abs());
         i += 1;
     }
-    if best == f32::NEG_INFINITY {
-        0.0
-    } else {
-        best
-    }
+    if best == f32::NEG_INFINITY { 0.0 } else { best }
 }
 
 /// 逐行最大绝对值：`out[r] = max_j |x[r·cols + j]|`。

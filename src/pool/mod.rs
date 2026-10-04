@@ -127,7 +127,7 @@
 
 pub mod sched;
 
-pub use sched::{pick_rows, Job, Pick, Strategy};
+pub use sched::{Job, Pick, Strategy, pick_rows};
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -175,7 +175,7 @@ struct Slot {
     /// 观察到的代次，不等就**直接跳过**（既不读其余字段、也不计数）。于是"没被写过的槽"
     /// 永远不会被误读成上一轮的活，"被写过的槽"在改写前一定已经等到过它的确认——
     /// 这是"只等有活的 worker"能成立的安全前提（见 `Shared` 的不变量清单）。
-    gen: AtomicUsize,
+    r#gen: AtomicUsize,
 }
 
 /// 类型擦除的入口：把裸指针还原成 `[&mut [T]; N]` 并调用闭包。
@@ -320,7 +320,7 @@ impl WorkerPool {
                         widths: [0; MAX_ARRAYS],
                         n_jobs: 0,
                         start: 0,
-                        gen: AtomicUsize::new(0),
+                        r#gen: AtomicUsize::new(0),
                     })
                 })
                 .collect(),
@@ -661,7 +661,7 @@ impl WorkerPool {
         // 从填槽一直持到 `wait()` 返回——这正是 worker 读写这些槽的整个窗口。
         let _token = DispatchToken::acquire(self);
         // 本轮代次（令牌在手 ⇒ 没有别的派活者能同时推进 epoch）
-        let gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
+        let r#gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
         // 本轮写了几个槽；收尾只等这些（见 `Shared::active`）
         let mut active = 0usize;
         // 下标即 worker 编号（slots[w] 必须与第 w 个 worker 对应），故用下标循环
@@ -690,7 +690,7 @@ impl WorkerPool {
                 slot.lens[k] = r * widths[k];
             }
             // `gen` 最后写：worker 只有在代次匹配后才读上面那些字段
-            slot.gen.store(gen, Ordering::Relaxed);
+            slot.r#gen.store(r#gen, Ordering::Relaxed);
         }
 
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待。
@@ -735,7 +735,7 @@ impl WorkerPool {
         // 派活令牌：从填槽一直持到 `wait()` 返回，替代原来 `&mut self` 提供的独占保证
         let _token = DispatchToken::acquire(self);
         // 本轮代次（令牌在手 ⇒ 没有别的派活者能同时推进 epoch）
-        let gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
+        let r#gen = self.shared.epoch.load(Ordering::Relaxed) + 1;
         // SAFETY: 令牌保证同一时刻只有一个派活者在写 `jobs`，且写入发生在 epoch 递增之前。
         unsafe { *self.shared.jobs.get() = jobs };
         self.shared.dynamic.store(dynamic, Ordering::Relaxed);
@@ -768,7 +768,7 @@ impl WorkerPool {
                 slot.widths[k] = widths[k];
                 slot.row_bytes[k] = widths[k] * std::mem::size_of::<T>();
             }
-            slot.gen.store(gen, Ordering::Relaxed);
+            slot.r#gen.store(r#gen, Ordering::Relaxed);
         }
         // 发布 → **主线程做 `during`（worker 正在算）** → 等待
         // SAFETY: 槽位已填好、长度由公开接口校验；`f` 与 `during` 都在本栈帧上活到 `wait()` 之后。
@@ -971,7 +971,7 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
         let slot = unsafe { &*sh.slots[i].get() };
         // **代次过滤**：只有"本轮为这个槽写过"的才干活并计数；没写过的槽保留旧 `gen`，
         // 整轮不碰（既不读其余字段、也不计数）——见 `Shared::active` 与不变量清单。
-        if slot.gen.load(Ordering::Relaxed) == seen {
+        if slot.r#gen.load(Ordering::Relaxed) == seen {
             // 跑一块：多块模式下由 `bases`/`widths`/作业行区间现场派生指针；
             // 单块模式下 `ptrs`/`lens` 已经在派活时算好（热路径不变）。
             let run_block = |start: usize, rows: usize, ptrs: &[*mut u8], lens: &[usize]| {

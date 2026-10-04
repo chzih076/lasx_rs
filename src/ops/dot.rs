@@ -167,7 +167,7 @@ fn dot_lsx(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use crate::ffi::reduce::lasx_dot;
-    use crate::ops::testutil::{both_paths, data, rel, NS};
+    use crate::ops::testutil::{NS, both_paths, data, rel};
 
     #[test]
     fn test_dot_matches_f64_reference() {

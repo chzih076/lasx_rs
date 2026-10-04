@@ -18,7 +18,7 @@
 //! 数值一致性：这些函数只把**行/下标区间**分给不同线程，每个输出元素的计算过程与
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
-use crate::api::{checked_mul, expect_len, Error};
+use crate::api::{Error, checked_mul, expect_len};
 use crate::ops::matmul;
 use crate::ops::matmul_f64 as matmul64;
 use crate::pool::sched::Pick;
@@ -250,7 +250,7 @@ fn matmul_f32_picked(
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
-                // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
+    // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
     pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |_start, rows, [ab, cb]| {
         crate::lasx_matmul(
             rows as i32,
@@ -405,7 +405,7 @@ pub fn matmul_f64(
     }
 
     let bs = b; // `&[T]` 是 Copy，闭包按值捕获这个引用即可
-                // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
+    // 行粒度 4：`lasx_matmul` 按 4 行分块（块内 B 复用 4 次），尾块只有 1 行
     pool.for_each_row_block_mut(m, 4, [(a, k), (c, n)], |_start, rows, [ab, cb]| {
         crate::lasx_matmul_f64(
             rows as i32,

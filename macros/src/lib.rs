@@ -318,16 +318,17 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Di
     let Some(TokenTree::Group(arg)) = tokens.get(at + 1) else {
         // 紧跟着 `*` 说明这是标量前缀（`alpha * x[..]`）：单独给消息，否则用户只看到
         // "缺少下标"，看不出真正的问题是 v1 还没做 `alpha`/融合。
-        if let Some(TokenTree::Punct(star)) = tokens.get(at + 1) {
-            if star.as_char() == '*' {
-                return Err(Diagnostic::new(
-                    format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
-                    name_span,
-                )
-                .with_note(
-                    "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用",
-                ));
-            }
+        // edition 2024：`if let` 链可以把这两层合成一个条件（clippy 的 collapsible_if 要求）。
+        if let Some(TokenTree::Punct(star)) = tokens.get(at + 1)
+            && star.as_char() == '*'
+        {
+            return Err(Diagnostic::new(
+                format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
+                name_span,
+            )
+            .with_note(
+                "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用",
+            ));
         }
         return Err(Diagnostic::new(
             format!("`{name}` 后面缺少下标：请写成 `{name}[行下标, 列下标]`"),
@@ -343,14 +344,16 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Di
 
     let parts: Vec<TokenTree> = arg.stream().into_iter().collect();
     let (i, j) = match parts.as_slice() {
-        [TokenTree::Ident(i), TokenTree::Punct(c), TokenTree::Ident(j)] if c.as_char() == ',' => {
-            (i.clone(), j.clone())
-        }
+        [
+            TokenTree::Ident(i),
+            TokenTree::Punct(c),
+            TokenTree::Ident(j),
+        ] if c.as_char() == ',' => (i.clone(), j.clone()),
         _ => {
             return Err(Diagnostic::new(
                 format!("`{name}` 的下标必须是两个标识符：`{name}[行下标, 列下标]`"),
                 arg.span(),
-            ))
+            ));
         }
     };
     if i.to_string() == j.to_string() {
@@ -380,7 +383,7 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
                     return Err(Diagnostic::new(
                         "输出与乘积之间缺少 `*`（v1 只接受单项乘积 `y[..] = a[..] * b[..]`）",
                         other.map_or(first.i.span(), TokenTree::span),
-                    ))
+                    ));
                 }
             }
             let (b, next) = parse_operand(&tokens, at)?;
@@ -398,7 +401,7 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
             return Err(Diagnostic::new(
                 "公式应该是 `y[行, 列] = a[行, 收缩] * b[收缩, 列]`（或省掉输出）",
                 other.map_or(first.i.span(), TokenTree::span),
-            ))
+            ));
         }
     };
 

@@ -1,4 +1,7 @@
 #![feature(stdarch_loongarch)]
+// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.6）。这个探针的 `unsafe fn` 体里
+// 几乎全是 intrinsic 调用，逐处显式化的收益为零。
+#![allow(unsafe_op_in_unsafe_fn)]
 //! 微内核探针：把 `tile4x32_chunk` 的循环体放到 **L1 热数据**上，量它自身的 FMA/周期上限。
 //!
 //! 结论（本机 Loongson-3B6000 / LA664，2.2 GHz，见 `docs/dev.md` §6.3）：
@@ -30,8 +33,8 @@ use std::time::Instant;
 
 use lasx_rs::aligned::AlignedVec;
 use lasx_rs::arch::lasx::{
-    load_f32x8, load_f64x4, splat_f32, splat_f64, store_f32x8, store_f64x4, zero_f32x8, zero_f64x4,
-    F32x8,
+    F32x8, load_f32x8, load_f64x4, splat_f32, splat_f64, store_f32x8, store_f64x4, zero_f32x8,
+    zero_f64x4,
 };
 
 /// 访存型内核每样品的内层重复次数（把 L1 热的循环体跑到 ~100 ms 量级）。
@@ -464,7 +467,9 @@ fn main() {
             println!("| {} | {:.3e} | {:.3e} |", pair[0].0, pair[0].1, pair[1].1);
         }
         println!();
-        println!("（周期/次见 kernel_probe 的 dfdiv/drecipe/drcp1 变体：精确除法 4.0、估算 6.8、估算+2 步牛顿 16.5）");
+        println!(
+            "（周期/次见 kernel_probe 的 dfdiv/drecipe/drcp1 变体：精确除法 4.0、估算 6.8、估算+2 步牛顿 16.5）"
+        );
         return;
     }
 

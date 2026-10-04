@@ -5,9 +5,9 @@
 //! | `f64` | [`RvMut::rk4_j2_step`] | `rk4_j2_step_batch`（中心项 + J2，单片 RK4） |
 //! | `f32` | [`RvMut::ballistic_step`] | `ballistic_step`（需要额外的阻力系数数组 `k`） |
 
-use crate::api::{expect_len, Error};
-use crate::shape::batch::V3Ref;
+use crate::api::{Error, expect_len};
 use crate::shape::VecRef;
+use crate::shape::batch::V3Ref;
 
 /// 批量状态**独占**视图：`rx, ry, rz, vx, vy, vz` 六条等长数组（原地更新）。
 pub struct RvMut<'a, T, const N: usize> {
@@ -185,8 +185,24 @@ mod tests {
             }
 
             // f32：弹道（重力 + 阻力 + k）
-            let [mut rx32, mut ry32, mut rz32, mut vx32, mut vy32, mut vz32, k] = state32(N, seed);
-            let [want_rx32, want_ry32, want_rz32, want_vx32, want_vy32, want_vz32, _] = {
+            let [
+                mut rx32,
+                mut ry32,
+                mut rz32,
+                mut vx32,
+                mut vy32,
+                mut vz32,
+                k,
+            ] = state32(N, seed);
+            let [
+                want_rx32,
+                want_ry32,
+                want_rz32,
+                want_vx32,
+                want_vy32,
+                want_vz32,
+                _,
+            ] = {
                 let [mut wrx, mut wry, mut wrz, mut wvx, mut wvy, mut wvz, kk] = state32(N, seed);
                 crate::ops::ballistic_step::ballistic_step(
                     &mut wrx, &mut wry, &mut wrz, &mut wvx, &mut wvy, &mut wvz, &kk, 0.01, 9.8,

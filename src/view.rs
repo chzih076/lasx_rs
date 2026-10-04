@@ -508,10 +508,12 @@ mod tests {
                 .len(),
             12
         );
-        assert!(MatRef::col_major(&d, 4, 3)
-            .unwrap()
-            .as_row_major_contiguous()
-            .is_none());
+        assert!(
+            MatRef::col_major(&d, 4, 3)
+                .unwrap()
+                .as_row_major_contiguous()
+                .is_none()
+        );
         // 单列矩阵：行主序与列主序是同一件事，都算连续
         let col = MatRef::col_major(&d[..4], 4, 1).unwrap();
         assert!(col.as_row_major_contiguous().is_some());

@@ -28,14 +28,16 @@
 //!   并发调用——池的派活本身是独占的。
 
 #![allow(non_camel_case_types)]
+// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.6）。这里只有 4 处（`yll::arg` 调用）。
+#![allow(unsafe_op_in_unsafe_fn)]
 
 mod convert;
 mod funcs;
 mod yll;
 
 use yll::{
-    str_value, with_cstr, yll_int, yll_module_add_const, yll_module_add_func, yll_module_new,
-    YllCFunc, YllModuleDefC,
+    YllCFunc, YllModuleDefC, str_value, with_cstr, yll_int, yll_module_add_const,
+    yll_module_add_func, yll_module_new,
 };
 
 /// 注册一个对外函数（名字与文档都是临时 C 串，调用期间存活）。

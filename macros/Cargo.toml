@@ -1,7 +1,7 @@
 [package]
 name = "lasx_rs_macros"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "lasx_rs 的公式 DSL 宏实现：把一维公式编译成 lasx_rs 的批量内核调用（零第三方依赖）"
 license = "MIT"
 repository = "https://github.com/chzih076/lasx_rs"

@@ -17,7 +17,7 @@
 //! ——**发布构建里长度不一致就是 UB**。这里把"等长"变成构造时的一次显式校验：
 //! 不一致就拿不到视图（[`V3Dyn::new`] 返回 `Err`），也就调不出内核。
 
-use crate::api::{expect_len, Error};
+use crate::api::{Error, expect_len};
 
 /// 三分量运行期长度**借用**视图。
 pub struct V3Dyn<'a, T> {

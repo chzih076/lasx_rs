@@ -43,7 +43,7 @@
 
 use proc_macro::{Delimiter, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 
-use crate::{amp, const_arg, group, id, method, p, Diagnostic, Kind};
+use crate::{Diagnostic, Kind, amp, const_arg, group, id, method, p};
 
 /* ==================== 纯规则层（可单测） ==================== */
 
@@ -180,7 +180,11 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(VecOperand, usize),
     let parts: Vec<TokenTree> = arg.stream().into_iter().collect();
     let idx = match parts.as_slice() {
         [TokenTree::Ident(i)] => vec![i.clone()],
-        [TokenTree::Ident(i), TokenTree::Punct(c), TokenTree::Ident(j)] if c.as_char() == ',' => {
+        [
+            TokenTree::Ident(i),
+            TokenTree::Punct(c),
+            TokenTree::Ident(j),
+        ] if c.as_char() == ',' => {
             if i.to_string() == j.to_string() {
                 return Err(Diagnostic::new(
                     format!("同一次操作数的两个下标不能同名（`{name}[{i}, {i}]`）"),
@@ -195,7 +199,7 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(VecOperand, usize),
             return Err(Diagnostic::new(
                 format!("`{name}` 的下标必须是 1 个或 2 个标识符：`{name}[K]` / `{name}[N, K]`"),
                 arg.span(),
-            ))
+            ));
         }
     };
     Ok((VecOperand { name, idx }, at + 2))
@@ -213,13 +217,13 @@ fn parse_product(
             return Err(Diagnostic::new(
                 "这里应该是 `*`（公式只接受单项乘积）",
                 other.span(),
-            ))
+            ));
         }
         None => {
             return Err(Diagnostic::new(
                 "公式在这里就结束了，缺少 `* 操作数`",
                 Span::call_site(),
-            ))
+            ));
         }
     }
     let (rhs, at) = parse_operand(tokens, at + 1)?;

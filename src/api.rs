@@ -2147,7 +2147,9 @@ mod tests {
              dt: f64| { rk4_j2_step_batch(rx, ry, rz, vx, vy, vz, mu, j2, re, dt) };
         // mu <= 0（与 lasx_*_checked 同为 NotPositive）
         assert!(matches!(
-            step(&mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz, 0.0, 1e-3, 6.4e6, 10.0),
+            step(
+                &mut rx, &mut ry, &mut rz, &mut vx, &mut vy, &mut vz, 0.0, 1e-3, 6.4e6, 10.0
+            ),
             Err(Error::NotPositive { what: "mu", .. })
         ));
         // dt 非有限
@@ -2350,9 +2352,11 @@ mod tests {
             })
         ));
         // 空输入
-        assert!(rope(&[], &[], &[], 0, 8, 8, RopeMode::NeoX)
-            .unwrap()
-            .is_empty());
+        assert!(
+            rope(&[], &[], &[], 0, 8, 8, RopeMode::NeoX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// f16 点积/GEMV：与 C ABI 逐位一致、`gemv` 逐行等于 `dot_f16`、输出对齐、错误路径。
@@ -2530,9 +2534,11 @@ mod tests {
         }
         // 空 ids ⇒ 空输出，且不碰 out
         assert!(gather_rows(&table, &[], row_len).unwrap().is_empty());
-        assert!(gather_rows_i8(&tq, &scales, &[], row_len)
-            .unwrap()
-            .is_empty());
+        assert!(
+            gather_rows_i8(&tq, &scales, &[], row_len)
+                .unwrap()
+                .is_empty()
+        );
 
         // 错误路径
         assert!(matches!(

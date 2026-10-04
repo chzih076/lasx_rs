@@ -5,8 +5,8 @@
 //! 不是同一条式子，逐位一致性由 `src/ops/{silu,gelu_quick}.rs` 的单测守。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
-use crate::timing::{time_mode, timeit, Mode};
+use crate::report::{Row, row3};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::ffi::nn::{lasx_gelu_erf, lasx_gelu_quick, lasx_silu};
 use std::hint::black_box;
 

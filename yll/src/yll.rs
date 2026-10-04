@@ -11,7 +11,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 
 /// 不透明的值包装（`yll.h` 中 `struct YllValueWrapper`）。
 pub type YllValueWrapper = c_void;
@@ -24,7 +24,7 @@ pub type YllModuleDefC = c_void;
 pub type YllCFunc =
     extern "C" fn(*mut YllContextC, c_int, *mut *mut YllValueWrapper) -> *mut YllValueWrapper;
 
-extern "C" {
+unsafe extern "C" {
     // ---- 构造 Value ----
     pub fn yll_int(i: i64) -> *mut YllValueWrapper;
     pub fn yll_float(f: f64) -> *mut YllValueWrapper;

@@ -292,10 +292,12 @@ mod tests {
         let x0 = VecRef::<f32, 0>::new(&[]).unwrap();
         let y0 = w0.gemv(&x0);
         assert_eq!(y0.as_slice(), &[0.0; 3]);
-        assert!(F16Mat::<0, 4>::new(&[])
-            .unwrap()
-            .gemv(&VecRef::<f32, 4>::new(&[1.0; 4]).unwrap())
-            .is_empty());
+        assert!(
+            F16Mat::<0, 4>::new(&[])
+                .unwrap()
+                .gemv(&VecRef::<f32, 4>::new(&[1.0; 4]).unwrap())
+                .is_empty()
+        );
         // 池化路径同口径
         let mut y_pooled = VecBuf::<f32, 3>::new();
         w0.gemv_pooled(&pool, &x0, &mut y_pooled).unwrap();

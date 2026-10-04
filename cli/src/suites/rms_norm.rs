@@ -5,8 +5,8 @@
 //! 的实现不同，逐位一致性由 `src/ops/rms_norm.rs` 的单测守）。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
-use crate::timing::{time_mode, timeit, Mode};
+use crate::report::{Row, row3};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::ffi::nn::lasx_rms_norm;
 use std::hint::black_box;
 

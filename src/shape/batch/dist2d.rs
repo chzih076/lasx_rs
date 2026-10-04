@@ -1,6 +1,6 @@
 //! 二分量的批量视图（f32，SOA）：给 `batch_distance2d` 这类"输入两条、输出一条"的算子用。
 
-use crate::api::{expect_len, Error};
+use crate::api::{Error, expect_len};
 use crate::shape::VecBuf;
 
 /// 二分量**借用**视图：x/y 两条等长数组，样本数 `N` 在类型里。

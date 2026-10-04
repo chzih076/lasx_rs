@@ -4,7 +4,7 @@
 //! `VecBuf`），与 [`crate::shape::Prepared::apply_into`] 的命名一致。
 
 use crate::aligned::AlignedVec;
-use crate::api::{expect_len, Error};
+use crate::api::{Error, expect_len};
 use crate::shape::VecBuf;
 
 /// 三分量**借用**视图：x/y/z 三条数组，样本数 `N` 在类型里。

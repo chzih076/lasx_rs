@@ -14,9 +14,9 @@
 //! ties-to-even、不夹取），所以"向量 vs 标量"列是同一份契约下的两条实现。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
+use crate::report::{Row, row3};
 use crate::scalar_ref::scalar_dot_i8;
-use crate::timing::{time_mode, timeit, Mode};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::ffi::quant::{
     lasx_absmax_rows, lasx_amax, lasx_dequantize_i8_rows, lasx_gemv_i8, lasx_matmul_i8,
     lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,

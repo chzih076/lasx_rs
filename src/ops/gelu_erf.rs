@@ -178,11 +178,7 @@ mod tests {
             let erfc = (-a * a).exp() / (a * std::f64::consts::PI.sqrt()) / (1.0 + cf);
             1.0 - erfc
         };
-        if z < 0.0 {
-            -v
-        } else {
-            v
-        }
+        if z < 0.0 { -v } else { v }
     }
 
     fn reference(x: f64) -> f64 {

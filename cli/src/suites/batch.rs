@@ -1,7 +1,7 @@
-use crate::data::{states, velocities, AlignedBuf, Lcg};
-use crate::report::{row3, Row};
+use crate::data::{AlignedBuf, Lcg, states, velocities};
+use crate::report::{Row, row3};
 use crate::scalar_ref::*;
-use crate::timing::{time_mode, timeit, Mode};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::*;
 use std::hint::black_box;
 

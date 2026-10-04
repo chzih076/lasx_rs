@@ -10,8 +10,8 @@
 //! A/B 不在这里——它在 `examples/gemv_pool_ab`，数据与线程数建议见 `docs/dev.md` §20.7。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::report::{row3, Row};
-use crate::timing::{time_mode, timeit, Mode};
+use crate::report::{Row, row3};
+use crate::timing::{Mode, time_mode, timeit};
 use lasx_rs::ffi::nn::{lasx_dot_f16, lasx_gemv_f16};
 use std::hint::black_box;
 

@@ -15,7 +15,7 @@
 //! 占比接近 100% ⇒ 已贴住搬运上限，只能靠"少搬字节"再优化；
 //! 明显偏低 ⇒ 还有别的东西在拖（访存形态、指令发射、归约串行、线程扩展），逐个查。
 
-use crate::data::{states, AlignedBuf, Lcg, Soa6, J2, MU, RE};
+use crate::data::{AlignedBuf, J2, Lcg, MU, RE, Soa6, states};
 use crate::timing::{fmt_t, timeit};
 use lasx_rs::pool::WorkerPool;
 use lasx_rs::*;
@@ -137,7 +137,9 @@ pub fn run() {
     println!();
     println!("### 锚点（同规模纯搬运实测）");
     println!();
-    println!("| 规模 | 单流只读 | 双流只读 | 双流字节读 | **6 流 3读3写** | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 | 字节/f64 |");
+    println!(
+        "| 规模 | 单流只读 | 双流只读 | 双流字节读 | **6 流 3读3写** | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 | 字节/f64 |"
+    );
     println!("|---|---|---|---|---|---|---|---|---|");
     let mut anchor = std::collections::HashMap::new();
     for &n in ns64.iter().chain(ns32.iter()) {

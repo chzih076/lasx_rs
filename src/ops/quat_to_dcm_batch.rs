@@ -210,7 +210,7 @@ fn tail(qw: &[f64], qx: &[f64], qy: &[f64], qz: &[f64], m: [&mut [f64]; 9], from
 #[cfg(test)]
 mod tests {
     use crate::ffi::attitude::lasx_quat_to_dcm_batch;
-    use crate::ops::testutil::{rel_err, states, Lcg};
+    use crate::ops::testutil::{Lcg, rel_err, states};
 
     /// 用 R 旋转向量必须与 `quat_rotate` 的公式逐位一致。
     #[test]

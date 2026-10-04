@@ -35,7 +35,7 @@
 //! ```
 
 use crate::aligned::AlignedVec;
-use crate::api::{expect_len, Error};
+use crate::api::{Error, expect_len};
 
 /// 一维向量的**借用**视图：长度 `N` 在类型里。
 ///

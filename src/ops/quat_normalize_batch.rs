@@ -160,7 +160,7 @@ fn tail(qw: &mut [f64], qx: &mut [f64], qy: &mut [f64], qz: &mut [f64], from: us
 #[cfg(test)]
 mod tests {
     use crate::ffi::attitude::lasx_quat_normalize_batch;
-    use crate::ops::testutil::{rel_err, Lcg};
+    use crate::ops::testutil::{Lcg, rel_err};
 
     #[test]
     fn test_quat_normalize_batch_matches_reference() {
