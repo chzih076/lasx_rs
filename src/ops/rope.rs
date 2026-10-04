@@ -125,10 +125,16 @@ pub(crate) unsafe fn rope_f32(
     debug_assert_eq!(sin.len(), rows * (n_dims / 2));
     let half = n_dims / 2;
     for r in 0..rows {
-        let xr = x.as_ptr().add(r * cols);
-        let or = out.as_mut_ptr().add(r * cols);
-        let cr = cos.as_ptr().add(r * half);
-        let sr = sin.as_ptr().add(r * half);
+        // SAFETY: 四个窗口都在各自切片内——行 `r` 的 `[r*cols, (r+1)*cols)` 在 `x`/`out` 内、
+        // `[r*half, (r+1)*half)` 在 `cos`/`sin` 内（形状由上面的 debug 断言与调用方保证）。
+        let (xr, or, cr, sr) = unsafe {
+            (
+                x.as_ptr().add(r * cols),
+                out.as_mut_ptr().add(r * cols),
+                cos.as_ptr().add(r * half),
+                sin.as_ptr().add(r * half),
+            )
+        };
         // SAFETY: 行内前 n_dims 列在本行内；原地/异地都成立（先读后写同样的位置）。
         unsafe {
             // `[n_dims, cols)`：原样复制（partial rope）
