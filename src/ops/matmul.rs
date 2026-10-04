@@ -371,14 +371,18 @@ pub(crate) fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed
 /// `src` 至少可读 32 个 `f32`，`dst` 至少可写 32 个 `f32`，且两者不重叠。
 #[inline]
 unsafe fn copy_block32(src: *const f32, dst: *mut f32) {
-    let v0 = lasx::load_f32x8(src);
-    let v1 = lasx::load_f32x8(src.add(8));
-    let v2 = lasx::load_f32x8(src.add(16));
-    let v3 = lasx::load_f32x8(src.add(24));
-    lasx::store_f32x8(dst, v0);
-    lasx::store_f32x8(dst.add(8), v1);
-    lasx::store_f32x8(dst.add(16), v2);
-    lasx::store_f32x8(dst.add(24), v3);
+    // SAFETY: 调用方保证 `src` 可读、`dst` 可写各 32 个 `f32` 且不重叠（见上面的 `# Safety`）；
+    // 8 次 `add` 的偏移都落在 0..32 内。
+    unsafe {
+        let v0 = lasx::load_f32x8(src);
+        let v1 = lasx::load_f32x8(src.add(8));
+        let v2 = lasx::load_f32x8(src.add(16));
+        let v3 = lasx::load_f32x8(src.add(24));
+        lasx::store_f32x8(dst, v0);
+        lasx::store_f32x8(dst.add(8), v1);
+        lasx::store_f32x8(dst.add(16), v2);
+        lasx::store_f32x8(dst.add(24), v3);
+    }
 }
 
 /// 微内核：4 行 × 32 列 × **kb 个 k 步**，B 从打包缓冲连续读。
@@ -681,12 +685,16 @@ unsafe fn scaled_store4(
     va: lasx::F32x8,
     vb: lasx::F32x8,
 ) {
-    for (g, a) in acc.into_iter().enumerate() {
-        let p = row.as_mut_ptr().add(j + g * 8);
-        let old = lasx::load_f32x8(p);
-        // 契约的"两次舍入"：先 alpha·acc（一次），再 fma(beta, C_old, ·)（再一次）
-        let out = lasx_xvfmadd_s(old, vb, lasx_xvfmul_s(a, va));
-        lasx::store_f32x8(p, out);
+    // SAFETY: 调用方保证 `row` 至少有 `j + 32` 个元素（见上面的 `# Safety`）；循环里
+    // `j + g*8 + 8 ≤ j + 32`，所以每次 8 元素读写都在界内。
+    unsafe {
+        for (g, a) in acc.into_iter().enumerate() {
+            let p = row.as_mut_ptr().add(j + g * 8);
+            let old = lasx::load_f32x8(p);
+            // 契约的"两次舍入"：先 alpha·acc（一次），再 fma(beta, C_old, ·)（再一次）
+            let out = lasx_xvfmadd_s(old, vb, lasx_xvfmul_s(a, va));
+            lasx::store_f32x8(p, out);
+        }
     }
 }
 
