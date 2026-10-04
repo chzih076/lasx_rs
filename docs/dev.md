@@ -3621,7 +3621,11 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 3 | `src/ffi/status.rs`（`checked_slice`/`checked_slice_mut`）+ `src/ops/dot_f16.rs` 的 `gemv_f16`/`gemv_f16_rows` | **4** | ✅ 已显式化（2026-10-04） |
 | 4 | `src/ops/dot_q4.rs`（`group_sums`/`horizontal_i64`） | **2** | ✅ 已显式化（2026-10-04） |
 | 5 | `src/ops/matmul.rs`（`copy_block32`/`scaled_store4`） | **2** | ✅ 已显式化（2026-10-04） |
-| — | 其余：`src/ops/*`（`dot_f16` 本体、`rope` 1、`rk4_j2_step_batch` 1…）、`src/pool/mod.rs` 3、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **35** | ⏳ 待办 |
+| 6 | `src/pool/mod.rs`（`publish_no_wait` 的 `UnsafeCell` 写、`thunk` 的 `from_raw_parts_mut`） | **2** | ✅ 已显式化（2026-10-04） |
+| — | 其余：`src/ops/*`（`dot_f16` 本体、`rope` 1、`rk4_j2_step_batch` 1…）、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **33** | ⏳ 待办 |
+
+**又两处假阳性（继续修正口径）**：`src/pool/mod.rs:186` 是**函数指针类型**（不是定义）、
+`noop_thunk` 是**空函数体**（没有 unsafe 操作、本来就不需要块）⇒ 这两处不算债。
 
 **代理指标的口径修正**：`grep -rc "unsafe fn"` 会把**注释**里提到的 "unsafe fn"（`src/lib.rs`
 两处）与**函数指针类型**（`src/pool/mod.rs:186` 的 `unsafe fn(...)`）也算进去 ⇒ 早期报的

@@ -798,7 +798,9 @@ impl WorkerPool {
     /// `active` 是本轮**写了几个槽**（= 分到活的 worker 数，由
     /// [`Self::dispatch_rows`]/[`Self::dispatch_jobs`] 数出来）；收尾只等这些。
     unsafe fn publish_no_wait(&self, t: Thunk, func: *const (), active: usize) {
-        *self.shared.call.get() = (t, func);
+        // SAFETY: `self.shared.call` 是 `UnsafeCell`；这里**唯一的写者**是调用方，且它必须持有
+        // 派活令牌（上一轮已收尾）⇒ 与 worker 的读不重叠（见上面的 `# Safety`）。
+        unsafe { *self.shared.call.get() = (t, func) };
         self.shared.done.store(0, Ordering::Relaxed);
         self.shared.active.store(active, Ordering::Relaxed);
         self.shared.panicked.store(false, Ordering::Relaxed);
@@ -1056,10 +1058,14 @@ unsafe fn thunk<T, const N: usize, F>(
 ) where
     F: Fn(usize, usize, [&mut [T]; N]),
 {
-    let arrays: [&mut [T]; N] =
-        std::array::from_fn(|k| std::slice::from_raw_parts_mut(ptrs[k] as *mut T, lens[k]));
-    let f = &*(func as *const F);
-    f(start, rows, arrays);
+    // SAFETY: 调用方保证 `ptrs`/`lens` 等长且为 `N` 个有效地址与元素个数、`func` 指向一个
+    // `F: Fn([&mut [T]; N])` 且在调用期间有效（见上面的 `# Safety`）。
+    unsafe {
+        let arrays: [&mut [T]; N] =
+            std::array::from_fn(|k| std::slice::from_raw_parts_mut(ptrs[k] as *mut T, lens[k]));
+        let f = &*(func as *const F);
+        f(start, rows, arrays);
+    }
 }
 
 /// 从"行主序切片 + 行宽"取出基址与行宽（派活用）。
