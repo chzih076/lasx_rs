@@ -3619,7 +3619,8 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 1 | `src/arch/lsx.rs`（4）+ `src/arch/lasx.rs` 的 4 个 load/store | **8** | ✅ 已显式化（2026-10-04） |
 | 2 | `src/arch/lasx.rs` 剩 2（`load_f16x16_as_f32x8x2`、`trunc_i32`）⇒ **`src/arch/*` 整块清零** | **2** | ✅ 已显式化（2026-10-04） |
 | 3 | `src/ffi/status.rs`（`checked_slice`/`checked_slice_mut`）+ `src/ops/dot_f16.rs` 的 `gemv_f16`/`gemv_f16_rows` | **4** | ✅ 已显式化（2026-10-04） |
-| — | 其余：`src/ops/*`（`dot_f16` 本体、`matmul` 2、`dot_q4` 2、`rope` 1、`rk4_j2_step_batch` 1…）、`src/pool/mod.rs` 3、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **42** | ⏳ 待办 |
+| 4 | `src/ops/dot_q4.rs`（`group_sums`/`horizontal_i64`） | **2** | ✅ 已显式化（2026-10-04） |
+| — | 其余：`src/ops/*`（`dot_f16` 本体、`matmul` 2、`rope` 1、`rk4_j2_step_batch` 1…）、`src/pool/mod.rs` 3、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **37** | ⏳ 待办 |
 
 **代理指标的口径修正**：`grep -rc "unsafe fn"` 会把**注释**里提到的 "unsafe fn"（`src/lib.rs`
 两处）与**函数指针类型**（`src/pool/mod.rs:186` 的 `unsafe fn(...)`）也算进去 ⇒ 早期报的

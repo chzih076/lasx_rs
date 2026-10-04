@@ -50,22 +50,29 @@ use std::arch::loongarch64::*;
 /// 一组（32 字节 = 64 个 nibble）的组内部分和：16 个 i16 lane，每 lane 两个 nibble 乘积之和。
 #[inline(always)]
 unsafe fn group_sums(va: m256i, vb: m256i) -> m256i {
-    let alo = lasx_xvandi_b(va, 0x0f);
-    let ahi = lasx_xvsrli_b(va, 4);
-    let blo = lasx_xvandi_b(vb, 0x0f);
-    let bhi = lasx_xvsrli_b(vb, 4);
-    let s0 = lasx_xvadd_h(lasx_xvmulwev_h_b(alo, blo), lasx_xvmulwod_h_b(alo, blo));
-    let s1 = lasx_xvadd_h(lasx_xvmulwev_h_b(ahi, bhi), lasx_xvmulwod_h_b(ahi, bhi));
-    lasx_xvadd_h(s0, s1)
+    // SAFETY: 纯寄存器操作（解包 4 位组、乘加、水平相加），无内存前提。
+    unsafe {
+        let alo = lasx_xvandi_b(va, 0x0f);
+        let ahi = lasx_xvsrli_b(va, 4);
+        let blo = lasx_xvandi_b(vb, 0x0f);
+        let bhi = lasx_xvsrli_b(vb, 4);
+        let s0 = lasx_xvadd_h(lasx_xvmulwev_h_b(alo, blo), lasx_xvmulwod_h_b(alo, blo));
+        let s1 = lasx_xvadd_h(lasx_xvmulwev_h_b(ahi, bhi), lasx_xvmulwod_h_b(ahi, bhi));
+        lasx_xvadd_h(s0, s1)
+    }
 }
 
 /// 16×i16 → 8×i32 → 4×i64（相邻两两相加），再 4 次标量加得到组内点积（精确整数）。
 #[inline(always)]
 unsafe fn horizontal_i64(sall: m256i, tmp: &mut [i64; 4]) -> i64 {
-    let w = lasx_xvhaddw_w_h(sall, sall);
-    let wide = lasx_xvhaddw_d_w(w, w);
-    lasx_xvst(wide, tmp.as_mut_ptr() as *mut i8, 0);
-    tmp[0] + tmp[1] + tmp[2] + tmp[3]
+    // SAFETY: `tmp` 是调用方给的 4 元素数组（`xvst` 写 32 字节 = 4×i64，正好装下）；
+    // 其余是纯寄存器操作。
+    unsafe {
+        let w = lasx_xvhaddw_w_h(sall, sall);
+        let wide = lasx_xvhaddw_d_w(w, w);
+        lasx_xvst(wide, tmp.as_mut_ptr() as *mut i8, 0);
+        tmp[0] + tmp[1] + tmp[2] + tmp[3]
+    }
 }
 
 /// LASX-only：本内核没有 `has_lasx()` 降级分支，直接执行 256 位实现。
