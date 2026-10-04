@@ -103,11 +103,15 @@ pub unsafe fn arg_f64(
     idx: usize,
     name: &str,
 ) -> Result<f64, String> {
-    let v = arg(argv, idx);
-    if yll_is_float(v) || yll_is_int(v) {
-        Ok(yll_as_float(v))
-    } else {
-        Err(format!("参数 `{name}` 必须是数值"))
+    // SAFETY: 见 [`arg`]（`argv` 至少有 `idx + 1` 个有效元素）；`yll_is_*`/`yll_as_*`
+    // 是 `unsafe extern` 里的宿主函数，前提是 `v` 由本模块的调用约定取得。
+    unsafe {
+        let v = arg(argv, idx);
+        if yll_is_float(v) || yll_is_int(v) {
+            Ok(yll_as_float(v))
+        } else {
+            Err(format!("参数 `{name}` 必须是数值"))
+        }
     }
 }
 
@@ -120,19 +124,22 @@ pub unsafe fn arg_int(
     idx: usize,
     name: &str,
 ) -> Result<i64, String> {
-    let v = arg(argv, idx);
-    if yll_is_int(v) {
-        Ok(yll_as_int(v))
-    } else if yll_is_float(v) {
-        // 允许 4.0 这种写法，但不能有小数部分
-        let f = yll_as_float(v);
-        if f.fract() == 0.0 && f.is_finite() {
-            Ok(f as i64)
+    // SAFETY: 见 [`arg`]；`yll_*` 是 `unsafe extern` 宿主函数。
+    unsafe {
+        let v = arg(argv, idx);
+        if yll_is_int(v) {
+            Ok(yll_as_int(v))
+        } else if yll_is_float(v) {
+            // 允许 4.0 这种写法，但不能有小数部分
+            let f = yll_as_float(v);
+            if f.fract() == 0.0 && f.is_finite() {
+                Ok(f as i64)
+            } else {
+                Err(format!("参数 `{name}` 必须是整数"))
+            }
         } else {
             Err(format!("参数 `{name}` 必须是整数"))
         }
-    } else {
-        Err(format!("参数 `{name}` 必须是整数"))
     }
 }
 
@@ -145,13 +152,16 @@ pub unsafe fn arg_arr_len(
     idx: usize,
     name: &str,
 ) -> Result<usize, String> {
-    let v = arg(argv, idx);
-    if !yll_is_arr(v) {
-        return Err(format!("参数 `{name}` 必须是数组"));
+    // SAFETY: 见 [`arg`]；`yll_*` 是 `unsafe extern` 宿主函数。
+    unsafe {
+        let v = arg(argv, idx);
+        if !yll_is_arr(v) {
+            return Err(format!("参数 `{name}` 必须是数组"));
+        }
+        let len = yll_arr_len(v);
+        if len < 0 {
+            return Err(format!("参数 `{name}` 的长度非法（{len}）"));
+        }
+        Ok(len as usize)
     }
-    let len = yll_arr_len(v);
-    if len < 0 {
-        return Err(format!("参数 `{name}` 的长度非法（{len}）"));
-    }
-    Ok(len as usize)
 }

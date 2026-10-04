@@ -3627,7 +3627,8 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 9 | `src/ops/rk4_j2_step_batch.rs` 的 `j2_accel_vec`（长体，纯寄存器 J2 摄动加速度） | **1** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧清零** |
 | 10 | `yll/src/yll.rs` 的 `arg`（`*argv.add(idx)`）；**并把 `cli/src/main.rs` 的 allow 删掉**（实测 `cli/src` 的 `unsafe fn` 数为 **0** ⇒ 删后 `cargo build` 仍 0 告警，这就是"无债"的证据） | **1** | ✅ 已显式化（2026-10-04） |
 | 11 | `src/ops/matmul_f64.rs` 的 `copy_block16_f64`(14 处) + `src/ops/dot_i8.rs` 的 `step_pair`(10 处)；**并删掉 `src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明 `src/` 真的清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧真正清零** |
-| — | 其余：`yll/src/*` 13（`convert.rs` 8、`yll.rs` 3、`lib.rs` 2）、`examples/kernel_probe.rs` 11 … | **22** | ⏳ 待办 |
+| 12 | `yll/src/yll.rs` 剩 3（`arg_f64`/`arg_int`/`arg_arr_len`——体里既调本模块的 `unsafe fn`、又调 `unsafe extern` 的宿主函数，都收进 `unsafe {}`） | **3** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/yll.rs` 清零** |
+| — | 其余：`yll/src/convert.rs` 8、`yll/src/lib.rs` 2、`examples/kernel_probe.rs` 11 | **19** | ⏳ 待办 |
 
 **allow 的进度**：4 处里 **`cli/src/main.rs` 与 `src/lib.rs` 已删**（都是"删后 0 告警"证过的）；
 剩 `yll/src/lib.rs`、`examples/kernel_probe.rs`。
