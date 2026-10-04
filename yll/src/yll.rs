@@ -90,7 +90,8 @@ pub fn str_value(s: &str) -> *mut YllValueWrapper {
 /// # Safety
 /// `argv` 必须至少有 `idx + 1` 个有效元素。
 pub unsafe fn arg(argv: *mut *mut YllValueWrapper, idx: usize) -> *mut YllValueWrapper {
-    *argv.add(idx)
+    // SAFETY: 调用方保证 `argv` 至少有 `idx + 1` 个有效元素（见上面的 `# Safety`）。
+    unsafe { *argv.add(idx) }
 }
 
 /// 读取一个数值参数（整数或浮点都接受，统一取 `f64`）。

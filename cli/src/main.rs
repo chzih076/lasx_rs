@@ -11,8 +11,6 @@
 //! 计时口径：预热 2 次后自适应重复至 ≈25 ms/样品，5 次取样取**中位数**，
 //! 每个内核在同一个线程内运行（强制 LSX 的钩子是线程级的）。
 #![feature(stdarch_loongarch)]
-// edition 2024 迁移债：同 `src/lib.rs` 的说明（`docs/dev.md` §22.6）。
-#![allow(unsafe_op_in_unsafe_fn)]
 
 mod data;
 mod group;
