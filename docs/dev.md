@@ -3629,7 +3629,8 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 11 | `src/ops/matmul_f64.rs` 的 `copy_block16_f64`(14 处) + `src/ops/dot_i8.rs` 的 `step_pair`(10 处)；**并删掉 `src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明 `src/` 真的清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧真正清零** |
 | 12 | `yll/src/yll.rs` 剩 3（`arg_f64`/`arg_int`/`arg_arr_len`——体里既调本模块的 `unsafe fn`、又调 `unsafe extern` 的宿主函数，都收进 `unsafe {}`） | **3** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/yll.rs` 清零** |
 | 13 | `yll/src/convert.rs` 的 `read_array`（体最长：`arg_arr_len` + 逐元素 `yll_arr_get`/`yll_is_*`/`yll_as_*`）+ `read_f64`/`read_f32`/`read_i8`（体各一句） | **4** | ✅ 已显式化（2026-10-04）（**该文件 8 个里做了 4 个**） |
-| — | 其余：`yll/src/convert.rs` **剩 4**（`read_f64_soa` 等）、`yll/src/lib.rs` 2、`examples/kernel_probe.rs` 11 | **17** | ⏳ 待办 |
+| 14 | `yll/src/convert.rs` 的 `push_f64_array`/`push_f64_arrays`（宿主构造器，前提是"解释器线程内"） | **2** | ✅ 已显式化（2026-10-04）（**该文件剩 2**：`read_f64_soa`/`read_f64_soa_at`） |
+| — | 其余：`yll/src/convert.rs` **剩 2**、`yll/src/lib.rs` 2、`examples/kernel_probe.rs` 11 | **15** | ⏳ 待办 |
 
 > **口径提醒（本轮又踩到一次边）**：`grep -c "unsafe fn" <file>` 数的是**该文件的定义数**，
 > **不是"还剩几处"**——`convert.rs` 做完 4 个后它仍然打印 8。**"还剩多少"只能靠逐文件核对

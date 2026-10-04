@@ -138,11 +138,14 @@ pub unsafe fn read_f64_soa_at<const N: usize>(
 /// # Safety
 /// 必须在解释器线程内调用（`yll_*` 构造器非线程安全）。
 pub unsafe fn push_f64_array(values: &[f64]) -> *mut YllValueWrapper {
-    let arr = yll_arr_new();
-    for &v in values {
-        yll_arr_push(arr, yll_float(v));
+    // SAFETY: 必须在解释器线程内调用（`yll_*` 构造器非线程安全，见上面的 `# Safety`）。
+    unsafe {
+        let arr = yll_arr_new();
+        for &v in values {
+            yll_arr_push(arr, yll_float(v));
+        }
+        arr
     }
-    arr
 }
 
 /// 把多组 `f64` 变成"数组的数组"（多分量内核的返回值）。
@@ -150,9 +153,12 @@ pub unsafe fn push_f64_array(values: &[f64]) -> *mut YllValueWrapper {
 /// # Safety
 /// 见 [`push_f64_array`]。
 pub unsafe fn push_f64_arrays(arrays: &[&[f64]]) -> *mut YllValueWrapper {
-    let outer = yll_arr_new();
-    for a in arrays {
-        yll_arr_push(outer, push_f64_array(a));
+    // SAFETY: 见 [`push_f64_array`]（同一条"解释器线程内"的前提）。
+    unsafe {
+        let outer = yll_arr_new();
+        for a in arrays {
+            yll_arr_push(outer, push_f64_array(a));
+        }
+        outer
     }
-    outer
 }
