@@ -128,7 +128,9 @@ pub(crate) unsafe fn gemv_f16(a: &[u16], x: &[f32], m: usize, k: usize, y: &mut 
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
-    gemv_f16_rows(a, x, k, y);
+    // SAFETY: 上面三条断言与调用方前提一致；`gemv_f16_rows` 的额外前提
+    // （`a.len() == y.len() * k`）由 `m` 条行块满足。
+    unsafe { gemv_f16_rows(a, x, k, y) };
 }
 
 /// [`gemv_f16`] 的**行块**形式：算 `y.len()` 行、每行 `k` 个权重。
@@ -142,7 +144,9 @@ pub(crate) unsafe fn gemv_f16_rows(a: &[u16], x: &[f32], k: usize, y: &mut [f32]
     debug_assert_eq!(a.len(), y.len() * k, "gemv_f16_rows: 行块长度不符");
     debug_assert_eq!(x.len(), k, "gemv_f16_rows: 向量长度不符");
     for (r, out) in y.iter_mut().enumerate() {
-        *out = dot_f16(&a[r * k..(r + 1) * k], x);
+        // SAFETY: `a.len() == y.len() * k` + `x.len() == k`（函数的 `# Safety`）；
+        // 行块 `[r*k, (r+1)*k)` 在界内。
+        *out = unsafe { dot_f16(&a[r * k..(r + 1) * k], x) };
     }
 }
 

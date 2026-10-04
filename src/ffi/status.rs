@@ -106,7 +106,8 @@ pub(crate) unsafe fn checked_slice<'a, T>(p: *const T, n: usize) -> Result<&'a [
             Err(LasxStatus::NullPointer)
         };
     }
-    Ok(std::slice::from_raw_parts(p, n))
+    // SAFETY: 上面已排除空指针；调用方保证 `p` 有 `n` 个可读 `T`（见函数的 `# Safety`）。
+    unsafe { Ok(std::slice::from_raw_parts(p, n)) }
 }
 
 /// 由裸指针 + 长度构造可写切片；`n > 0` 时指针不得为空。
@@ -125,7 +126,9 @@ pub(crate) unsafe fn checked_slice_mut<'a, T>(
             Err(LasxStatus::NullPointer)
         };
     }
-    Ok(std::slice::from_raw_parts_mut(p, n))
+    // SAFETY: 上面已排除空指针；调用方保证 `p` 有 `n` 个可写 `T` 且不与其他在用引用重叠
+    // （见函数的 `# Safety`）。
+    unsafe { Ok(std::slice::from_raw_parts_mut(p, n)) }
 }
 
 /// 形状相乘，溢出报错。
