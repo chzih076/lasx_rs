@@ -26,24 +26,28 @@ unsafe fn read_array<T: Copy + Default>(
     name: &str,
     convert: impl Fn(f64, usize, &str) -> Result<T, String>,
 ) -> Result<AlignedVec<T>, String> {
-    let len = arg_arr_len(argv, idx, name)?;
-    if len > MAX_LEN {
-        return Err(format!("参数 `{name}` 过大（{len} > {MAX_LEN}）"));
+    // SAFETY: `argv` 至少有 `idx + 1` 个有效元素（见上面的 `# Safety`）；`yll_*` 是
+    // `unsafe extern` 宿主函数，`arr` 由 `arg` 按同一约定取得、下标由 `len` 界定。
+    unsafe {
+        let len = arg_arr_len(argv, idx, name)?;
+        if len > MAX_LEN {
+            return Err(format!("参数 `{name}` 过大（{len} > {MAX_LEN}）"));
+        }
+        let arr = arg(argv, idx);
+        let mut out = AlignedVec::<T>::new(len);
+        for (i, slot) in out.as_mut_slice().iter_mut().enumerate() {
+            let v = yll_arr_get(arr, i as i64);
+            let raw = if yll_is_float(v) {
+                yll_as_float(v)
+            } else if yll_is_int(v) {
+                yll_as_int(v) as f64
+            } else {
+                return Err(format!("参数 `{name}` 的第 {i} 个元素不是数值"));
+            };
+            *slot = convert(raw, i, name)?;
+        }
+        Ok(out)
     }
-    let arr = arg(argv, idx);
-    let mut out = AlignedVec::<T>::new(len);
-    for (i, slot) in out.as_mut_slice().iter_mut().enumerate() {
-        let v = yll_arr_get(arr, i as i64);
-        let raw = if yll_is_float(v) {
-            yll_as_float(v)
-        } else if yll_is_int(v) {
-            yll_as_int(v) as f64
-        } else {
-            return Err(format!("参数 `{name}` 的第 {i} 个元素不是数值"));
-        };
-        *slot = convert(raw, i, name)?;
-    }
-    Ok(out)
 }
 
 /// 读成对齐的 `f64` 缓冲（`f64` 内核用）。
@@ -55,7 +59,8 @@ pub unsafe fn read_f64(
     idx: usize,
     name: &str,
 ) -> Result<AlignedVec<f64>, String> {
-    read_array(argv, idx, name, |f, _, _| Ok(f))
+    // SAFETY: 见 [`read_array`]。
+    unsafe { read_array(argv, idx, name, |f, _, _| Ok(f)) }
 }
 
 /// 读成对齐的 `f32` 缓冲（`f32` 内核用；按 IEEE 就近舍入收窄）。
@@ -67,7 +72,8 @@ pub unsafe fn read_f32(
     idx: usize,
     name: &str,
 ) -> Result<AlignedVec<f32>, String> {
-    read_array(argv, idx, name, |f, _, _| Ok(f as f32))
+    // SAFETY: 见 [`read_array`]。
+    unsafe { read_array(argv, idx, name, |f, _, _| Ok(f as f32)) }
 }
 
 /// 读成对齐的 `i8` 缓冲（量化内核用；要求是 −128..=127 上的整数）。
@@ -79,12 +85,15 @@ pub unsafe fn read_i8(
     idx: usize,
     name: &str,
 ) -> Result<AlignedVec<i8>, String> {
-    read_array(argv, idx, name, |f, i, name| {
-        if f.fract() != 0.0 || !(-128.0..=127.0).contains(&f) {
-            return Err(format!("参数 `{name}` 的第 {i} 个元素不是 int8（{f}）"));
-        }
-        Ok(f as i8)
-    })
+    // SAFETY: 见 [`read_array`]。
+    unsafe {
+        read_array(argv, idx, name, |f, i, name| {
+            if f.fract() != 0.0 || !(-128.0..=127.0).contains(&f) {
+                return Err(format!("参数 `{name}` 的第 {i} 个元素不是 int8（{f}）"));
+            }
+            Ok(f as i8)
+        })
+    }
 }
 
 /// 读一组等长数组（SOA 内核的多个分量），任一长度不一致即报错。
