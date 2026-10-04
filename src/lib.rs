@@ -47,12 +47,9 @@
 //!
 //! 测试/验证用的线程级降级钩子见 [`lasx_force_lsx_thread`]。
 #![feature(stdarch_loongarch)]
-// **edition 2024 迁移债（2026-10-04）**：2024 把 `unsafe_op_in_unsafe_fn` 变成默认警告，
-// 本 crate 有 **~149 处**"`unsafe fn` 体内隐式 unsafe"（集中在 `src/arch/*` 的 intrinsic
-// 包装与 `src/ops/*` 对它们的调用）。这些函数的 SAFETY 契约本来就写在**模块/函数级**
-// （见各文件顶部的 SAFETY 段），逐处显式包块是一个**独立的、机械的**改动，记为待办
-// （`docs/dev.md` §22.6，触发条件：下一次动 `src/arch` 或 `src/ops` 时按文件就地显式化）。
-// **现在显式允许，而不是让它以 149 条警告的形式存在**——警告会被忽略，允许是可见的债。
+// edition 2024 迁移债：**还剩 2 个文件 24 处**（`src/ops/matmul_f64.rs` 14、`src/ops/dot_i8.rs` 10）
+// ——这两处是"删掉 allow 实测"出来的，不是靠 `grep "unsafe fn"` 代理指标（那个指标被
+// `head -14` 截断过，漏了它们）。还清后再删本行，见 `docs/dev.md` §22.6。
 #![allow(unsafe_op_in_unsafe_fn)]
 // **unsafe 审查**：`undocumented_unsafe_blocks` 要求每个 `unsafe` 块都紧邻一条 SAFETY 说明。
 // 策略（见 docs/dev.md §17）：
