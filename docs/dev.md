@@ -3624,7 +3624,8 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 6 | `src/pool/mod.rs`（`publish_no_wait` 的 `UnsafeCell` 写、`thunk` 的 `from_raw_parts_mut`） | **2** | ✅ 已显式化（2026-10-04） |
 | 7 | `src/ops/rope.rs`（`rope_f32` 循环开头那 4 行指针运算——函数内部**本来就**有 `unsafe {}`，露出来的是它们） | **1** | ✅ 已显式化（2026-10-04） |
 | 8 | `src/ops/dot_f16.rs` 的 `dot_f16` 本体（**长体**：4 条累加链 + 尾部 lane 聚合） | **1** | ✅ 已显式化（2026-10-04） |
-| — | 其余：`src/ops/rk4_j2_step_batch.rs` 的 `j2_accel_vec`、`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **31** | ⏳ 待办 |
+| 9 | `src/ops/rk4_j2_step_batch.rs` 的 `j2_accel_vec`（长体，纯寄存器 J2 摄动加速度） | **1** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧清零** |
+| — | 其余：`yll/src/*` 14、`examples/kernel_probe.rs` 11 … | **30** | ⏳ 待办 |
 
 **长函数体的做法（本轮记下，后面照用）**：不必整段重写——只做**两次小编辑**：① 在签名行之后
 插入 `unsafe {`（并写 `// SAFETY:`）；② 在函数最后一行返回值之后插入 `}`。缩进交给

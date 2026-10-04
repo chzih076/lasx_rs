@@ -181,26 +181,29 @@ unsafe fn j2_accel_vec(
     v1: m256d,
     v3: m256d,
 ) -> (m256d, m256d, m256d) {
-    let vrm2 = lasx_xvfadd_d(
-        lasx_xvfmul_d(vx, vx),
-        lasx_xvfadd_d(lasx_xvfmul_d(vy, vy), lasx_xvfmul_d(vz, vz)),
-    );
-    let vrm = lasx_xvfsqrt_d(vrm2);
-    // 1 次除法 + 乘法推导（与 j2_accel_batch 的 LASX/标量路径同式，见 docs/dev.md §13）
-    let vone = lasx::splat_f64(1.0);
-    let vinv2 = lasx_xvfdiv_d(vone, vrm2);
-    let vinvrm = lasx_xvfmul_d(vinv2, vrm);
-    let vinv3 = lasx_xvfmul_d(vinv2, vinvrm);
-    let vinv5 = lasx_xvfmul_d(vinv3, vinv2);
-    let vcen = lasx_xvfmul_d(vmu, vinv3); // −μ/|r|³
-    let vk = lasx_xvfmul_d(vj2k, vinv5); // +1.5·J2·μ·Re²/|r|⁵
-    let vzr2 = lasx_xvfmul_d(lasx_xvfmul_d(vz, vz), vinv2);
-    let m1 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v1); // 5·zr2−1
-    let m3 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v3); // 5·zr2−3
-    let ax = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vx), m1, lasx_xvfmul_d(vcen, vx));
-    let ay = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vy), m1, lasx_xvfmul_d(vcen, vy));
-    let az = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vz), m3, lasx_xvfmul_d(vcen, vz));
-    (ax, ay, az)
+    // SAFETY: 纯寄存器运算（`lasx_xv*_d` 系列都在向量寄存器上），无内存访问、无前提。
+    unsafe {
+        let vrm2 = lasx_xvfadd_d(
+            lasx_xvfmul_d(vx, vx),
+            lasx_xvfadd_d(lasx_xvfmul_d(vy, vy), lasx_xvfmul_d(vz, vz)),
+        );
+        let vrm = lasx_xvfsqrt_d(vrm2);
+        // 1 次除法 + 乘法推导（与 j2_accel_batch 的 LASX/标量路径同式，见 docs/dev.md §13）
+        let vone = lasx::splat_f64(1.0);
+        let vinv2 = lasx_xvfdiv_d(vone, vrm2);
+        let vinvrm = lasx_xvfmul_d(vinv2, vrm);
+        let vinv3 = lasx_xvfmul_d(vinv2, vinvrm);
+        let vinv5 = lasx_xvfmul_d(vinv3, vinv2);
+        let vcen = lasx_xvfmul_d(vmu, vinv3); // −μ/|r|³
+        let vk = lasx_xvfmul_d(vj2k, vinv5); // +1.5·J2·μ·Re²/|r|⁵
+        let vzr2 = lasx_xvfmul_d(lasx_xvfmul_d(vz, vz), vinv2);
+        let m1 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v1); // 5·zr2−1
+        let m3 = lasx_xvfsub_d(lasx_xvfmul_d(v5, vzr2), v3); // 5·zr2−3
+        let ax = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vx), m1, lasx_xvfmul_d(vcen, vx));
+        let ay = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vy), m1, lasx_xvfmul_d(vcen, vy));
+        let az = lasx_xvfmadd_d(lasx_xvfmul_d(vk, vz), m3, lasx_xvfmul_d(vcen, vz));
+        (ax, ay, az)
+    }
 }
 
 pub(crate) fn rk4_j2_step_scalar(
