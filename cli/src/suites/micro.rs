@@ -561,10 +561,9 @@ pub fn dispatch_overhead() {
         );
         let q: Vec<f64> = (0..n).map(|i| 0.5 + 1e-6 * i as f64).collect();
         let mut outs: Vec<Vec<f64>> = (0..9).map(|_| vec![0f64; n]).collect();
-        let x = timeit(|| {
-            let v = lasx_rs::api::quat_to_dcm_batch([&q[..], &q[..], &q[..], &q[..]]).unwrap();
-            let _ = black_box(v[0][0]);
-        });
+        // **对称设计**（上一版"api vs FFI"给出反直觉的 2.3×，已查明两者调的是**同一个 op**）：
+        // 两个闭包都走**同一个 FFI 内核**，唯一差别是"9 个输出缓冲预分配 vs 每次分配"
+        // ⇒ 差额才是**纯粹的分配成本**。
         let y = timeit(|| {
             lasx_quat_to_dcm_batch(
                 q.as_ptr(),
@@ -584,8 +583,28 @@ pub fn dispatch_overhead() {
             );
             let _ = black_box(outs[0][0]);
         });
+        let x = timeit(|| {
+            let mut o: Vec<Vec<f64>> = (0..9).map(|_| vec![0f64; n]).collect();
+            lasx_quat_to_dcm_batch(
+                q.as_ptr(),
+                q.as_ptr(),
+                q.as_ptr(),
+                q.as_ptr(),
+                o[0].as_mut_ptr(),
+                o[1].as_mut_ptr(),
+                o[2].as_mut_ptr(),
+                o[3].as_mut_ptr(),
+                o[4].as_mut_ptr(),
+                o[5].as_mut_ptr(),
+                o[6].as_mut_ptr(),
+                o[7].as_mut_ptr(),
+                o[8].as_mut_ptr(),
+                n as i32,
+            );
+            let _ = black_box(o[0][0]);
+        });
         println!(
-            "| `quat_to_dcm_batch`（**9 缓冲**） | {n} | {} | {} | **{:.1}%** |",
+            "| `quat_to_dcm_batch`（9 缓冲，对称 A/B） | {n} | 每次分配 {} | 预分配 {} | **{:.1}%** |",
             crate::timing::fmt_t(x),
             crate::timing::fmt_t(y),
             100.0 * x.saturating_sub(y).as_secs_f64() / x.as_secs_f64()
