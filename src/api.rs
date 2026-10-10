@@ -2888,4 +2888,60 @@ mod tests {
         ));
         assert!(rope_into(&[], &[], &[], 0, cols_r, nd, RopeMode::NeoX, &mut []).is_ok());
     }
+
+    /// **`quat_to_dcm_batch`：api 与裸 FFI 是否逐位一致？**
+    ///
+    /// 起因是一条反常识的 A/B（`lasx_bench dispatch`）：api（**9 个缓冲、每次都分配**）比
+    /// FFI（预分配）**快 2.3×**（900 µs vs 2.11 ms）——分配不可能产生这个方向的差额
+    /// ⇒ 两者**不是同一条路径**。这个测试回答"数值是否一致"：
+    /// 一致 ⇒ 纯性能差异；不一致 ⇒ **真 bug**（优先级高于任何 `_into`）。
+    #[test]
+    fn test_quat_to_dcm_batch_api_matches_ffi_bit_for_bit() {
+        let n = 9usize;
+        let mut rng = crate::ops::testutil::Lcg(0xd0c0_1234);
+        // 4 个分量各自独立（避免"同一个指针传 4 次"这种退化输入）
+        let qw: Vec<f64> = (0..n).map(|_| 2.0 * rng.f64() - 1.0).collect();
+        let qx: Vec<f64> = (0..n).map(|_| 2.0 * rng.f64() - 1.0).collect();
+        let qy: Vec<f64> = (0..n).map(|_| 2.0 * rng.f64() - 1.0).collect();
+        let qz: Vec<f64> = (0..n).map(|_| 2.0 * rng.f64() - 1.0).collect();
+        let api_out = quat_to_dcm_batch([&qw[..], &qx[..], &qy[..], &qz[..]]).unwrap();
+        let mut ffi_out: [Vec<f64>; 9] = std::array::from_fn(|_| vec![0f64; n]);
+        // SAFETY: 四个输入各 n 个 `f64`、九个输出各 n 个可写 `f64`（都是本测试自己分配的）。
+        unsafe {
+            crate::ffi::attitude::lasx_quat_to_dcm_batch(
+                qw.as_ptr(),
+                qx.as_ptr(),
+                qy.as_ptr(),
+                qz.as_ptr(),
+                ffi_out[0].as_mut_ptr(),
+                ffi_out[1].as_mut_ptr(),
+                ffi_out[2].as_mut_ptr(),
+                ffi_out[3].as_mut_ptr(),
+                ffi_out[4].as_mut_ptr(),
+                ffi_out[5].as_mut_ptr(),
+                ffi_out[6].as_mut_ptr(),
+                ffi_out[7].as_mut_ptr(),
+                ffi_out[8].as_mut_ptr(),
+                n as i32,
+            );
+        }
+        let mut diffs = 0usize;
+        for k in 0..9 {
+            for i in 0..n {
+                if api_out[k][i].to_bits() != ffi_out[k][i].to_bits() {
+                    diffs += 1;
+                    if diffs <= 3 {
+                        println!(
+                            "  差异：m{k}[{i}] api={:.17e} ffi={:.17e}",
+                            api_out[k][i], ffi_out[k][i]
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            diffs, 0,
+            "api 与 FFI 的 quat_to_dcm_batch 结果不逐位一致（{diffs} 个分量）——这不是分配开销，是路径差异"
+        );
+    }
 }
