@@ -249,7 +249,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ## 4. 测试与验证
 
-当前规模：**216 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
+当前规模：**217 个单元测试**（`cargo test --workspace --release`；N1 批次前是 128 个，
 其中 27 个分布在 §20 的六个算子，11 个是 §19.13 的一维 DSL，12 个是 §19.14 的批量样本视图，
 18 个是 §21 的 N3 批次（量化/反量化/GEMV/批量 GEMM/C ABI），2 个是 §21.9 里 k 方向归约那两项
 （逐位一致 + 错误/退化），2 个是 §20.7 的池化 `gemv_f16`，
@@ -261,7 +261,8 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 **1 个是 int8 家族的 `_into`**（量化/反量化/absmax/gemv/matmul 的免分配版与分配版逐位一致 + 错误路径），
 **1 个是 int8 的整模型级口径**（合成 12 层栈，实测 7.250e-4 ≤ 5e-3，见 `docs/ops.md` §2.15），
 **1 个是激活的 `_into`**（`silu`/`gelu_quick`/`gelu_erf` 免分配版逐位一致 + 错误路径，
-分配占比实测 10–15%，见 §7.9 ③））。
+分配占比实测 10–15%，见 §7.9 ③），
+**1 个是 `quat_to_dcm_batch` 的"api ≡ FFI"逐位对拍**（起因见 §7.9：两条入口快慢差 2.3×，先证明数值一致））。
 
 | 测试类型 | 目的 | 例子 |
 |---|---|---|
@@ -292,7 +293,7 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 216 单测（+ 5 个宏单测 + 17 个文档测试）
+cargo test --workspace --release        # 217 单测（+ 5 个宏单测 + 17 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
