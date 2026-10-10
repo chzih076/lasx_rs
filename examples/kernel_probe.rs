@@ -347,30 +347,34 @@ unsafe fn probe_dfma16() -> f64 {
 /// `norepl`：16 FMA + 4 条 B 载入（A 广播用常量寄存器顶替）。
 #[inline(never)]
 unsafe fn probe_norepl(strip: &[f32], k: usize) -> f64 {
-    let s = [
-        splat_f32(1.0),
-        splat_f32(0.5),
-        splat_f32(0.25),
-        splat_f32(0.125),
-    ];
-    let mut acc = [zero_f32x8(); 16];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 32);
-            let b = [
-                load_f32x8(ptr),
-                load_f32x8(ptr.add(8)),
-                load_f32x8(ptr.add(16)),
-                load_f32x8(ptr.add(24)),
-            ];
-            for i in 0..4 {
-                for r in 0..4 {
-                    acc[r * 4 + i] = lasx_xvfmadd_s(b[i], s[r], acc[r * 4 + i]);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * 32` 个 `f32`（调用点保证）；`ptr` 的 4 次 `add`
+    // 落在 `[0, k*32)` 内。
+    unsafe {
+        let s = [
+            splat_f32(1.0),
+            splat_f32(0.5),
+            splat_f32(0.25),
+            splat_f32(0.125),
+        ];
+        let mut acc = [zero_f32x8(); 16];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 32);
+                let b = [
+                    load_f32x8(ptr),
+                    load_f32x8(ptr.add(8)),
+                    load_f32x8(ptr.add(16)),
+                    load_f32x8(ptr.add(24)),
+                ];
+                for i in 0..4 {
+                    for r in 0..4 {
+                        acc[r * 4 + i] = lasx_xvfmadd_s(b[i], s[r], acc[r * 4 + i]);
+                    }
                 }
             }
         }
+        sink(&acc)
     }
-    sink(&acc)
 }
 
 /// `kernel`：与生产内核同形 —— 4 行 × 32 列，4 条 B 载入 + 4 条 A 广播 + 16 FMA。
