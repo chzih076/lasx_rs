@@ -2906,25 +2906,26 @@ mod tests {
         let qz: Vec<f64> = (0..n).map(|_| 2.0 * rng.f64() - 1.0).collect();
         let api_out = quat_to_dcm_batch([&qw[..], &qx[..], &qy[..], &qz[..]]).unwrap();
         let mut ffi_out: [Vec<f64>; 9] = std::array::from_fn(|_| vec![0f64; n]);
-        // SAFETY: 四个输入各 n 个 `f64`、九个输出各 n 个可写 `f64`（都是本测试自己分配的）。
-        unsafe {
-            crate::ffi::attitude::lasx_quat_to_dcm_batch(
-                qw.as_ptr(),
-                qx.as_ptr(),
-                qy.as_ptr(),
-                qz.as_ptr(),
-                ffi_out[0].as_mut_ptr(),
-                ffi_out[1].as_mut_ptr(),
-                ffi_out[2].as_mut_ptr(),
-                ffi_out[3].as_mut_ptr(),
-                ffi_out[4].as_mut_ptr(),
-                ffi_out[5].as_mut_ptr(),
-                ffi_out[6].as_mut_ptr(),
-                ffi_out[7].as_mut_ptr(),
-                ffi_out[8].as_mut_ptr(),
-                n as i32,
-            );
-        }
+        // SAFETY 说明：四个输入各 n 个 `f64`、九个输出各 n 个可写 `f64`（都是本测试自己分配的）。
+        // 注意 `lasx_quat_to_dcm_batch` 是**安全**的 `pub extern "C" fn`（裸指针解引用在它内部
+        // 用 `unsafe` 包着），所以调用点**不需要** `unsafe` 块——clippy 的 `unused_unsafe` 就是
+        // 这么发现的（这也解释了为什么它没有 `_checked` 变体的那种签名约定）。
+        crate::ffi::attitude::lasx_quat_to_dcm_batch(
+            qw.as_ptr(),
+            qx.as_ptr(),
+            qy.as_ptr(),
+            qz.as_ptr(),
+            ffi_out[0].as_mut_ptr(),
+            ffi_out[1].as_mut_ptr(),
+            ffi_out[2].as_mut_ptr(),
+            ffi_out[3].as_mut_ptr(),
+            ffi_out[4].as_mut_ptr(),
+            ffi_out[5].as_mut_ptr(),
+            ffi_out[6].as_mut_ptr(),
+            ffi_out[7].as_mut_ptr(),
+            ffi_out[8].as_mut_ptr(),
+            n as i32,
+        );
         let mut diffs = 0usize;
         for k in 0..9 {
             for i in 0..n {
