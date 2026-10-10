@@ -446,31 +446,35 @@ unsafe fn probe_kernel_lr(strip: &[f32], at: &[f32], k: usize) -> f64 {
 /// `c<行>x<列>`：扫描 (R, C) 形状空间（累加器 = R·C/8，必须 ≤ 16 才放得进寄存器）。
 #[inline(never)]
 unsafe fn probe_rc<const R: usize, const NB: usize>(strip: &[f32], at: &[f32], k: usize) -> f64 {
-    let mut acc = [[zero_f32x8(); NB]; R];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 8 * NB);
-            let mut b = [zero_f32x8(); NB];
-            for (i, bi) in b.iter_mut().enumerate() {
-                *bi = load_f32x8(ptr.add(i * 8));
-            }
-            for (r, row) in acc.iter_mut().enumerate() {
-                let a = splat_f32(*at.get_unchecked(r * k + p));
-                for (i, x) in row.iter_mut().enumerate() {
-                    *x = lasx_xvfmadd_s(b[i], a, *x);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * R * NB * 8` 个 `f32`、`at` 至少 `R * k` 个
+    // （调用点保证）；循环里各处 `add`/`get_unchecked` 的偏移都落在界内。
+    unsafe {
+        let mut acc = [[zero_f32x8(); NB]; R];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 8 * NB);
+                let mut b = [zero_f32x8(); NB];
+                for (i, bi) in b.iter_mut().enumerate() {
+                    *bi = load_f32x8(ptr.add(i * 8));
+                }
+                for (r, row) in acc.iter_mut().enumerate() {
+                    let a = splat_f32(*at.get_unchecked(r * k + p));
+                    for (i, x) in row.iter_mut().enumerate() {
+                        *x = lasx_xvfmadd_s(b[i], a, *x);
+                    }
                 }
             }
         }
-    }
-    let mut tmp = [0f32; 8];
-    let mut s = 0f64;
-    for row in acc.iter() {
-        for v in row.iter() {
-            store_f32x8(tmp.as_mut_ptr(), *v);
-            s += tmp.iter().map(|&x| x as f64).sum::<f64>();
+        let mut tmp = [0f32; 8];
+        let mut s = 0f64;
+        for row in acc.iter() {
+            for v in row.iter() {
+                store_f32x8(tmp.as_mut_ptr(), *v);
+                s += tmp.iter().map(|&x| x as f64).sum::<f64>();
+            }
         }
+        black_box(s)
     }
-    black_box(s)
 }
 
 fn main() {
