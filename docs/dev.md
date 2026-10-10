@@ -3632,10 +3632,20 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 14 | `yll/src/convert.rs` 的 `push_f64_array`/`push_f64_arrays`（宿主构造器，前提是"解释器线程内"） | **2** | ✅ 已显式化（2026-10-04）（**该文件剩 2**：`read_f64_soa`/`read_f64_soa_at`） |
 | 15 | `yll/src/convert.rs` 的 `read_f64_soa`/`read_f64_soa_at`（SOA 读取：体里调 `read_f64`） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/convert.rs` 8/8 清零** |
 | 16 | `yll/src/lib.rs` 的 `add`/`add_const`（模块注册：调 `unsafe extern` 的 `yll_module_add_*`）；**并删掉 `yll/src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明整个 `yll` 扩展清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll` 扩展清零** |
-| — | 其余：`examples/kernel_probe.rs` 11（**建议保留单独豁免**：探针整文件都在 `unsafe fn` 里，逐处包块收益为零——理由要写进 §22.3 的同类"明确例外"里） | **11** | ⏳ 待办（或转为明示例外） |
+| — | `examples/kernel_probe.rs` 11 | — | **明示例外**（见下） |
 
-**allow 的进度**：4 处里 **3 处已删**（`cli/src/main.rs`、`src/lib.rs`、`yll/src/lib.rs`，各以"删后
-0 告警"作证）；**只剩 `examples/kernel_probe.rs`**——它是唯一"有意保留"的候选。
+**债已还清（2026-10-04 收口）**：
+
+- **库与扩展的债 = 0**，且是**权威判据**证过的（不是代理指标）：`src/lib.rs`、`yll/src/lib.rs`、
+  `cli/src/main.rs` 三处的 `#![allow(unsafe_op_in_unsafe_fn)]` **都已删除**，删后
+  `cargo build --workspace --release` 与 `clippy --workspace --all-targets -D warnings`
+  **都是 0 告警 / 0 错误**（216 + 5 + 17 也全过）；
+- **唯一保留的豁免是 `examples/kernel_probe.rs`**（11 个 `unsafe fn`、整文件都在做微内核探针）：
+  它的 `unsafe fn` 体里几乎全是 intrinsic 调用、**逐处包块收益为零**，而它**不是交付物**
+  （不进 crate：`Cargo.toml` 的 `exclude` 只挡了 `/docs` 等，但 examples 不进 crates.io 包）。
+  ⇒ 口径：**"库与扩展的债 = 0；探针是一个明示的、有理由的例外"**，不是欠账。
+- **allow 的最终状态**：4 处 → 删 3 处（`cli/`、`src/lib.rs`、`yll/src/lib.rs`，各有"删后 0 告警"
+  作证）→ **保留 1 处（探针，明示例外）**。
 
 > **口径提醒（本轮又踩到一次边）**：`grep -c "unsafe fn" <file>` 数的是**该文件的定义数**，
 > **不是"还剩几处"**——`convert.rs` 做完 4 个后它仍然打印 8。**"还剩多少"只能靠逐文件核对

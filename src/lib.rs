@@ -1,5 +1,16 @@
 //! lasx_rs —— 龙芯 LoongArch 平台的 LASX（256 位）/ LSX（128 位）批量数值内核库。
 //!
+//! # 平台要求（分发前必读）
+//!
+//! | 要求 | 说明 |
+//! |---|---|
+//! | **只在 `loongarch64` 上编译** | `src/` 里 **0 处** `target_arch` 门控、66 个文件直接用 LASX/LSX intrinsic ⇒ 其它架构**编译期**就过不去（这是**有意**的：不给 x86 加标量兜底，避免把"用错平台"从编译期错误退化成运行期错结果）。依赖方必须写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会直接红（Cargo 为所有目标解析依赖、不按平台跳过） |
+//! | **需要 nightly 工具链** | 唯一的 feature 门是 `#![feature(stdarch_loongarch)]`（跟踪 **issue [#117427]**）——stable 上 `std::arch::loongarch64` 仍是 unstable（实测：stable **1.98.1** 与 nightly **1.100.0** 都仍要求该门）。**复查触发条件**：某个 stable 的 release note 宣布 `stdarch_loongarch` 稳定时，删掉 `src/lib.rs`/`cli/src/main.rs` 里的那两行 `#![feature(...)]` 并跑全套测试，然后本 crate 才能真正在 stable 上编译 |
+//! | **`-C target-feature=+lasx` 只影响性能** | 仓库的 `.cargo/config.toml` 里有它，但**依赖方的 cargo 不会读依赖自带的 config**。实测：**不带它也能编、数值也位精确**（intrinsic 自带 `#[target_feature(enable = "lasx")]`）；它对性能有意义（没有全局特性 ⇒ 那些 LASX 函数不能跨函数内联），所以想拿满性能请自行加 |
+//! | **LA664 勘误** | 3A6000/3C6000/3B6000 的原子操作丢失更新（`amadd` 等无屏障变体）会**静默错结果**；本库的生产路径已全部使用带屏障的序（`AcqRel`），并有"同输入跑两次逐位一致"的回归测试守着。详见 [`docs/platform.md`](https://github.com/chzih076/lasx_rs/blob/master/docs/platform.md) §1 |
+//!
+//! [#117427]: https://github.com/rust-lang/rust/issues/117427
+//!
 //! 无 LASX 的 CPU（3A5000/3A6000 等 LSX-only）自动降级到 LSX 路径，逐位确定。
 //!
 //! # 代码组织

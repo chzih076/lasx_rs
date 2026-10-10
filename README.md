@@ -34,6 +34,15 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 - **NN 侧算子按目标平台取舍**：N1 批次**不提供 LSX 降级**（目标平台 6000 系列均支持 LASX），
   在无 LASX 的 CPU 上执行 LASX 指令会产生 SIGILL，使用时需自行按 CPU 能力调度。
 
+## 平台要求（用之前先看这一段）
+
+| 要求 | 说明 |
+|---|---|
+| **只在 `loongarch64` 上编译** | 其它架构**编译期**就过不去（`src/` 里 0 处 `target_arch` 门控）。依赖方请写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则你的 x86 CI 会直接红（Cargo 为所有目标解析依赖、不按平台跳过）。这是**有意**的：不给 x86 加标量兜底，避免把"用错平台"从编译期错误退化成运行期错结果 |
+| **需要 nightly** | 唯一 feature 门是 `#![feature(stdarch_loongarch)]`（跟踪 [issue #117427](https://github.com/rust-lang/rust/issues/117427)）：stable 上 `std::arch::loongarch64` 仍是 unstable（实测 stable 1.98.1 与 nightly 1.100.0 都仍要求该门）。**等它稳定后**删掉那两行 `#![feature(...)]` 就能在 stable 上编译 |
+| **`+lasx` 只影响性能** | 仓库 `.cargo/config.toml` 里有 `-C target-feature=+lasx`，但**依赖方的 cargo 不会读依赖自带的 config**。实测**不带它也能编、也位精确**；想拿满性能请自行加 |
+| **LA664 勘误** | 3A6000/3C6000/3B6000 的原子操作丢失更新会**静默错结果**；本库生产路径已全部用带屏障的序，并有"同输入跑两次逐位一致"的回归测试守着（见 [docs/platform.md](docs/platform.md) §1） |
+
 ## 快速开始
 
 ```bash
