@@ -370,25 +370,29 @@ unsafe fn probe_norepl(strip: &[f32], k: usize) -> f64 {
 /// `kernel`：与生产内核同形 —— 4 行 × 32 列，4 条 B 载入 + 4 条 A 广播 + 16 FMA。
 #[inline(never)]
 unsafe fn probe_kernel(strip: &[f32], at: &[f32], k: usize) -> f64 {
-    let mut acc = [zero_f32x8(); 16];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 32);
-            let b = [
-                load_f32x8(ptr),
-                load_f32x8(ptr.add(8)),
-                load_f32x8(ptr.add(16)),
-                load_f32x8(ptr.add(24)),
-            ];
-            for r in 0..4 {
-                let a = splat_f32(*at.get_unchecked(r * k + p));
-                for i in 0..4 {
-                    acc[r * 4 + i] = lasx_xvfmadd_s(b[i], a, acc[r * 4 + i]);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * 32` 个 `f32`、`at` 至少 `4 * k` 个（调用点保证）；
+    // 循环里的 `add` 与广播地址都落在各自界内。
+    unsafe {
+        let mut acc = [zero_f32x8(); 16];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 32);
+                let b = [
+                    load_f32x8(ptr),
+                    load_f32x8(ptr.add(8)),
+                    load_f32x8(ptr.add(16)),
+                    load_f32x8(ptr.add(24)),
+                ];
+                for r in 0..4 {
+                    let a = splat_f32(*at.get_unchecked(r * k + p));
+                    for i in 0..4 {
+                        acc[r * 4 + i] = lasx_xvfmadd_s(b[i], a, acc[r * 4 + i]);
+                    }
                 }
             }
         }
+        sink(&acc)
     }
-    sink(&acc)
 }
 
 /// `kernel_lr`：与 `kernel` 同形，但 A 广播改用**载入-复制**（`xvldrepl.w`）从内存直接广播。
