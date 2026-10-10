@@ -531,6 +531,66 @@ pub fn dispatch_overhead() {
             100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
         );
     }
+    // 物理/几何批量族（f64）：api 分配版 vs FFI 预分配版。**注意它们一次返回多个缓冲**
+    // （`norm3_batch` 1 个、`quat_to_dcm_batch` **9 个**）⇒ 差额里含"每个缓冲一次分配"。
+    {
+        let n = 65536usize;
+        let a1: Vec<f64> = (0..n).map(|i| i as f64 * 1e-3 + 1.0).collect();
+        let a2: Vec<f64> = (0..n).map(|i| i as f64 * 2e-3).collect();
+        let a3: Vec<f64> = (0..n).map(|i| i as f64 * 3e-3).collect();
+        let mut o = vec![0f64; n];
+        let x = timeit(|| {
+            let v = lasx_rs::api::norm3_batch(&a1, &a2, &a3).unwrap();
+            let _ = black_box(v[0]);
+        });
+        let y = timeit(|| {
+            lasx_norm3_batch(
+                a1.as_ptr(),
+                a2.as_ptr(),
+                a3.as_ptr(),
+                o.as_mut_ptr(),
+                n as i32,
+            );
+            let _ = black_box(o[0]);
+        });
+        println!(
+            "| `norm3_batch`（1 缓冲） | {n} | {} | {} | **{:.1}%** |",
+            crate::timing::fmt_t(x),
+            crate::timing::fmt_t(y),
+            100.0 * x.saturating_sub(y).as_secs_f64() / x.as_secs_f64()
+        );
+        let q: Vec<f64> = (0..n).map(|i| 0.5 + 1e-6 * i as f64).collect();
+        let mut outs: Vec<Vec<f64>> = (0..9).map(|_| vec![0f64; n]).collect();
+        let x = timeit(|| {
+            let v = lasx_rs::api::quat_to_dcm_batch([&q[..], &q[..], &q[..], &q[..]]).unwrap();
+            let _ = black_box(v[0][0]);
+        });
+        let y = timeit(|| {
+            lasx_quat_to_dcm_batch(
+                q.as_ptr(),
+                q.as_ptr(),
+                q.as_ptr(),
+                q.as_ptr(),
+                outs[0].as_mut_ptr(),
+                outs[1].as_mut_ptr(),
+                outs[2].as_mut_ptr(),
+                outs[3].as_mut_ptr(),
+                outs[4].as_mut_ptr(),
+                outs[5].as_mut_ptr(),
+                outs[6].as_mut_ptr(),
+                outs[7].as_mut_ptr(),
+                outs[8].as_mut_ptr(),
+                n as i32,
+            );
+            let _ = black_box(outs[0][0]);
+        });
+        println!(
+            "| `quat_to_dcm_batch`（**9 缓冲**） | {n} | {} | {} | **{:.1}%** |",
+            crate::timing::fmt_t(x),
+            crate::timing::fmt_t(y),
+            100.0 * x.saturating_sub(y).as_secs_f64() / x.as_secs_f64()
+        );
+    }
 }
 
 /// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。
