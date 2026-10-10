@@ -3631,7 +3631,11 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 13 | `yll/src/convert.rs` 的 `read_array`（体最长：`arg_arr_len` + 逐元素 `yll_arr_get`/`yll_is_*`/`yll_as_*`）+ `read_f64`/`read_f32`/`read_i8`（体各一句） | **4** | ✅ 已显式化（2026-10-04）（**该文件 8 个里做了 4 个**） |
 | 14 | `yll/src/convert.rs` 的 `push_f64_array`/`push_f64_arrays`（宿主构造器，前提是"解释器线程内"） | **2** | ✅ 已显式化（2026-10-04）（**该文件剩 2**：`read_f64_soa`/`read_f64_soa_at`） |
 | 15 | `yll/src/convert.rs` 的 `read_f64_soa`/`read_f64_soa_at`（SOA 读取：体里调 `read_f64`） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/convert.rs` 8/8 清零** |
-| — | 其余：`yll/src/lib.rs` 2、`examples/kernel_probe.rs` 11 | **13** | ⏳ 待办 |
+| 16 | `yll/src/lib.rs` 的 `add`/`add_const`（模块注册：调 `unsafe extern` 的 `yll_module_add_*`）；**并删掉 `yll/src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明整个 `yll` 扩展清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll` 扩展清零** |
+| — | 其余：`examples/kernel_probe.rs` 11（**建议保留单独豁免**：探针整文件都在 `unsafe fn` 里，逐处包块收益为零——理由要写进 §22.3 的同类"明确例外"里） | **11** | ⏳ 待办（或转为明示例外） |
+
+**allow 的进度**：4 处里 **3 处已删**（`cli/src/main.rs`、`src/lib.rs`、`yll/src/lib.rs`，各以"删后
+0 告警"作证）；**只剩 `examples/kernel_probe.rs`**——它是唯一"有意保留"的候选。
 
 > **口径提醒（本轮又踩到一次边）**：`grep -c "unsafe fn" <file>` 数的是**该文件的定义数**，
 > **不是"还剩几处"**——`convert.rs` 做完 4 个后它仍然打印 8。**"还剩多少"只能靠逐文件核对

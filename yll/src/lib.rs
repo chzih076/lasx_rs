@@ -28,8 +28,6 @@
 //!   并发调用——池的派活本身是独占的。
 
 #![allow(non_camel_case_types)]
-// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.6）。这里只有 4 处（`yll::arg` 调用）。
-#![allow(unsafe_op_in_unsafe_fn)]
 
 mod convert;
 mod funcs;
@@ -52,11 +50,15 @@ unsafe fn add(
     max_args: i32,
     doc: &str,
 ) {
-    with_cstr(name, |n| {
-        with_cstr(doc, |d| {
-            yll_module_add_func(module, n, func, min_args, max_args, d)
-        })
-    });
+    // SAFETY: `module` 是 `yll_module_new` 的返回值（见上面的 `# Safety`）；
+    // `yll_module_add_func` 是 `unsafe extern` 宿主函数，`n`/`d` 由 `with_cstr` 保证有效。
+    unsafe {
+        with_cstr(name, |n| {
+            with_cstr(doc, |d| {
+                yll_module_add_func(module, n, func, min_args, max_args, d)
+            })
+        });
+    }
 }
 
 /// 注册一个常量。
@@ -64,7 +66,8 @@ unsafe fn add(
 /// # Safety
 /// `module` 必须是 `yll_module_new` 的返回值。
 unsafe fn add_const(module: *mut YllModuleDefC, name: &str, value: *mut yll::YllValueWrapper) {
-    with_cstr(name, |n| yll_module_add_const(module, n, value));
+    // SAFETY: 同 `add`（`module` 来自 `yll_module_new`，`n` 由 `with_cstr` 保证有效）。
+    unsafe { with_cstr(name, |n| yll_module_add_const(module, n, value)) };
 }
 
 /// 模块初始化入口：脚本 `use "./lasx"` 时由解释器调用。
