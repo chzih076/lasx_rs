@@ -398,27 +398,31 @@ unsafe fn probe_kernel(strip: &[f32], at: &[f32], k: usize) -> f64 {
 /// 的那一步。探针把两种广播放在同一指令配比下对比，先确认"广播走哪个端口"再改内核。
 #[inline(never)]
 unsafe fn probe_kernel_lr(strip: &[f32], at: &[f32], k: usize) -> f64 {
-    let mut acc = [zero_f32x8(); 16];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 32);
-            let b = [
-                load_f32x8(ptr),
-                load_f32x8(ptr.add(8)),
-                load_f32x8(ptr.add(16)),
-                load_f32x8(ptr.add(24)),
-            ];
-            for r in 0..4 {
-                let a: F32x8 = std::mem::transmute(lasx_xvldrepl_w::<0>(
-                    at.as_ptr().add(r * k + p) as *const i8,
-                ));
-                for i in 0..4 {
-                    acc[r * 4 + i] = lasx_xvfmadd_s(b[i], a, acc[r * 4 + i]);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * 32` 个 `f32`、`at` 至少 `4 * k` 个（调用点保证）；
+    // `ptr` 的 4 次 `add` 落在 `[0, k*32)` 内，`xvldrepl_w` 的地址 `at[r*k+p]` 也在界内。
+    unsafe {
+        let mut acc = [zero_f32x8(); 16];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 32);
+                let b = [
+                    load_f32x8(ptr),
+                    load_f32x8(ptr.add(8)),
+                    load_f32x8(ptr.add(16)),
+                    load_f32x8(ptr.add(24)),
+                ];
+                for r in 0..4 {
+                    let a: F32x8 = std::mem::transmute(lasx_xvldrepl_w::<0>(
+                        at.as_ptr().add(r * k + p) as *const i8,
+                    ));
+                    for i in 0..4 {
+                        acc[r * 4 + i] = lasx_xvfmadd_s(b[i], a, acc[r * 4 + i]);
+                    }
                 }
             }
         }
+        sink(&acc)
     }
-    sink(&acc)
 }
 
 /// `c<行>x<列>`：扫描 (R, C) 形状空间（累加器 = R·C/8，必须 ≤ 16 才放得进寄存器）。
