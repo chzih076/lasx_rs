@@ -44,13 +44,16 @@ const FMA_ITERS: usize = 5_000_000;
 
 /// 把累加器求和成一个标量，防止优化器把整个循环消掉。
 unsafe fn sink(acc: &[m256]) -> f64 {
-    let mut tmp = [0f32; 8];
-    let mut s = 0f64;
-    for v in acc {
-        store_f32x8(tmp.as_mut_ptr(), *v);
-        s += tmp.iter().map(|&x| x as f64).sum::<f64>();
+    // SAFETY: `store_f32x8` 写 `tmp`（8 个 `f32`，正好一个向量宽），无其它前提。
+    unsafe {
+        let mut tmp = [0f32; 8];
+        let mut s = 0f64;
+        for v in acc {
+            store_f32x8(tmp.as_mut_ptr(), *v);
+            s += tmp.iter().map(|&x| x as f64).sum::<f64>();
+        }
+        black_box(s)
     }
-    black_box(s)
 }
 
 /// `dkernel`：与 f64 生产内核同形 —— 4 行 × 16 列，4 条 B 载入 + 4 条 A 广播 + 16 FMA。
