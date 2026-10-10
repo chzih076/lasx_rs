@@ -59,31 +59,35 @@ unsafe fn sink(acc: &[m256]) -> f64 {
 /// `dkernel`：与 f64 生产内核同形 —— 4 行 × 16 列，4 条 B 载入 + 4 条 A 广播 + 16 FMA。
 #[inline(never)]
 unsafe fn probe_dkernel(strip: &[f64], at: &[f64], k: usize) -> f64 {
-    let mut acc = [zero_f64x4(); 16];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 16);
-            let b = [
-                load_f64x4(ptr),
-                load_f64x4(ptr.add(4)),
-                load_f64x4(ptr.add(8)),
-                load_f64x4(ptr.add(12)),
-            ];
-            for r in 0..4 {
-                let a = splat_f64(*at.get_unchecked(r * k + p));
-                for i in 0..4 {
-                    acc[r * 4 + i] = lasx_xvfmadd_d(b[i], a, acc[r * 4 + i]);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * 16` 个 `f64`、`at` 至少 `4 * k` 个（调用点保证）；
+    // `ptr` 的 4 次 `add` 落在 `[0, k*16)` 内，`get_unchecked` 的下标 `r * k + p < 4 * k`。
+    unsafe {
+        let mut acc = [zero_f64x4(); 16];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 16);
+                let b = [
+                    load_f64x4(ptr),
+                    load_f64x4(ptr.add(4)),
+                    load_f64x4(ptr.add(8)),
+                    load_f64x4(ptr.add(12)),
+                ];
+                for r in 0..4 {
+                    let a = splat_f64(*at.get_unchecked(r * k + p));
+                    for i in 0..4 {
+                        acc[r * 4 + i] = lasx_xvfmadd_d(b[i], a, acc[r * 4 + i]);
+                    }
                 }
             }
         }
+        let mut tmp = [0f64; 4];
+        let mut sink = 0f64;
+        for v in acc {
+            store_f64x4(tmp.as_mut_ptr(), v);
+            sink += tmp.iter().sum::<f64>();
+        }
+        black_box(sink)
     }
-    let mut tmp = [0f64; 4];
-    let mut sink = 0f64;
-    for v in acc {
-        store_f64x4(tmp.as_mut_ptr(), v);
-        sink += tmp.iter().sum::<f64>();
-    }
-    black_box(sink)
 }
 
 /// 除法/开方类探针：`xvfdiv_d` / `xvfsqrt_d`（精确）vs `xvfrecipe_d` / `xvfrsqrte_d`（估算）
