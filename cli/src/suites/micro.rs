@@ -539,10 +539,7 @@ pub fn dispatch_overhead() {
         let a2: Vec<f64> = (0..n).map(|i| i as f64 * 2e-3).collect();
         let a3: Vec<f64> = (0..n).map(|i| i as f64 * 3e-3).collect();
         let mut o = vec![0f64; n];
-        let x = timeit(|| {
-            let v = lasx_rs::api::norm3_batch(&a1, &a2, &a3).unwrap();
-            let _ = black_box(v[0]);
-        });
+        // 对称设计（同 `quat_to_dcm_batch` 那条）：两臂都走同一个 FFI 内核，只差"预分配 vs 每次分配"。
         let y = timeit(|| {
             lasx_norm3_batch(
                 a1.as_ptr(),
@@ -553,8 +550,19 @@ pub fn dispatch_overhead() {
             );
             let _ = black_box(o[0]);
         });
+        let x = timeit(|| {
+            let mut o2 = vec![0f64; n];
+            lasx_norm3_batch(
+                a1.as_ptr(),
+                a2.as_ptr(),
+                a3.as_ptr(),
+                o2.as_mut_ptr(),
+                n as i32,
+            );
+            let _ = black_box(o2[0]);
+        });
         println!(
-            "| `norm3_batch`（1 缓冲） | {n} | {} | {} | **{:.1}%** |",
+            "| `norm3_batch`（1 缓冲，对称 A/B） | {n} | 每次分配 {} | 预分配 {} | **{:.1}%** |",
             crate::timing::fmt_t(x),
             crate::timing::fmt_t(y),
             100.0 * x.saturating_sub(y).as_secs_f64() / x.as_secs_f64()
