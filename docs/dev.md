@@ -3645,7 +3645,14 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
   （不进 crate：`Cargo.toml` 的 `exclude` 只挡了 `/docs` 等，但 examples 不进 crates.io 包）。
   ⇒ 口径：**"库与扩展的债 = 0；探针是一个明示的、有理由的例外"**，不是欠账。
 - **allow 的最终状态**：4 处 → 删 3 处（`cli/`、`src/lib.rs`、`yll/src/lib.rs`，各有"删后 0 告警"
-  作证）→ **保留 1 处（探针，明示例外）**。
+  作证）**最终收口（2026-10-04）：全仓 0 豁免。** 探针的 10 个 `unsafe fn` 也全部显式化后，**第 4 处
+allow（`examples/kernel_probe.rs`）也删掉了**，并同样用权威判据收口：`cargo build --workspace
+--release` 与 `clippy --workspace --all-targets -D warnings` **都是 0 告警 / 0 错误**，
+`grep -rn "unsafe_op_in_unsafe_fn" src/ cli/ yll/ examples/` **为空** ⇒ 口径不再是"库与扩展 = 0，
+探针例外"，而是 **"全仓 0 豁免"**。
+**顺带纠正一条我先前的错误印象**：我曾写"探针不进 crates.io 包"——**实测是错的**
+（`cargo package --no-verify --list` 显示它带进了 **13 个文件**）。已在 `Cargo.toml` 的 `exclude`
+里补上 `"/examples"`，并复核：**examples 0 个文件、包内总数 90 → 77**。
 
 > **口径提醒（本轮又踩到一次边）**：`grep -c "unsafe fn" <file>` 数的是**该文件的定义数**，
 > **不是"还剩几处"**——`convert.rs` 做完 4 个后它仍然打印 8。**"还剩多少"只能靠逐文件核对

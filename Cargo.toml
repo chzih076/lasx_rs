@@ -12,7 +12,10 @@ readme = "README.md"
 keywords = ["loongarch", "lasx", "lsx", "simd", "numerics"]
 categories = ["hardware-support", "mathematics", "science"]
 # 只收录要发出去的东西：文档/基准/脚本/下游样板都不进 crate（`docs/` 有 250 KB+）。
-exclude = ["/docs", "/scripts", "/cli", "/yll", "/AGENTS.md"]
+# `/examples`：实测（`cargo package --no-verify --list`）它会带进 **13 个文件**，而里面是
+# **机器相关的微内核探针与 A/B 台架**（`kernel_probe`、`matmul_ab` 等），不是给用户看的用法示例
+# ——README 里那些 `cargo run --example …` 的说明指向的是**源码仓库**。
+exclude = ["/docs", "/scripts", "/cli", "/yll", "/examples", "/AGENTS.md"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
