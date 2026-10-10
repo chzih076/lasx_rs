@@ -1,5 +1,5 @@
 #![feature(stdarch_loongarch)]
-// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.6）。这个探针的 `unsafe fn` 体里
+// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.5）。这个探针的 `unsafe fn` 体里
 // 几乎全是 intrinsic 调用，逐处显式化的收益为零。
 #![allow(unsafe_op_in_unsafe_fn)]
 //! 微内核探针：把 `tile4x32_chunk` 的循环体放到 **L1 热数据**上，量它自身的 FMA/周期上限。
