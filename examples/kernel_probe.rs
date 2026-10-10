@@ -239,30 +239,34 @@ fn special_accuracy() -> Vec<(&'static str, f64)> {
 /// 32 列理论 4.0（受 FP 峰值 3.97 与 B 载入吞吐约束）。这个探针就是来验这条的。
 #[inline(never)]
 unsafe fn probe_dkernel2x32(strip: &[f64], at: &[f64], k: usize) -> f64 {
-    let mut r0 = [zero_f64x4(); 8];
-    let mut r1 = [zero_f64x4(); 8];
-    for _ in 0..ITERS {
-        for p in 0..k {
-            let ptr = strip.as_ptr().add(p * 32);
-            let mut b = [zero_f64x4(); 8];
-            for (i, bi) in b.iter_mut().enumerate() {
-                *bi = load_f64x4(ptr.add(i * 4));
-            }
-            let a0 = splat_f64(*at.get_unchecked(p));
-            let a1 = splat_f64(*at.get_unchecked(k + p));
-            for i in 0..8 {
-                r0[i] = lasx_xvfmadd_d(b[i], a0, r0[i]);
-                r1[i] = lasx_xvfmadd_d(b[i], a1, r1[i]);
+    // SAFETY: 探针内部约定——`strip` 至少 `k * 32` 个 `f64`、`at` 至少 `2 * k` 个（调用点保证）；
+    // 两处 `get_unchecked` 的下标 `p`/`k + p` 与各 `add` 都落在界内。
+    unsafe {
+        let mut r0 = [zero_f64x4(); 8];
+        let mut r1 = [zero_f64x4(); 8];
+        for _ in 0..ITERS {
+            for p in 0..k {
+                let ptr = strip.as_ptr().add(p * 32);
+                let mut b = [zero_f64x4(); 8];
+                for (i, bi) in b.iter_mut().enumerate() {
+                    *bi = load_f64x4(ptr.add(i * 4));
+                }
+                let a0 = splat_f64(*at.get_unchecked(p));
+                let a1 = splat_f64(*at.get_unchecked(k + p));
+                for i in 0..8 {
+                    r0[i] = lasx_xvfmadd_d(b[i], a0, r0[i]);
+                    r1[i] = lasx_xvfmadd_d(b[i], a1, r1[i]);
+                }
             }
         }
+        let mut tmp = [0f64; 4];
+        let mut sink = 0f64;
+        for v in r0.iter().chain(r1.iter()) {
+            store_f64x4(tmp.as_mut_ptr(), *v);
+            sink += tmp.iter().sum::<f64>();
+        }
+        black_box(sink)
     }
-    let mut tmp = [0f64; 4];
-    let mut sink = 0f64;
-    for v in r0.iter().chain(r1.iter()) {
-        store_f64x4(tmp.as_mut_ptr(), *v);
-        sink += tmp.iter().sum::<f64>();
-    }
-    black_box(sink)
 }
 
 /// `fma16`：16 条独立 FMA，无任何访存 —— 量 f32 侧 FP 流水线峰值。
