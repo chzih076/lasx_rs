@@ -306,39 +306,42 @@ unsafe fn probe_fma16() -> f64 {
 /// `dfma16`：同上，f64（`xvfmadd.d`）—— 量 f64 侧 FP 流水线峰值。
 #[inline(never)]
 unsafe fn probe_dfma16() -> f64 {
-    let s = splat_f64(1.0);
-    let c = splat_f64(1e-9);
-    let (mut v0, mut v1, mut v2, mut v3) = (c, c, c, c);
-    let (mut v4, mut v5, mut v6, mut v7) = (c, c, c, c);
-    let (mut v8, mut v9, mut v10, mut v11) = (c, c, c, c);
-    let (mut v12, mut v13, mut v14, mut v15) = (c, c, c, c);
-    for _ in 0..FMA_ITERS {
-        v0 = lasx_xvfmadd_d(s, c, v0);
-        v1 = lasx_xvfmadd_d(s, c, v1);
-        v2 = lasx_xvfmadd_d(s, c, v2);
-        v3 = lasx_xvfmadd_d(s, c, v3);
-        v4 = lasx_xvfmadd_d(s, c, v4);
-        v5 = lasx_xvfmadd_d(s, c, v5);
-        v6 = lasx_xvfmadd_d(s, c, v6);
-        v7 = lasx_xvfmadd_d(s, c, v7);
-        v8 = lasx_xvfmadd_d(s, c, v8);
-        v9 = lasx_xvfmadd_d(s, c, v9);
-        v10 = lasx_xvfmadd_d(s, c, v10);
-        v11 = lasx_xvfmadd_d(s, c, v11);
-        v12 = lasx_xvfmadd_d(s, c, v12);
-        v13 = lasx_xvfmadd_d(s, c, v13);
-        v14 = lasx_xvfmadd_d(s, c, v14);
-        v15 = lasx_xvfmadd_d(s, c, v15);
+    // SAFETY: 探针内部约定——`store_f64x4` 写 `tmp`（4 个 `f64`，正好一个向量宽），其余是寄存器运算。
+    unsafe {
+        let s = splat_f64(1.0);
+        let c = splat_f64(1e-9);
+        let (mut v0, mut v1, mut v2, mut v3) = (c, c, c, c);
+        let (mut v4, mut v5, mut v6, mut v7) = (c, c, c, c);
+        let (mut v8, mut v9, mut v10, mut v11) = (c, c, c, c);
+        let (mut v12, mut v13, mut v14, mut v15) = (c, c, c, c);
+        for _ in 0..FMA_ITERS {
+            v0 = lasx_xvfmadd_d(s, c, v0);
+            v1 = lasx_xvfmadd_d(s, c, v1);
+            v2 = lasx_xvfmadd_d(s, c, v2);
+            v3 = lasx_xvfmadd_d(s, c, v3);
+            v4 = lasx_xvfmadd_d(s, c, v4);
+            v5 = lasx_xvfmadd_d(s, c, v5);
+            v6 = lasx_xvfmadd_d(s, c, v6);
+            v7 = lasx_xvfmadd_d(s, c, v7);
+            v8 = lasx_xvfmadd_d(s, c, v8);
+            v9 = lasx_xvfmadd_d(s, c, v9);
+            v10 = lasx_xvfmadd_d(s, c, v10);
+            v11 = lasx_xvfmadd_d(s, c, v11);
+            v12 = lasx_xvfmadd_d(s, c, v12);
+            v13 = lasx_xvfmadd_d(s, c, v13);
+            v14 = lasx_xvfmadd_d(s, c, v14);
+            v15 = lasx_xvfmadd_d(s, c, v15);
+        }
+        let mut tmp = [0f64; 4];
+        let mut sum = 0f64;
+        for v in [
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
+        ] {
+            store_f64x4(tmp.as_mut_ptr(), v);
+            sum += tmp.iter().sum::<f64>();
+        }
+        black_box(sum)
     }
-    let mut tmp = [0f64; 4];
-    let mut sum = 0f64;
-    for v in [
-        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
-    ] {
-        store_f64x4(tmp.as_mut_ptr(), v);
-        sum += tmp.iter().sum::<f64>();
-    }
-    black_box(sum)
 }
 
 /// `norepl`：16 FMA + 4 条 B 载入（A 广播用常量寄存器顶替）。
