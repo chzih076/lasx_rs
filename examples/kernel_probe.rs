@@ -1,7 +1,4 @@
 #![feature(stdarch_loongarch)]
-// edition 2024 迁移债：同 `src/lib.rs`（`docs/dev.md` §22.5）。这个探针的 `unsafe fn` 体里
-// 几乎全是 intrinsic 调用，逐处显式化的收益为零。
-#![allow(unsafe_op_in_unsafe_fn)]
 //! 微内核探针：把 `tile4x32_chunk` 的循环体放到 **L1 热数据**上，量它自身的 FMA/周期上限。
 //!
 //! 结论（本机 Loongson-3B6000 / LA664，2.2 GHz，见 `docs/dev.md` §6.3）：
@@ -95,90 +92,95 @@ unsafe fn probe_dkernel(strip: &[f64], at: &[f64], k: usize) -> f64 {
 /// （结论在 `docs/dev.md` §13.1：本机估算**比精确除法更慢**）。
 #[inline(never)]
 unsafe fn probe_special(variant: &str) -> f64 {
-    let a = splat_f64(1.5);
-    let two = splat_f64(2.0);
-    // 初值：从 1.0 起迭代，保证既不溢出也不收敛到 0
-    let init = splat_f64(1.0);
-    let (mut v0, mut v1, mut v2, mut v3) = (init, init, init, init);
-    let (mut v4, mut v5, mut v6, mut v7) = (init, init, init, init);
-    let (mut v8, mut v9, mut v10, mut v11) = (init, init, init, init);
-    let (mut v12, mut v13, mut v14, mut v15) = (init, init, init, init);
-    macro_rules! step {
-        ($op:expr) => {{
-            v0 = $op(v0);
-            v1 = $op(v1);
-            v2 = $op(v2);
-            v3 = $op(v3);
-            v4 = $op(v4);
-            v5 = $op(v5);
-            v6 = $op(v6);
-            v7 = $op(v7);
-            v8 = $op(v8);
-            v9 = $op(v9);
-            v10 = $op(v10);
-            v11 = $op(v11);
-            v12 = $op(v12);
-            v13 = $op(v13);
-            v14 = $op(v14);
-            v15 = $op(v15);
-        }};
-    }
-    // 牛顿迭代：r ← r·(2 − d·r)；两步用 fnmadd + fmul
-    macro_rules! nr2 {
-        ($r:expr, $d:expr) => {{
-            let e = lasx_xvfnmadd_d($d, $r, two);
-            let r = lasx_xvfmul_d($r, e);
-            let e = lasx_xvfnmadd_d($d, r, two);
-            lasx_xvfmul_d(r, e)
-        }};
-    }
-    // 独立操作数版本：操作数都是常量寄存器，16 条指令互不依赖 ⇒ 量到吞吐而非延迟
-    macro_rules! indep {
-        ($op:expr) => {{
-            v0 = $op;
-            v1 = $op;
-            v2 = $op;
-            v3 = $op;
-            v4 = $op;
-            v5 = $op;
-            v6 = $op;
-            v7 = $op;
-            v8 = $op;
-            v9 = $op;
-            v10 = $op;
-            v11 = $op;
-            v12 = $op;
-            v13 = $op;
-            v14 = $op;
-            v15 = $op;
-        }};
-    }
-    let b = splat_f64(2.5);
-    for _ in 0..FMA_ITERS {
-        match variant {
-            "dfdiv_i" => indep!(lasx_xvfdiv_d(a, b)),
-            "dfsqrt_i" => indep!(lasx_xvfsqrt_d(a)),
-            "drecipe_i" => indep!(lasx_xvfrecipe_d(a)),
-            "drsqrte_i" => indep!(lasx_xvfrsqrte_d(a)),
-            "dfma_i" => indep!(lasx_xvfmadd_d(a, b, a)),
-            "dfdiv" => step!(|x| lasx_xvfdiv_d(a, x)),
-            "dfsqrt" => step!(lasx_xvfsqrt_d),
-            "drecipe" => step!(lasx_xvfrecipe_d),
-            "drcp1" => step!(|x| nr2!(lasx_xvfrecipe_d(x), x)),
-            "drsqrte" => step!(lasx_xvfrsqrte_d),
-            "drsqrt1" => step!(|x| nr2!(lasx_xvfrsqrte_d(x), x)),
-            _ => step!(lasx_xvfsqrt_d),
+    // SAFETY: 探针内部约定——`strip`/`at` 的尺寸由调用点按各变体保证，循环里的 `add` 与
+    // `get_unchecked` 都落在界内；三个 `macro_rules!`（`step`/`nr2`/`indep`）定义在块内，
+    // 它们的展开只做寄存器运算与已界定的访存（函数体内原本没有任何内层 `unsafe {}`）。
+    unsafe {
+        let a = splat_f64(1.5);
+        let two = splat_f64(2.0);
+        // 初值：从 1.0 起迭代，保证既不溢出也不收敛到 0
+        let init = splat_f64(1.0);
+        let (mut v0, mut v1, mut v2, mut v3) = (init, init, init, init);
+        let (mut v4, mut v5, mut v6, mut v7) = (init, init, init, init);
+        let (mut v8, mut v9, mut v10, mut v11) = (init, init, init, init);
+        let (mut v12, mut v13, mut v14, mut v15) = (init, init, init, init);
+        macro_rules! step {
+            ($op:expr) => {{
+                v0 = $op(v0);
+                v1 = $op(v1);
+                v2 = $op(v2);
+                v3 = $op(v3);
+                v4 = $op(v4);
+                v5 = $op(v5);
+                v6 = $op(v6);
+                v7 = $op(v7);
+                v8 = $op(v8);
+                v9 = $op(v9);
+                v10 = $op(v10);
+                v11 = $op(v11);
+                v12 = $op(v12);
+                v13 = $op(v13);
+                v14 = $op(v14);
+                v15 = $op(v15);
+            }};
         }
+        // 牛顿迭代：r ← r·(2 − d·r)；两步用 fnmadd + fmul
+        macro_rules! nr2 {
+            ($r:expr, $d:expr) => {{
+                let e = lasx_xvfnmadd_d($d, $r, two);
+                let r = lasx_xvfmul_d($r, e);
+                let e = lasx_xvfnmadd_d($d, r, two);
+                lasx_xvfmul_d(r, e)
+            }};
+        }
+        // 独立操作数版本：操作数都是常量寄存器，16 条指令互不依赖 ⇒ 量到吞吐而非延迟
+        macro_rules! indep {
+            ($op:expr) => {{
+                v0 = $op;
+                v1 = $op;
+                v2 = $op;
+                v3 = $op;
+                v4 = $op;
+                v5 = $op;
+                v6 = $op;
+                v7 = $op;
+                v8 = $op;
+                v9 = $op;
+                v10 = $op;
+                v11 = $op;
+                v12 = $op;
+                v13 = $op;
+                v14 = $op;
+                v15 = $op;
+            }};
+        }
+        let b = splat_f64(2.5);
+        for _ in 0..FMA_ITERS {
+            match variant {
+                "dfdiv_i" => indep!(lasx_xvfdiv_d(a, b)),
+                "dfsqrt_i" => indep!(lasx_xvfsqrt_d(a)),
+                "drecipe_i" => indep!(lasx_xvfrecipe_d(a)),
+                "drsqrte_i" => indep!(lasx_xvfrsqrte_d(a)),
+                "dfma_i" => indep!(lasx_xvfmadd_d(a, b, a)),
+                "dfdiv" => step!(|x| lasx_xvfdiv_d(a, x)),
+                "dfsqrt" => step!(lasx_xvfsqrt_d),
+                "drecipe" => step!(lasx_xvfrecipe_d),
+                "drcp1" => step!(|x| nr2!(lasx_xvfrecipe_d(x), x)),
+                "drsqrte" => step!(lasx_xvfrsqrte_d),
+                "drsqrt1" => step!(|x| nr2!(lasx_xvfrsqrte_d(x), x)),
+                _ => step!(lasx_xvfsqrt_d),
+            }
+        }
+        let mut tmp = [0f64; 4];
+        let mut sum = 0f64;
+        for v in [
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
+        ] {
+            store_f64x4(tmp.as_mut_ptr(), v);
+            sum += tmp.iter().sum::<f64>();
+        }
+        black_box(sum)
     }
-    let mut tmp = [0f64; 4];
-    let mut sum = 0f64;
-    for v in [
-        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
-    ] {
-        store_f64x4(tmp.as_mut_ptr(), v);
-        sum += tmp.iter().sum::<f64>();
-    }
-    black_box(sum)
 }
 
 /// 精度实测：把 x ∈ [0.5, 4) 上的估算/迭代结果与精确值比，返回最大相对误差。
