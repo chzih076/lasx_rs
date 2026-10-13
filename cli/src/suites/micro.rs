@@ -590,6 +590,51 @@ pub fn dispatch_overhead() {
                 );
             }
         }
+        // **DSL vs 直接调用**：两臂都写**预分配**缓冲（`MatBuf` / `lasx_matmul` 的 `c` 指针），
+        // 唯一差别是"宏生成的代码 vs 手写直接调用"。**不能用 `api::matmul`**——它分配，
+        // 那测出来的是"分配开销"而不是 DSL 开销（本库 matmul 没有 `_into` 变体）。
+        {
+            use lasx_rs::matmul;
+            use lasx_rs::shape::{Mat, MatBuf};
+            const M: usize = 64;
+            const K: usize = 256;
+            const N: usize = 256;
+            let wv: Vec<f32> = (0..K * N).map(|i| (i % 13) as f32).collect();
+            let xv2: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32).collect();
+            let w = Mat::<f32, { K }, { N }>::new(&wv).unwrap();
+            let x = Mat::<f32, { M }, { K }>::new(&xv2).unwrap();
+            let mut yb = MatBuf::<f32, { M }, { N }>::new();
+            let mut yc = vec![0f32; M * N];
+            let dsl = timeit(|| {
+                matmul!(yb[M, N] = x[M, K] * w[K, N]);
+                let _ = black_box(yb.as_slice()[0]);
+            });
+            let direct = timeit(|| {
+                lasx_matmul(
+                    M as i32,
+                    K as i32,
+                    N as i32,
+                    xv2.as_ptr(),
+                    wv.as_ptr(),
+                    yc.as_mut_ptr(),
+                );
+                let _ = black_box(yc[0]);
+            });
+            // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
+            let mut bits_ok = true;
+            for (i, v) in yc.iter().enumerate() {
+                if yb.as_slice()[i].to_bits() != v.to_bits() {
+                    bits_ok = false;
+                    break;
+                }
+            }
+            println!(
+                "| DSL `matmul!` vs 直接 `lasx_matmul` | {M}×{K}×{N} | DSL {} | 直接 {} | 差 **{:.1}%**（逐位一致：{bits_ok}） |",
+                crate::timing::fmt_t(dsl),
+                crate::timing::fmt_t(direct),
+                100.0 * (dsl.as_secs_f64() - direct.as_secs_f64()).abs() / dsl.as_secs_f64()
+            );
+        }
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
