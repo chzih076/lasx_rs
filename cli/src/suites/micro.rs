@@ -546,6 +546,31 @@ pub fn dispatch_overhead() {
             crate::timing::fmt_t(serial_tables),
             crate::timing::fmt_t(spawn)
         );
+        // **池的派发开销**（常驻线程；上一轮量的 `std::thread` 不是这个）。空闭包 + 每线程一个块。
+        {
+            let pool = lasx_rs::pool::WorkerPool::auto();
+            let nt = pool.threads();
+            let mut dummy = vec![0u8; nt * 64];
+            let disp = timeit(|| {
+                pool.for_each_chunk_mut(&mut dummy, |_| {});
+            });
+            println!(
+                "| 池派发一次（{nt} 线程、空闭包） | **⚠️ 无效对照** | — | {} | 空闭包被优化器消除，这个数（~ns）不是派发成本 |",
+                crate::timing::fmt_t(disp)
+            );
+            // 串行建表的**规模扫描**：池能不能回本取决于"工作 / 派发"之比。
+            for &np in &[192usize, 4096, 16384] {
+                let ps: Vec<f32> = (0..np).map(|i| i as f32 * 0.5).collect();
+                let t = timeit(|| {
+                    let v = lasx_rs::api::rope_tables(&ps, n_dims, 10_000.0).unwrap();
+                    let _ = black_box(v.0[0]);
+                });
+                println!(
+                    "| 串行 `rope_tables` | {np} 位置 × {n_dims} | — | {} | — |",
+                    crate::timing::fmt_t(t)
+                );
+            }
+        }
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
