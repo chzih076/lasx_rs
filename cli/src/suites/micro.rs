@@ -714,6 +714,36 @@ pub fn dispatch_overhead() {
                 narrow.as_secs_f64() / wide.as_secs_f64()
             );
         }
+        // **池在"多而小"工作项上的行为**（§7.11 ⑥ 的 12× 归因落到这里）：同一份活儿分别切 32 项/8 项，
+        // 在 1 线程与 8 线程下计时。`black_box(item)` 保证闭包不可被优化掉（否则空活儿会被消除，
+        // 我之前就踩过"空闭包 2 ns"这个假数）。
+        {
+            let mut items32: Vec<(usize, usize)> = (0..32).map(|s| (s * 96, s * 96 + 96)).collect();
+            let mut items8: Vec<(usize, usize)> =
+                (0..8).map(|s| (s * 384, s * 384 + 384)).collect();
+            for &nt in &[1usize, 8] {
+                let pool = WorkerPool::new(nt);
+                let t32 = timeit(|| {
+                    pool.for_each_chunk_mut(&mut items32, |my| {
+                        for &(j0, j1) in my.iter() {
+                            let _ = black_box(j1 - j0);
+                        }
+                    });
+                });
+                let t8 = timeit(|| {
+                    pool.for_each_chunk_mut(&mut items8, |my| {
+                        for &(j0, j1) in my.iter() {
+                            let _ = black_box(j1 - j0);
+                        }
+                    });
+                });
+                println!(
+                    "| 池：空活儿切 **32 项 vs 8 项** | {nt} 线程 | 32 项 {} | 8 项 {} | — |",
+                    crate::timing::fmt_t(t32),
+                    crate::timing::fmt_t(t8)
+                );
+            }
+        }
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
