@@ -550,13 +550,32 @@ pub fn dispatch_overhead() {
         {
             let pool = lasx_rs::pool::WorkerPool::auto();
             let nt = pool.threads();
-            let mut dummy = vec![0u8; nt * 64];
-            let disp = timeit(|| {
-                pool.for_each_chunk_mut(&mut dummy, |_| {});
+            // **真正的派发开销 = (24 线程跑大块) − (1 线程跑同量大块)/24 的理想值**。上一版用
+            // 小数据（24×64 B）测出 16 ns——那不是派发成本：**数据太小时池不派发、直接内联执行**
+            // （这本身是个好设计，但用"小数据"量不到派发）。这里用 24 MB 让 24 个线程都真动起来。
+            let mut big = vec![0u8; 24 * 1_000_000];
+            let p1 = lasx_rs::pool::WorkerPool::new(1);
+            let t1 = timeit(|| {
+                p1.for_each_chunk_mut(&mut big, |c| {
+                    for b in c.iter_mut() {
+                        *b = 3;
+                    }
+                });
+                let _ = black_box(big[0]);
+            });
+            let t24 = timeit(|| {
+                pool.for_each_chunk_mut(&mut big, |c| {
+                    for b in c.iter_mut() {
+                        *b = 3;
+                    }
+                });
+                let _ = black_box(big[0]);
             });
             println!(
-                "| 池派发一次（{nt} 线程、空闭包） | **⚠️ 无效对照** | — | {} | 空闭包被优化器消除，这个数（~ns）不是派发成本 |",
-                crate::timing::fmt_t(disp)
+                "| 池：24 MB 写 | 1 线程 {} | 24 线程 {} | 理想 1/24 = {}；差 = 派发+同步 |",
+                crate::timing::fmt_t(t1),
+                crate::timing::fmt_t(t24),
+                crate::timing::fmt_t(t1 / 24)
             );
             // 串行建表的**规模扫描**：池能不能回本取决于"工作 / 派发"之比。
             for &np in &[192usize, 4096, 16384] {
