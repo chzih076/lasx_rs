@@ -506,6 +506,26 @@ pub fn dispatch_overhead() {
             crate::timing::fmt_t(f),
             100.0 * a.saturating_sub(f).as_secs_f64() / a.as_secs_f64()
         );
+        // `rope_at`（**每次调用重算表**：2 次分配 + 2 次逐元素拷贝）vs 预建表 + `rope`（1 次分配）。
+        // 这不是"分配 vs 预分配"，而是**用法级**对照：表该不该由调用方 hoist。
+        let positions: Vec<f32> = (0..rows).map(|i| i as f32 * 0.5).collect();
+        let (ctab, stab) = lasx_rs::api::rope_tables(&positions, n_dims, 10_000.0).unwrap();
+        let mode2 = lasx_rs::api::RopeMode::NeoX;
+        let at_call = timeit(|| {
+            let v = lasx_rs::api::rope_at(&xr, &positions, rows, cols, n_dims, 10_000.0, mode2)
+                .unwrap();
+            let _ = black_box(v[0]);
+        });
+        let hoisted = timeit(|| {
+            let v = lasx_rs::api::rope(&xr, &ctab, &stab, rows, cols, n_dims, mode2).unwrap();
+            let _ = black_box(v[0]);
+        });
+        println!(
+            "| `rope_at` vs 预建表 `rope` | {rows}×{cols} | 每次重算 {} | 预建表 {} | **{:.0}%** |",
+            crate::timing::fmt_t(at_call),
+            crate::timing::fmt_t(hoisted),
+            100.0 * at_call.saturating_sub(hoisted).as_secs_f64() / at_call.as_secs_f64()
+        );
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
