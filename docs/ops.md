@@ -1034,7 +1034,7 @@ lasx_gelu_erf_checked(x, out, n, &status);
 > 实测 **515.7 / 541.0 / 526.8 µs vs 预建表 + `rope` 的 56.5 / 57.8 / 56.8 µs（差 89%）**
 > ——**用现有 API 就能拿到这 9×，不需要任何新接口**：层循环外调一次
 > `api::rope_tables(&positions, n_dims, freq_base)`，每层只调 `api::rope_into`。
-> （口径：load 3.18–3.25 的安静窗口、3 轮；见 `docs/dev.md` §7.9 ④⑤。）
+> （口径：load 3.18–3.25 的安静窗口、3 轮；见 `docs/dev.md` §7.9 ⑤。）
 >
 > **`rope_tables` 本身也优化过（2026-10-04）**：它的 `powf` 原本在**内层循环**里（每个
 > (位置, 维度) 对重算一次 ⇒ 192×64 = 12288 次），hoist 到循环外后只剩 64 次，
