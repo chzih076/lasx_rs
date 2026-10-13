@@ -526,6 +526,26 @@ pub fn dispatch_overhead() {
             crate::timing::fmt_t(hoisted),
             100.0 * at_call.saturating_sub(hoisted).as_secs_f64() / at_call.as_secs_f64()
         );
+        // 并行建表值不值得：先量**线程启动开销的下界**（12 个空线程 spawn+join）。`rope_tables`
+        // 的活儿只有 ~232 µs，若启动开销与它同量级，并行就是白搭（每元素独立 ⇒ 位精确与线程数
+        // 无关，所以"安不安全"不是问题，**"划不划算"才是**）。
+        let spawn = timeit(|| {
+            std::thread::scope(|s| {
+                let hs: Vec<_> = (0..12).map(|_| s.spawn(|| {})).collect();
+                for h in hs {
+                    h.join().unwrap();
+                }
+            });
+        });
+        let serial_tables = timeit(|| {
+            let t = lasx_rs::api::rope_tables(&positions, n_dims, 10_000.0).unwrap();
+            let _ = black_box(t.0[0]);
+        });
+        println!(
+            "| 串行 `rope_tables`（{rows} 位置）vs 12 线程空 spawn+join | — | 串行 {} | 启动下界 {} | — |",
+            crate::timing::fmt_t(serial_tables),
+            crate::timing::fmt_t(spawn)
+        );
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
