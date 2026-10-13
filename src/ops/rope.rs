@@ -201,11 +201,17 @@ pub(crate) fn rope_tables(
     }
     let inv_dims = 1.0 / n_dims as f64;
     let base = freq_base as f64;
+    // **频率只与维度 `i` 有关 ⇒ hoist 出位置循环。** 原来 `base.powf(…)` 写在内层循环里，
+    // 每个 (位置, 维度) 对都要算一次（192×64 = 12288 次 `powf`，实测 ~460 µs 的主因）；
+    // 现在只算 `half` 次（64 次）。**位精确**：`freq[i]` 与逐次重算是**同一个表达式、同一组输入**，
+    // `powf` 是确定性的 ⇒ `theta = pos * freq[i]` 与原来逐位相同（下游 `sin_cos` 也相同）。
+    let freq: Vec<f64> = (0..half)
+        .map(|i| base.powf(-2.0 * i as f64 * inv_dims))
+        .collect();
     for (r, &p) in positions.iter().enumerate() {
         let pos = p as f64;
         for i in 0..half {
-            let theta = pos * base.powf(-2.0 * i as f64 * inv_dims);
-            let (s, c) = theta.sin_cos();
+            let (s, c) = (pos * freq[i]).sin_cos();
             cos[r * half + i] = c as f32;
             sin[r * half + i] = s as f32;
         }
@@ -429,6 +435,45 @@ mod tests {
             let (y0, y1) = rotate_pair(x0, x1, c, s);
             assert_eq!(y0.to_bits(), x0.mul_add(c, -(x1 * s)).to_bits());
             assert_eq!(y1.to_bits(), x1.mul_add(c, x0 * s).to_bits());
+        }
+    }
+
+    /// **`rope_tables` 的位精确回归**：hoist 频率（把 `powf` 从内层循环提到循环外）之后，
+    /// 输出必须与"逐元素重算 `powf`"的参考实现**逐位一致**。
+    ///
+    /// 为什么需要它：这次优化把每个 (位置, 维度) 的 `base.powf(…)` 改成只算 `half` 次
+    /// （192×64 = 12288 → 64 次），实测 ~460 µs → ~232 µs。**它合法的唯一理由是值不变**
+    /// ——`freq[i]` 与逐次重算是同一个表达式、同一组输入、`powf` 确定性。这条测试把这个理由
+    /// 钉住：将来谁再动频率计算（例如改用递推 `freq[i+1] = freq[i] * ratio`，那会**改变舍入**），
+    /// 这里会红。
+    #[test]
+    fn test_rope_tables_bit_exact_vs_per_element_powf() {
+        for (positions, n_dims, base) in &[
+            (vec![0.0f32, 1.0, 2.5, 191.0], 128usize, 10_000.0f32),
+            (vec![0.5, 7.25], 8, 1.0e4),
+            (vec![3.0], 2, 1.0),
+        ] {
+            let (positions, n_dims, base) = (&positions[..], *n_dims, *base);
+            let half = n_dims / 2;
+            let inv_dims = 1.0 / n_dims as f64;
+            let b = base as f64;
+            // 参考：**逐元素重算** `powf`（即优化前的写法）
+            let mut rc = vec![0f32; positions.len() * half];
+            let mut rs = vec![0f32; positions.len() * half];
+            for (r, &p) in positions.iter().enumerate() {
+                for i in 0..half {
+                    let theta = p as f64 * b.powf(-2.0 * i as f64 * inv_dims);
+                    let (s, c) = theta.sin_cos();
+                    rc[r * half + i] = c as f32;
+                    rs[r * half + i] = s as f32;
+                }
+            }
+            let (c, s) = rope_tables(positions, n_dims, base);
+            assert_eq!(c.len(), rc.len());
+            for k in 0..rc.len() {
+                assert_eq!(c[k].to_bits(), rc[k].to_bits(), "cos[{k}] 不逐位一致");
+                assert_eq!(s[k].to_bits(), rs[k].to_bits(), "sin[{k}] 不逐位一致");
+            }
         }
     }
 }
