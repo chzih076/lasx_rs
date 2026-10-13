@@ -1028,6 +1028,13 @@ lasx_gelu_erf_checked(x, out, n, &status);
 > **这是全库分配占比最高的算子：实测 39–41%**（192×768、n_dims = 128：83.9 → 50.6 µs，
 > 内核只 ~51 µs 而输出 0.6 MiB 的分配约 33 µs），而 RoPE 在注意力里**每层都调**
 > ⇒ 热路径上应该用 `_into`（A/B 表见 `docs/dev.md` §7.9 ③）。
+>
+> **更值钱的一条用法：`rope_tables` 必须 hoist 出层循环。** `api::rope_at` 每次调用都会
+> **重算 cos/sin 表**（`rope_tables`：三角 + 两次逐元素拷贝 + 两次分配，再加输出分配），
+> 实测 **515.7 / 541.0 / 526.8 µs vs 预建表 + `rope` 的 56.5 / 57.8 / 56.8 µs（差 89%）**
+> ——**用现有 API 就能拿到这 9×，不需要任何新接口**：层循环外调一次
+> `api::rope_tables(&positions, n_dims, freq_base)`，每层只调 `api::rope_into`。
+> （口径：load 3.18–3.25 的安静窗口、3 轮；见 `docs/dev.md` §7.9 ④。）
 
 | 层 | 签名 |
 |---|---|
