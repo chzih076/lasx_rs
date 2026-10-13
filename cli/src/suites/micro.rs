@@ -679,6 +679,41 @@ pub fn dispatch_overhead() {
                 naive.as_secs_f64() / simd.as_secs_f64()
             );
         }
+        // **窄列分解本身是否低效？**（串行、只用公开 API）：1 次宽 `n` vs 32 次窄 `n/32` 的**同量工作**。
+        // 这是把"窄列"从"并发"里单独拎出来的判别实验（§7.11 ⑥ 的 12× 归因需要它）。
+        // 注意口径：窄臂把 B 的列段**在计时外**拷成连续缓冲（否则拷 B 的成本会混进来）；两臂都含分配。
+        {
+            let (m, k, n, seg) = (192usize, 768usize, 3072usize, 96usize);
+            let av: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.0625).collect();
+            let bv: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 * 0.0625).collect();
+            let bcols: Vec<Vec<f32>> = (0..n / seg)
+                .map(|s| {
+                    let j0 = s * seg;
+                    let mut chunk = Vec::with_capacity(k * seg);
+                    for p in 0..k {
+                        chunk.extend_from_slice(&bv[p * n + j0..p * n + j0 + seg]);
+                    }
+                    chunk
+                })
+                .collect();
+            let wide = timeit(|| {
+                let v = lasx_rs::api::matmul(m, k, n, &av, &bv).unwrap();
+                let _ = black_box(v[0]);
+            });
+            let narrow = timeit(|| {
+                for bc in &bcols {
+                    let v = lasx_rs::api::matmul(m, k, seg, &av, bc).unwrap();
+                    let _ = black_box(v[0]);
+                }
+            });
+            println!(
+                "| 宽 1 次 vs **窄 {} 次**（串行、同量工作） | {m}×{k}×{n} | 宽 {} | 窄 {} | **{:.1}×** |",
+                n / seg,
+                crate::timing::fmt_t(wide),
+                crate::timing::fmt_t(narrow),
+                narrow.as_secs_f64() / wide.as_secs_f64()
+            );
+        }
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
