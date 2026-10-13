@@ -635,6 +635,50 @@ pub fn dispatch_overhead() {
                 100.0 * (dsl.as_secs_f64() - direct.as_secs_f64()).abs() / dsl.as_secs_f64()
             );
         }
+        // **"真标量"基线**：`scalar_ref.rs` 那一列在 `+lasx` 下会被 LLVM **自动向量化**，
+        // 所以它回答的是"手写 intrinsic vs 编译器自动向量化"。这里用逐元素 `black_box`
+        // 掐断向量化（编译器屏障，运行期是 no-op）⇒ 这才是"vs 朴素循环"的分母。
+        {
+            /// 朴素三重循环 GEMM（阻止自动向量化；也不允许 FMA 收缩）。
+            #[inline(never)]
+            fn naive_gemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut s = 0f32;
+                        for p in 0..k {
+                            s = black_box(s) + black_box(a[i * k + p]) * black_box(b[p * n + j]);
+                        }
+                        c[i * n + j] = s;
+                    }
+                }
+            }
+            let n = 256usize;
+            let av: Vec<f32> = (0..n * n).map(|i| (i % 17) as f32 * 0.0625).collect();
+            let bv: Vec<f32> = (0..n * n).map(|i| (i % 13) as f32 * 0.0625).collect();
+            let mut cv = vec![0f32; n * n];
+            let mut cv2 = vec![0f32; n * n];
+            let naive = timeit(|| {
+                naive_gemm(n, n, n, &av, &bv, &mut cv);
+                let _ = black_box(cv[0]);
+            });
+            let simd = timeit(|| {
+                lasx_matmul(
+                    n as i32,
+                    n as i32,
+                    n as i32,
+                    av.as_ptr(),
+                    bv.as_ptr(),
+                    cv2.as_mut_ptr(),
+                );
+                let _ = black_box(cv2[0]);
+            });
+            println!(
+                "| 真标量 vs LASX（GEMM {n}³） | — | 朴素三重循环 {} | LASX {} | **{:.1}×** |",
+                crate::timing::fmt_t(naive),
+                crate::timing::fmt_t(simd),
+                naive.as_secs_f64() / simd.as_secs_f64()
+            );
+        }
         let (m, k) = (4096usize, 4096usize);
         let aw: Vec<u16> = (0..m * k).map(|i| (i % 1024) as u16).collect();
         let xv: Vec<f32> = vec![0.25; k];
