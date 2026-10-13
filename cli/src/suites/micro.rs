@@ -572,10 +572,10 @@ pub fn dispatch_overhead() {
                 let _ = black_box(big[0]);
             });
             println!(
-                "| 池：24 MB 写 | 1 线程 {} | 24 线程 {} | 理想 1/24 = {}；差 = 派发+同步 |",
+                "| 池：24 MB 写（{nt} 线程） | 1 线程 {} | {nt} 线程 {} | 理想 1/{nt} = {}；差含带宽饱和 |",
                 crate::timing::fmt_t(t1),
                 crate::timing::fmt_t(t24),
-                crate::timing::fmt_t(t1 / 24)
+                crate::timing::fmt_t(t1 / nt as u32)
             );
             // 串行建表的**规模扫描**：池能不能回本取决于"工作 / 派发"之比。
             for &np in &[192usize, 4096, 16384] {
