@@ -90,7 +90,10 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 （丢弃首轮、取后 5 轮中位数）、进程级；单线程表绑核、带线程的表不绑核；分级按
 `docs/dev.md` §6.4（本机桌面常驻负载 ≈2.5–3，绝大多数轮为 B 级正式数）。**每个数字的极差、
 逐轮 loadavg 与完整口径见 [docs/dev.md](docs/dev.md) §7**；编译期常量/阈值的对照（k 分块、
-列块宽度、调度策略等）记录在其中的设计小节。
+列块宽度、调度策略等）记录在其中的设计小节。**测量工具**（复现这条链条）：
+[`scripts/bench_rounds.sh`](scripts/bench_rounds.sh)（按组分批、轮间 settle、逐轮记 loadavg 与
+A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐各轮、输出 `中位数（极差）`，
+`render` 模式直接输出可粘贴的表格行）。
 
 | 项 | 读数 |
 |---|---|
