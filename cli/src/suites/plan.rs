@@ -9,9 +9,13 @@
 //! | ③ `MatmulPlan::run_into` | 复用调用方的 | **只打包一次** |
 //!
 //! 所以"③ / ②"就是**纯粹**的打包复用收益，不受输出分配干扰。
+//!
+//! 最后一段 `dsl_plan_reuse` 把同一件事搬到**公式 DSL** 上：`matmul!(y = x * w[K,N])` 生成的
+//! `x.mul_into(&w, &mut y)` 内部每次 `prepare()`；新形态 `matmul!(y = x * p)`（右操作数不带
+//! 方括号 = `Prepared`）生成 `p.apply_into(&x, &mut y)`。两臂进程级交替、丢弃首轮、取中位数。
 
 use crate::data::{AlignedBuf, Lcg};
-use crate::timing::{fmt_t, timeit};
+use crate::timing::{fmt_t, median, timeit};
 use lasx_rs::api;
 use lasx_rs::lasx_matmul;
 use lasx_rs::lasx_matmul_f64;
@@ -47,6 +51,126 @@ pub fn run() {
     println!("小形状上计划固定走打包路径，而 `lasx_matmul` 会按形状走流式路径，两者可能持平。");
     println!();
     shape_layer();
+    dsl_plan_reuse();
+}
+
+/// DSL 侧的同一件事：`matmul!` 默认**每次调用都重新打包**右操作数。
+///
+/// 根因是 `Mat::mul_into` 的实现 `rhs.prepare().apply_into(self, out)`：`matmul!(y[M,N] =
+/// x[M,K] * w[K,N])` 生成 `x.mul_into(&w, &mut y)`，所以层循环里复用同一权重会重复打包。
+/// 新形态让右操作数**不写方括号**（`Prepared` 自带形状）：`matmul!(y[M,N] = x[M,K] * p)`
+/// 生成 `p.apply_into(&x, &mut y)`，打包只在循环外的 `w.prepare()` 发生一次。
+///
+/// 口径（`docs/dev.md` §6.4）：两臂**进程级交替**、≥3 轮、**丢弃首轮**、取中位数；每轮内部是
+/// [`timeit`]（自适应重复 + 5 取样中位数）。输出第一行是 `/proc/loadavg`——load ≤3 才算正式
+/// 数，否则只能当趋势。计时**不含计划构建**（`p` 在计时区之外建好）。
+fn dsl_plan_reuse() {
+    use lasx_rs::matmul;
+    use lasx_rs::shape::{Mat, MatBuf};
+
+    const M: usize = 256;
+    const K: usize = 256;
+    const N: usize = 256;
+    const ROUNDS: usize = 4; // 丢弃首轮后仍有 3 轮
+
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "\n## DSL 计划复用：每次重新打包 vs 复用 plan（{M}×{K}×{N}，loadavg = {}）",
+        load.trim()
+    );
+    println!();
+    println!(
+        "| 轮次 | ① `matmul!(y = x * w[K,N])`（每次 pack） | ② `matmul!(y = x * p)`（plan 复用） | ②/① |"
+    );
+    println!("|---|---|---|---|");
+
+    let mut rng = Lcg::new(0x5eed_1234);
+    let weights = AlignedBuf::fill_with(K * N, |_| rng.f32());
+    let batch = AlignedBuf::fill_with(M * K, |_| rng.f32());
+    let w = Mat::<f32, { K }, { N }>::new(weights.as_slice()).unwrap();
+    let x = Mat::<f32, { M }, { K }>::new(batch.as_slice()).unwrap();
+    let mut y_pack = MatBuf::<f32, { M }, { N }>::new();
+    let mut y_plan = MatBuf::<f32, { M }, { N }>::new();
+
+    // 计划在**计时区之外**建一次：这就是"循环外准备"的形态本身。
+    let p = w.prepare();
+
+    let mut pack_rounds = Vec::with_capacity(ROUNDS - 1);
+    let mut plan_rounds = Vec::with_capacity(ROUNDS - 1);
+
+    {
+        let mut arm_pack = || {
+            timeit(|| {
+                matmul!(y_pack[M, N] = x[M, K] * w[K, N]); // → x.mul_into(&w, &mut y_pack)
+                let _ = black_box(y_pack.as_slice()[0]);
+            })
+        };
+        let mut arm_plan = || {
+            timeit(|| {
+                matmul!(y_plan[M, N] = x[M, K] * p); // → p.apply_into(&x, &mut y_plan)
+                let _ = black_box(y_plan.as_slice()[0]);
+            })
+        };
+        for round in 0..ROUNDS {
+            // 交替顺序（奇偶轮互换），抵消"第二个被测者占便宜/吃亏"的顺序效应
+            let (t_pack, t_plan) = if round % 2 == 0 {
+                let a = arm_pack();
+                let b = arm_plan();
+                (a, b)
+            } else {
+                let b = arm_plan();
+                let a = arm_pack();
+                (a, b)
+            };
+            println!(
+                "| r{} | {} | {} | {:.2}× |",
+                round + 1,
+                fmt_t(t_pack),
+                fmt_t(t_plan),
+                t_pack.as_secs_f64() / t_plan.as_secs_f64()
+            );
+            if round > 0 {
+                pack_rounds.push(t_pack);
+                plan_rounds.push(t_plan);
+            }
+        }
+    }
+
+    let t_pack = median(pack_rounds);
+    let t_plan = median(plan_rounds);
+    let speedup = t_pack.as_secs_f64() / t_plan.as_secs_f64();
+    println!(
+        "| **中位数（丢弃首轮，{} 轮）** | **{}** | **{}** | **{:.2}×（省 {:.0}%）** |",
+        ROUNDS - 1,
+        fmt_t(t_pack),
+        fmt_t(t_plan),
+        speedup,
+        100.0 * (1.0 - 1.0 / speedup)
+    );
+
+    // 快但不能错：两臂互相比、再与 `api::matmul` 逐位比（`to_bits()`，不是近似）
+    let want = api::matmul(M, K, N, batch.as_slice(), weights.as_slice()).unwrap();
+    let want_bits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+    let arms = [
+        ("① 每次 pack", y_pack.as_slice()),
+        ("② plan 复用", y_plan.as_slice()),
+    ];
+    let mut arm_bits: Vec<Vec<u32>> = Vec::with_capacity(arms.len());
+    for (label, got) in arms {
+        let bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        assert!(
+            bits == want_bits,
+            "{M}×{K}×{N}: {label} 与 api::matmul 不逐位一致"
+        );
+        arm_bits.push(bits);
+    }
+    assert!(
+        arm_bits[0] == arm_bits[1],
+        "{M}×{K}×{N}: 两臂之间不逐位一致"
+    );
+    println!();
+    println!("两臂与 `api::matmul` 逐位一致（`to_bits()` 全量比对）——② 只是少了重复打包，");
+    println!("数值路径完全相同，没有近似的余地。load > 3 时上表只能当趋势。");
 }
 
 /// `shape` 层自己的验收：**同一个 `Prepared` 类型、只换策略参数**（`Auto` vs `Single`）。

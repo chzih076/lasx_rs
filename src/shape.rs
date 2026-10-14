@@ -101,9 +101,40 @@
 //! let mut yd = MatBufDyn::<f32, { N }>::with_rows(M);
 //! matmul!(yd[m, N] = xd[m, K] * w[K, N]);
 //!
+//! // plan 形态：右操作数不写方括号 ⇒ 宏直接吃打包好的 `Prepared`
+//! let p = w.prepare();
+//! let mut yp = MatBuf::<f32, { M }, { N }>::new();
+//! matmul!(yp[M, N] = x[M, K] * p);
+//!
 //! assert_eq!(y.as_slice(), yd.as_slice());
+//! assert_eq!(y.as_slice(), yp.as_slice());
 //! # Ok::<(), lasx_rs::api::Error>(())
 //! ```
+//!
+//! 第三种写法是**消掉打包浪费**的正规做法：`w[K,N]` 形态生成 `x.mul_into(&w, &mut y)`，而
+//! [`Mat::mul_into`] 内部是 `rhs.prepare().apply_into(self, out)`——**每次调用都重新打包**
+//! （256³ 实测损失 31–34%）。`p` 形态生成 `p.apply_into(&x, &mut y)`，打包只发生在 `prepare()`
+//! 一次，所以循环里复用同一权重应当写成：
+//!
+//! ```
+//! # use lasx_rs::matmul;
+//! # use lasx_rs::shape::{Mat, MatBuf};
+//! # const M: usize = 64; const K: usize = 256; const N: usize = 256;
+//! # let weights: Vec<f32> = (0..K * N).map(|i| (i % 13) as f32).collect();
+//! # let batch: Vec<f32> = vec![0.0; M * K];
+//! # let w = Mat::<f32, { K }, { N }>::new(&weights)?;
+//! # let x = Mat::<f32, { M }, { K }>::new(&batch)?;
+//! # let mut y = MatBuf::<f32, { M }, { N }>::new();
+//! let p = w.prepare();                                 // 循环外一次
+//! // for layer in 0..layers { … }                       // 每层新写 x
+//! matmul!(y[M, N] = x[M, K] * p);                       // 循环内：零打包
+//! # Ok::<(), lasx_rs::api::Error>(())
+//! ```
+//!
+//! **位精确**：plan 形态与手写 `p.apply_into(&x, &mut y)` 生成同一段调用，逐位一致是构造性的
+//! （`shape::tests::test_formula_dsl_plan_matches_hand_hoist_bit_for_bit` 用 `to_bits()` 钉住）。
+//! **不做隐式缓存**：`.prepare()` 返回的 `Prepared` 借用权重切片，只有**显式** plan 才可证明
+//! 安全；按指针/指纹键做透明缓存会在缓冲区复用时给出陈旧结果（静默错结果）。
 //!
 //! # 数值保证
 //!
@@ -967,5 +998,93 @@ mod tests {
             bits_f32(&want),
             "权重在左 + DYN"
         );
+    }
+
+    /// plan 形态（`matmul!(y[M, N] = x[M, K] * p)`）：与**手写 hoist** 逐位一致。
+    ///
+    /// 这是"消除每次重新打包"那条形态的验收。宏生成的调用与手写
+    /// `let p = w.prepare(); p.apply_into(&x, &mut y)` 完全同形（见 `macros/src/lib.rs` 的
+    /// `expand`），所以逐位一致是构造性的；测试的价值是把这个同形关系**钉住**——生成路径
+    /// 将来被改（例如换成另一条内核）就会红。同时覆盖静态 / DYN / 无输出三种落点。
+    #[test]
+    fn test_formula_dsl_plan_matches_hand_hoist_bit_for_bit() {
+        const K: usize = 64;
+        const N: usize = 48;
+        let weights = f32s(K * N, 0x1357);
+        let w = Mat::<f32, { K }, { N }>::new(&weights).unwrap();
+        let p = w.prepare();
+
+        // ① 静态档：M ∈ {1 行、常规、行尾 + 列尾}（形状写死在类型里，只能逐例列）
+        macro_rules! plan_static {
+            ($m:expr) => {{
+                const M: usize = $m;
+                let batch = f32s(M * K, 0x2468 ^ M as u64);
+                let x = Mat::<f32, { M }, { K }>::new(&batch).unwrap();
+                let want = crate::api::matmul(M, K, N, &batch, &weights).unwrap();
+
+                // 手写 hoist（对照）
+                let mut hand = MatBuf::<f32, { M }, { N }>::new();
+                p.apply_into(&x, &mut hand);
+
+                // plan 形态：右操作数不写方括号 ⇒ `p.apply_into(&x, &mut y)`
+                let mut y = MatBuf::<f32, { M }, { N }>::new();
+                crate::matmul!(y[M, N] = x[M, K] * p);
+                assert_eq!(
+                    bits_f32(y.as_slice()),
+                    bits_f32(hand.as_slice()),
+                    "plan 静态 {M}×{K}×{N} vs 手写 hoist"
+                );
+                assert_eq!(
+                    bits_f32(y.as_slice()),
+                    bits_f32(&want),
+                    "plan 静态 {M}×{K}×{N} vs api"
+                );
+
+                // 无输出形态：`p.apply(&x)`（新分配）
+                let expr = crate::matmul!(x[M, K] * p);
+                assert_eq!(
+                    bits_f32(expr.as_slice()),
+                    bits_f32(hand.as_slice()),
+                    "plan 无输出 {M}×{K}×{N} vs 手写 hoist"
+                );
+            }};
+        }
+        plan_static!(1);
+        plan_static!(32);
+        plan_static!(65); // 行尾（4 行一块的尾）+ 列尾
+
+        // ② DYN 档：行下标小写 ⇒ `p.apply_dyn_into(&xd, &mut yd)`，同一个 plan 吃多种行数
+        for rows in [1usize, 3, 32, 64] {
+            let batch = f32s(rows * K, 0x99 ^ rows as u64);
+            let want = crate::api::matmul(rows, K, N, &batch, &weights).unwrap();
+            let xd = MatDyn::<f32, { K }>::new(&batch).unwrap();
+
+            let mut hand = MatBufDyn::<f32, { N }>::with_rows(rows);
+            p.apply_dyn_into(&xd, &mut hand);
+
+            let mut yd = MatBufDyn::<f32, { N }>::with_rows(rows);
+            crate::matmul!(yd[m, N] = xd[m, K] * p);
+            assert_eq!(
+                bits_f32(yd.as_slice()),
+                bits_f32(hand.as_slice()),
+                "plan DYN rows={rows} vs 手写 hoist"
+            );
+            assert_eq!(
+                bits_f32(yd.as_slice()),
+                bits_f32(&want),
+                "plan DYN rows={rows} vs api"
+            );
+
+            // 无输出形态：`p.apply_dyn(&xd)`
+            let expr = crate::matmul!(xd[m, K] * p);
+            assert_eq!(
+                bits_f32(expr.as_slice()),
+                bits_f32(hand.as_slice()),
+                "plan 无输出 DYN rows={rows} vs 手写 hoist"
+            );
+        }
+
+        // ③ 同一个 plan 复用的直接证据：打包字节数只算一次（`prepare()` 之外不再打包）
+        assert_eq!(p.packed_bytes(), K * N * 4);
     }
 }

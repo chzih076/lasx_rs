@@ -48,7 +48,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 219 lib tests + 5 macro tests + 17 doc tests (2 ignored)
+cargo test --workspace --release         # 220 lib tests + 6 macro tests + 18 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -91,6 +91,14 @@ live in the respective design sections.
 
 Comparisons against OpenBLAS 0.3.34 (single-threaded) on the same machine, together with the
 per-shape root-cause analysis, are in `docs/dev.md`.
+
+> **Formula-DSL reuse note**: `matmul!`'s `mul_into` re-packs `B` on every call, so a layer loop
+> that reuses the same weight should hoist the preparation out of the loop (256³ measured
+> **143.7 µs → 96.5–99.1 µs**, on par with the direct pooled call). **The DSL can now reuse a plan
+> directly** — an operand written *without* brackets is a `Prepared`: with
+> `let p = w.prepare();` outside the loop, `matmul!(y[M, N] = x[M, K] * p);` generates
+> `p.apply_into(&x, &mut y)`, bit-for-bit identical to the hand-written hoist (`to_bits()`
+> comparison). The bracketed form `w[K, N]` is unchanged. Full usage: [docs/ops.md](docs/ops.md).
 
 > How to read these numbers: the tables above are a cross-section of one continuous collection and
 > are **only comparable within that run**. Cross-run comparisons require re-measurement; observed

@@ -1582,6 +1582,32 @@ wp.apply_dyn_into(&xd, &mut yd);
 - 与 `api::matmul` **逐位一致**（走同一套打包 + k 分块内核，理由见 §2.5），
   含 DYN 档的多种行数。
 
+**公式 DSL 里复用同一个 plan**：右操作数**不写方括号**就是 `Prepared`（它自带形状，方括号的
+有无是天然区分信号）。这是消除"每次调用都重新打包"的正规写法：
+
+```rust
+use lasx_rs::matmul;
+use lasx_rs::shape::{Mat, MatBuf};
+
+const M: usize = 64;
+const K: usize = 256;
+const N: usize = 256;
+let w = Mat::<f32, { K }, { N }>::new(&weights)?;
+let x = Mat::<f32, { M }, { K }>::new(&batch)?;
+let p = w.prepare();                      // 循环外一次：打包只发生在这里
+let mut y = MatBuf::<f32, { M }, { N }>::new();
+matmul!(y[M, N] = x[M, K] * p);           // 生成 `p.apply_into(&x, &mut y)`
+
+// DYN 档（行数运行期）：`matmul!(yd[m, N] = xd[m, K] * p)` → `apply_dyn_into`
+```
+
+带方括号的写法 `matmul!(y[M, N] = x[M, K] * w[K, N])` 行为**完全不变**——它生成
+`x.mul_into(&w, &mut y)`，而 `Mat::mul_into` 内部是 `rhs.prepare().apply_into(self, out)`
+⇒ **每次调用都重新打包**。层循环里复用同一权重时两者的差是**纯打包开销**：256³ 实测
+`142.2 µs → 99.3 µs`（4 轮丢弃首轮取中位数，**省 30%**），两臂与手写 hoist **逐位一致**。
+plan 只能写在乘积**右侧**（左侧留给标量前缀的诊断）；**不做**隐式/指纹缓存——那会在缓冲区
+复用时给出陈旧结果，与位精确承诺冲突。
+
 > 三层的分工：**`view` 管布局**（列主序/跨距/转置）、**`plan` 管复用**（打包一次）、
 > **`shape` 管形状**（进类型）。它们可以叠：`shape::Prepared` 内部就是 `plan::MatmulPlan`。
 

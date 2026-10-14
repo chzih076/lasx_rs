@@ -3,6 +3,7 @@
 //! ```text
 //! matmul!(y[M, N] = x[M, K] * w[K, N]);     // 全静态：M/K/N 是 const
 //! matmul!(y[m, N] = x[m, K] * w[K, N]);     // DYN：m 是运行期行数，K/N 仍是 const
+//! matmul!(y[M, N] = x[M, K] * p);           // 右操作数是 Prepared plan（不带方括号）
 //! ```
 //!
 //! 这个 crate 是**内部实现**（`publish = false`），用户只看到 `lasx_rs::matmul!`：
@@ -32,9 +33,10 @@
 //! 公式   := 操作数 '=' 操作数 '*' 操作数
 //!         | 操作数 '*' 操作数
 //! 操作数 := ident '[' ident ',' ident ']'
+//!         | ident                                   ← 只在乘积右侧：视为 Prepared plan
 //! ```
 //!
-//! 两个操作数**按"共享下标出现在哪一侧"判角色**，两种读法都认：
+//! 两个**带下标**的操作数按"共享下标出现在哪一侧"判角色，两种读法都认：
 //!
 //! | 写法 | 判定 | 角色 |
 //! |---|---|---|
@@ -48,19 +50,57 @@
 //! 仍**不做**：`alpha`/`beta` 融合、`+` 多操作数、不带下标的简写里判静态/DYN 两档
 //! （`matmul!(x * w)` 按全静态生成）。
 //!
+//! # 直接吃 `Prepared`（plan 形态）
+//!
+//! `Mat::mul_into` 的实现是 `rhs.prepare().apply_into(self, out)`：**每次调用都重新打包
+//! 右操作数**。层循环里复用同一权重时这是纯浪费（256³ 实测 143.7 µs → 96.5–99.1 µs，
+//! 省 **31–34%**）。所以给 DSL 一个"**右操作数不写方括号**"的形态——`Prepared` 自带形状，
+//! 方括号的有无就是区分信号：
+//!
+//! ```text
+//! matmul!(y[M, N] = x[M, K] * p);   →  p.apply_into(&x, &mut y)         // const 行数
+//! matmul!(y[m, N] = x[m, K] * p);   →  p.apply_dyn_into(&x, &mut y)     // 运行期行数
+//! matmul!(x[M, K] * p)              →  p.apply(&x) / p.apply_dyn(&x)    // 无输出、新分配
+//! ```
+//!
+//! `p` 由调用方**在循环外**建好，打包只发生一次：
+//!
+//! ```text
+//! let p = w.prepare();                        // 循环外一次
+//! for _ in 0..layers { matmul!(y[M, N] = x[M, K] * p); }
+//! ```
+//!
+//! 三条边界，都是刻意的：
+//!
+//! - **plan 只能写在乘积右侧**。`alpha * x[M,K]`（标量前缀，v1 不支持）与 `p * x[M,K]`
+//!   在 token 层**完全同形**，无法区分；留一条"形状必须写在左侧"的硬规则，才能保住
+//!   标量前缀那条诊断（见诊断第 3 条）。
+//! - **权重形状不进公式**。K/N 由 `Prepared` 自己的 const 参数定，与 `x` / `y` 的类型标注
+//!   对接（写错仍是编译错误：`x` 的列、`y` 的列分别与 plan 的 K/N 对齐）。
+//! - **不做隐式/指纹缓存**。`.prepare()` 返回的 `Prepared` 借用了权重切片，只有**显式**
+//!   plan 才是可证明安全的；按指针/指纹键做透明缓存会在缓冲区复用时给出**陈旧结果**
+//!   （静默错结果），与位精确承诺冲突。
+//!
+//! **位精确**：这条形态与手写 `let p = w.prepare(); p.apply_into(&x, &mut y)` 生成的是
+//! **同一段调用**（宏不额外做任何事），所以逐位一致是构造性的，不是巧合。
+//!
 //! # 诊断
 //!
 //! | # | 情况 | 谁报 | 锚点 |
 //! |---|---|---|---|
 //! | 1 | 同一维两侧下标名不同（`y[M,N] = x[m,K] * …`、`x[M,K] * w[Q,N]`） | 宏 | 两个下标（**双锚定**） |
 //! | 2 | 同一次操作数两个下标同名（`y[M, M]`） | 宏 | 两个下标 |
-//! | 3 | 下标个数 ≠ 2 / 没写在方括号里 | 宏 | 该操作数 |
-//! | 4 | 不是 `a[..] * b[..]` 这个形状（多了 `+`、少了 `*`…） | 宏 | 出错的那个 token |
-//! | 5 | 大写下标其实**不是** `const` | rustc | `cannot find value 'M' in this scope` |
+//! | 3 | 标量前缀（`alpha * x[..]`）或 plan 写在乘积左侧 | 宏 | 该操作数 |
+//! | 4 | 下标个数 ≠ 2 / 下标没写在方括号里（`x[]`、`x(M, K)`） | 宏 | 该操作数 |
+//! | 5 | 不是 `a[..] * b[..]` 这个形状（多了 `+`、少了 `*`…） | 宏 | 出错的那个 token |
+//! | 6 | 大写下标其实**不是** `const` | rustc | `cannot find value 'M' in this scope` |
 //!
-//! 第 5 条必须说清楚：**proc-macro 没有名字解析**，它无法知道 `M` 是不是 `const`，所以
+//! 第 6 条必须说清楚：**proc-macro 没有名字解析**，它无法知道 `M` 是不是 `const`，所以
 //! "大写下标必须是 const"这句提示只能写在**本文档**里，进不了编译错误。用类型标注去逼也
 //! 徒劳——名字解析失败发生在任何类型检查之前。
+//!
+//! 第 3 条的两半共用一条诊断：`alpha * x[M,K]` 与 `p * x[M,K]` 在 token 层同形，所以带
+//! 方括号的操作数只能出现在乘积**左侧**（plan 形态因此只认右操作数，见上一节）。
 //!
 //! # Span 从第一行就保留
 //!
@@ -105,24 +145,58 @@ impl Kind {
     }
 }
 
-/// 一个带两个下标的操作数：`x[M, K]`。
+/// 一个操作数：`x[M, K]`（带方括号，形状写进公式）或 `p`（不带方括号 ⇒ `Prepared` plan）。
+///
+/// 下标是 `Option`：`None` 就是 plan——`Prepared` 自带形状，所以不需要（也不能）在公式里写。
+/// 解析保证"输入 / 输出"这两个角色一定有下标（见 [`parse_operand`] 的 `allow_plan`），
+/// 所以 [`Operand::i`] / [`Operand::j`] 对它们是安全的。
 struct Operand {
     name: Ident,
-    i: Ident,
-    j: Ident,
+    dims: Option<(Ident, Ident)>,
 }
 
 impl Operand {
-    fn shape(&self) -> (String, String) {
-        (self.i.to_string(), self.j.to_string())
+    /// 不带方括号的操作数：视为 `Prepared` plan。
+    fn plan(name: Ident) -> Operand {
+        Operand { name, dims: None }
+    }
+
+    fn is_plan(&self) -> bool {
+        self.dims.is_none()
+    }
+
+    /// 形状（名字层）。`None` = plan（形状在运行期由 plan 自带）。
+    fn shape(&self) -> Option<(String, String)> {
+        self.dims
+            .as_ref()
+            .map(|(i, j)| (i.to_string(), j.to_string()))
+    }
+
+    fn dims(&self) -> &(Ident, Ident) {
+        self.dims
+            .as_ref()
+            .expect("该角色由解析保证带下标（输入/输出）")
+    }
+
+    /// 行下标（编译期 const 或运行期值由首字符决定）。
+    fn i(&self) -> &Ident {
+        &self.dims().0
+    }
+
+    /// 列下标。
+    fn j(&self) -> &Ident {
+        &self.dims().1
     }
 }
 
-/// 解析出来的公式。固定读法：`out[am, bn] = a[am, ak] * b[ak, bn]`。
+/// 解析出来的公式，已按角色归一：`input` 是输入、`weight` 是权重（可能是 plan）。
+///
+/// `weight.is_plan()` 为真表示宏吃到的是 [`Prepared`]：生成 `weight.apply_into(&input, …)`
+/// 而不是 `input.mul_into(&weight, …)`——后者内部每次都会 `prepare()`。
 struct Formula {
     out: Option<Operand>,
-    a: Operand,
-    b: Operand,
+    input: Operand,
+    weight: Operand,
 }
 
 /// 一条诊断：主锚点 + 可选第二锚点（双锚定）+ 可选 note。
@@ -299,7 +373,16 @@ pub(crate) fn const_arg(ident: &Ident) -> TokenTree {
 
 /* ------------------------------ 解析 ------------------------------ */
 
-fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Diagnostic> {
+/// 解析一个操作数。
+///
+/// `allow_plan` 只对**乘积右侧**的操作数放行"不带方括号"的 plan 形态：`Prepared` 自带形状，
+/// 所以那里不写方括号就是"这是打包好的权重"。左侧必须写形状——`alpha * x[M,K]` 与
+/// `p * x[M,K]` 在 token 层同形，只有把 plan 限死在右侧，标量前缀那条诊断才留得住。
+fn parse_operand(
+    tokens: &[TokenTree],
+    at: usize,
+    allow_plan: bool,
+) -> Result<(Operand, usize), Diagnostic> {
     let Some(found) = tokens.get(at) else {
         return Err(Diagnostic::new(
             "公式在这里就结束了，缺少操作数",
@@ -308,32 +391,39 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Di
     };
     let TokenTree::Ident(name) = found else {
         return Err(Diagnostic::new(
-            "这里应该是操作数（形如 `x[M, K]`）",
+            "这里应该是操作数（形如 `x[M, K]`；乘积右侧还可以是不带方括号的 `p`，即 `Prepared`）",
             found.span(),
         ));
     };
     let name = name.clone();
     let name_span = name.span();
 
-    let Some(TokenTree::Group(arg)) = tokens.get(at + 1) else {
-        // 紧跟着 `*` 说明这是标量前缀（`alpha * x[..]`）：单独给消息，否则用户只看到
-        // "缺少下标"，看不出真正的问题是 v1 还没做 `alpha`/融合。
-        // edition 2024：`if let` 链可以把这两层合成一个条件（clippy 的 collapsible_if 要求）。
-        if let Some(TokenTree::Punct(star)) = tokens.get(at + 1)
-            && star.as_char() == '*'
-        {
+    // 后面不是一个方括号组：要么是 plan 形态（右侧），要么是缺下标 / 标量前缀（左侧）。
+    let arg = match tokens.get(at + 1) {
+        Some(TokenTree::Group(arg)) => arg,
+        other => {
+            if allow_plan {
+                return Ok((Operand::plan(name), at + 1));
+            }
+            // 紧跟着 `*` 说明这是标量前缀（`alpha * x[..]`）：单独给消息，否则用户只看到
+            // "缺少下标"，看不出真正的问题是 v1 还没做 `alpha`/融合。
+            if let Some(TokenTree::Punct(star)) = other
+                && star.as_char() == '*'
+            {
+                return Err(Diagnostic::new(
+                    format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
+                    name_span,
+                )
+                .with_note(
+                    "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用。\
+                     若这个操作数是 `Prepared`（plan 形态），它只能写在乘积右侧：`x[M, K] * p`",
+                ));
+            }
             return Err(Diagnostic::new(
-                format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
+                format!("`{name}` 后面缺少下标：请写成 `{name}[行下标, 列下标]`"),
                 name_span,
-            )
-            .with_note(
-                "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用",
             ));
         }
-        return Err(Diagnostic::new(
-            format!("`{name}` 后面缺少下标：请写成 `{name}[行下标, 列下标]`"),
-            name_span,
-        ));
     };
     if arg.delimiter() != Delimiter::Bracket {
         return Err(Diagnostic::new(
@@ -364,43 +454,50 @@ fn parse_operand(tokens: &[TokenTree], at: usize) -> Result<(Operand, usize), Di
         .with_second(j.span())
         .with_note("两个下标必须分别表示行与列"));
     }
-    Ok((Operand { name, i, j }, at + 2))
+    Ok((
+        Operand {
+            name,
+            dims: Some((i, j)),
+        },
+        at + 2,
+    ))
 }
 
 fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
-    let (first, mut at) = parse_operand(&tokens, 0)?;
+    // 左侧（输出、输入）必须写形状；只有乘积右侧允许 plan 形态。
+    let (first, mut at) = parse_operand(&tokens, 0, false)?;
 
     let parsed = match tokens.get(at) {
         // `out[..] = a[..] * b[..]`
         Some(TokenTree::Punct(eq)) if eq.as_char() == '=' => {
             at += 1;
-            let (lhs, next) = parse_operand(&tokens, at)?;
+            let (lhs, next) = parse_operand(&tokens, at, false)?;
             at = next;
             match tokens.get(at) {
                 Some(TokenTree::Punct(star)) if star.as_char() == '*' => at += 1,
                 other => {
                     return Err(Diagnostic::new(
                         "输出与乘积之间缺少 `*`（v1 只接受单项乘积 `y[..] = a[..] * b[..]`）",
-                        other.map_or(first.i.span(), TokenTree::span),
+                        other.map_or(first.i().span(), TokenTree::span),
                     ));
                 }
             }
-            let (b, next) = parse_operand(&tokens, at)?;
+            let (b, next) = parse_operand(&tokens, at, true)?;
             at = next;
             (Some(first), lhs, b)
         }
         // `a[..] * b[..]`
         Some(TokenTree::Punct(star)) if star.as_char() == '*' => {
             at += 1;
-            let (b, next) = parse_operand(&tokens, at)?;
+            let (b, next) = parse_operand(&tokens, at, true)?;
             at = next;
             (None, first, b)
         }
         other => {
             return Err(Diagnostic::new(
                 "公式应该是 `y[行, 列] = a[行, 收缩] * b[收缩, 列]`（或省掉输出）",
-                other.map_or(first.i.span(), TokenTree::span),
+                other.map_or(first.i().span(), TokenTree::span),
             ));
         }
     };
@@ -417,7 +514,7 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
 
 /// 角色归一（**纯名字层**：能单元测试）。
 ///
-/// 两个操作数有两种合法读法，靠"共享下标出现在哪一侧"区分：
+/// 两个**带下标**的操作数有两种合法读法，靠"共享下标出现在哪一侧"区分：
 ///
 /// - `x[M,K] * w[K,N]`：左.j == 右.i → 左是**输入**、右是**权重**（= `A·B`）
 /// - `w[K,N] * x[M,K]`：左.i == 右.j → 左是**权重**、右是**输入**（权重在左）
@@ -433,26 +530,52 @@ fn roles(left: (&str, &str), right: (&str, &str)) -> Result<bool, ()> {
     }
 }
 
-/// 按 [`roles`] 的判定把 `a`/`b` 归一成 **input / weight**，下游的检查与生成都只认角色。
+/// 按角色归一成 **input / weight**，下游的检查与生成都只认角色。
+///
+/// 右侧不带下标（plan）时角色由**位置**直接定下：右侧是打包好的权重、左侧是输入，
+/// 不需要（也无法）用共享下标判——`Prepared` 的形状不在公式里。
 fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Formula, Diagnostic> {
-    let (li, lj) = left.shape();
-    let (ri, rj) = right.shape();
+    if right.is_plan() {
+        if left.is_plan() {
+            return Err(Diagnostic::new(
+                "plan 形态只能有一个操作数：右侧是不带方括号的 `p`，左侧必须写形状 `x[M, K]`",
+                right.name.span(),
+            )
+            .with_second(left.name.span())
+            .with_note("生成的是 `p.apply_into(&x, &mut y)`，需要一个带形状的输入"));
+        }
+        return Ok(Formula {
+            out,
+            input: left,
+            weight: right,
+        });
+    }
+    if left.is_plan() {
+        // `parse` 只对右侧放行 plan，这里防御性报错（这个函数是纯函数、也能单测）。
+        return Err(Diagnostic::new(
+            "plan 形态（不带方括号的 `p`）只能写在乘积右侧：`x[M, K] * p`",
+            left.name.span(),
+        )
+        .with_note("左侧写形状后才能用共享下标判角色；这也是标量前缀 `alpha * x[..]` 的诊断前提"));
+    }
+    let (li, lj) = left.shape().expect("非 plan 必有下标");
+    let (ri, rj) = right.shape().expect("非 plan 必有下标");
     match roles((li.as_str(), lj.as_str()), (ri.as_str(), rj.as_str())) {
         Ok(false) => Ok(Formula {
             out,
-            a: left,
-            b: right,
+            input: left,
+            weight: right,
         }),
         Ok(true) => Ok(Formula {
             out,
-            a: right,
-            b: left,
+            input: right,
+            weight: left,
         }),
         Err(()) => Err(Diagnostic::new(
             format!("收缩维的下标不一致：左侧操作数写 `{lj}`，右侧操作数写 `{ri}`"),
-            left.j.span(),
+            left.j().span(),
         )
-        .with_second(right.i.span())
+        .with_second(right.i().span())
         .with_note("两种读法都对不上：`x[M,K] * w[K,N]`（A·B）或 `w[K,N] * x[M,K]`（权重在左）")),
     }
 }
@@ -473,16 +596,24 @@ enum Violation {
 }
 
 /// 纯逻辑层：**同一维必须写同一个下标**（行、收缩、列各查一次）。
+///
+/// `weight` 为 `None` 表示 plan 形态：权重形状不在公式里（`Prepared` 自带），所以收缩维与
+/// 列维**没有可对照的名字**，只查"输出行 == 输入行"这一条。K/N 是否对得上由类型系统守
+/// （plan 的 const 参数与 `x`/`y` 的类型标注对接）。
 fn check_names(
     out: Option<(&str, &str)>,
-    a: (&str, &str),
-    b: (&str, &str),
+    input: (&str, &str),
+    weight: Option<(&str, &str)>,
 ) -> Result<(), Violation> {
-    let mut pairs: Vec<(&'static str, &str, &str, &'static str, &'static str)> =
-        vec![("收缩", a.1, b.0, "左侧操作数", "右侧操作数")];
+    let mut pairs: Vec<(&'static str, &str, &str, &'static str, &'static str)> = Vec::new();
+    if let Some((w_i, _)) = weight {
+        pairs.push(("收缩", input.1, w_i, "左侧操作数", "右侧操作数"));
+    }
     if let Some((out_i, out_j)) = out {
-        pairs.push(("行", out_i, a.0, "输出", "左侧操作数"));
-        pairs.push(("列", out_j, b.1, "输出", "右侧操作数"));
+        pairs.push(("行", out_i, input.0, "输出", "左侧操作数"));
+        if let Some((_, w_j)) = weight {
+            pairs.push(("列", out_j, w_j, "输出", "右侧操作数"));
+        }
     }
     for (dim, lhs, rhs, lhs_op, rhs_op) in pairs {
         if lhs != rhs {
@@ -500,21 +631,21 @@ fn check_names(
 
 /// 在操作数里按名字找下标 token（用于把违规锚到具体位置）。
 fn span_of(op: &Operand, name: &str) -> Span {
-    if op.i.to_string() == name {
-        op.i.span()
+    if op.i().to_string() == name {
+        op.i().span()
     } else {
-        op.j.span()
+        op.j().span()
     }
 }
 
 fn check(f: &Formula) -> Result<(), Diagnostic> {
-    let out_names = f.out.as_ref().map(Operand::shape);
-    let a_names = f.a.shape();
-    let b_names = f.b.shape();
+    let out_names = f.out.as_ref().and_then(Operand::shape);
+    let input_names = f.input.shape().expect("输入必有下标");
+    let weight_names = f.weight.shape();
     match check_names(
         out_names.as_ref().map(|(i, j)| (i.as_str(), j.as_str())),
-        (a_names.0.as_str(), a_names.1.as_str()),
-        (b_names.0.as_str(), b_names.1.as_str()),
+        (input_names.0.as_str(), input_names.1.as_str()),
+        weight_names.as_ref().map(|(i, j)| (i.as_str(), j.as_str())),
     ) {
         Ok(()) => Ok(()),
         Err(Violation::SameDimDifferentNames {
@@ -526,12 +657,12 @@ fn check(f: &Formula) -> Result<(), Diagnostic> {
         }) => {
             let lhs_operand = match lhs_op {
                 "输出" => f.out.as_ref().expect("输出维检查的前提是有输出"),
-                _ => &f.a,
+                _ => &f.input,
             };
             let rhs_operand = if rhs_op == "右侧操作数" {
-                &f.b
+                &f.weight
             } else {
-                &f.a
+                &f.input
             };
             let kinds = match (Kind::of(&lhs), Kind::of(&rhs)) {
                 (Ok(l), Ok(r)) if l != r => {
@@ -554,8 +685,14 @@ fn check(f: &Formula) -> Result<(), Diagnostic> {
 /* ------------------------------ 生成 ------------------------------ */
 
 /// 生成代码。**复用用户的 token**（Span 保留），只有样板用 `call_site()`。
+///
+/// plan 形态（`weight.is_plan()`）与非 plan 形态只差两处：少一条权重类型标注、
+/// 接收者换成权重（`weight.apply_into(&input, &mut out)` 而不是 `input.mul_into(&weight, &mut out)`）。
 fn expand(f: &Formula) -> TokenStream {
-    let runtime_rows = matches!(Kind::of(&f.a.i.to_string()), Ok(Kind::Runtime));
+    let input = &f.input;
+    let weight = &f.weight;
+    let planned = weight.is_plan();
+    let runtime_rows = matches!(Kind::of(&input.i().to_string()), Ok(Kind::Runtime));
 
     match &f.out {
         // 写进已有输出
@@ -563,8 +700,8 @@ fn expand(f: &Formula) -> TokenStream {
             let mut body = TokenStream::new();
             // 前三行是形状标注（大写下标）或运行期绑定 + 断言（小写下标）
             if runtime_rows {
-                body.extend([id("let"), TokenTree::Ident(f.a.i.clone()), p('=')]);
-                body.extend(method(&f.a.name, "rows", TokenStream::new()));
+                body.extend([id("let"), TokenTree::Ident(input.i().clone()), p('=')]);
+                body.extend(method(&input.name, "rows", TokenStream::new()));
                 body.extend([p(';')]);
                 let mut args = TokenStream::new();
                 args.extend([
@@ -573,7 +710,7 @@ fn expand(f: &Formula) -> TokenStream {
                     id("rows"),
                     group(Delimiter::Parenthesis, TokenStream::new()),
                     p(','),
-                    TokenTree::Ident(f.a.i.clone()),
+                    TokenTree::Ident(input.i().clone()),
                 ]);
                 body.extend([
                     id("assert_eq"),
@@ -581,49 +718,69 @@ fn expand(f: &Formula) -> TokenStream {
                     group(Delimiter::Parenthesis, args),
                     p(';'),
                 ]);
-                body.extend(annotate("MatDyn", true, vec![const_arg(&f.a.j)], &f.a.name));
                 body.extend(annotate(
-                    "Mat",
+                    "MatDyn",
                     true,
-                    vec![const_arg(&f.b.i), const_arg(&f.b.j)],
-                    &f.b.name,
+                    vec![const_arg(input.j())],
+                    &input.name,
                 ));
+                if !planned {
+                    body.extend(annotate(
+                        "Mat",
+                        true,
+                        vec![const_arg(weight.i()), const_arg(weight.j())],
+                        &weight.name,
+                    ));
+                }
+                // 非 plan：列宽取权重下标（与原实现逐字一致）；plan：权重没下标，取输出下标，
+                // 它与 plan 自己的 N 由类型系统对齐。
+                let n_col = if planned { out.j() } else { weight.j() };
                 body.extend(annotate(
                     "MatBufDyn",
                     false,
-                    vec![const_arg(&f.b.j)],
+                    vec![const_arg(n_col)],
                     &out.name,
                 ));
                 let mut args = TokenStream::new();
-                args.extend(amp(&f.a.name));
+                args.extend(amp(&input.name));
                 args.extend([p(',')]);
                 args.extend(amp_mut(&out.name));
-                body.extend(method(&f.b.name, "apply_dyn_into", args));
+                body.extend(method(&weight.name, "apply_dyn_into", args));
             } else {
                 body.extend(annotate(
                     "Mat",
                     true,
-                    vec![const_arg(&f.a.i), const_arg(&f.a.j)],
-                    &f.a.name,
+                    vec![const_arg(input.i()), const_arg(input.j())],
+                    &input.name,
                 ));
-                body.extend(annotate(
-                    "Mat",
-                    true,
-                    vec![const_arg(&f.b.i), const_arg(&f.b.j)],
-                    &f.b.name,
-                ));
+                if !planned {
+                    body.extend(annotate(
+                        "Mat",
+                        true,
+                        vec![const_arg(weight.i()), const_arg(weight.j())],
+                        &weight.name,
+                    ));
+                }
                 body.extend(annotate(
                     "MatBuf",
                     false,
-                    vec![const_arg(&out.i), const_arg(&out.j)],
+                    vec![const_arg(out.i()), const_arg(out.j())],
                     &out.name,
                 ));
                 let mut args = TokenStream::new();
-                args.extend(amp(&f.b.name));
-                args.extend([p(',')]);
-                args.extend(amp_mut(&out.name));
-                // 静态档写进已有输出：`Mat::mul_into`（`apply_into` 在 `Prepared` 上）
-                body.extend(method(&f.a.name, "mul_into", args));
+                if planned {
+                    // plan：打包已完成，直接吃 `Prepared::apply_into`
+                    args.extend(amp(&input.name));
+                    args.extend([p(',')]);
+                    args.extend(amp_mut(&out.name));
+                    body.extend(method(&weight.name, "apply_into", args));
+                } else {
+                    args.extend(amp(&weight.name));
+                    args.extend([p(',')]);
+                    args.extend(amp_mut(&out.name));
+                    // 静态档写进已有输出：`Mat::mul_into`（`apply_into` 在 `Prepared` 上）
+                    body.extend(method(&input.name, "mul_into", args));
+                }
             }
             // 包进 block：不污染调用点作用域，也让整条公式是一个表达式
             let mut ts = TokenStream::new();
@@ -632,14 +789,22 @@ fn expand(f: &Formula) -> TokenStream {
         }
         // 只写乘积：输出新分配（无下标时无法判档，按全静态生成；DYN 请写下标形式）
         None => {
-            if runtime_rows {
+            if planned {
                 let mut args = TokenStream::new();
-                args.extend([amp(&f.a.name)]);
-                method(&f.b.name, "apply_dyn", args)
+                args.extend([amp(&input.name)]);
+                if runtime_rows {
+                    method(&weight.name, "apply_dyn", args)
+                } else {
+                    method(&weight.name, "apply", args)
+                }
+            } else if runtime_rows {
+                let mut args = TokenStream::new();
+                args.extend([amp(&input.name)]);
+                method(&weight.name, "apply_dyn", args)
             } else {
                 let mut args = TokenStream::new();
-                args.extend([amp(&f.b.name)]);
-                method(&f.a.name, "mul", args)
+                args.extend([amp(&weight.name)]);
+                method(&input.name, "mul", args)
             }
         }
     }
@@ -702,27 +867,41 @@ mod tests {
     #[test]
     fn same_dimension_must_use_the_same_name() {
         // 收缩维
-        let v = check_names(Some(("M", "N")), ("M", "K"), ("Q", "N")).unwrap_err();
+        let v = check_names(Some(("M", "N")), ("M", "K"), Some(("Q", "N"))).unwrap_err();
         assert!(matches!(
             v,
             Violation::SameDimDifferentNames { dim: "收缩", .. }
         ));
         // 行维（输出大写、输入小写：档次也不同，提示里会点出来）
-        let v = check_names(Some(("M", "N")), ("m", "K"), ("K", "N")).unwrap_err();
+        let v = check_names(Some(("M", "N")), ("m", "K"), Some(("K", "N"))).unwrap_err();
         let Violation::SameDimDifferentNames { dim, lhs, rhs, .. } = v;
         assert_eq!(dim, "行");
         assert_eq!((lhs.as_str(), rhs.as_str()), ("M", "m"));
         // 列维
-        let v = check_names(Some(("M", "N")), ("M", "K"), ("K", "n")).unwrap_err();
+        let v = check_names(Some(("M", "N")), ("M", "K"), Some(("K", "n"))).unwrap_err();
         assert!(matches!(
             v,
             Violation::SameDimDifferentNames { dim: "列", .. }
         ));
         // 正例：全静态、全运行期都合法
-        assert!(check_names(Some(("M", "N")), ("M", "K"), ("K", "N")).is_ok());
-        assert!(check_names(Some(("m", "N")), ("m", "K"), ("K", "N")).is_ok());
+        assert!(check_names(Some(("M", "N")), ("M", "K"), Some(("K", "N"))).is_ok());
+        assert!(check_names(Some(("m", "N")), ("m", "K"), Some(("K", "N"))).is_ok());
         // 无输出时只查收缩维
-        assert!(check_names(None, ("M", "K"), ("K", "N")).is_ok());
-        assert!(check_names(None, ("M", "K"), ("Q", "N")).is_err());
+        assert!(check_names(None, ("M", "K"), Some(("K", "N"))).is_ok());
+        assert!(check_names(None, ("M", "K"), Some(("Q", "N"))).is_err());
+    }
+
+    /// plan 形态（权重不带下标）：只查"输出行 == 输入行"，权重侧没有可对照的名字。
+    #[test]
+    fn plan_form_only_checks_the_row_dimension() {
+        // 行维仍然要一致（这就是 plan 形态下唯一的静态维度检查）
+        let v = check_names(Some(("M", "N")), ("m", "K"), None).unwrap_err();
+        let Violation::SameDimDifferentNames { dim, .. } = v;
+        assert_eq!(dim, "行");
+        // `matmul!(y[M, N] = x[M, K] * p)` 与 DYN 档都合法
+        assert!(check_names(Some(("M", "N")), ("M", "K"), None).is_ok());
+        assert!(check_names(Some(("m", "N")), ("m", "K"), None).is_ok());
+        // 无输出：plan 形态没有可查的维度，收缩维也查不了
+        assert!(check_names(None, ("M", "K"), None).is_ok());
     }
 }

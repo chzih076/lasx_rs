@@ -291,7 +291,7 @@ int8 的整模型级口径 1 个（合成 12 层栈，实测 7.250e-4 ≤ 5e-3�
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 218 单测（+ 5 个宏单测 + 17 个文档测试）
+cargo test --workspace --release        # 220 单测（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -1184,10 +1184,42 @@ OpenBLAS 上同样出现，与 `rope_tables` 那处的判断互相印证。
 **与 §5.12 的 RoPE 是同一模式**（本次调查的第二个实例）：**天真用法=每次重建准备；正确用法=准备一次、
 循环里只用**。两条现在都有可对比的用法与数字（RoPE 89%、matmul 31–34%）。
 
-**为什么不给宏加"接 prepared plan"的新形态**（例如 `matmul!(y = p * x)`）：收益**已经能由用户侧
-`Mat::prepare()` 拿到**（上面 ② 就是零 API 改动的用法），而新增宏形态会增加 API 面积、要按规则 3
-走 §19.7 冻结流程、并需要新的测试与文档 ⇒ **收益/成本不划算，不做**。（触发条件：若将来出现
-"用户无法在循环外持有 plan"的具体场景——例如跨 FFI 边界的框架——再重新评估。）
+**为什么现在还是给宏加了"接 prepared plan"的新形态**（2026-10-15，用户要求"斩草除根"）：
+上面那段原来的判断是"收益能由用户侧 `Mat::prepare()` 拿到 ⇒ 不加"。**触发条件在用户侧出现了**：
+DSL 的默认写法（`x[M,K] * w[K,N]`）把"每次调用都重新打包"藏在了宏后面——**代码看上去完全一样，
+循环里就是会慢 30%**，而"记得手动 hoist"是**只靠约定**的契约。于是按规则 3 的同一套成本算法重估：
+新增的只是**宏的输出形态**（右操作数不写方括号 ⇒ 视为 `Prepared`），§19.7 冻结的接口**一个都没动**，
+代价落在"解析 + 一份位精确测试 + 文档"上，收益是**把那条隐式陷阱从 API 表面消掉**。
+
+**实测（本次，`cargo run -p lasx_bench --release -- plan` 的最后一段）**：256³，两臂进程级交替、
+4 轮丢弃首轮取中位数（每轮内部 `timeit` 自适应重复 + 5 取样中位数；loadavg 1/5 分钟 = 2.54/2.79，
+15 分钟 3.65 为衰减中的历史负载）：
+
+| 轮次 | ① `matmul!(y = x * w[K,N])`（每次 pack） | ② `matmul!(y = x * p)`（plan 复用） | ②/① |
+|---|---|---|---|
+| r1 / r2 / r3 / r4 | 139.3 / 145.1 / 140.2 / 142.2 µs | 99.9 / 99.2 / 99.4 / 99.3 µs | 1.39 / 1.46 / 1.41 / 1.43× |
+| **中位数（丢弃首轮，3 轮）** | **142.2 µs** | **99.3 µs** | **1.43×（省 30%）** |
+
+与上表 ② 的 97 µs 一致（都是"打包一次 + 复用"），两臂输出与 `api::matmul` **逐位一致**
+（`to_bits()` 全量比对，基准里内联断言，不是只在单测里）。
+
+**新形态生成什么**（`cargo rustc --example … -- -Zunpretty=expanded` 实测）：
+
+```text
+matmul!(y[M, N] = x[M, K] * p);
+=>
+{ let _: &Mat<'_, _, { M }, { K }> = &x;
+  let _: &MatBuf<_, { M }, { N }> = &y;
+  p.apply_into(&x, &mut y) }        // DYN 档是 p.apply_dyn_into(&xd, &mut yd)
+```
+
+即**与手写 hoist 完全相同的那一次调用**，所以"逐位一致"是构造性的；宏这一层没有额外开销、
+也没有额外语义。**不做**隐式/指纹缓存：`.prepare()` 返回的 `Prepared` 借用权重切片，只有显式
+plan 才可证明安全，指针键缓存在缓冲区复用时会给**陈旧结果**（静默错结果）。
+
+**边界**：plan 只能写在乘积**右侧**——`alpha * x[M,K]`（标量前缀，v1 不支持）与 `p * x[M,K]`
+在 token 层同形，留一条"形状必须写在左侧"的硬规则才保得住原来的诊断；权重形状不进公式
+（K/N 由 `Prepared` 的 const 参数与 `x`/`y` 的类型标注对接，写错仍是编译错误）。
 
 ### 7.12 外部成果评估：OpenAI 的 722 篇数学手稿（2026-10-06 公开）——**对本库无可直接使用者**
 
@@ -2711,9 +2743,12 @@ pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
 （`cargo doc -p lasx_rs_macros`），这里只记**这篇文档层面需要知道的东西**。
 
 **v1 接受**：`操作数 '=' 操作数 '*' 操作数` 或 `操作数 '*' 操作数`，操作数形如 `x[M, K]`；
-两个操作数**按共享下标出现在哪一侧判角色**——`x[M,K] * w[K,N]`（左.j == 右.i，`A·B`）与
+两个带下标操作数**按共享下标出现在哪一侧判角色**——`x[M,K] * w[K,N]`（左.j == 右.i，`A·B`）与
 `w[K,N] * x[M,K]`（左.i == 右.j，权重在左）都认，归一成同一套 input/weight 后生成同一段
-代码。**v1 不做**：`alpha`/`beta` 融合、`+` 多操作数、无下标简写里判档（按全静态生成）。
+代码。**乘积右侧的操作数可以不写方括号**：那是 `Prepared` plan（§7.10 ④续 末段），生成
+`p.apply_into(&x, &mut y)` / DYN 档 `p.apply_dyn_into`、无输出 `p.apply` / `p.apply_dyn`。
+**v1 不做**：`alpha`/`beta` 融合、`+` 多操作数、无下标简写里判档（按全静态生成）、
+plan 写在乘积左侧（与标量前缀同形，共用下表"标量前缀"那条诊断）。
 
 **分派规则**：大写开头 = 编译期 const（生成类型标注）、小写/`_` 开头 = 运行期值
 （宏自己 `let m = x.rows();` + 断言）；**同一维必须写同一个下标**（行、收缩、列各查一次，
@@ -2746,24 +2781,28 @@ error: 两处必须写同一个下标（当前是 `M` 与 `P`）。大写=编译
    |                         ^
 ```
 
-标量前缀那条（第 2 条）额外给替代做法：
+标量前缀那条（第 2 条）额外给替代做法，并把"plan 只能写右侧"一起点出来（两者 token 同形，
+只能共用一条诊断）：
 
 ```text
 error: v1 不支持标量前缀：`alpha * …`（`alpha` 缩放/融合还没实现）
   --> examples/formula_dsl.rs:21:23
 21 |     matmul!(y[M, N] = alpha * x[M, K] * w[K, N]);
    |                       ^^^^^
-error: 要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用
+error: 要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用。若这个操作数是 `Prepared`（plan 形态），它只能写在乘积右侧：`x[M, K] * p`
 ```
 
 **验证方式（零依赖前提下）**：
 
 - **正面路径**进 CI：`shape::tests::test_formula_dsl_matches_api_bit_for_bit`（静态 + DYN +
-  无输出形态，与 `api::matmul` 逐位对照）、`examples/formula_dsl.rs`（`--all-targets` 会编译）、
-  `shape` 模块的 doctest；
+  无输出形态，与 `api::matmul` 逐位对照）、
+  `shape::tests::test_formula_dsl_plan_matches_hand_hoist_bit_for_bit`（plan 形态 × 静态 3 形状 ×
+  DYN 4 种行数 × 无输出，与**手写 hoist** 及 `api::matmul` 双向逐位对照）、
+  `examples/formula_dsl.rs`（`--all-targets` 会编译）、`shape` 模块的 doctest；
 - **负面路径**用上表那种人工核对的 transcript 守（每加一条诊断就在本节补一条 transcript）；
-- 宏自己的纯逻辑（首字符分派、同一维同名检查）有 2 个单测——它们**只吃名字**，因为
-  `proc_macro` 类型在宏之外构造会 panic（`procedural macro API is used outside of a procedural macro`），
+- 宏自己的纯逻辑（首字符分派、两种读法、同一维同名、plan 只查行维）有 6 个单测——它们
+  **只吃名字**，因为 `proc_macro` 类型在宏之外构造会 panic
+  （`procedural macro API is used outside of a procedural macro`），
   所以 Span 归位那一层不做单测、靠上面的 transcript。
 
 **本版实现中出现的三个问题**（都写进了代码注释，避免以后再次发生）：
