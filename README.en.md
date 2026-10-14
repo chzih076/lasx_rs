@@ -38,8 +38,10 @@ Four workload classes are covered:
   `lasx_rs_macros` provides a formula DSL (`matmul!` for matrix products, `dot!` for dot
   products, `gemv!` for matrix-vector products).
 - **NN operators are LASX-only by design** — the N1 batch deliberately omits an LSX fallback,
-  because every target platform in the 6000 series supports LASX. On a CPU without LASX these
-  kernels execute LASX instructions and raise SIGILL; callers must dispatch by CPU capability.
+  because the target platforms (**LA664** cores: 3A6000 / 3C6000 / 3B6000) all support LASX.
+  Note that **3B6000M** carries a 6000-series name but is built on the **LA364E** core with LSX
+  only, and is therefore *not* a target. On such LSX-only CPUs these kernels execute LASX
+  instructions and raise SIGILL; callers must dispatch by CPU capability.
 
 ## Getting started
 
