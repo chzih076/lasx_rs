@@ -1,6 +1,6 @@
 //! 量化内核的 C ABI 导出（LASX-only）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -41,10 +41,14 @@ pub extern "C" fn lasx_dot_q4(
 
 /* ==================== N3：int8 推理（量化生产端 + GEMV） ==================== */
 //
-// 契约（数值与边界）在 `docs/ops.md` §2.12/§2.13；设计记录在 `docs/dev.md` §21。
-// 这些是**追加**的新符号，原始 15 个（§4.1）的签名与语义不受影响。
+// 对称 int8 口径：`scale = amax / 127`、`q ∈ [−127, 127]`（**不使用 −128**）、取整是
+// ties-to-even、用**倒数乘**而不是除法（LASX 没有向量除法指令）、不做夹取（`|q| ≤ 127`
+// 由 scale 的定义保证）。累加是**整数精确**的（i16 乘积 → i32 累加 → i64 落盘），出口
+// **一次乘法**（两个 scale 先乘成一个，再一次舍入）。这是有意选择的追加批次，
+// 原始 15 个符号的签名与语义不受影响。
 
-/// 最大绝对值：`max_i |x_i|`。空输入返回 `0.0`（NaN 被忽略，见 §2.12）。
+/// 最大绝对值：`max_i |x_i|`。NaN 被忽略（与 `f32::max` 折叠同语义），空输入或全 NaN
+/// 输入返回 `0.0`。
 ///
 /// C 签名：`float lasx_amax(const float *x, int n)`
 #[unsafe(no_mangle)]

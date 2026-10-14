@@ -8,7 +8,7 @@
 //! "数组真实长度是否与声明的形状一致"只有知道长度的上层（如 YouLiLong 原生扩展）
 //! 才判得了，那里用 [`LasxStatus::BadShape`]。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -225,7 +225,8 @@ pub extern "C" fn lasx_dot_q4_checked(
 /* ==================== N3：int8 推理（量化生产端 + GEMV） ==================== */
 //
 // 这些包装能查的是**结构**：负长度、尺寸相乘溢出、空指针。形状之间的真实关系
-// （`x` 的实际长度是否等于 rows×cols）只有知道长度语义的上层才判得了（§2.12 的约定）。
+// （`x` 的实际长度是否等于 rows×cols）只有知道长度语义的上层才判得了——这是本库
+// 与调用方之间**只靠约定**的一条，违反的后果是读写越界（错结果甚至 UB）。
 
 /// 带错误通道的最大绝对值。C 签名：`float lasx_amax_checked(const float*, int, int*)`
 #[unsafe(no_mangle)]
@@ -990,7 +991,8 @@ pub extern "C" fn lasx_gelu_quick_checked(x: *const f32, out: *mut f32, n: i32, 
 ///
 /// C 签名：`void lasx_gelu_erf_checked(const float*, float*, int, int*)`
 ///
-/// 校验语义与 [`lasx_silu_checked`] 完全一致（`erf` 用 A&S 7.1.26，见 `docs/ops.md` §2.9）。
+/// 校验语义与 [`lasx_silu_checked`] 完全一致（`erf` 用 A&S 7.1.26 近似，本身绝对误差
+/// ≤1.5e-7，**不是"真 erf"**）。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gelu_erf_checked(x: *const f32, out: *mut f32, n: i32, status: *mut i32) {
     let n = or_fail!(checked_len(n), status, ());
@@ -1161,8 +1163,8 @@ pub extern "C" fn lasx_layer_norm_checked(
 ///
 /// 校验：`row_len`/`n_table_rows` 需 > 0、`n_ids >= 0`（否则 [`LasxStatus::BadShape`]）；
 /// **每个 id 必须在 `[0, n_table_rows)`**，越界同样报 [`LasxStatus::BadShape`]
-/// （契约 §2.17 里"复用 `Shape`"在 C 侧就映射到这一档）；`n_ids > 0` 时指针不可空
-/// （[`LasxStatus::NullPointer`]）。`n_ids == 0` 是合法空操作。
+/// （"越界复用 `Shape`、不新增错误变体"这条约定在 C 侧就映射到这一档）；`n_ids > 0` 时
+/// 指针不可空（[`LasxStatus::NullPointer`]）。`n_ids == 0` 是合法空操作。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gather_rows_checked(
     table: *const f32,

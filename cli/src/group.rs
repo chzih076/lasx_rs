@@ -57,7 +57,7 @@ pub enum Group {
     DispatchOverhead,
     /// 指令级微基准：LSX/LASX 的延迟与吞吐、`SimdPath::detect()` 的每调用成本、极小 n 的 `dot` 四路对照。
     Lat,
-    /// 池在核数附近的表现（记录 `loadavg` 的对照测量，见 `docs/dev.md` §7.9）。
+    /// 池在核数附近的表现（同时记录 `loadavg` 作对照，排除邻居负载造成的超订）。
     PoolScaling,
     /// 8 线程下降的判别实验（换工作集 / 换调度策略）。
     PoolAttribution,

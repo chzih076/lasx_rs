@@ -141,9 +141,10 @@ pub fn thread_scaling() {
 
 /// f32 GEMM 的多线程扩展（`parallel::matmul_f32`，常驻池）。
 ///
-/// 动机见 `docs/dev.md` §21.8：批量形态下 **f32 `lasx_matmul` 比 int8 快 2.5×**，
+/// 批量形态下 **f32 `lasx_matmul` 比 int8 快 2.5×**（int8 的复用发生在 L2 而不是寄存器，
+/// 而 f32 一条 `xvfmadd.s` 是 16 FLOP/指令、本 ISA 的 int8 链只有 ~4–5 MAC/指令），
 /// 所以"端到端能不能进分档目标"要按 **f32 + 多核**来算——这张表就是那个乘数。
-/// 形状取 §21.2 消费者的三层形状（token = 192）。线程表**不绑核**（§7 开头口径）。
+/// 形状取目标消费者一层的三层形状（token = 192）。线程表**不绑核**（与其它线程表同口径）。
 pub fn matmul_thread_scaling() {
     let tokens = 192usize;
     println!();
@@ -196,7 +197,7 @@ pub fn fma_peak_lasx() -> f64 {
         let a: m256 = std::mem::transmute(lasx_xvreplgr2vr_w(0x3f80_0000));
         let b: m256 = std::mem::transmute(lasx_xvreplgr2vr_w(0x3f00_0000));
         // **16 条独立累加链**：8 条链时量到的是 FMA 延迟上限（≈2.66 条/周期），
-        // 16 条才够盖住延迟、量到流水线吞吐（≈3.96 条/周期）。见 docs/dev.md §6.2。
+        // 16 条才够盖住延迟、量到流水线吞吐（≈3.96 条/周期）。
         let (mut v0, mut v1, mut v2, mut v3) = (a, a, a, a);
         let (mut v4, mut v5, mut v6, mut v7) = (a, a, a, a);
         let (mut v8, mut v9, mut v10, mut v11) = (a, a, a, a);
@@ -386,7 +387,7 @@ pub fn dispatch_overhead() {
 
     // 分配的固定开销：`AlignedVec::new(n)` = 分配 + 清零（`vec![T::default(); n + 对齐余量]`）。
     // 这就是"每次调用分配输出"的 api 在**调用方改用 `_into` 后能省掉的那笔**
-    // （对照数据与筛选结论见 `docs/dev.md` §7.9 的 `_into` 一节）。
+    // （对照数据就是本页下一条 `_into` 候选表）。
     println!("\n### 输出缓冲的分配成本（`AlignedVec::new`：分配 + 清零）");
     println!("\n| 元素数（`f32`） | 字节 | 时间 | 等效带宽 |");
     println!("|---|---|---|---|");
@@ -406,7 +407,7 @@ pub fn dispatch_overhead() {
 
     // `_into` 候选的 A/B：**api（每次分配输出）vs 同内核的 FFI（调用方给缓冲）**。
     // 两者是同一个内核，差的就是"分配 + 清零 + 释放" ⇒ 这条 A/B 直接给出分配占比，
-    // 不需要先写 `_into`（`docs/dev.md` §7.9 ③ 筛选口径：先测后铺）。
+    // 不需要先写 `_into`（筛选口径：先测后铺）。
     println!("\n### `_into` 候选：api（分配） vs FFI（预分配）");
     println!("\n| 算子 | 规模 | api（分配） | FFI（预分配） | 分配占比 |");
     println!("|---|---|---|---|---|");
@@ -653,7 +654,7 @@ pub fn dispatch_overhead() {
                 100.0 * (dsl.as_secs_f64() - reused.as_secs_f64()).max(0.0) / dsl.as_secs_f64(),
                 crate::timing::fmt_t(direct)
             );
-            // **派发/屏障开销的判别实验**（§7.11 ⑩ 的调度假设）：**同一份活儿**（192 行 × 3072 列）
+            // **派发/屏障开销的判别实验**（验证"调度假设"）：**同一份活儿**（192 行 × 3072 列）
             // 切成 **N 次** `for_each_row_block_mut` 派发 vs **1 次**。`matmul_f32_picked` 是
             // **逐面板派发**（每面板一次整队 + 屏障），所以"每次派发的固定成本"直接乘上面板数。
             // 闭包用 `black_box` 保证真跑（别再用"空闭包"——那会被优化掉，我早前踩过）。
@@ -835,7 +836,7 @@ pub fn dispatch_overhead() {
             );
         }
         // **窄列分解本身是否低效？**（串行、只用公开 API）：1 次宽 `n` vs 32 次窄 `n/32` 的**同量工作**。
-        // 这是把"窄列"从"并发"里单独拎出来的判别实验（§7.11 ⑥ 的 12× 归因需要它）。
+        // 这是把"窄列"从"并发"里单独拎出来的判别实验（12× 归因需要它）。
         // 注意口径：窄臂把 B 的列段**在计时外**拷成连续缓冲（否则拷 B 的成本会混进来）；两臂都含分配。
         {
             let (m, k, n, seg) = (192usize, 768usize, 3072usize, 96usize);
@@ -869,7 +870,7 @@ pub fn dispatch_overhead() {
                 narrow.as_secs_f64() / wide.as_secs_f64()
             );
         }
-        // **池在"多而小"工作项上的行为**（§7.11 ⑥ 的 12× 归因落到这里）：同一份活儿分别切 32 项/8 项，
+        // **池在"多而小"工作项上的行为**（12× 归因落到这里）：同一份活儿分别切 32 项/8 项，
         // 在 1 线程与 8 线程下计时。`black_box(item)` 保证闭包不可被优化掉（否则空活儿会被消除，
         // 我之前就踩过"空闭包 2 ns"这个假数）。
         {
@@ -1013,12 +1014,12 @@ pub fn dispatch_overhead() {
     }
 }
 
-/// 池**在核数附近**的表现：`docs/dev.md` §7.9 要求的那一步测量。
+/// 池**在核数附近**的表现。
 ///
-/// 为什么要单独一条：§7.9 那张 f32 GEMM 表在 `load ≈1.6–1.9` 的窗口里出现过"8/12 线程比
+/// 为什么要单独一条：那张 f32 GEMM 表在 `load ≈1.6–1.9` 的窗口里出现过"8/12 线程比
 /// 4 线程慢"，首轮复测却是单调的。要把它判成"池的缺陷"还是"邻居负载造成的超订"，
 /// 必须**记录负载**并做对照。所以本函数的输出**第一行就是 `/proc/loadavg`**，
-/// 线程数扫得比 §7.9 那张表更密（1,2,3,4,6,8,10,12,16,24）——判据是：
+/// 线程数扫得比那张表更密（1,2,3,4,6,8,10,12,16,24）——判据是：
 /// **在"物理核数 − 邻居数"以内是否单调**。当前 12 物理核、load ≈2 ⇒ 10 是分界。
 ///
 /// 用法：高负载窗口与低负载窗口各跑 ≥3 轮，两份输出对照。
@@ -1035,7 +1036,7 @@ pub fn pool_scaling() {
     println!("|---|---|---|---|---|");
     let tokens = 192usize;
     // 线程数可用 `LASX_BENCH_THREADS=8`（或 `6,8`）覆盖：perf profile 要把样本集中在
-    // **一个**线程数上，扫 1..24 会把符号占比稀释掉（`docs/dev.md` §7.9 的归因步骤）。
+    // **一个**线程数上，扫 1..24 会把符号占比稀释掉（把样本集中是 perf profile 的归因步骤）。
     let threads: Vec<usize> = match std::env::var("LASX_BENCH_THREADS") {
         Ok(s) => s
             .split(',')
@@ -1067,8 +1068,8 @@ pub fn pool_scaling() {
             );
         }
     }
-    // 立方形状：文档里"回退赢/持平/共享赢"的**原始数据点**就在这些形状上（`docs/dev.md` §14.3
-    // 与 §7.9 的"待改"注记）⇒ 改 `need_shared_pack` 前必须在这里扫过，否则就是"只按一个形状改"。
+    // 立方形状："回退赢/持平/共享赢"的**原始数据点**就在这些形状上 ⇒ 改 `need_shared_pack`
+    // 前必须在这里扫过，否则就是"只按一个形状改"。
     for &s in &[256usize, 512, 1024] {
         let (m, k, n) = (s, s, s);
         let mut rng = crate::data::Lcg::new((s * 31) as u64);
@@ -1100,7 +1101,7 @@ pub fn pool_scaling() {
 /// `parallel::gemv_i8_k`（**k 方向切分**，为 `m = 1` 的单 token 档位而做）的线程扩展。
 ///
 /// **判别实验**：8 线程处那次系统性下降，是"缓存/L3 争用"还是"调度/块粒度"？
-/// 两个只读对照（见 `docs/dev.md` §7.9）：① 换工作集（9.4 MB → 512 KB）；② 固定 8 线程换 `Pick`。
+/// 两个只读对照：① 换工作集（9.4 MB → 512 KB）；② 固定 8 线程换 `Pick`。
 pub fn pool_attribution() {
     use lasx_rs::pool::Pick;
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
@@ -1178,10 +1179,10 @@ pub fn pool_attribution() {
     }
 }
 
-/// 动机：int8 唯一占优的档位是"单 token、权重流 DRAM"（`docs/ops.md` §5.15），那一档 `m = 1`
+/// 动机：int8 唯一占优的档位是"单 token、权重流 DRAM"（每权重 1 B vs 4 B），那一档 `m = 1`
 /// ⇒ 按行切分没有并行度；本函数量的是"按 `k` 切块"能拿回多少。
 /// 三个 `k` 分别代表：模型单层（3072，L2 内）、1 MiB（L2 边缘）、16 MiB（DRAM 流）。
-/// 线程表**不绑核**（§7 开头口径）。
+/// 线程表**不绑核**。
 pub fn gemv_i8_k_thread_scaling() {
     println!();
     println!("## 多线程扩展性：`parallel::gemv_i8_k`（`m = 1`，k 方向切块，int8 GEMV）");

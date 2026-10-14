@@ -13,5 +13,5 @@ categories = ["hardware-support", "mathematics"]
 proc-macro = true
 
 # 零第三方依赖：手写 TokenStream 解析，不用 syn/quote。
-# 理由见 docs/dev.md §19.3（第一条是"按 ident 首字符分派"，macro_rules! 做不到）。
+# 第一条理由是"按 ident 首字符分派"——macro_rules! 拿不到 token 文本，做不到。
 [dependencies]

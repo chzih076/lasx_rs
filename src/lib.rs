@@ -59,7 +59,7 @@
 //! 测试/验证用的线程级降级钩子见 [`lasx_force_lsx_thread`]。
 #![feature(stdarch_loongarch)]
 // **unsafe 审查**：`undocumented_unsafe_blocks` 要求每个 `unsafe` 块都紧邻一条 SAFETY 说明。
-// 策略（见 docs/dev.md §17）：
+// 分层策略（全文见 docs/dev.md §17 —— 本仓库保留的唯一一份策略正本）：
 // - `src/pool`、`src/arch`、`src/aligned`、`src/api`、`src/parallel`、`src/scalar_ref.rs`
 //   这些**基础设施**里逐块写清楚（那里才是指针/生命周期/并发不变量的所在）；
 // - `src/ops/*`、`src/ffi/*` 里同一组前提下的 intrinsic 调用是重复的（406 个 unsafe 块里
@@ -98,7 +98,8 @@ pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &
 }
 
 /// **实验性**：`C = alpha·(A·B) + beta·C`（原地），只在 k 不分块、`m%4==0`、`n%32==0`
-/// 时成立。用于量"融合内核能不能保持非融合内核的速度"（`docs/dev.md` §19.11）。
+/// 时成立。用于量"融合内核能不能保持非融合内核的速度"；该融合已**实测否掉**（微内核收尾那次
+/// 按 4 行跨距的读-改-写吃掉了它本想省下的那一遍的 91–96%），这个入口只作那条结论的可复现凭据。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn ops_bench_scaled(
@@ -114,13 +115,13 @@ pub fn ops_bench_scaled(
     ops::matmul::matmul_f32_scaled(m, k, n, alpha, beta, a, b, c);
 }
 
-/// 同上，f64 侧（`docs/dev.md` §8.5 的 A/B 用）。
+/// 同上，f64 侧（打包路径的 A/B 基准用）。
 #[doc(hidden)]
 pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     ops::matmul_f64::matmul_f64_packed(m, k, n, a, b, c);
 }
 
-/// 强制 f32 走"列块在外"次序（A/B 基准；`docs/dev.md` §8.4）。
+/// 强制 f32 走"列块在外"次序（A/B 基准）。
 #[doc(hidden)]
 pub fn ops_bench_cols_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     ops::matmul::matmul_f32_cols_block(m, k, n, 0, n, a, b, c, ops::matmul::COL_BLOCK);
@@ -143,16 +144,16 @@ pub use ffi::matmul::{lasx_matmul, lasx_matmul_f64};
 pub use ffi::memory::lasx_alloc;
 pub use ffi::physics::{lasx_ballistic_step, lasx_j2_accel_batch, lasx_rk4_j2_step_batch};
 pub use ffi::quant::{lasx_dot_i8, lasx_dot_q4};
-// N3 批次（int8 推理，`docs/dev.md` §21）：新增符号按 C ABI"只追加"的约定挂在这里，
+// N3 批次（int8 推理）：新增符号按 C ABI"只追加"的约定挂在这里，
 // `lasx_*_checked` 变体在 `lasx_rs::ffi::checked`。
 pub use ffi::quant::{
     lasx_absmax_rows, lasx_amax, lasx_dequantize_i8, lasx_dequantize_i8_rows, lasx_gemv_i8,
     lasx_matmul_i8, lasx_quantize_i8_per_row, lasx_quantize_i8_per_tensor,
 };
 pub use ffi::reduce::{lasx_axpy, lasx_dot, lasx_dot_f64, lasx_sum};
-// NN 侧 N1 批次（`docs/dev.md` §20）：与上面的导出保持一致，Rust 侧可以直接 `lasx_rs::lasx_silu`。
+// NN 侧 N1 批次：与上面的导出保持一致，Rust 侧可以直接 `lasx_rs::lasx_silu`。
 // 上一轮加 `softmax_rows`/`rms_norm` 时漏了这行重新导出——只有 `lasx_rs::ffi::nn::*` 能用，
-// 这一轮补齐（`docs/ops.md` §4 的符号表列的是 C ABI 名，Rust 路径不该和它不一致）。
+// 这一轮补齐（符号表列的是 C ABI 名，Rust 路径不该和它不一致）。
 pub use ffi::nn::{
     lasx_dot_f16, lasx_gather_rows, lasx_gather_rows_i8, lasx_gelu_erf, lasx_gelu_quick,
     lasx_gemv_f16, lasx_layer_norm, lasx_rms_norm, lasx_rope, lasx_silu, lasx_softmax_rows,

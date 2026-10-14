@@ -6,8 +6,9 @@
 //!
 //! 标量参照用同一个累加口径（16 元素块 + lane = j%8 + 固定次序归约），所以列间可比。
 //!
-//! 本表是**单线程、绑核**口径（见 `docs/dev.md` §7 开头）。多核（`parallel::gemv_f16`）的
-//! A/B 不在这里——它在 `examples/gemv_pool_ab`，数据与线程数建议见 `docs/dev.md` §20.7。
+//! 本表是**单线程、绑核**口径。多核（`parallel::gemv_f16`）的 A/B 不在这里——它在
+//! `examples/gemv_pool_ab`。那里有一条结论值得记在这里：**别超订**——`gemv 1024×2048`
+//! 12 线程 0.041 ms，24 线程反而 0.078 ms（"人人有活 + 25 个可运行线程挤 24 个 CPU"）。
 
 use crate::data::{AlignedBuf, Lcg};
 use crate::report::{Row, row3};

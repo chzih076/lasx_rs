@@ -1,6 +1,6 @@
 //! FFI 侧内存管理的 C ABI 导出。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -9,8 +9,7 @@
 ///
 /// 32 字节的 `xvld/xvst` 只有在 32 字节边界上才不会跨 64 字节缓存行；
 /// 实测 f32 内核在 L1 驻留规模上对齐可再快 **1.06×–1.31×**（n ≤ 8192），
-/// 而大集（n = 65536）反而 0.92×——带宽主导。完整表在 `docs/dev.md` §7.6，
-/// 原始数据由 `cli` 的 `align` 套件现算。
+/// 而大集（n = 65536）反而 0.92×——带宽主导。原始数据由 `cli` 的 `align` 套件现算。
 pub const LASX_ALIGN: usize = 32;
 
 /// 分配 n 个 `f32` 的缓冲区并交出所有权（内存**未初始化**）。

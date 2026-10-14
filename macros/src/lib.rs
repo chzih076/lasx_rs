@@ -16,7 +16,7 @@
 //!
 //! # 核心规则：**按 ident 首字符分派**
 //!
-//! 这是上 proc-macro 的第一条理由（`docs/dev.md §19.3`）：`macro_rules!` 拿不到 token 的
+//! 这是选 proc-macro 而不是 `macro_rules!` 的第一条理由：`macro_rules!` 拿不到 token 的
 //! 文本，读不到首字符，所以做不到这件事。规则：
 //!
 //! | 下标写法 | 判定 | 生成什么 |

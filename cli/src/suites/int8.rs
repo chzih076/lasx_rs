@@ -1,6 +1,6 @@
 //! N3（int8 推理）：`lasx_gemv_i8` 与量化生产端（`lasx_amax` / `lasx_quantize_i8_*`）的带宽实测。
 //!
-//! 口径与 §7 一致（**单线程、绑核**）。两组行的比较意义：
+//! 口径与其它套件一致（**单线程、绑核**）。两组行的比较意义：
 //!
 //! - `lasx_gemv_i8`：工作量按**权重字节**算（int8 是 1 B/元素），并给出同形状 f32
 //!   `lasx_matmul`（`n = 1`，即 f32 的 GEMV 等价路径）的对照行——**同样的数学乘加，
@@ -10,7 +10,7 @@
 //!   per-tensor 与 per-row 的差就是 **per-token 量化的额外开销**（多一遍 amax 与每行 scale）。
 //!
 //! 标量参照：GEMV 用 `scalar_dot_i8` 逐行（口径与内核一致的整数点积），
-//! 量化用本文件的 `scalar_quantize_rows`（照 `docs/ops.md` §2.12 的契约写：乘倒数、
+//! 量化用本文件的 `scalar_quantize_rows`（照内核同一份契约写：乘倒数、
 //! ties-to-even、不夹取），所以"向量 vs 标量"列是同一份契约下的两条实现。
 
 use crate::data::{AlignedBuf, Lcg};
@@ -32,7 +32,8 @@ fn scalar_gemv_i8(w: &[i8], sw: &[f32], x: &[i8], sx: f32, m: usize, k: usize, y
     }
 }
 
-/// 标量量化（逐行；`rows == 1` 即逐张量）：照 `docs/ops.md` §2.12 的契约写。
+/// 标量量化（逐行；`rows == 1` 即逐张量）：照内核同一份契约写（`scale = amax/127`、
+/// 倒数乘、ties-to-even 取整、不夹取）。
 fn scalar_quantize_rows(x: &[f32], rows: usize, cols: usize, q: &mut [i8], scales: &mut [f32]) {
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
@@ -145,9 +146,9 @@ pub fn int8_gemv(rows: &mut Vec<Row>) {
 
 /// `lasx_matmul_i8`：批量（prefill 形态）与"逐 token 跑 GEMV"的对照。
 ///
-/// 这两行是 §21.6 那笔账的实测：批量让权重在 L2 里被 `tokens` 个 token 复用，
-/// 把限制从**带宽**换成**算力**。f32 对照用**真正的 GEMM**（`lasx_matmul`，n = tokens），
-/// 不用 n=1 的打包路径——否则会重复 §7.9 第 2 条那个"对照选错"的坑。
+/// 这两行是对"批量到底有没有收益"那笔账的实测：批量让权重在 L2 里被 `tokens` 个 token
+/// 复用，把限制从**带宽**换成**算力**。f32 对照用**真正的 GEMM**（`lasx_matmul`，n = tokens），
+/// 不用 n = 1 的那条路径——两臂口径不同的话，比值没有意义（"对照选错"的坑）。
 pub fn int8_matmul(rows: &mut Vec<Row>) {
     let tokens = 192usize;
     for &(k, n) in &[(768usize, 768usize), (768, 3072), (3072, 768)] {
@@ -231,10 +232,10 @@ pub fn int8_matmul(rows: &mut Vec<Row>) {
 
 /// int8 **保活胶水**的实测：反量化 → f32 归一化/softmax → 再量化，值不值一个"整数版"。
 ///
-/// 动机（`docs/dev.md` §21.5 的两行"整数 softmax / int8 归一化"）：如果量化模型必须保留
+/// 动机（立项时留下的"整数 softmax / int8 归一化"两条候选）：如果量化模型必须保留
 /// 注意力与归一化，有两条路——(a) 用现有算子拼**组合路径**（dequantize → `rms_norm` /
 /// `softmax_rows` → quantize），(b) 专门写整数/定点版。这张表量 (a) 的代价，
-/// 与同一层的 int8 GEMM（§7.9）比：**只有它占比可观，(b) 才值得做**。
+/// 与同一层的 int8 GEMM 比：**只有它占比可观，(b) 才值得做**。
 pub fn int8_keepalive(rows: &mut Vec<Row>) {
     let tokens = 192usize;
     for &hidden in &[768usize, 3072] {
@@ -269,7 +270,7 @@ pub fn int8_keepalive(rows: &mut Vec<Row>) {
                     black_box(v);
                 });
         });
-        // (a2') 免分配版（`docs/ops.md` §5.15 里"要抠那 1.9% 先做 `_into`"的那一条）：
+        // (a2') 免分配版（"要抠那 1.9% 先做 `_into`"的那一条）：
         // 同一份数据、同一个内核，只少一次输出缓冲分配 ⇒ 两者之差就是分配的成本。
         let mut normed: Vec<f32> = vec![0.0; n];
         let d_norm_into = timeit(|| {
@@ -316,7 +317,7 @@ pub fn int8_keepalive(rows: &mut Vec<Row>) {
         );
         // int8 族的两步（反量化 / 再量化）的分配成本：api 分配版 vs `_into`。
         // 注意上面 (a1)/(a3) 走的是 **FFI 预分配**路径，所以这里量的是"Rust 调用方用 api 时"
-        // 的那笔分配——两套数不可混用（`docs/dev.md` §6.4 的口径）。
+        // 的那笔分配——两套数的口径不同，不可混用（一个是 FFI 预分配、一个是 api 分配）。
         let d_deq_alloc = timeit(|| {
             let v = lasx_rs::api::dequantize_i8_rows(&q, tokens, hidden, &scales).unwrap();
             let _ = black_box(v[0]);

@@ -26,8 +26,8 @@
 //!
 //! # 为什么输出是 [`AlignedVec`] 而不是 `Vec`
 //!
-//! LASX 是 32 字节访存，缓冲区是否对齐直接影响性能（L1 驻留规模上实测 1.06–1.31×，
-//! 大集下无关，见 `docs/dev.md` §7.6），
+//! LASX 是 32 字节访存，缓冲区是否对齐直接影响性能（L1 驻留规模上实测 1.06–1.31×；
+//! 大集下无关，带宽主导），
 //! 而 `Vec<T>` 只保证 `align_of::<T>()`（f32 只有 4 字节）。本层新分配的输出落在
 //! 对齐窗口内，调用方不必再操心，也不会因为"忘了 `posix_memalign`"而白丢性能。
 //!
@@ -278,7 +278,7 @@ pub fn axpy(alpha: f32, x: &[f32], y: &mut [f32]) -> Result<()> {
 ///
 /// `mask` 是**可选**的加性偏置（同形状；`None` = 无 mask）。返回值是新分配的对齐缓冲。
 ///
-/// # 数值契约（见 `docs/ops.md` §2.6）
+/// # 数值契约
 /// - 行内先减 max 再 `exp`；归一化写成 `e · (1/Σ)`（一次除法 + 乘法），不是逐元素除法；
 /// - `exp` 是 `exp2` 的多项式近似（与 f64 参考的相对误差 ~1e-7 量级），**向量路径与标量
 ///   模拟逐位一致**（单测守着）；
@@ -330,13 +330,13 @@ pub fn softmax_rows(
 ///
 /// `w` 是**按列**的可选权重（`None` = 无权重）。返回值是新分配的对齐缓冲。
 ///
-/// # 数值契约（见 `docs/ops.md` §2.7）
+/// # 数值契约
 /// - 平方和用**每个 k 步一条 `fma(x, x, acc)`**（一次舍入），再按固定次序两两归约；列尾补
 ///   `0.0`（`0² = 0`，精确无贡献）；
 /// - 行级数学（`s/cols`、`+eps`、`sqrt`、`1/x`）在**标量域**算完再广播——省指令，而且
 ///   天然让"标量模拟"与向量路径逐位相同；
 /// - 输出次序固定为 `(x · inv) · w`；
-/// - 开方与倒数用**精确指令**，不用 `frsqrte` 估算（`docs/dev.md` §13.1 实测估算更慢）。
+/// - 开方与倒数用**精确指令**，不用 `frsqrte` 估算（本机实测估算比精确除法更慢：6.8 周期 vs 4.0）。
 ///
 /// # Errors
 /// - `eps` 非有限（[`Error::NotFinite`]）或 `≤ 0`（[`Error::NotPositive`]）；
@@ -380,8 +380,8 @@ pub fn rms_norm(
 /// [`rms_norm`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须等于 `rows × cols`）。
 ///
 /// 为什么有它：`rms_norm` 每次调用都分配一个 `AlignedVec`。对"逐层保活"这种调用
-/// （int8 模型每层都要"反量化 → 归一化 → 再量化"），分配会进到每层的关键路径上
-/// （`docs/dev.md` §7.9 末表的保活口径里，`192×768` 的 RMSNorm 是 181.0 µs，含分配）。
+/// （int8 模型每层都要"反量化 → 归一化 → 再量化"），分配会进到每层的关键路径上：
+/// 保活口径下 `192×768` 的 RMSNorm 是 181.0 µs（含分配），`_into` 把它压到 75.5 µs。
 /// 数值与 [`rms_norm`] **逐位一致**（同一个内核，只少一次分配；测试守着）。
 ///
 /// # Errors
@@ -424,7 +424,7 @@ pub fn rms_norm_into(
 /// [`softmax_rows`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须等于 `rows × cols`）。
 ///
 /// 与 [`softmax_rows`] **逐位一致**（同一个内核，只少一次分配）；校验口径相同，
-/// 外加 `out.len() != rows × cols`。见 `docs/ops.md` §5.15 里"先做 `_into`"那条。
+/// 外加 `out.len() != rows × cols`。凡是"每层都要调一次"的算子都优先用 `_into`：分配占比实测 58–63%。
 ///
 /// # Errors
 /// 与 [`softmax_rows`] 同一套，外加 `out.len() != rows × cols`。
@@ -458,11 +458,11 @@ pub fn softmax_rows_into(
 
 /// 行内 **LayerNorm**：`out[i][j] = (x[i][j] − mean_i)/√(var_i + eps) · w[j] + b[j]`（行主序）。
 ///
-/// 与 [`rms_norm`] 的差别只有**减均值**与**偏置**：契约（`docs/ops.md` §2.16）要求方差用
-/// **两遍法**（先 mean、再 `Σ(x−mean)²`），不是 `E[x²] − mean²`；`w`/`b` 传 `None` 表示
-/// 无权重/无偏置（**无偏置是跳过加法**，不是加 `0.0`——那会翻 `−0.0` 的符号）。
+/// 与 [`rms_norm`] 的差别只有**减均值**与**偏置**：方差用**两遍法**（先 mean、再
+/// `Σ(x−mean)²`），不是 `E[x²] − mean²`（后者在 `mean ≫ std` 时灾难性相消）；`w`/`b` 传
+/// `None` 表示无权重/无偏置（**无偏置是跳过加法**，不是加 `0.0`——那会翻 `−0.0` 的符号）。
 ///
-/// 存在理由：外部契约（ONNX 图 17 处 `LayerNormalization`，见 `docs/platform.md` §4）。
+/// 存在理由：外部契约（ONNX 图上有 17 处 `LayerNormalization`）。
 ///
 /// # Errors
 /// - `x.len() != rows × cols` 或 `out.len() != rows × cols`（[`Error::Shape`]）；
@@ -483,7 +483,7 @@ pub fn layer_norm(
     Ok(out)
 }
 
-/// [`layer_norm`] 的**免分配**版本（与分配版**逐位一致**，见 `docs/dev.md` §7.9 的 `_into` 实测）。
+/// [`layer_norm`] 的**免分配**版本（与分配版**逐位一致**：同一个内核，只少一次分配）。
 ///
 /// # Errors
 /// 同 [`layer_norm`]。
@@ -528,14 +528,15 @@ pub fn layer_norm_into(
 
 /// **按 id 取行**（嵌入表查找，f32 表）：`out[i] = table[ids[i]]`，行宽 `row_len`。
 ///
-/// 契约见 `docs/ops.md` §2.17；"库侧为什么同时给 int8 口径、表存什么由谁决定"见
-/// `docs/platform.md` §4.2。纯行拷贝（无算术 ⇒ 无结合次序问题，输出逐位确定）。
+/// 纯行拷贝（无算术 ⇒ 无结合次序问题，输出逐位确定）；库侧同时给 f32/int8 两种口径，
+/// **"表存 f32 还是 int8"由消费侧决定**，库侧只保证两种都正确、边界责任清楚。
 ///
 /// # Errors
 /// - `row_len == 0`（[`Error::NotPositive`]）；
 /// - `table.len()` 不是 `row_len` 的整数倍（[`Error::Shape`]，`what = "table"`）；
 /// - 某个 `id >= table.len()/row_len`（[`Error::Shape`]，`what = "ids"`——`want` 是表行数、
-///   `got` 是越界的那个 id；**复用 `Shape` 而不新增错误变体**，理由见 §2.17）；
+///   `got` 是越界的那个 id；**复用 `Shape` 而不新增错误变体**——[`Error`] 是 C ABI 的一部分，
+///   加一个变体就要动错误码表与所有绑定，而 `what = "ids"` 已把信息说全）；
 /// - `out.len() != ids.len() × row_len`（[`Error::Shape`]，`what = "out"`，仅 `_into` 版）。
 pub fn gather_rows(table: &[f32], ids: &[usize], row_len: usize) -> Result<AlignedVec<f32>> {
     let n = checked_mul("gather_rows", "ids.len()×row_len", ids.len(), row_len)?;
@@ -566,7 +567,8 @@ pub fn gather_rows_into(
 /// **按 id 取行并反量化**（int8 表 + **每行**一个 scale）：
 /// `out[i][j] = table[ids[i]][j] as f32 * scales[ids[i]]`。
 ///
-/// 见 `docs/ops.md` §2.17 与 `docs/platform.md` §4.2。
+/// 与 [`gather_rows`] 同一套语义（纯行拷贝），外加每行一次 `scale` 乘法
+/// （int8 → f32 是一次转换）。
 ///
 /// # Errors
 /// 同 [`gather_rows`]，外加 `scales.len() != table.len()/row_len`（[`Error::Shape`]，
@@ -646,7 +648,7 @@ fn gather_checks(
 
 /// SiLU（swish）：`y[i] = x[i] / (1 + exp(−x[i]))`，逐元素，返回新分配的对齐缓冲。
 ///
-/// # 数值契约（见 `docs/ops.md` §2.8）
+/// # 数值契约
 /// - 公式写**直接除法**（`x / den`，单次舍入），不是 `x · (1/den)`——参考实现必须照抄
 ///   才算逐位一致；
 /// - 门控分母 `1 + exp(−x)` 与 `exp` 用 `ops::nn_math` 那一份（自带输入夹取
@@ -665,7 +667,7 @@ pub fn silu(x: &[f32]) -> AlignedVec<f32> {
 /// GELU 的 sigmoid 近似（ggml `GELU_QUICK`）：`y[i] = x[i] / (1 + exp(−1.702·x[i]))`。
 ///
 /// 契约同 [`silu`]：直接除法、共用 `nn_math` 的 `exp`、逐元素位精确。
-/// erf 形式（PyTorch 默认那个）是另一个入口，见 `docs/ops.md` §2.8 的规划。
+/// erf 形式（PyTorch 默认那个）是另一个入口：[`gelu_erf`]。
 pub fn gelu_quick(x: &[f32]) -> AlignedVec<f32> {
     let mut out = AlignedVec::<f32>::new(x.len());
     if x.is_empty() {
@@ -680,7 +682,7 @@ pub fn gelu_quick(x: &[f32]) -> AlignedVec<f32> {
 ///
 /// `erf` 没有硬件指令，用 **Abramowitz & Stegun 7.1.26**（本身绝对误差 ≤1.5e-7；折算到
 /// 输出上最差 ≈2.1e-7，出现在 `|x| ≈ 3.08`）。所以这个入口是**近似**，不是"真 erf"——
-/// 需要与 ggml 对齐的场景请用 [`gelu_quick`]。契约见 `docs/ops.md` §2.9。
+/// 需要与 ggml 对齐的场景请用 [`gelu_quick`]。
 ///
 /// 常数契约同 [`silu`]：`|x|` 用 `max(x, −x)`、最终写成 `0.5x + 0.5|x|·erf(|x|/√2)`
 /// （避免 `copysign`）、`exp` 复用 `ops::nn_math`。
@@ -695,7 +697,7 @@ pub fn gelu_erf(x: &[f32]) -> AlignedVec<f32> {
 
 /// [`silu`] 的**免分配**版本：`out` 长度必须 `x.len()`。
 ///
-/// 为什么有它：**逐层激活**在实际推理路径上每层都调一次，而实测（`docs/dev.md` §7.9 ③）
+/// 为什么有它：**逐层激活**在实际推理路径上每层都调一次，而实测
 /// 在 192×3072（589 824 个元素）规模上分配占 `silu` 调用的 **14–15%**
 /// （840 → 720 µs，同一内核、只差一次分配）。
 ///
@@ -740,7 +742,7 @@ pub fn gelu_erf_into(x: &[f32], out: &mut [f32]) -> Result<()> {
 
 /// [`rope`] 的**免分配**版本（输出写进 `out`，长度必须 `rows × cols`）。
 ///
-/// 为什么有它：这是**全库分配占比最高的算子**——实测（`docs/dev.md` §7.9 ③）
+/// 为什么有它：这是**全库分配占比最高的算子**——实测
 /// `192×768`（n_dims = 128）规模上分配占 `rope` 调用的 **39–41%**
 /// （83.9 → 50.6 µs，同一内核、只差一次分配；输出 0.6 MiB ⇒ 与直接量的 33 µs 一致），
 /// 而 RoPE 在注意力里**每层都要调**。
@@ -792,7 +794,7 @@ pub fn rope_into(
 /// `cos`/`sin` 各 `rows × (n_dims/2)`、行主序（第 `r` 行第 `i` 列 = `θ_i` 的余弦/正弦），
 /// 通常由 [`rope_tables`] 生成。表**与 mode 无关**：同一张表两种配对都能用。
 ///
-/// # 数值契约（见 `docs/ops.md` §2.10）
+/// # 数值契约
 /// - 每一对元素：`y0 = fma(x0, c, −(x1·s))`、`y1 = fma(x1, c, x0·s)`（**两次舍入**）；
 /// - `[n_dims, cols)` 的元素**原样复制**（partial rope）；
 /// - 逐元素、无归约；`NeoX` 走 LASX（8 对/向量），`GptJ` 走标量（原因见 `ops::rope` 模块文档）；
@@ -911,7 +913,7 @@ pub fn rope_at(
 
 /// f16 权重与 f32 向量的点积：`Σ f16_to_f32(a[i]) · b[i]`（`a` 是 **u16 位型**）。
 ///
-/// # 数值契约（见 `docs/ops.md` §2.11）
+/// # 数值契约
 /// - f16→f32 是**精确**转换（测试穷举全部 65536 个 f16 位型对硬件验证）；误差只来自
 ///   "权重本来是 f16"这件事本身（相对 ~4.9e-4）；
 /// - **4 条独立累加链**、每 32 元素一轮（不足 32 补一轮 16 元素、再不足走标量尾），
@@ -970,7 +972,7 @@ pub fn matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Alig
     Ok(c)
 }
 
-/// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快，见 dev.md §8.1）。
+/// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快）。
 ///
 /// 与 [`matmul`] **逐位一致**（每个输出元素的累加次序相同）。`matmul` 会按形状自动
 /// 选择；这个入口用于调用方想自己控制、或做 A/B 测量。
@@ -1400,7 +1402,7 @@ fn alloc3(n: usize) -> (AlignedVec<f64>, AlignedVec<f64>, AlignedVec<f64>) {
 
 /// 最大绝对值（逐张量）：`max_i |x_i|`。
 ///
-/// 契约（`docs/ops.md` §2.12）：与 `f32::max` 折叠同语义——**NaN 被忽略**，全 NaN 输入得
+/// 与 `f32::max` 折叠同语义——**NaN 被忽略**，全 NaN 输入得
 /// `0.0`；空输入得 `0.0`。`±inf` 不在契约内。
 pub fn amax(x: &[f32]) -> Result<f32> {
     Ok(crate::ops::quant_i8::amax(x))
@@ -1426,7 +1428,7 @@ pub fn absmax_rows(x: &[f32], rows: usize, cols: usize) -> Result<AlignedVec<f32
 
 /// 逐张量对称量化：`q = round_ties_even(x · (1/scale))`，返回 `(q, scale)`。
 ///
-/// 契约（`docs/ops.md` §2.12）：`scale = max|x| / 127`；`q ∈ [−127, 127]`（**不使用 −128**）；
+/// `scale = max|x| / 127`；`q ∈ [−127, 127]`（**不使用 −128**）；
 /// 取整是 **ties-to-even**；用**倒数乘**而不是除法（LASX 无向量除法）；全零（或全 NaN）输入
 /// ⇒ `scale = 0` 且 `q` 全 0。
 ///
@@ -1524,7 +1526,7 @@ pub fn dequantize_i8_rows(
 /// int8 权重 × int8 激活的矩阵-向量乘（N3 的消费主力）：
 /// `y[o] = (Σ_i W[o,i]·x[i]) · (scale_w[o] · scale_x)`。
 ///
-/// 契约（`docs/ops.md` §2.13）：累加是**整数精确**的（i16 乘积 → i32 累加 → i64 落盘，
+/// 累加是**整数精确**的（i16 乘积 → i32 累加 → i64 落盘，
 /// 与 `dot_i8` 同一内核）；出口是**一次乘法**——先把两个 scale 乘成一个（一次舍入）再乘
 /// `acc`，写成 `((acc as f32)·sw)·sx` 是两次舍入、不保证逐位一致。
 ///
@@ -1556,7 +1558,7 @@ pub fn gemv_i8(
 /// `x` 是 `m × k`（每 **token** 一个 scale，`scale_x` 长 `m`），`w` 是 `n × k`
 /// （每 **输出通道** 一个 scale，`scale_w` 长 `n`），`y` 是 `m × n`。
 ///
-/// 契约（`docs/ops.md` §2.14）：每个输出元素是**一次 `dot_i8`**（整数精确、顺序无关），
+/// 每个输出元素是**一次 `dot_i8`**（整数精确、顺序无关），
 /// 出口与 `gemv_i8` 完全同口径——先把两个 scale 乘成一个（一次舍入）再乘 `acc as f32`。
 /// `m = 1` 时与 [`gemv_i8`] **逐位一致**（测试守着）。
 ///
@@ -1592,7 +1594,7 @@ pub fn matmul_i8(
 
 /// [`absmax_rows`] 的**免分配**版本：逐行最大绝对值写进 `out`（长度必须 `rows`）。
 ///
-/// 为什么有它：逐层保活路径上每次调用都分配一个 `AlignedVec`，而实测（`docs/dev.md` §7.9）
+/// 为什么有它：逐层保活路径上每次调用都分配一个 `AlignedVec`，而实测
 /// 分配可占 `rms_norm` 调用的 **58–63%**。凡是"每层都要调一次"的算子都该有 `_into` 入口。
 ///
 /// # Errors
@@ -1609,7 +1611,7 @@ pub fn absmax_rows_into(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) ->
 }
 
 /// [`quantize_i8_per_tensor`] 的**免分配**版本：量化结果写进 `q`，**返回 `scale`**
-/// （与分配版同一套取整与倒数乘，见 §2.12）。
+/// （与分配版同一套取整与倒数乘：倒数乘 + ties-to-even）。
 ///
 /// # Errors
 /// `q.len() != x.len()`（[`Error::Shape`]）。
@@ -1715,7 +1717,7 @@ pub fn dequantize_i8_rows_into(
 
 /// [`gemv_i8`] 的**免分配**版本：`y` 长度必须 `m`。
 ///
-/// 动机同 `dequantize_i8_into`（逐层保活路径上的分配可占调用的一半以上，`docs/dev.md` §7.9）。
+/// 动机同 `dequantize_i8_into`（逐层保活路径上的分配可占调用的一半以上）。
 ///
 /// # Errors
 /// 同 [`gemv_i8`]，外加 `y.len() != m`。
@@ -1744,7 +1746,7 @@ pub fn gemv_i8_into(
 ///
 /// # Errors
 /// 同 [`matmul_i8`]，外加 `y.len() != m × n`。
-#[allow(clippy::too_many_arguments)] // 8 个参数：与分配版 `matmul_i8` 同形 + `y`（§19.7 口径）
+#[allow(clippy::too_many_arguments)] // 8 个参数：与分配版 `matmul_i8` 同形 + `y`（免分配入口的固定口径）
 pub fn matmul_i8_into(
     x: &[i8],
     w: &[i8],
@@ -1781,16 +1783,16 @@ mod tests {
 
     /* ==================== N3：int8 推理 ==================== */
 
-    /// **int8 端到端口径的实测**（`docs/platform.md` §5.1：模型级验收标准还缺依据）。
+    /// **int8 端到端口径的实测**（补上"模型级验收标准"缺的那份依据）。
     ///
     /// 口径：参考量用 **f64 累加**（既不是 f32 路径也不是 int8 路径）；
     /// 误差按 **∞-范数相对量** `max|Y_q − Y| / max|Y|` 报——这是"跨算子叠加后"的可复核口径。
     /// 同时报 f32 路径的同口径误差作对照（量化误差应当主导）。覆盖 per-token 激活 +
-    /// per-channel 权重（`docs/dev.md` §21.3 的结论：这两个是前提而非优化项）。
+    /// per-channel 权重（这两个是前提而非优化项：per-token 与 per-tensor 同量级，选准确率高的那个不付性能代价）。
     /// `_into` 版与分配版**逐位一致**（同一个内核、只少一次分配），错误路径打准。
     ///
-    /// 动机：`docs/dev.md` §7.9 末表的保活口径里 RMSNorm 占 181.0 µs（含每次调用的分配），
-    /// 而 `docs/ops.md` §5.15 指出的"要抠那 1.9% 先做 `_into`"就是这一条。
+    /// 动机：保活口径里 RMSNorm 占 181.0 µs（含每次调用的分配），而 `rms_norm_into` 实测
+    /// 75.2–75.7 µs（分配占 58%）——凡"每层都要调一次"的算子，`_into` 省的就是这一笔。
     #[test]
     fn test_nn_into_variants_match_allocating_bit_for_bit() {
         let (rows, cols) = (7usize, 33usize);
@@ -1904,7 +1906,7 @@ mod tests {
             }
         }
         println!("  ⇒ 最坏：int8 {worst_q:.3e} / f32 {worst_f32:.3e}（∞-范数相对 f64 参考）");
-        // **这就是 int8 端到端口径的验收界**（`docs/ops.md` §2.15）：实测最坏 6.05e-3，
+        // **这就是 int8 端到端口径的验收界**：实测最坏 6.05e-3，
         // 界取 1e-2（1.65× 余量）。f32 路径同口径 ~1.4e-6 作对照，两者差三个数量级。
         assert!(
             worst_q <= 1e-2,
@@ -1917,7 +1919,7 @@ mod tests {
     ///
     /// 界怎么定：权重与激活各引入 ≤ `scale/2` 的绝对误差，累加 `k` 项后最坏
     /// `≈ (k/2)·(sw·sx_max + sx·sw_max)`；随机数据的实测值远小于这个上界，这里按
-    /// **实测留 3 倍余量**断言（定量界见 `docs/ops.md` §2.12，绝对最坏界不写成断言，
+    /// **实测留 3 倍余量**断言（绝对最坏界不写成断言，
     /// 免得把"随机数据的实测"伪装成"理论保证"）。
     #[test]
     fn test_gemv_i8_pipeline_matches_f32_within_quantization_error() {
@@ -2101,7 +2103,8 @@ mod tests {
         ));
     }
 
-    /// `dot_q4` 的 scale 数组按"≥ 组数"约定（组数 = `ceil(n_bytes/32)`；见 `docs/ops.md` §5.8）。
+    /// `dot_q4` 的 scale 数组按"≥ 组数"约定（组数 = `ceil(n_bytes/32)`；非 32 倍数时最后一组
+    /// 按 `j/32` 取 scale；多给合法、少给报错）。
     #[test]
     fn test_q4_scale_length() {
         let qa = vec![0x21u8; 64]; // 2 组
@@ -2503,7 +2506,7 @@ mod tests {
         }
     }
 
-    /// `gather_rows`/`gather_rows_i8`（`docs/ops.md` §2.17）：
+    /// `gather_rows`/`gather_rows_i8`：
     /// `_into` 与分配版**逐位一致**；三条错误路径（`row_len = 0`、`table` 不整除、
     /// **id 越界**）与 `scales` 长度不符都打准；空 `ids` 退化为空输出。
     #[test]
@@ -2567,7 +2570,7 @@ mod tests {
     /// int8 家族的 `_into` 版与分配版**逐位一致**（同一个内核、只少一次分配），错误路径打准。
     ///
     /// 动机：逐层保活路径上每一步（量化 → 反量化 → 归一化 → 再量化）都在 api 层，
-    /// 而实测分配可占 `rms_norm` 调用的 58–63%（`docs/dev.md` §7.9）。
+    /// 而实测分配可占 `rms_norm` 调用的 58–63%。
     #[test]
     fn test_int8_into_variants_match_allocating_bit_for_bit() {
         let (rows, cols) = (5usize, 7usize);
@@ -2693,10 +2696,10 @@ mod tests {
         ));
     }
 
-    /// **整模型级（合成 12 层栈）的 int8 端到端误差实测**（`docs/ops.md` §2.15 待定的那一格）。
+    /// **整模型级（合成 12 层栈）的 int8 端到端误差实测**（补上端到端口径原先留着待定的那一格）。
     ///
     /// 结构：每层 = `matmul_i8`（per-token 激活 + per-channel 权重）→ f32 RMSNorm →
-    /// `matmul_i8` → **残差相加**；共 12 层（这就是 §5.15 说的"组合路径"：线性走 int8、
+    /// `matmul_i8` → **残差相加**；共 12 层（这就是"组合路径"：线性走 int8、
     /// 归一化走 f32）。参考量 = **同一结构、f64 精确算术、权重不量化** ⇒ 量到的正是
     /// "量化误差沿深度累积"。对照组 = 同 12 层但**不量化**的 f32 栈（应小三个数量级）。
     ///
@@ -2819,7 +2822,7 @@ mod tests {
         );
     }
 
-    /// 激活函数的 `_into` 与分配版**逐位一致** + 长度错误路径（`docs/dev.md` §7.9 ③：
+    /// 激活函数的 `_into` 与分配版**逐位一致** + 长度错误路径（分配占 10–15%，
     /// 实测分配占 10–15%，所以这三个值得铺）。
     #[test]
     fn test_activation_into_variants_match_allocating_bit_for_bit() {

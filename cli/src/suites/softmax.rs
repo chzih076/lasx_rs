@@ -1,8 +1,8 @@
 //! `softmax_rows`：行内 softmax 的带宽实测。
 //!
 //! 这个算子**吃带宽**：读 `x`（可选再读 `mask`）、写 `out`，算力只有"减 max + exp + 乘"。
-//! 所以口径用**字节吞吐**而不是 FLOP/s，参照是 `docs/ops.md` §12.2 记的那组数
-//! （llama.cpp 的 `SOFT_MAX` 典型 2.4–4 GB/s、可达 ~25 GB/s）。
+//! 所以口径用**字节吞吐**而不是 FLOP/s；参照是 llama.cpp 的 `SOFT_MAX`
+//! （典型 2.4–4 GB/s、可达 ~25 GB/s）。
 //!
 //! 「标量」列是一条朴素的 Rust 行循环（`f32::exp`）——**只作性能参照**，不与算子逐位比较
 //! （`exp` 的实现不同，逐位一致性由 `src/ops/softmax_rows.rs` 的单测守）。

@@ -1,4 +1,4 @@
-//! NN 类内核的 C ABI 导出（`docs/ops.md` §12.3 的 N1 批次）。
+//! NN 类内核的 C ABI 导出（N1 批次）。
 //!
 //! 与其它导出模块一致：本文件只做"裸指针 + 长度 → 切片"，算法在 `ops`。
 //!
@@ -24,9 +24,9 @@
 //!
 //! 数值契约（**不是**"差不多"）：`out = e · (1/Σ)`，`e = exp(clamp(scale·x + mask − max))`，
 //! `exp` 用 `exp2` 的 6 次多项式 + magic 数取整；向量路径与标量模拟**逐位一致**
-//! （见 `docs/dev.md` §20.1 与 `src/ops/softmax_rows.rs` 的模块文档）。
+//! （完整 op 序列与推导见 [`crate::ops`] 的 `softmax_rows` 模块文档）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -81,7 +81,7 @@ fn softmax_shape(n_rows: i32, n_cols: i32) -> Option<(usize, usize, usize)> {
 /// C 签名：`void lasx_rms_norm(const float *x, const float *w, float *out, int n_rows, int n_cols, float eps)`
 ///
 /// `w` 是按列的权重、**允许为 NULL**（无权重）；`eps` 的合法性由 `_checked` 变体与 `api`
-/// 层把关（`eps = 0` 且整行全零会得到 NaN，属定义域问题，数值契约见 `docs/ops.md` §2.7）。
+/// 层把关（`eps = 0` 且整行全零会得到 NaN，属定义域问题，所以 `eps` 必须有限且 > 0）。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_rms_norm(
     x: *const f32,
@@ -118,7 +118,7 @@ pub extern "C" fn lasx_rms_norm(
 /// 允许 `out == x`（就地）。`n < 0` 会被夹成 0（原始符号零校验，不做错误上报）。
 ///
 /// 数值契约：**直接除法**（`x/den`，单次舍入，不是 `x·(1/den)`），`exp` 与门控分母用
-/// `ops::nn_math` 那一份；向量路径与标量尾逐位一致（`docs/ops.md` §2.8）。
+/// `ops::nn_math` 那一份；逐元素、无归约，不存在第二种结合次序，所以向量路径与标量尾逐位一致。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_silu(x: *const f32, out: *mut f32, n: i32) {
     let n = n.max(0) as usize;
@@ -137,7 +137,7 @@ pub extern "C" fn lasx_silu(x: *const f32, out: *mut f32, n: i32) {
 ///
 /// C 签名：`void lasx_gelu_quick(const float *x, float *out, int n)`
 ///
-/// 允许 `out == x`（就地）。契约同 `lasx_silu`（`docs/ops.md` §2.8）。
+/// 允许 `out == x`（就地）。契约同 `lasx_silu`（直接除法 `x/den`，单次舍入）。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gelu_quick(x: *const f32, out: *mut f32, n: i32) {
     let n = n.max(0) as usize;
@@ -156,7 +156,8 @@ pub extern "C" fn lasx_gelu_quick(x: *const f32, out: *mut f32, n: i32) {
 ///
 /// C 签名：`void lasx_gelu_erf(const float *x, float *out, int n)`
 ///
-/// 允许 `out == x`（就地）。`erf` 用 A&S 7.1.26（绝对误差 ≤1.5e-7），契约见 `docs/ops.md` §2.9。
+/// 允许 `out == x`（就地）。`erf` 用 A&S 7.1.26 近似（本身绝对误差 ≤1.5e-7，折算到输出
+/// 最差 ≈2.1e-7，出现在 `|x| ≈ 3.08`），所以这个入口是**近似**、不是"真 erf"。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gelu_erf(x: *const f32, out: *mut f32, n: i32) {
     let n = n.max(0) as usize;
@@ -255,7 +256,9 @@ fn rope_shape(
 /// C 签名：`float lasx_dot_f16(const uint16_t *a, const float *b, int n)`
 ///
 /// f16 以 **u16 位型**给出（本库零依赖，不引入 half crate）；`n = 0` 返回 `0.0`。
-/// 累加次序与位精确契约见 `docs/ops.md` §2.11。
+/// 累加用**4 条独立累加链**（每 32 元素一轮，不足 32 补一轮 16 元素、再不足走标量尾，
+/// 元素下标 `j` 始终落在 lane `j % 8`），最后按固定次序 `(c0+c1)+(c2+c3)` 合并再两两归约
+/// ⇒ 向量与标量模拟逐位相同。f16→f32 是**精确**转换，误差只来自"权重本来是 f16"这一事实。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_dot_f16(a: *const u16, b: *const f32, n: i32) -> f32 {
     let n = n.max(0) as usize;
@@ -314,7 +317,8 @@ fn gemv_shape(m: i32, k: i32) -> Option<(usize, usize, usize)> {
 /// `void lasx_layer_norm(const float *x, const float *w, const float *b, float *out, int n_rows, int n_cols, float eps)`
 ///
 /// `w`/`b` **允许为 NULL**（无权重 / 无偏置）；`eps` 的合法性由 `_checked` 变体与 `api`
-/// 层把关（数值契约与"无偏置是跳过加法"的理由见 `docs/ops.md` §2.16）。
+/// 层把关。两条契约要点：方差用**两遍法**（先 mean、再 `Σ(x−mean)²`，避免 `E[x²]−mean²`
+/// 的灾难性相消）；**无偏置必须跳过加法**，加 `0.0` 会把 `−0.0` 翻成 `+0.0`、破坏逐位一致。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_layer_norm(
     x: *const f32,
@@ -356,7 +360,8 @@ pub extern "C" fn lasx_layer_norm(
 /// `void lasx_gather_rows(const float *table, const int *ids, float *out, int n_ids, int row_len, int n_table_rows)`
 ///
 /// `n_table_rows` 供 `_checked` 变体判 id 越界；原始符号里**id 越界即 UB**（与其它原始符号
-/// "零校验"的约定一致）。契约见 `docs/ops.md` §2.17。
+/// "零校验"的约定一致）。契约：纯行拷贝、无算术 ⇒ 无结合次序问题，输出逐位确定；
+/// `row_len == 0`、表长不是 `row_len` 的整数倍、id 越界，在 `_checked` 里都报 `BadShape`。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gather_rows(
     table: *const f32,
@@ -392,7 +397,8 @@ pub extern "C" fn lasx_gather_rows(
 /// C 签名：
 /// `void lasx_gather_rows_i8(const signed char *table, const float *scales, const int *ids, float *out, int n_ids, int row_len, int n_table_rows)`
 ///
-/// 契约见 `docs/ops.md` §2.17；"表存 f32 还是 int8 由消费侧决定"见 `docs/platform.md` §4.2。
+/// 契约同 [`lasx_gather_rows`]（纯行拷贝，外加每行一次 `scale` 乘法；int8 → f32 是一次转换）；
+/// **"表存 f32 还是 int8"由消费侧决定**，库侧只保证两种口径都正确、边界责任清楚。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_gather_rows_i8(
     table: *const i8,
