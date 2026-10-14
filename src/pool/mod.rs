@@ -945,9 +945,18 @@ impl Drop for WaitGuard<'_> {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.epoch.fetch_add(1, Ordering::Release);
-        self.shared.wake.notify_all();
+        // **必须持 `park` 锁再改状态并通知**：worker 在 `worker_loop` 里是"持锁求值条件 →
+        // `wait` 释放锁入睡"；若这里不持锁就 `notify_all`，通知可能落在 worker 注册等待者**之前**
+        // ⇒ **丢唤醒** ⇒ worker 永久睡在条件变量上 ⇒ 下面的 `join()` 永久阻塞。
+        // 实测特征：整套测试并行跑时 `pool::tests::test_every_element_processed_*` 会**间歇性
+        // 挂住 >60 s**，而单独跑往往秒过——正是"时序恰好的丢唤醒"。持锁后 `wait` 与"改状态+通知"
+        // 互斥：worker 要么在求值时看到 `stop`，要么在注册等待者之后才被通知。
+        {
+            let _g = self.shared.park.lock().unwrap();
+            self.shared.stop.store(true, Ordering::Relaxed);
+            self.shared.epoch.fetch_add(1, Ordering::Release);
+            self.shared.wake.notify_all();
+        }
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
