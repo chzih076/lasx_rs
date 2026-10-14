@@ -24,6 +24,34 @@ pub(crate) fn norm3_batch(xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f64]) {
 fn norm3_batch_lasx(xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f64]) {
     let n = xs.len();
     let mut i = 0;
+    // **2 路展开（8 样本/迭代）**：每样本的结合次序是**逐元素固定**的（`x² + (y²+z²)` 再开方）
+    // ⇒ 展开**不改变任何数值**（按构造与改前逐位相同），只为摊薄循环开销、提高访存并行度。
+    // 动机：单路时 1M 档比 LLVM 自动向量化略慢（0.98×）；同型循环在 `axpy` / `vec3_add_scaled_batch`
+    // 上展开后分别拿回 23% / 3.5%。
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` ⇒ 两组访存分别落在 [i,i+4)、[i+4,i+8)，全在 `n` 之内；
+        // 四个切片等长（`api` 入口已校验），`out` 是新分配、与输入不重叠。
+        unsafe {
+            let (p, q) = (i, i + 4);
+            let x0 = lasx::load_f64x4(xs.as_ptr().add(p));
+            let y0 = lasx::load_f64x4(ys.as_ptr().add(p));
+            let z0 = lasx::load_f64x4(zs.as_ptr().add(p));
+            let x1 = lasx::load_f64x4(xs.as_ptr().add(q));
+            let y1 = lasx::load_f64x4(ys.as_ptr().add(q));
+            let z1 = lasx::load_f64x4(zs.as_ptr().add(q));
+            let s0 = lasx_xvfadd_d(
+                lasx_xvfmul_d(x0, x0),
+                lasx_xvfadd_d(lasx_xvfmul_d(y0, y0), lasx_xvfmul_d(z0, z0)),
+            );
+            let s1 = lasx_xvfadd_d(
+                lasx_xvfmul_d(x1, x1),
+                lasx_xvfadd_d(lasx_xvfmul_d(y1, y1), lasx_xvfmul_d(z1, z1)),
+            );
+            lasx::store_f64x4(out.as_mut_ptr().add(p), lasx_xvfsqrt_d(s0));
+            lasx::store_f64x4(out.as_mut_ptr().add(q), lasx_xvfsqrt_d(s1));
+        }
+        i += 8;
+    }
     while i + 4 <= n {
         let vx = unsafe { lasx::load_f64x4(xs.as_ptr().add(i)) };
         let vy = unsafe { lasx::load_f64x4(ys.as_ptr().add(i)) };
