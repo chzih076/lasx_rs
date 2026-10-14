@@ -45,7 +45,44 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
         // 取数/归并指令成本 > 省下的那点依赖延迟（此规模下已在单链的 ~3 周期/次 FMA 串行极限附近）。
         // ⇒ **结论：这个 8–15% 拿不到，现状（0.86×/0.85–0.92×）就是本机该规模的实际水平**；
         //    n≥24 走向量路径，实测领先 1.64–3.11×。**别再把"改结合次序"当作可行方向。**
+        // **短路：`n ≥ 8` 走"`f32x8` 乘法 + 定序归约"**（`lasx_bench dispatch` 的同口径实测，
+        // 2026-10-14，ns/调用）：**n=8 5.76**（标量参考 7.08、原回退 8.35）、**n=16 10.38**
+        // （13.99 / 15.99）、**n=24 14.77**（21.24 / 25.10）⇒ 对参考 1.23–1.44×、对原回退 1.45–1.70×。
+        //
+        // **关键：这里不调用 `SimdPath::detect()`**。实测它单次 **1.52 ns**（含 `forced_lsx()` 的
+        // **线程局部读** + `hardware()` 原子读），在 n=8 这种 7 ns 级调用上会把收益全吃掉
+        // （`vec + detect` 8.32 ns vs `vec` 5.76 ns）。这里只用 `hardware().lasx`（进程级缓存的
+        // 一次原子读）。**取舍**：本短路径**不响应 `lasx_force_lsx_thread`** 测试开关（强制 LSX 时
+        // 仍走向量短路径）——为把 1.5 ns 分派从 7 ns 级调用里去掉，这是有意的；`dot_lsx` 的覆盖
+        // 由 ops 单测**直接调用** `dot_lsx` 保证，不依赖本入口。
+        //
+        // 归约次序：按 8 元素块顺序（`t[0..8]` 依次相加）再进尾巴 ⇒ 与旧的严格顺序不同（用户已
+        // 授权的小 n 口径变更）；`n ∈ [8, 24)` 因此不再走下面的单链标量。仍是 f32 单精度累加。
         let n = a.len().min(b.len());
+        if n >= 8 && crate::arch::hardware().lasx {
+            let mut t = [0f32; 8];
+            let mut s = 0f32;
+            let mut i = 0;
+            while i + 8 <= n {
+                // SAFETY: `i + 8 <= n` ⇒ 两次载入都在界内；`store_f32x8` 写 `t`（恰好 8 个 f32）。
+                unsafe {
+                    let va = lasx::load_f32x8(a.as_ptr().add(i));
+                    let vb = lasx::load_f32x8(b.as_ptr().add(i));
+                    lasx::store_f32x8(t.as_mut_ptr(), lasx_xvfmul_s(va, vb));
+                }
+                let mut k = 0;
+                while k < 8 {
+                    s += t[k];
+                    k += 1;
+                }
+                i += 8;
+            }
+            while i < n {
+                s += a[i] * b[i];
+                i += 1;
+            }
+            return s;
+        }
         let mut acc = 0f32;
         let mut i = 0;
         while i + 4 <= n {

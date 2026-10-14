@@ -7,6 +7,7 @@ pub mod batch;
 pub mod f16;
 pub mod int8;
 pub mod large;
+pub mod lat;
 pub mod matmul;
 pub mod micro;
 pub mod physics;

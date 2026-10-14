@@ -120,7 +120,12 @@ fn dispatch(group: Group, rows: &mut Vec<report::Row>) {
             suites::micro::gemv_i8_k_thread_scaling();
         }
         Group::Align => suites::align::align(),
-        Group::DispatchOverhead => suites::micro::dispatch_overhead(),
+        Group::DispatchOverhead => {
+            suites::micro::dispatch_overhead();
+            // 指令级/调用级微基准（LSX/LASX 延迟与吞吐、`detect()` 每调用成本、极小 n 四路对照）。
+            // 先用 `DispatchOverhead` 组当入口；正式 `Group::Lat` 变体随后补。
+            suites::lat::lat(rows);
+        }
         Group::PoolScaling => suites::micro::pool_scaling(),
         Group::PoolAttribution => suites::micro::pool_attribution(),
         Group::Scenario => suites::scenario::run_all(),
