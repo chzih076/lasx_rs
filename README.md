@@ -131,7 +131,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **算子与用法**：75 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据（§5.15） |
+| [docs/ops.md](docs/ops.md) | **算子与用法**：81 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据（§5.15） |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据（§7）**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 | [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |
 
