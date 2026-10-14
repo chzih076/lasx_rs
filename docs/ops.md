@@ -675,8 +675,9 @@ impl SimdPath {
 | LASX-only（无降级分支） | 23 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 8 个**（§4.3） | 直接执行 LASX 指令 |
 | 内存工具（不涉及 SIMD） | 1 | `lasx_alloc` | 与路径无关 |
 
-N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全），6000 系列都支持 LASX，
-不为 3000 及以下机型付这份复杂度（决策记录见 `docs/dev.md` §20.1）。
+N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LA664，LASX 齐全），同核的 6000 机型
+（3A6000 / 3C6000 / 3B6000）都支持 LASX；不为只有 LSX 的机型（如 2K3000 / 3B6000M，
+LA364E 核）付这份复杂度（决策记录见 `docs/dev.md` §20.1）。
 
 **N3 批次（int8 推理，8 个新符号，逐项见 §4.3 清单）同样 LASX-only**（`lasx_amax`、
 `lasx_absmax_rows`、`lasx_quantize_i8_per_tensor`、`lasx_quantize_i8_per_row`、
@@ -691,8 +692,9 @@ N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全）�
 
 有一批 LASX-only 内核**没有 `has_lasx()` 检查，也没有降级分支**（完整清单与分类见 §3.2 的分类表）：
 
-- 在 LSX-only CPU（3A5000 / 3A6000 等）上调用会执行 LASX 指令，产生**非法指令
-  （SIGILL）**，不会自动降级。使用方必须自行按 CPU 能力调度。
+- 在**只有 LSX（128 位）、没有 LASX 的机型**（如 2K3000 / 3B6000M，LA364E 核）上调用会执行
+  LASX 指令，产生**非法指令（SIGILL）**，不会自动降级。使用方必须自行按 CPU 能力调度；
+  LA464（3A5000）/ LA664（3A6000 等）支持 128/256 位两档向量指令，不属于此列。
 - 源码模块文档对每个 LASX-only 内核都显式标注了这一点。
 - `SimdPath::detect()` 与 `lasx_force_lsx_thread` 的降级只对有降级分支的内核有效；
   对 LASX-only 内核，`lasx_force_lsx_thread(true)` 不改变行为。
