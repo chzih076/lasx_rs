@@ -707,6 +707,38 @@ pub fn dispatch_overhead() {
                         / stream.as_secs_f64()
                 );
             }
+            // **(c) 判据复核**：LLM 形状上"打包路 vs 流式路"谁快（单线程、同形状）。流式走 FFI
+            // 写调用方缓冲；打包版只多分配 C(0.59 MB)，相对 ~14 ms 可忽略 ⇒ 两者可比。
+            // 若打包并不更快，说明 `need_shared_pack`（`src/parallel.rs:54`）在这个形状上选错了。
+            {
+                let (mm, kk, nn) = (192usize, 768usize, 3072usize);
+                let a2: Vec<f32> = (0..mm * kk).map(|i| (i % 17) as f32 * 0.0625).collect();
+                let b2: Vec<f32> = (0..kk * nn).map(|i| (i % 13) as f32 * 0.0625).collect();
+                let mut c2 = vec![0f32; mm * nn];
+                let stream1 = timeit(|| {
+                    lasx_matmul(
+                        mm as i32,
+                        kk as i32,
+                        nn as i32,
+                        a2.as_ptr(),
+                        b2.as_ptr(),
+                        c2.as_mut_ptr(),
+                    );
+                    let _ = black_box(c2[0]);
+                });
+                let packed1 = timeit(|| {
+                    let v = lasx_rs::api::matmul_f32_packed(mm, kk, nn, &a2, &b2).unwrap();
+                    let _ = black_box(v[0]);
+                });
+                println!(
+                    "| **(c) 流式 vs 打包**（{mm}×{kk}×{nn}，单线程） | 流式 {} | 打包 {} | 打包**{}{:.1}%** | — |",
+                    crate::timing::fmt_t(stream1),
+                    crate::timing::fmt_t(packed1),
+                    if packed1 < stream1 { "省" } else { "多" },
+                    100.0 * (packed1.as_secs_f64() - stream1.as_secs_f64()).abs()
+                        / stream1.as_secs_f64()
+                );
+            }
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
