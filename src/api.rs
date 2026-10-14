@@ -999,8 +999,81 @@ pub fn matmul_f32_packed(
         checked_mul("matmul_f32_packed", "k×n", k, n)?,
     )?;
     let mut c = AlignedVec::<f32>::new(checked_mul("matmul_f32_packed", "m×n", m, n)?);
-    crate::ops::matmul::matmul_f32_packed(m, k, n, a, b, c.as_mut_slice());
+    crate::ops::matmul::matmul_f32_packed(
+        m,
+        k,
+        n,
+        a,
+        b,
+        c.as_mut_slice(),
+        crate::ops::matmul::Epi::Plain,
+    );
     Ok(c)
+}
+
+/// `C = alpha·(A·B) + beta·C`（行主序，**原地写回 `c`**）——把缩放融进输出那一遍。
+///
+/// 这是 `cblas_sgemm(..., alpha, A, lda, B, ldb, beta, C, ldc)` 的 f32、B 不转置版本；
+/// `alpha = 1, beta = 0` 时与 [`matmul`] **逐位一致**（同一条内核，收尾不多一次乘法）。
+///
+/// # 与"先算 `A·B` 再对结果做 `alpha·C + beta·C_old`"的关系
+/// 两者**逐位一致**：融合只是把 `fma(beta, C_old, alpha·acc)` 搬进内核收尾，`acc` 仍然是
+/// 沿 `k` 从 0 起的同一个 f32 累加（k 循环、累加次序、向量宽度都没变）。
+/// 口径是**表达式**而不是"数学值"：参考实现写成 `beta.mul_add(C_old, alpha * acc)`
+/// 才逐位相同（普通 `alpha * acc + beta * C_old` 在多数输入上会差 1 ulp）。
+/// 列尾的标量段不是 FMA，但它与参考实现走的是同一段代码，所以仍然逐位一致。
+///
+/// # `c` 的读写与 `beta`
+/// - `beta == 0.0`：**不读 `c`**（CBLAS 语义：`beta = 0` 时 `C` 无需在入参里有效），
+///   于是 `c` 可以是任意初始内容（含 NaN）；
+/// - `beta != 0.0`：读 `c` 的旧值，`c` 必须已经初始化。
+///
+/// # 哪些形状真的融合（不是"一律更快"）
+/// 融合要求收尾时 `C_old` 还没被部分和覆盖。打包路径在 `k > 384` 时把部分和落进 `C`
+/// 再读回，此时 `beta != 0` 无法融合、退回二遍法（先算进临时缓冲再收尾，与朴素实现等价，
+/// 不会更快）；`beta == 0` 不受此限。见 `docs/dev.md` 的融合小节与
+/// `lasx_bench` 的 `matmul` 组实测。
+///
+/// # Errors
+/// - `a`/`b`/`c` 长度不等于 `m×k`/`k×n`/`m×n`（[`Error::Shape`]）；
+/// - 三个乘积溢出 `usize`（[`Error::Overflow`]）。
+///
+/// # Panics
+/// 不 panic（`beta != 0` 且打包路径要 k 分块时会分配一份 `m×n` 的临时缓冲，分配失败即 abort）。
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_scaled_into(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> Result<()> {
+    expect_len(
+        "matmul_scaled_into",
+        "a",
+        a.len(),
+        checked_mul("matmul_scaled_into", "m×k", m, k)?,
+    )?;
+    expect_len(
+        "matmul_scaled_into",
+        "b",
+        b.len(),
+        checked_mul("matmul_scaled_into", "k×n", k, n)?,
+    )?;
+    expect_len(
+        "matmul_scaled_into",
+        "c",
+        c.len(),
+        checked_mul("matmul_scaled_into", "m×n", m, n)?,
+    )?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    crate::ops::matmul::matmul_f32_scaled(m, k, n, alpha, beta, a, b, c);
+    Ok(())
 }
 
 /// f64 版 [`matmul`]。
@@ -2947,5 +3020,94 @@ mod tests {
             diffs, 0,
             "api 与 FFI 的 quat_to_dcm_batch 结果不逐位一致（{diffs} 个分量）——这不是分配开销，是路径差异"
         );
+    }
+
+    /// `matmul_scaled_into`（`C = alpha·A·B + beta·C`）的数值口径与边界。
+    ///
+    /// ① **与"未融合参考"逐位一致**：参考 = 先 `matmul` 出 `acc`，再
+    /// `beta.mul_add(C_old, alpha * acc)`（两次舍入）。融合只是把这一步搬进内核收尾，
+    /// 表达式一模一样，所以这里断言的是**逐位**而不是容差；
+    /// ② `alpha = 1, beta = 0` 逐位退化为 [`matmul`]（同一条内核、收尾不多一次乘法）；
+    /// ③ `beta = 0` **不读 `C`**：把 `c` 填成 NaN，结果里不许出现 NaN（CBLAS 语义）；
+    /// ④ 三个数组长度不对各报 `Error::Shape`。
+    ///
+    /// 形状覆盖三条路径与边界：打包（单 k 块）、列块（极宽 n）、打包 + k 分块（`k > 384`，
+    /// 此时 `beta != 0` 走二遍法回退）、行/列尾。
+    #[test]
+    fn test_matmul_scaled_into_bit_exact_and_contract() {
+        use crate::ops::testutil::Lcg;
+        let mut rng = Lcg(0x5ca1_ed02);
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (5, 7, 40),
+            (32, 64, 96),
+            (33, 65, 31),
+            (100, 64, 4096),
+            (100, 448, 1024),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
+            let c0: Vec<f32> = (0..m * n).map(|_| rng.f64() as f32).collect();
+            let plain = matmul(m, k, n, &a, &b).unwrap();
+            for &(alpha, beta) in &[
+                (1.0f32, 0.0f32),
+                (1.5, 0.0),
+                (-0.25, 0.0),
+                (1.0, 1.0),
+                (1.5, 0.5),
+                (0.75, -1.25),
+            ] {
+                let want: Vec<f32> = plain
+                    .iter()
+                    .zip(c0.iter())
+                    .map(|(&x, &old)| beta.mul_add(old, alpha * x))
+                    .collect();
+                let mut got = c0.clone();
+                matmul_scaled_into(m, k, n, alpha, beta, &a, &b, &mut got).unwrap();
+                for i in 0..m * n {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "{m}×{k}×{n} alpha={alpha} beta={beta} @ {i}: 融合与未融合参考不一致"
+                    );
+                }
+            }
+            // ② 退化：alpha = 1, beta = 0 就是 matmul
+            let mut got = vec![f32::NAN; m * n];
+            matmul_scaled_into(m, k, n, 1.0, 0.0, &a, &b, &mut got).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    plain[i].to_bits(),
+                    "{m}×{k}×{n}: alpha=1,beta=0 没退化成 matmul @ {i}"
+                );
+            }
+            // ③ beta = 0 不读 C：NaN 不许传播出来
+            let mut got = vec![f32::NAN; m * n];
+            matmul_scaled_into(m, k, n, 1.5, 0.0, &a, &b, &mut got).unwrap();
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "{m}×{k}×{n}: beta = 0 时读了 C（NaN 传播进了输出）"
+            );
+        }
+
+        // ④ 错误路径
+        let a = vec![0f32; 6];
+        let b = vec![0f32; 12];
+        let mut c = vec![0f32; 8];
+        assert!(matches!(
+            matmul_scaled_into(2, 3, 4, 1.0, 0.0, &a[..5], &b, &mut c),
+            Err(Error::Shape { what: "a", .. })
+        ));
+        assert!(matches!(
+            matmul_scaled_into(2, 3, 4, 1.0, 0.0, &a, &b[..11], &mut c),
+            Err(Error::Shape { what: "b", .. })
+        ));
+        assert!(matches!(
+            matmul_scaled_into(2, 3, 4, 1.0, 0.0, &a, &b, &mut c[..7]),
+            Err(Error::Shape { what: "c", .. })
+        ));
+        // 空形状不 panic、也不写
+        assert!(matmul_scaled_into(0, 3, 4, 1.5, 0.5, &[], &b, &mut []).is_ok());
     }
 }

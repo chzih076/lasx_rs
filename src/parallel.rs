@@ -194,6 +194,7 @@ fn matmul_f32_picked(
                                 ab,
                                 cb,
                                 m4,
+                                matmul::Epi::Plain,
                             );
                         },
                         || {
@@ -219,6 +220,7 @@ fn matmul_f32_picked(
                                 ab,
                                 cb,
                                 m4,
+                                matmul::Epi::Plain,
                             );
                         },
                         || {
@@ -241,7 +243,16 @@ fn matmul_f32_picked(
                     for i in 0..rows {
                         let a_row = &ab[i * k..(i + 1) * k];
                         let c_row = &mut cb[i * n..(i + 1) * n];
-                        matmul::row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+                        matmul::row_tail_range_f32(
+                            a_row,
+                            c_row,
+                            b,
+                            k,
+                            n,
+                            n32,
+                            n,
+                            matmul::Epi::Plain,
+                        );
                     }
                 },
             );

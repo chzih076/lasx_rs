@@ -94,12 +94,13 @@ pub use lasx_rs_macros::{dot, gemv, matmul};
 /// 内部基准用的转发（不面向使用者；生产路径由 `lasx_matmul` 的按形状分派选择）。
 #[doc(hidden)]
 pub fn ops_bench_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    ops::matmul::matmul_f32_packed(m, k, n, a, b, c);
+    ops::matmul::matmul_f32_packed(m, k, n, a, b, c, ops::matmul::Epi::Plain);
 }
 
-/// **实验性**：`C = alpha·(A·B) + beta·C`（原地），只在 k 不分块、`m%4==0`、`n%32==0`
-/// 时成立。用于量"融合内核能不能保持非融合内核的速度"；该融合已**实测否掉**（微内核收尾那次
-/// 按 4 行跨距的读-改-写吃掉了它本想省下的那一遍的 91–96%），这个入口只作那条结论的可复现凭据。
+/// `C = alpha·(A·B) + beta·C`（原地）；正式实现见 [`api::matmul_scaled_into`]。
+///
+/// 保留这个 `#[doc(hidden)]` 入口只为让基准/例子能直接量内核层（`examples/fusion_kernel.rs`
+/// 用它做"融合 vs 两遍"的对照），语义与 `api` 层一致：`beta == 0` 不读 `C`。
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn ops_bench_scaled(
@@ -124,7 +125,18 @@ pub fn ops_bench_packed_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], 
 /// 强制 f32 走"列块在外"次序（A/B 基准）。
 #[doc(hidden)]
 pub fn ops_bench_cols_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    ops::matmul::matmul_f32_cols_block(m, k, n, 0, n, a, b, c, ops::matmul::COL_BLOCK);
+    ops::matmul::matmul_f32_cols_block(
+        m,
+        k,
+        n,
+        0,
+        n,
+        a,
+        b,
+        c,
+        ops::matmul::COL_BLOCK,
+        ops::matmul::Epi::Plain,
+    );
 }
 
 /// 强制 f64 走流式次序（A/B 基准）。

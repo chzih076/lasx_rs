@@ -4,6 +4,7 @@
 //! matmul!(y[M, N] = x[M, K] * w[K, N]);     // 全静态：M/K/N 是 const
 //! matmul!(y[m, N] = x[m, K] * w[K, N]);     // DYN：m 是运行期行数，K/N 仍是 const
 //! matmul!(y[M, N] = x[M, K] * p);           // 右操作数是 Prepared plan（不带方括号）
+//! matmul!(y[M, N] = alpha * x[M, K] * w[K, N]);  // 标量前缀：C = alpha·A·B（beta = 0）
 //! ```
 //!
 //! 这个 crate 是**内部实现**（`publish = false`），用户只看到 `lasx_rs::matmul!`：
@@ -34,6 +35,7 @@
 //!         | 操作数 '*' 操作数
 //! 操作数 := ident '[' ident ',' ident ']'
 //!         | ident                                   ← 只在乘积右侧：视为 Prepared plan
+//! 标量   := ident | 字面量                          ← 可选前缀，写在乘积最前面
 //! ```
 //!
 //! 两个**带下标**的操作数按"共享下标出现在哪一侧"判角色，两种读法都认：
@@ -47,8 +49,33 @@
 //! （DYN 档为 `apply_dyn_into`）。**同一维必须写同一个下标**（见诊断第 1 条），所以
 //! `M`/`K`/`N` 这些名字在三处出现时是一致的。
 //!
-//! 仍**不做**：`alpha`/`beta` 融合、`+` 多操作数、不带下标的简写里判静态/DYN 两档
-//! （`matmul!(x * w)` 按全静态生成）。
+//! 仍**不做**：`beta`（累加/原地）的 DSL 写法——那需要输出是输入之一，与"输入输出不能是
+//! 同一块内存"的契约冲突，请直接用 `api::matmul_scaled_into`（`C = alpha·A·B + beta·C`）；
+//! `+` 多操作数、不带下标的简写里判静态/DYN 两档（`matmul!(x * w)` 按全静态生成）。
+//!
+//! # 标量前缀（`alpha`）
+//!
+//! 乘积最前面可以写一个标量（`matmul!(y[M,N] = alpha * x[M,K] * w[K,N])`），语义是
+//! **`y = alpha·(A·B)`**，即 CBLAS 的 `alpha` 配 `beta = 0`（输出被完全覆盖、旧值不读）：
+//!
+//! ```text
+//! matmul!(y[M, N] = alpha * x[M, K] * w[K, N]);  →  x.mul_scaled_into(alpha, &w, &mut y)
+//! matmul!(y[M, N] = alpha * x[M, K] * p);        →  p.apply_scaled_into(alpha, &x, &mut y)
+//! matmul!(y[m, N] = alpha * x[m, K] * w[K, N]);  →  w.apply_scaled_dyn_into(alpha, &x, &mut y)
+//! matmul!(alpha * x[M, K] * w[K, N]);            →  x.mul_scaled(alpha, &w)
+//! ```
+//!
+//! 标量 token **原样进生成的代码**，所以可以是局部变量、`const` 或字面量（求值为 `f32`）。
+//!
+//! 两条边界是刻意的：
+//!
+//! - **只对 `f32` 成立**。融合内核（`ops::matmul::Epi::Scale`）只在 f32 路径上；`f64` 写标量
+//!   前缀得到的是"方法不存在"的编译错误，而不是静默退化成两遍法——`f64` 要缩放请先
+//!   `mul` 再整体乘。
+//! - **`beta` 没有 DSL 写法**（见上）。
+//!
+//! 数值上 `alpha` 只是从"算完再整体乘"搬进输出那一遍，累加次序没动 ⇒ 与两遍法**逐位一致**
+//! （`shape.rs` 的 `test_formula_dsl_scaled_matches_two_pass_bit_for_bit` 钉住）。
 //!
 //! # 直接吃 `Prepared`（plan 形态）
 //!
@@ -72,9 +99,8 @@
 //!
 //! 三条边界，都是刻意的：
 //!
-//! - **plan 只能写在乘积右侧**。`alpha * x[M,K]`（标量前缀，v1 不支持）与 `p * x[M,K]`
-//!   在 token 层**完全同形**，无法区分；留一条"形状必须写在左侧"的硬规则，才能保住
-//!   标量前缀那条诊断（见诊断第 3 条）。
+//! - **plan 只能写在乘积右侧**。`p * x[M,K]` 与"带方括号的输入写在右侧"在 token 层无法与
+//!   标量前缀区分，于是留一条"形状必须写在左侧"的硬规则（plan 形态只认右操作数）。
 //! - **权重形状不进公式**。K/N 由 `Prepared` 自己的 const 参数定，与 `x` / `y` 的类型标注
 //!   对接（写错仍是编译错误：`x` 的列、`y` 的列分别与 plan 的 K/N 对齐）。
 //! - **不做隐式/指纹缓存**。`.prepare()` 返回的 `Prepared` 借用了权重切片，只有**显式**
@@ -90,7 +116,7 @@
 //! |---|---|---|---|
 //! | 1 | 同一维两侧下标名不同（`y[M,N] = x[m,K] * …`、`x[M,K] * w[Q,N]`） | 宏 | 两个下标（**双锚定**） |
 //! | 2 | 同一次操作数两个下标同名（`y[M, M]`） | 宏 | 两个下标 |
-//! | 3 | 标量前缀（`alpha * x[..]`）或 plan 写在乘积左侧 | 宏 | 该操作数 |
+//! | 3 | 操作数没写方括号（`y[M,N] = x * w[K,N]`）、或 plan 写在乘积左侧 | 宏 | 该操作数 |
 //! | 4 | 下标个数 ≠ 2 / 下标没写在方括号里（`x[]`、`x(M, K)`） | 宏 | 该操作数 |
 //! | 5 | 不是 `a[..] * b[..]` 这个形状（多了 `+`、少了 `*`…） | 宏 | 出错的那个 token |
 //! | 6 | 大写下标其实**不是** `const` | rustc | `cannot find value 'M' in this scope` |
@@ -99,8 +125,8 @@
 //! "大写下标必须是 const"这句提示只能写在**本文档**里，进不了编译错误。用类型标注去逼也
 //! 徒劳——名字解析失败发生在任何类型检查之前。
 //!
-//! 第 3 条的两半共用一条诊断：`alpha * x[M,K]` 与 `p * x[M,K]` 在 token 层同形，所以带
-//! 方括号的操作数只能出现在乘积**左侧**（plan 形态因此只认右操作数，见上一节）。
+//! 第 3 条只对"没写方括号、也不在 plan 位置"的操作数成立：形如 `ident * …` 的**最前面**
+//! 那个 ident 已经被标量前缀的解析（源码里的 `parse_scalar`）吃掉了，不会走到这条诊断。
 //!
 //! # Span 从第一行就保留
 //!
@@ -193,10 +219,15 @@ impl Operand {
 ///
 /// `weight.is_plan()` 为真表示宏吃到的是 [`Prepared`]：生成 `weight.apply_into(&input, …)`
 /// 而不是 `input.mul_into(&weight, …)`——后者内部每次都会 `prepare()`。
+///
+/// `scalar` 是标量前缀的 token（`matmul!(y = alpha * x * w)` 里的 `alpha`）。它原样进生成的
+/// 代码，所以可以是任何求值为 `f32` 的表达式（局部变量、`const`、字面量）；语义是
+/// `out = alpha·(A·B)`，即 `beta = 0`（`out` 被完全覆盖、旧值不读）。
 struct Formula {
     out: Option<Operand>,
     input: Operand,
     weight: Operand,
+    scalar: Option<TokenTree>,
 }
 
 /// 一条诊断：主锚点 + 可选第二锚点（双锚定）+ 可选 note。
@@ -405,18 +436,18 @@ fn parse_operand(
             if allow_plan {
                 return Ok((Operand::plan(name), at + 1));
             }
-            // 紧跟着 `*` 说明这是标量前缀（`alpha * x[..]`）：单独给消息，否则用户只看到
-            // "缺少下标"，看不出真正的问题是 v1 还没做 `alpha`/融合。
+            // 紧跟着 `*` 说明这个操作数少了方括号（合法操作数必须写 `x[行, 列]`；标量前缀
+            // 是 `alpha * x[..] * w[..]`，标量在最前面，已经在 `parse_scalar` 里吃掉）。
             if let Some(TokenTree::Punct(star)) = other
                 && star.as_char() == '*'
             {
                 return Err(Diagnostic::new(
-                    format!("v1 不支持标量前缀：`{name} * …`（`alpha` 缩放/融合还没实现）"),
+                    format!("`{name}` 后面缺少下标：请写成 `{name}[行下标, 列下标]`"),
                     name_span,
                 )
                 .with_note(
-                    "要缩放请先算 `matmul!(…)` 再对结果乘标量；`alpha`/`beta` 的语义记在契约里、尚未启用。\
-                     若这个操作数是 `Prepared`（plan 形态），它只能写在乘积右侧：`x[M, K] * p`",
+                    "标量前缀要写成 `alpha * x[M, K] * w[K, N]`（标量在最前面）——\
+                     `alpha` 会走融合入口，等价于 `C = alpha·A·B`（`beta = 0`）",
                 ));
             }
             return Err(Diagnostic::new(
@@ -465,18 +496,46 @@ fn parse_operand(
 
 fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
+    // 标量前缀可以出现在最前面（无输出形态：`alpha * x[M,K] * w[K,N]`）或 `=` 之后。
+    // 识别条件是"标识符/字面量后面直接跟 `*`"：合法操作数一定写方括号，所以这个形状只可能
+    // 是标量（`Prepared` 形态只允许出现在乘积右侧，不受影响）。
+    let (scalar0, mut at) = parse_scalar(&tokens, 0)?;
     // 左侧（输出、输入）必须写形状；只有乘积右侧允许 plan 形态。
-    let (first, mut at) = parse_operand(&tokens, 0, false)?;
+    let (first, next) = parse_operand(&tokens, at, false)?;
+    at = next;
 
-    let parsed = match tokens.get(at) {
-        // `out[..] = a[..] * b[..]`
+    let (scalar, parsed) = match tokens.get(at) {
+        // `out[..] = a[..] * b[..]`（`=` 之后可以再有标量前缀）
         Some(TokenTree::Punct(eq)) if eq.as_char() == '=' => {
             at += 1;
+            let (scalar1, next) = parse_scalar(&tokens, at)?;
+            at = next;
+            if scalar0.is_some() && scalar1.is_some() {
+                return Err(Diagnostic::new(
+                    "标量前缀只能写一次",
+                    scalar1.as_ref().map_or(first.i().span(), TokenTree::span),
+                )
+                .with_note("把标量写在 `=` 之后：`y[M, N] = alpha * x[M, K] * w[K, N]`"));
+            }
             let (lhs, next) = parse_operand(&tokens, at, false)?;
             at = next;
             match tokens.get(at) {
                 Some(TokenTree::Punct(star)) if star.as_char() == '*' => at += 1,
                 other => {
+                    // `=` 之后已经吃到一个标量前缀、却只解析出一项：`y[M,N] = x * w[K,N]`
+                    // 就是这条（`x` 被当成了标量）。这时把三种可能一次说清，否则用户只会
+                    // 看到"缺少 `*`"——那正是他写对的地方。
+                    if let Some(scalar) = &scalar1 {
+                        return Err(Diagnostic::new(
+                            format!(
+                                "`=` 之后只解析出一项乘积：`{scalar}` 若是输入矩阵，请补下标\
+                                 （`x[行, 列]`）；若是 `Prepared` plan，它只能写在乘积右侧\
+                                 （`x[M, K] * p`）；若确实是标量前缀，公式还缺第二项\
+                                 （`alpha * x[M, K] * w[K, N]`）"
+                            ),
+                            scalar.span(),
+                        ));
+                    }
                     return Err(Diagnostic::new(
                         "输出与乘积之间缺少 `*`（v1 只接受单项乘积 `y[..] = a[..] * b[..]`）",
                         other.map_or(first.i().span(), TokenTree::span),
@@ -485,14 +544,14 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
             }
             let (b, next) = parse_operand(&tokens, at, true)?;
             at = next;
-            (Some(first), lhs, b)
+            (scalar0.or(scalar1), (Some(first), lhs, b))
         }
-        // `a[..] * b[..]`
+        // `a[..] * b[..]`（标量前缀已经在最前面吃掉）
         Some(TokenTree::Punct(star)) if star.as_char() == '*' => {
             at += 1;
             let (b, next) = parse_operand(&tokens, at, true)?;
             at = next;
-            (None, first, b)
+            (scalar0, (None, first, b))
         }
         other => {
             return Err(Diagnostic::new(
@@ -504,12 +563,28 @@ fn parse(input: TokenStream) -> Result<Formula, Diagnostic> {
 
     if let Some(trailing) = tokens.get(at) {
         return Err(Diagnostic::new(
-            "公式到乘积就结束了（v1 不支持 `+`/`alpha`/多操作数，见 crate 文档）",
+            "公式到乘积就结束了（v1 不支持 `+`/多操作数，见 crate 文档）",
             trailing.span(),
         ));
     }
     let (out, left, right) = parsed;
-    normalize(out, left, right)
+    normalize(out, left, right, scalar)
+}
+
+/// 可选的标量前缀 `alpha * …`：返回 `(标量 token, 新位置)`。
+///
+/// 只有"标识符或字面量 + `*`"才算标量——`x[M, K]` 的 `x` 后面跟的是方括号组，落不进这里。
+fn parse_scalar(tokens: &[TokenTree], at: usize) -> Result<(Option<TokenTree>, usize), Diagnostic> {
+    let Some(found) = tokens.get(at) else {
+        return Ok((None, at));
+    };
+    if !matches!(found, TokenTree::Ident(_) | TokenTree::Literal(_)) {
+        return Ok((None, at));
+    }
+    match tokens.get(at + 1) {
+        Some(TokenTree::Punct(s)) if s.as_char() == '*' => Ok((Some(found.clone()), at + 2)),
+        _ => Ok((None, at)),
+    }
 }
 
 /// 角色归一（**纯名字层**：能单元测试）。
@@ -534,7 +609,12 @@ fn roles(left: (&str, &str), right: (&str, &str)) -> Result<bool, ()> {
 ///
 /// 右侧不带下标（plan）时角色由**位置**直接定下：右侧是打包好的权重、左侧是输入，
 /// 不需要（也无法）用共享下标判——`Prepared` 的形状不在公式里。
-fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Formula, Diagnostic> {
+fn normalize(
+    out: Option<Operand>,
+    left: Operand,
+    right: Operand,
+    scalar: Option<TokenTree>,
+) -> Result<Formula, Diagnostic> {
     if right.is_plan() {
         if left.is_plan() {
             return Err(Diagnostic::new(
@@ -548,6 +628,7 @@ fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Form
             out,
             input: left,
             weight: right,
+            scalar,
         });
     }
     if left.is_plan() {
@@ -556,7 +637,7 @@ fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Form
             "plan 形态（不带方括号的 `p`）只能写在乘积右侧：`x[M, K] * p`",
             left.name.span(),
         )
-        .with_note("左侧写形状后才能用共享下标判角色；这也是标量前缀 `alpha * x[..]` 的诊断前提"));
+        .with_note("左侧写形状后才能用共享下标判角色"));
     }
     let (li, lj) = left.shape().expect("非 plan 必有下标");
     let (ri, rj) = right.shape().expect("非 plan 必有下标");
@@ -565,11 +646,13 @@ fn normalize(out: Option<Operand>, left: Operand, right: Operand) -> Result<Form
             out,
             input: left,
             weight: right,
+            scalar,
         }),
         Ok(true) => Ok(Formula {
             out,
             input: right,
             weight: left,
+            scalar,
         }),
         Err(()) => Err(Diagnostic::new(
             format!("收缩维的下标不一致：左侧操作数写 `{lj}`，右侧操作数写 `{ri}`"),
@@ -688,10 +771,15 @@ fn check(f: &Formula) -> Result<(), Diagnostic> {
 ///
 /// plan 形态（`weight.is_plan()`）与非 plan 形态只差两处：少一条权重类型标注、
 /// 接收者换成权重（`weight.apply_into(&input, &mut out)` 而不是 `input.mul_into(&weight, &mut out)`）。
+///
+/// 有标量前缀（`f.scalar`：`matmul!(y = alpha * x * w)`）时，方法名换成 `*_scaled*` 并把标量
+/// token 作为**第一个实参**——底层是 `ops::matmul` 的 `Epi::Scale`，`alpha` 进输出那一遍，
+/// 不再单独跑一遍 elementwise（见 `shape.rs` 里那批 `*_scaled*` 方法）。
 fn expand(f: &Formula) -> TokenStream {
     let input = &f.input;
     let weight = &f.weight;
     let planned = weight.is_plan();
+    let scaled = f.scalar.is_some();
     let runtime_rows = matches!(Kind::of(&input.i().to_string()), Ok(Kind::Runtime));
 
     match &f.out {
@@ -742,10 +830,16 @@ fn expand(f: &Formula) -> TokenStream {
                     &out.name,
                 ));
                 let mut args = TokenStream::new();
+                alpha_arg(&mut args, f.scalar.as_ref());
                 args.extend(amp(&input.name));
                 args.extend([p(',')]);
                 args.extend(amp_mut(&out.name));
-                body.extend(method(&weight.name, "apply_dyn_into", args));
+                let name = if scaled {
+                    "apply_scaled_dyn_into"
+                } else {
+                    "apply_dyn_into"
+                };
+                body.extend(method(&weight.name, name, args));
             } else {
                 body.extend(annotate(
                     "Mat",
@@ -768,18 +862,30 @@ fn expand(f: &Formula) -> TokenStream {
                     &out.name,
                 ));
                 let mut args = TokenStream::new();
+                alpha_arg(&mut args, f.scalar.as_ref());
                 if planned {
-                    // plan：打包已完成，直接吃 `Prepared::apply_into`
+                    // plan：打包已完成，直接吃 `Prepared::apply_scaled_into` / `apply_into`
                     args.extend(amp(&input.name));
                     args.extend([p(',')]);
                     args.extend(amp_mut(&out.name));
-                    body.extend(method(&weight.name, "apply_into", args));
+                    let name = if scaled {
+                        "apply_scaled_into"
+                    } else {
+                        "apply_into"
+                    };
+                    body.extend(method(&weight.name, name, args));
                 } else {
                     args.extend(amp(&weight.name));
                     args.extend([p(',')]);
                     args.extend(amp_mut(&out.name));
-                    // 静态档写进已有输出：`Mat::mul_into`（`apply_into` 在 `Prepared` 上）
-                    body.extend(method(&input.name, "mul_into", args));
+                    // 静态档写进已有输出：`Mat::mul_scaled_into` / `mul_into`
+                    // （`apply_into` 在 `Prepared` 上）
+                    let name = if scaled {
+                        "mul_scaled_into"
+                    } else {
+                        "mul_into"
+                    };
+                    body.extend(method(&input.name, name, args));
                 }
             }
             // 包进 block：不污染调用点作用域，也让整条公式是一个表达式
@@ -791,22 +897,40 @@ fn expand(f: &Formula) -> TokenStream {
         None => {
             if planned {
                 let mut args = TokenStream::new();
+                alpha_arg(&mut args, f.scalar.as_ref());
                 args.extend([amp(&input.name)]);
-                if runtime_rows {
-                    method(&weight.name, "apply_dyn", args)
-                } else {
-                    method(&weight.name, "apply", args)
-                }
+                let name = match (runtime_rows, scaled) {
+                    (true, true) => "apply_scaled_dyn",
+                    (true, false) => "apply_dyn",
+                    (false, true) => "apply_scaled",
+                    (false, false) => "apply",
+                };
+                method(&weight.name, name, args)
             } else if runtime_rows {
                 let mut args = TokenStream::new();
+                alpha_arg(&mut args, f.scalar.as_ref());
                 args.extend([amp(&input.name)]);
-                method(&weight.name, "apply_dyn", args)
+                let name = if scaled {
+                    "apply_scaled_dyn"
+                } else {
+                    "apply_dyn"
+                };
+                method(&weight.name, name, args)
             } else {
                 let mut args = TokenStream::new();
+                alpha_arg(&mut args, f.scalar.as_ref());
                 args.extend([amp(&weight.name)]);
-                method(&input.name, "mul", args)
+                let name = if scaled { "mul_scaled" } else { "mul" };
+                method(&input.name, name, args)
             }
         }
+    }
+}
+
+/// 把标量前缀写成**第一个实参**（没有标量就什么都不做）。
+fn alpha_arg(args: &mut TokenStream, scalar: Option<&TokenTree>) {
+    if let Some(s) = scalar {
+        args.extend([s.clone(), p(',')]);
     }
 }
 
@@ -904,4 +1028,10 @@ mod tests {
         // 无输出：plan 形态没有可查的维度，收缩维也查不了
         assert!(check_names(None, ("M", "K"), None).is_ok());
     }
+
+    // 标量前缀（`alpha * …`）的**解析**在这里测不了：`proc_macro` 的 `TokenStream` 一旦
+    // 离开真实宏调用就会 panic（"procedural macro API is used outside of a procedural macro"）。
+    // 它的正面路径由 `src/shape.rs` 的 `test_formula_dsl_scaled_matches_two_pass_bit_for_bit`
+    // 覆盖（宏真的展开、真的跑出逐位一致的结果）；负面路径（诊断文案）与既有做法一致，
+    // 靠人工核对的编译输出守着。
 }

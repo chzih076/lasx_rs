@@ -73,11 +73,89 @@ const L1_BUDGET: usize = 48 * 1024;
 const K_CHUNK: usize = 256;
 use std::arch::loongarch64::*;
 
+/// 输出那一遍的缩放口径：`C = alpha·acc + beta·C_old`（`acc` 是沿 k 从 0 起的完整累加）。
+///
+/// 这是"融合"的全部内容——把缩放**融进最终的 store**，不再单独跑一遍 elementwise。
+/// 三种模式的差别只在收尾，k 循环与既有内核**逐条指令相同**：
+///
+/// | 模式 | 触发 | 收尾 | 读 `C_old` |
+/// |---|---|---|---|
+/// | `Plain` | `alpha == 1 && beta == 0` | `store(acc)` | 否（与既有内核逐字节相同） |
+/// | `Scale` | `beta == 0` | `store(alpha·acc)` | **否**（CBLAS 语义：`beta = 0` 时 `C` 无需初始化） |
+/// | `Fma` | `beta != 0` | `store(fma(beta, C_old, alpha·acc))` | 是 |
+///
+/// `Fma` 与参考实现 `beta.mul_add(C_old, alpha * acc)` **逐位一致**（两次舍入：`alpha·acc`
+/// 一次、FMA 一次）；`Scale` 与 `alpha * acc` 逐位一致（一次舍入）。列尾的标量段不是 FMA，
+/// 所以口径按**表达式**定义（参考实现同样写成 `beta.mul_add(old, alpha * acc)`），不按
+/// "数学值"定义；NaN 的 payload 不在逐位承诺内。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Epi {
+    /// `C = acc`：不读 `C`，store 与既有内核逐字节相同。
+    Plain,
+    /// `C = alpha·acc`：不读 `C`。
+    Scale(f32),
+    /// `C = fma(beta, C_old, alpha·acc)`：读 `C_old`。
+    Fma(f32, f32),
+}
+
+impl Epi {
+    /// 按 `(alpha, beta)` 选口径；`beta == 0` 一律不读 `C`。
+    pub(crate) fn new(alpha: f32, beta: f32) -> Epi {
+        if beta == 0.0 {
+            if alpha == 1.0 {
+                Epi::Plain
+            } else {
+                Epi::Scale(alpha)
+            }
+        } else {
+            Epi::Fma(alpha, beta)
+        }
+    }
+    /// 写回连续的 8 个 `f32`（`p` 指向该段起点）。
+    ///
+    /// # Safety
+    /// `Epi::Fma` 要求 `p` 可读写 8 个 `f32`；另两种模式只要求可写 8 个 `f32`。
+    #[inline]
+    unsafe fn store8(self, p: *mut f32, acc: lasx::F32x8) {
+        match self {
+            // SAFETY: 调用方保证 `p` 可写 8 个 `f32`（见内核函数的 SAFETY 段）。
+            Epi::Plain => unsafe { lasx::store_f32x8(p, acc) },
+            // SAFETY: 同上，只写不读。
+            Epi::Scale(a) => unsafe {
+                lasx::store_f32x8(p, lasx_xvfmul_s(acc, lasx::splat_f32(a)))
+            },
+            // SAFETY: 调用方保证 `p` 可读写 8 个 `f32`。
+            Epi::Fma(a, b) => unsafe {
+                let old = lasx::load_f32x8(p);
+                let out = lasx_xvfmadd_s(
+                    old,
+                    lasx::splat_f32(b),
+                    lasx_xvfmul_s(acc, lasx::splat_f32(a)),
+                );
+                lasx::store_f32x8(p, out);
+            },
+        }
+    }
+    /// 标量列尾的同一口径。`old` 惰性取值：`Plain`/`Scale` 下**不读** `C`。
+    #[inline]
+    fn scalar<F: FnOnce() -> f32>(self, old: F, acc: f32) -> f32 {
+        match self {
+            Epi::Plain => acc,
+            Epi::Scale(a) => a * acc,
+            Epi::Fma(a, b) => b.mul_add(old(), a * acc),
+        }
+    }
+}
+
 /// f32 矩阵乘 `C[m×n] = A[m×k]·B[k×n]`（行主序）。
 ///
 /// 循环顺序是"每个 4 行块把 B 扫一遍"——**这个顺序是实测选出来的**：
 /// 把它改成两级 L2 分块（列块在外、行块在内）在多核下慢 8–12%，单线程也无收益，
 /// 因为 4×32 微块本来就让 B 被复用 4 次，分块只是把流量从 L3 挪到 L2、体量不变。
+///
+/// **这条生产路径的判据与流式循环保持内联**（不抽成 `pick_f32_path` + `matmul_f32_stream`）：
+/// 抽出去以后最小形状会慢——64³ 实测 7.6 → 7.9 µs（+3.9%），是"多一层调用 + 微内核拿不到
+/// 同样的内联"造成的（基线 A/B 测到，改回内联后回到 7.6）。融合入口自己复制那十几行判据。
 #[inline]
 pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     if m == 0 || n == 0 {
@@ -97,11 +175,11 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
         && !wide_n_small_k
         && (m as u128) * (k as u128) * (n as u128) >= PACK_MIN_WORK
     {
-        matmul_f32_packed(m, k, n, a, b, c);
+        matmul_f32_packed(m, k, n, a, b, c, Epi::Plain);
         return;
     }
     if m <= COL_ORDER_MAX_M && n >= COL_ORDER_MIN_N {
-        matmul_f32_cols_block(m, k, n, 0, n, a, b, c, COL_BLOCK);
+        matmul_f32_cols_block(m, k, n, 0, n, a, b, c, COL_BLOCK, Epi::Plain);
         return;
     }
 
@@ -138,6 +216,127 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
     }
 }
 
+/// `C = alpha·(A·B) + beta·C`（原地）——把缩放**融进输出那一遍**。
+///
+/// 与 [`matmul_f32`] 的关系：`alpha = 1, beta = 0` 时逐位等于 [`matmul_f32`]（同一条内核、
+/// 收尾 `Plain`，连一次乘法都不多）；其余情况下每个输出元素的收尾是
+/// `C = fma(beta, C_old, alpha·acc)`，而 `acc` 与 [`matmul_f32`] 算出的值**逐位相同**
+/// （k 循环一条指令都没动）。
+///
+/// **`beta == 0` 不读 `C`**（CBLAS 语义），此时 `c` 可以是未初始化内容的缓冲；`beta != 0`
+/// 时读 `c` 的旧值。
+///
+/// **哪些形状真的融合**：融合的硬前提是"收尾时 `C_old` 还没被部分和覆盖"。打包路径在
+/// `k > 384`（条带超过 `L1_BUDGET`）时会把部分和落进 `C` 再读回，此时 `beta != 0` 无法
+/// 融合，退回二遍法（[`matmul_f32_scaled_two_pass`]，与朴素实现等价、不会更快）；`beta == 0`
+/// 没有这个约束（根本不读 `C_old`），任何 `k` 都能融合。
+///
+/// # Panics
+/// 不 panic：形状由调用方保证（`api` 层先做长度与溢出检查）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f32_scaled(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let epi = Epi::new(alpha, beta);
+    if epi == Epi::Plain {
+        matmul_f32(m, k, n, a, b, c);
+        return;
+    }
+    // k 不分块时部分和不落 C，收尾读 C_old 才安全；`beta == 0` 时压根不读。
+    let single_chunk = k * 32 * 4 <= L1_BUDGET;
+    match pick_f32_path(m, k, n) {
+        Path::Packed if single_chunk || beta == 0.0 => matmul_f32_packed(m, k, n, a, b, c, epi),
+        Path::Packed => matmul_f32_scaled_two_pass(m, k, n, alpha, beta, a, b, c),
+        Path::Cols => matmul_f32_cols_block(m, k, n, 0, n, a, b, c, COL_BLOCK, epi),
+        // 流式档（三条判据都不满足的小形状）：融合收益在噪声里，直接走二遍法，
+        // 让那条路径保持与改动前逐字节相同。见 `matmul_f32_stream` 的注释。
+        Path::Stream => matmul_f32_scaled_two_pass(m, k, n, alpha, beta, a, b, c),
+    }
+}
+
+/// `beta != 0` 且打包路径要 k 分块时的兜底：`acc = A·B` 算进临时缓冲，再
+/// `C = fma(beta, C_old, alpha·acc)`。
+///
+/// 这就是"朴素二遍法"本身——融合在这里**不成立**：k 分块会把部分和落进输出缓冲再读回，
+/// 若输出就是 `C`，`C_old` 会被部分和覆盖；而给累加器播种 `beta·C_old` 会改结合次序、
+/// 破坏与参考实现逐位一致的口径。所以本函数**不假装更快**：它逐位等于参考实现，
+/// 访存量也与调用方手写的两遍法相同（省下的是"融合"本身，这里没有）。
+///
+/// 临时缓冲走线程局部复用：每次调用新分配一个 `m×n` 的 `Vec` 会带来一次 `malloc` +
+/// 首次触页（512³ 实测 +1.6%，正好是"退化成两遍法"之外多出来的那点），而这本该是零成本。
+fn matmul_f32_scaled_two_pass(
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    beta: f32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) {
+    SCALED_ACC.with(|buf| {
+        let mut acc = buf.borrow_mut();
+        acc.resize(m * n, 0.0);
+        let acc = &mut acc[..m * n];
+        matmul_f32(m, k, n, a, b, acc);
+        // 索引走切片、不用 `AlignedVec` 的 `Deref` 索引，也不用 `zip`：这一遍是要与
+        // 调用方手写的 `for i in 0..m*n { … }` 比时间的，写法差一点就是测量误差。
+        let (c, acc) = (&mut c[..m * n], &acc[..m * n]);
+        if beta == 0.0 {
+            // `beta == 0` **不读 C**（CBLAS 语义）在所有路径上都要成立——写成
+            // `0.0.mul_add(C_old[i], ·)` 会读 C，NaN 会从"不该读的旧值"传播进输出
+            // （测试用 NaN 探针钉住这条）。
+            for i in 0..m * n {
+                c[i] = alpha * acc[i];
+            }
+        } else {
+            for i in 0..m * n {
+                c[i] = beta.mul_add(c[i], alpha * acc[i]);
+            }
+        }
+    });
+}
+
+/// f32 的三条访存次序（都**逐位一致**，只是循环嵌套不同）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Path {
+    Packed,
+    Cols,
+    Stream,
+}
+
+/// 路径选择（只看形状）：
+///   1) 打包 B 面板：让微内核的 k 循环顺序读。交叉点实测 work ≈ 8 MFLOP；k 下限在 k 分块
+///      落地后从 192 降到 64（见 `PACK_MIN_K`），只有"小 k + 极宽 n"例外仍走列块
+///      （见 `WIDE_N_FOR_COLS`）。
+///   2) 列块在外：k 小、m 小、n 大——打包摊不掉，但仍要让 B 只流一遍。
+///   3) 流式：其余（工作集本来就装得下缓存）。
+fn pick_f32_path(m: usize, k: usize, n: usize) -> Path {
+    let cols_regime = m <= COL_ORDER_MAX_M && n >= COL_ORDER_MIN_N;
+    let wide_n_small_k = cols_regime && k < K_ALWAYS_PACK && n > WIDE_N_FOR_COLS;
+    if m >= PACK_MIN_M
+        && k >= PACK_MIN_K
+        && !wide_n_small_k
+        && (m as u128) * (k as u128) * (n as u128) >= PACK_MIN_WORK
+    {
+        Path::Packed
+    } else if cols_regime {
+        Path::Cols
+    } else {
+        Path::Stream
+    }
+}
+
 /// 列区间入口：只算 `C[:, j0..j1)`（`b`/`c` 的行跨距仍是完整的 `n`），列块宽度可调。
 ///
 /// 与 [`matmul_f32`] **逐位一致**（每个输出元素的累加次序相同），区别只在循环嵌套：
@@ -155,6 +354,9 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
 ///
 /// # Panics
 /// `debug` 构建下要求 `j0 % 32 == 0` 且 `j1 <= n`。
+///
+/// `epi` 是输出那一遍的缩放口径（`Epi::Plain` 时与不带缩放逐位相同）；列块次序**不分块
+/// k**，所以累加器一直在寄存器里，`Epi::Fma` 读 `C_old` 是安全的。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_f32_cols_block(
     m: usize,
@@ -166,6 +368,7 @@ pub(crate) fn matmul_f32_cols_block(
     b: &[f32],
     c: &mut [f32],
     col_block: usize,
+    epi: Epi,
 ) {
     debug_assert_eq!(j0 % 32, 0, "列区间起点需 32 对齐（尾路径的标量段不是 FMA）");
     debug_assert!(j1 <= n && j1 >= j0);
@@ -183,7 +386,13 @@ pub(crate) fn matmul_f32_cols_block(
         while i < m4 {
             let mut j = jc;
             while j < jce {
-                tile4x32_f32(i, j, k, n, a, b, c);
+                // `Epi::Plain` 走**与改动前逐字节相同**的微内核（它是 64³ 那类小形状的热点，
+                // 给它加运行时口径参数实测 +3.9%）；只有要缩放时才进 scaled 微内核。
+                if let Epi::Plain = epi {
+                    tile4x32_f32(i, j, k, n, a, b, c);
+                } else {
+                    tile4x32_f32_scaled(i, j, k, n, a, b, c, epi);
+                }
                 j += 32;
             }
             i += 4;
@@ -192,7 +401,7 @@ pub(crate) fn matmul_f32_cols_block(
         while i < m {
             let a_row = &a[i * k..(i + 1) * k];
             let c_row = &mut c[i * n..(i + 1) * n];
-            row_tail_range_f32(a_row, c_row, b, k, n, jc, jce);
+            row_tail_range_f32(a_row, c_row, b, k, n, jc, jce, epi);
             i += 1;
         }
         jc = jce;
@@ -203,7 +412,7 @@ pub(crate) fn matmul_f32_cols_block(
         for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
             let c_row = &mut c[i * n..(i + 1) * n];
-            row_tail_range_f32(a_row, c_row, b, k, n, from, j1);
+            row_tail_range_f32(a_row, c_row, b, k, n, from, j1, epi);
         }
     }
 }
@@ -211,6 +420,12 @@ pub(crate) fn matmul_f32_cols_block(
 // B 面板打包用的线程局部缓冲（跨调用复用，避免每次 malloc 1.8 MB）。
 thread_local! {
     static PACK_BUF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// 融合退化成二遍法时用的 `A·B` 临时缓冲（`beta != 0` + k 分块；见
+// `matmul_f32_scaled_two_pass`）。同样跨调用复用，否则每次调用都要付一次 malloc + 触页。
+thread_local! {
+    static SCALED_ACC: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// "打包 B + 宏内核"路径：小 m、大 n 时的主力。
@@ -224,8 +439,20 @@ thread_local! {
 /// 数值与 [`matmul_f32`] **逐位一致**（每个输出元素的 p 升序累加不变）。
 ///
 /// 参考水位：同形状 OpenBLAS 0.3.34（LASX，la464）单线程 32.6 ms / 52.7 GFLOP/s。
+///
+/// `epi` 是输出那一遍的缩放口径（`Epi::Plain` 时与不带缩放逐位相同）。**只有最后一个 k 块**
+/// 才应用 `epi`：中间的 k 块落盘的是部分和，必须原样写回，否则读回来继续累加就错了。
+/// 于是 `beta != 0` 的原地融合只在 `k` 不分块时成立（`k` 分块时部分和会覆盖 `C_old`）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+pub(crate) fn matmul_f32_packed(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    epi: Epi,
+) {
     if m == 0 || n == 0 {
         return;
     }
@@ -246,16 +473,17 @@ pub(crate) fn matmul_f32_packed(m: usize, k: usize, n: usize, a: &[f32], b: &[f3
             pack_b(k, n, jb, nc, b, &mut packed);
             // 面板打包好后，交给"用已打包面板算一个行块"的入口（并行层复用同一个入口，
             // 于是打包只做一次、面板跨线程共享）。
-            matmul_f32_packed_rows(k, n, jb, nc, &packed, a, c, m4);
+            matmul_f32_packed_rows(k, n, jb, nc, &packed, a, c, m4, epi);
             s0 = s1;
         }
     });
-    // 列尾 [n32, n)：走原来的跨距尾路径（列数 < 32，代价可忽略）
+    // 列尾 [n32, n)：走原来的跨距尾路径（列数 < 32，代价可忽略）。这条尾路径按整体 k
+    // 累加（不分块），所以收尾可以直接应用 `epi`。
     if n > n32 {
         for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
             let c_row = &mut c[i * n..(i + 1) * n];
-            row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+            row_tail_range_f32(a_row, c_row, b, k, n, n32, n, epi);
         }
     }
 }
@@ -278,6 +506,7 @@ pub(crate) fn matmul_f32_packed_rows(
     a_rows: &[f32],
     c_rows: &mut [f32],
     m4: usize,
+    epi: Epi,
 ) {
     // k == 0 时不会走进这个入口（调用方已提前返回），用 checked_div 让 clippy 与读者都放心
     let m = a_rows.len().checked_div(k).unwrap_or(0);
@@ -290,6 +519,8 @@ pub(crate) fn matmul_f32_packed_rows(
     while kb0 < k {
         let kb = kb_size.min(k - kb0);
         let first = kb0 == 0;
+        // 只有最后一个 k 块才应用输出口径；中间的块写的是**部分和**，必须原样落盘。
+        let epi = if kb0 + kb == k { epi } else { Epi::Plain };
         for s in 0..strips {
             let base = s * k * 32 + kb0 * 32;
             let strip = &packed[base..base + kb * 32];
@@ -308,6 +539,7 @@ pub(crate) fn matmul_f32_packed_rows(
                     ct,
                     n,
                     j,
+                    epi,
                 );
                 i += 4;
             }
@@ -320,6 +552,7 @@ pub(crate) fn matmul_f32_packed_rows(
                     c_row,
                     first,
                     j,
+                    epi,
                 );
                 i += 1;
             }
@@ -387,6 +620,9 @@ unsafe fn copy_block32(src: *const f32, dst: *mut f32) {
 /// `first` 为真表示这是该 (行块, 列条带) 的第一个 k 块，累加器从 0 起；否则先把 C 里
 /// 已有的部分和读进累加器再继续加——**结合次序与不分块时完全一致**（都是按 p 递增累加
 /// f32 部分和），所以结果逐位不变。
+///
+/// `epi` 只该在**最后一个 k 块**传非 `Plain`（见 [`matmul_f32_packed_rows`]）：中间块落盘的
+/// 是部分和，必须原样写。
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn tile4x32_chunk(
@@ -400,6 +636,7 @@ fn tile4x32_chunk(
     ct: &mut [f32],
     n: usize,
     j: usize,
+    epi: Epi,
 ) {
     let mut rows = ct.chunks_mut(n);
     let c0 = rows.next().expect("4 行");
@@ -462,29 +699,38 @@ fn tile4x32_chunk(
             r3d = lasx_xvfmadd_s(vb3, s3, r3d);
         }
     }
+    // SAFETY: j..j+32 在行内（调用方保证 32 列条带完整）；`Epi::Fma` 会读同一段 C。
     unsafe {
-        lasx::store_f32x8(c0.as_mut_ptr().add(j), r0a);
-        lasx::store_f32x8(c0.as_mut_ptr().add(j + 8), r0b);
-        lasx::store_f32x8(c0.as_mut_ptr().add(j + 16), r0c);
-        lasx::store_f32x8(c0.as_mut_ptr().add(j + 24), r0d);
-        lasx::store_f32x8(c1.as_mut_ptr().add(j), r1a);
-        lasx::store_f32x8(c1.as_mut_ptr().add(j + 8), r1b);
-        lasx::store_f32x8(c1.as_mut_ptr().add(j + 16), r1c);
-        lasx::store_f32x8(c1.as_mut_ptr().add(j + 24), r1d);
-        lasx::store_f32x8(c2.as_mut_ptr().add(j), r2a);
-        lasx::store_f32x8(c2.as_mut_ptr().add(j + 8), r2b);
-        lasx::store_f32x8(c2.as_mut_ptr().add(j + 16), r2c);
-        lasx::store_f32x8(c2.as_mut_ptr().add(j + 24), r2d);
-        lasx::store_f32x8(c3.as_mut_ptr().add(j), r3a);
-        lasx::store_f32x8(c3.as_mut_ptr().add(j + 8), r3b);
-        lasx::store_f32x8(c3.as_mut_ptr().add(j + 16), r3c);
-        lasx::store_f32x8(c3.as_mut_ptr().add(j + 24), r3d);
+        epi.store8(c0.as_mut_ptr().add(j), r0a);
+        epi.store8(c0.as_mut_ptr().add(j + 8), r0b);
+        epi.store8(c0.as_mut_ptr().add(j + 16), r0c);
+        epi.store8(c0.as_mut_ptr().add(j + 24), r0d);
+        epi.store8(c1.as_mut_ptr().add(j), r1a);
+        epi.store8(c1.as_mut_ptr().add(j + 8), r1b);
+        epi.store8(c1.as_mut_ptr().add(j + 16), r1c);
+        epi.store8(c1.as_mut_ptr().add(j + 24), r1d);
+        epi.store8(c2.as_mut_ptr().add(j), r2a);
+        epi.store8(c2.as_mut_ptr().add(j + 8), r2b);
+        epi.store8(c2.as_mut_ptr().add(j + 16), r2c);
+        epi.store8(c2.as_mut_ptr().add(j + 24), r2d);
+        epi.store8(c3.as_mut_ptr().add(j), r3a);
+        epi.store8(c3.as_mut_ptr().add(j + 8), r3b);
+        epi.store8(c3.as_mut_ptr().add(j + 16), r3c);
+        epi.store8(c3.as_mut_ptr().add(j + 24), r3d);
     }
 }
 
-/// 单行 × 32 列，B 从打包缓冲读（不足 4 行的尾部行）。
+/// 单行 × 32 列，B 从打包缓冲读（不足 4 行的尾部行）。`epi` 同 [`tile4x32_chunk`]：
+/// 只该在最后一个 k 块传非 `Plain`。
 #[inline]
-fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], first: bool, j: usize) {
+fn row_tail_packed(
+    a_row: &[f32],
+    strip: &[f32],
+    c_row: &mut [f32],
+    first: bool,
+    j: usize,
+    epi: Epi,
+) {
     let mut acc0 = lasx::zero_f32x8();
     let mut acc1 = lasx::zero_f32x8();
     let mut acc2 = lasx::zero_f32x8();
@@ -512,11 +758,12 @@ fn row_tail_packed(a_row: &[f32], strip: &[f32], c_row: &mut [f32], first: bool,
             acc3 = lasx_xvfmadd_s(b3, va, acc3);
         }
     }
+    // SAFETY: j..j+32 在行内（调用方保证 32 列条带完整）；`Epi::Fma` 会读同一段 C。
     unsafe {
-        lasx::store_f32x8(c_row.as_mut_ptr().add(j), acc0);
-        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 8), acc1);
-        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 16), acc2);
-        lasx::store_f32x8(c_row.as_mut_ptr().add(j + 24), acc3);
+        epi.store8(c_row.as_mut_ptr().add(j), acc0);
+        epi.store8(c_row.as_mut_ptr().add(j + 8), acc1);
+        epi.store8(c_row.as_mut_ptr().add(j + 16), acc2);
+        epi.store8(c_row.as_mut_ptr().add(j + 24), acc3);
     }
 }
 
@@ -532,170 +779,6 @@ pub(crate) fn pack_strips(k: usize) -> usize {
     const L2_BUDGET: usize = 2 * 1024 * 1024;
     let per_strip = (k * 32 * 4).max(1);
     (L2_BUDGET / per_strip).clamp(1, 256)
-}
-
-/// **实验性**：`C = alpha·(A·B) + beta·C`（原地）。对外融合已按实测否掉——微内核收尾
-/// 那一次"按 4 行跨距、32 列切块"的读-改-写吃掉了它本想省下的那一遍的 91–96%；
-/// 这个内核只作为那条结论的可复现凭据留在树里。
-///
-/// 只在 **k 不分块**（f32 `k·32·4 ≤ L1_BUDGET`，即 `k ≤ 384`）时位精确：k 分块会把部分和
-/// 落进输出缓冲再读回，而输出正是 `C`，`C_old` 会被部分和覆盖——那样 `beta·C_old` 只能靠
-/// "给累加器播种"拿到，违反契约（契约的收尾是 `C = fma(beta, C_old, alpha·acc)`）。
-/// 不分块时累加器一直在寄存器里，
-/// 收尾读 `C_old` 才安全。
-///
-/// 数值：`C = fma(beta, C_old, alpha·acc)`，与契约的"两次舍入"一致。参考实现必须写成
-/// `beta.mul_add(C_old, alpha * acc)` 才逐位相同（普通 `alpha*acc + beta*C_old` 是三次舍入）。
-///
-/// 实验范围：要求 `m % 4 == 0 && n % 32 == 0`（省掉行尾/列尾；生产化要把尾路径补齐）。
-///
-/// # Panics
-/// 上述条件不满足时 panic（实验代码，宁可炸也不要静默算错）。
-pub(crate) fn matmul_f32_scaled(
-    m: usize,
-    k: usize,
-    n: usize,
-    alpha: f32,
-    beta: f32,
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-) {
-    assert!(
-        k * 32 * 4 <= L1_BUDGET,
-        "融合内核只支持 k 不分块（f32 k ≤ 384）"
-    );
-    assert_eq!(m % 4, 0, "实验内核要求 m 是 4 的倍数");
-    assert_eq!(n % 32, 0, "实验内核要求 n 是 32 的倍数");
-    if m == 0 || n == 0 {
-        return;
-    }
-    let nc_strips = pack_strips(k);
-    PACK_BUF.with(|buf| {
-        let mut packed = buf.borrow_mut();
-        packed.resize(k * nc_strips * 32, 0.0);
-        let mut s0 = 0;
-        while s0 < n / 32 {
-            let s1 = (s0 + nc_strips).min(n / 32);
-            let jb = s0 * 32;
-            let nc = (s1 - s0) * 32;
-            pack_b(k, n, jb, nc, b, &mut packed);
-            for s in 0..nc / 32 {
-                let strip = &packed[s * k * 32..(s + 1) * k * 32];
-                let j = jb + s * 32;
-                let mut i = 0;
-                while i < m {
-                    let ct = &mut c[i * n..(i + 4) * n];
-                    scaled_tile4x32(
-                        strip,
-                        &a[i * k..(i + 1) * k],
-                        &a[(i + 1) * k..(i + 2) * k],
-                        &a[(i + 2) * k..(i + 3) * k],
-                        &a[(i + 3) * k..(i + 4) * k],
-                        ct,
-                        n,
-                        j,
-                        alpha,
-                        beta,
-                    );
-                    i += 4;
-                }
-            }
-            s0 = s1;
-        }
-    });
-}
-
-/// [`tile4x32_chunk`] 的融合收尾版：k 步累加（累加器从 0 起，故不做 C 读回），
-/// 收尾做 `C = fma(beta, C_old, alpha·acc)` 再写回——每个 8 列组多 1 载入 + 1 乘 + 1 FMA。
-#[allow(clippy::too_many_arguments)]
-fn scaled_tile4x32(
-    strip: &[f32],
-    a0: &[f32],
-    a1: &[f32],
-    a2: &[f32],
-    a3: &[f32],
-    ct: &mut [f32],
-    n: usize,
-    j: usize,
-    alpha: f32,
-    beta: f32,
-) {
-    let mut rows = ct.chunks_mut(n);
-    let c0 = rows.next().expect("4 行");
-    let c1 = rows.next().expect("4 行");
-    let c2 = rows.next().expect("4 行");
-    let c3 = rows.next().expect("4 行");
-
-    let (mut r0a, mut r0b, mut r0c, mut r0d) = z4();
-    let (mut r1a, mut r1b, mut r1c, mut r1d) = z4();
-    let (mut r2a, mut r2b, mut r2c, mut r2d) = z4();
-    let (mut r3a, mut r3b, mut r3c, mut r3d) = z4();
-    for p in 0..strip.len() / 32 {
-        let base = p * 32;
-        // SAFETY: `strip` 是完整条带（长度 k×32），`base + 24 + 8 ≤ k×32`。
-        let vb0 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base)) };
-        let vb1 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 8)) };
-        let vb2 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 16)) };
-        let vb3 = unsafe { lasx::load_f32x8(strip.as_ptr().add(base + 24)) };
-        let s0 = lasx::splat_f32(a0[p]);
-        let s1 = lasx::splat_f32(a1[p]);
-        let s2 = lasx::splat_f32(a2[p]);
-        let s3 = lasx::splat_f32(a3[p]);
-        unsafe {
-            r0a = lasx_xvfmadd_s(vb0, s0, r0a);
-            r0b = lasx_xvfmadd_s(vb1, s0, r0b);
-            r0c = lasx_xvfmadd_s(vb2, s0, r0c);
-            r0d = lasx_xvfmadd_s(vb3, s0, r0d);
-            r1a = lasx_xvfmadd_s(vb0, s1, r1a);
-            r1b = lasx_xvfmadd_s(vb1, s1, r1b);
-            r1c = lasx_xvfmadd_s(vb2, s1, r1c);
-            r1d = lasx_xvfmadd_s(vb3, s1, r1d);
-            r2a = lasx_xvfmadd_s(vb0, s2, r2a);
-            r2b = lasx_xvfmadd_s(vb1, s2, r2b);
-            r2c = lasx_xvfmadd_s(vb2, s2, r2c);
-            r2d = lasx_xvfmadd_s(vb3, s2, r2d);
-            r3a = lasx_xvfmadd_s(vb0, s3, r3a);
-            r3b = lasx_xvfmadd_s(vb1, s3, r3b);
-            r3c = lasx_xvfmadd_s(vb2, s3, r3c);
-            r3d = lasx_xvfmadd_s(vb3, s3, r3d);
-        }
-    }
-    let va = lasx::splat_f32(alpha);
-    let vb = lasx::splat_f32(beta);
-    // SAFETY: `j..j+32` 在行内（条带完整，调用方保证 n 是 32 的倍数）。
-    unsafe {
-        scaled_store4(c0, [r0a, r0b, r0c, r0d], j, va, vb);
-        scaled_store4(c1, [r1a, r1b, r1c, r1d], j, va, vb);
-        scaled_store4(c2, [r2a, r2b, r2c, r2d], j, va, vb);
-        scaled_store4(c3, [r3a, r3b, r3c, r3d], j, va, vb);
-    }
-}
-
-/// 一行的 32 列（4 个 8 列组）融合写回。
-///
-/// # Safety
-/// `row` 至少有 `j + 32` 个元素。
-#[inline]
-#[allow(clippy::too_many_arguments)]
-unsafe fn scaled_store4(
-    row: &mut [f32],
-    acc: [lasx::F32x8; 4],
-    j: usize,
-    va: lasx::F32x8,
-    vb: lasx::F32x8,
-) {
-    // SAFETY: 调用方保证 `row` 至少有 `j + 32` 个元素（见上面的 `# Safety`）；循环里
-    // `j + g*8 + 8 ≤ j + 32`，所以每次 8 元素读写都在界内。
-    unsafe {
-        for (g, a) in acc.into_iter().enumerate() {
-            let p = row.as_mut_ptr().add(j + g * 8);
-            let old = lasx::load_f32x8(p);
-            // 契约的"两次舍入"：先 alpha·acc（一次），再 fma(beta, C_old, ·)（再一次）
-            let out = lasx_xvfmadd_s(old, vb, lasx_xvfmul_s(a, va));
-            lasx::store_f32x8(p, out);
-        }
-    }
 }
 
 /// 强制走"流式"次序（**测试对照用**；生产路径由 [`matmul_f32`] 按形状分派）。
@@ -724,7 +807,7 @@ pub(crate) fn matmul_f32_stream_ref(
         for r in 0..4 {
             let a_row = &a[(i + r) * k..(i + r + 1) * k];
             let c_row = &mut c[(i + r) * n..(i + r + 1) * n];
-            row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+            row_tail_range_f32(a_row, c_row, b, k, n, n32, n, Epi::Plain);
         }
         i += 4;
     }
@@ -732,7 +815,7 @@ pub(crate) fn matmul_f32_stream_ref(
         let a_row = &a[i * k..(i + 1) * k];
         let c_row = &mut c[i * n..(i + 1) * n];
         cols32_f32(a_row, c_row, b, n);
-        row_tail_range_f32(a_row, c_row, b, k, n, n32, n);
+        row_tail_range_f32(a_row, c_row, b, k, n, n32, n, Epi::Plain);
         i += 1;
     }
 }
@@ -741,6 +824,10 @@ pub(crate) fn matmul_f32_stream_ref(
 ///
 /// `j + 32 <= n` 由调用方保证（只走 `[0, n/32*32)`）；列尾另由 [`row_tail_f32`] 处理。
 /// `p` 既用于索引 4 行 A 又用于计算 B 的地址，故保留下标循环。
+///
+/// **不带缩放**（流式档专用）：这条内核是小形状的热点，给它加运行时口径参数实测
+/// 64³ 7.6 → 7.9 µs（+3.9%）；所以融合走下面的 [`tile4x32_f32_scaled`]，本函数与改动前
+/// 逐字节相同。
 #[inline]
 #[allow(clippy::needless_range_loop)]
 fn tile4x32_f32(i0: usize, j: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
@@ -809,7 +896,89 @@ fn tile4x32_f32(i0: usize, j: usize, k: usize, n: usize, a: &[f32], b: &[f32], c
     }
 }
 
-/// 单行主循环：32 列一块（4 个累加器）。
+/// [`tile4x32_f32`] 的**融合收尾版**（列块路径用）：k 循环逐条指令相同，只是收尾走
+/// [`Epi::store8`]（`alpha·acc` 或 `fma(beta, C_old, alpha·acc)`）。累加器一直在寄存器里
+/// （列块次序不分块 k），所以 `Epi::Fma` 读 `C_old` 时 C 还没被写过。
+#[inline]
+#[allow(clippy::needless_range_loop)]
+fn tile4x32_f32_scaled(
+    i0: usize,
+    j: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    epi: Epi,
+) {
+    let a0 = &a[i0 * k..(i0 + 1) * k];
+    let a1 = &a[(i0 + 1) * k..(i0 + 2) * k];
+    let a2 = &a[(i0 + 2) * k..(i0 + 3) * k];
+    let a3 = &a[(i0 + 3) * k..(i0 + 4) * k];
+
+    // 4 行 C 互不重叠，用 chunks_mut 安全地同时取出
+    let mut rows = c[i0 * n..(i0 + 4) * n].chunks_mut(n);
+    let c0 = rows.next().expect("4 行");
+    let c1 = rows.next().expect("4 行");
+    let c2 = rows.next().expect("4 行");
+    let c3 = rows.next().expect("4 行");
+
+    let (mut r0a, mut r0b, mut r0c, mut r0d) = z4();
+    let (mut r1a, mut r1b, mut r1c, mut r1d) = z4();
+    let (mut r2a, mut r2b, mut r2c, mut r2d) = z4();
+    let (mut r3a, mut r3b, mut r3c, mut r3d) = z4();
+    for p in 0..k {
+        let base = p * n + j;
+        let vb0 = unsafe { lasx::load_f32x8(b.as_ptr().add(base)) };
+        let vb1 = unsafe { lasx::load_f32x8(b.as_ptr().add(base + 8)) };
+        let vb2 = unsafe { lasx::load_f32x8(b.as_ptr().add(base + 16)) };
+        let vb3 = unsafe { lasx::load_f32x8(b.as_ptr().add(base + 24)) };
+        let s0 = lasx::splat_f32(a0[p]);
+        let s1 = lasx::splat_f32(a1[p]);
+        let s2 = lasx::splat_f32(a2[p]);
+        let s3 = lasx::splat_f32(a3[p]);
+        unsafe {
+            r0a = lasx_xvfmadd_s(vb0, s0, r0a);
+            r0b = lasx_xvfmadd_s(vb1, s0, r0b);
+            r0c = lasx_xvfmadd_s(vb2, s0, r0c);
+            r0d = lasx_xvfmadd_s(vb3, s0, r0d);
+            r1a = lasx_xvfmadd_s(vb0, s1, r1a);
+            r1b = lasx_xvfmadd_s(vb1, s1, r1b);
+            r1c = lasx_xvfmadd_s(vb2, s1, r1c);
+            r1d = lasx_xvfmadd_s(vb3, s1, r1d);
+            r2a = lasx_xvfmadd_s(vb0, s2, r2a);
+            r2b = lasx_xvfmadd_s(vb1, s2, r2b);
+            r2c = lasx_xvfmadd_s(vb2, s2, r2c);
+            r2d = lasx_xvfmadd_s(vb3, s2, r2d);
+            r3a = lasx_xvfmadd_s(vb0, s3, r3a);
+            r3b = lasx_xvfmadd_s(vb1, s3, r3b);
+            r3c = lasx_xvfmadd_s(vb2, s3, r3c);
+            r3d = lasx_xvfmadd_s(vb3, s3, r3d);
+        }
+    }
+    // SAFETY: j..j+32 在行内（调用方保证 32 列条带完整）；`Epi::Fma` 会读同一段 C。
+    unsafe {
+        epi.store8(c0.as_mut_ptr().add(j), r0a);
+        epi.store8(c0.as_mut_ptr().add(j + 8), r0b);
+        epi.store8(c0.as_mut_ptr().add(j + 16), r0c);
+        epi.store8(c0.as_mut_ptr().add(j + 24), r0d);
+        epi.store8(c1.as_mut_ptr().add(j), r1a);
+        epi.store8(c1.as_mut_ptr().add(j + 8), r1b);
+        epi.store8(c1.as_mut_ptr().add(j + 16), r1c);
+        epi.store8(c1.as_mut_ptr().add(j + 24), r1d);
+        epi.store8(c2.as_mut_ptr().add(j), r2a);
+        epi.store8(c2.as_mut_ptr().add(j + 8), r2b);
+        epi.store8(c2.as_mut_ptr().add(j + 16), r2c);
+        epi.store8(c2.as_mut_ptr().add(j + 24), r2d);
+        epi.store8(c3.as_mut_ptr().add(j), r3a);
+        epi.store8(c3.as_mut_ptr().add(j + 8), r3b);
+        epi.store8(c3.as_mut_ptr().add(j + 16), r3c);
+        epi.store8(c3.as_mut_ptr().add(j + 24), r3d);
+    }
+}
+
+/// 单行主循环：32 列一块（4 个累加器）。**不带缩放**（流式档专用，理由同
+/// [`tile4x32_f32`]：小形状的热点，加口径参数实测 +3.9%）。
 #[inline]
 fn cols32_f32(a_row: &[f32], c_row: &mut [f32], b: &[f32], n: usize) {
     let mut j = 0;
@@ -839,13 +1008,16 @@ fn cols32_f32(a_row: &[f32], c_row: &mut [f32], b: &[f32], n: usize) {
     }
 }
 
-/// 单行的列尾：`[j0, n)`，先 8 列块再标量。
+/// 单行的列尾：`[j0, n)`，先 8 列块再标量。**不带缩放**（流式档专用）。
 #[inline]
 fn row_tail_f32(a_row: &[f32], c_row: &mut [f32], b: &[f32], k: usize, n: usize, j0: usize) {
-    row_tail_range_f32(a_row, c_row, b, k, n, j0, n);
+    row_tail_range_f32(a_row, c_row, b, k, n, j0, n, Epi::Plain);
 }
 
 /// 单行的列尾 `[j0, j1)`：先 8 列块再标量。`n` 始终是 B/C 的**行跨距**。
+///
+/// `epi` 的标量段走 [`Epi::scalar`]（与参考实现同一个表达式）；`beta == 0` 时**不读**
+/// `c_row`。
 #[inline]
 pub(crate) fn row_tail_range_f32(
     a_row: &[f32],
@@ -855,6 +1027,7 @@ pub(crate) fn row_tail_range_f32(
     n: usize,
     j0: usize,
     j1: usize,
+    epi: Epi,
 ) {
     let mut j = j0;
     while j + 8 <= j1 {
@@ -864,7 +1037,8 @@ pub(crate) fn row_tail_range_f32(
             let vb = unsafe { lasx::load_f32x8(b.as_ptr().add(p * n + j)) };
             acc = unsafe { lasx_xvfmadd_s(vb, va, acc) };
         }
-        unsafe { lasx::store_f32x8(c_row.as_mut_ptr().add(j), acc) };
+        // SAFETY: j..j+8 在行内；`Epi::Fma` 会读同一段 C。
+        unsafe { epi.store8(c_row.as_mut_ptr().add(j), acc) };
         j += 8;
     }
     for jj in j..j1 {
@@ -872,7 +1046,7 @@ pub(crate) fn row_tail_range_f32(
         for p in 0..k {
             s += a_row[p] * b[p * n + jj];
         }
-        c_row[jj] = s;
+        c_row[jj] = epi.scalar(|| c_row[jj], s);
     }
 }
 
@@ -971,7 +1145,7 @@ mod cols_exp {
             }
             for &(j0, j1) in &ranges {
                 let mut got = vec![f32::NAN; m * n];
-                matmul_f32_cols_block(m, k, n, j0, j1, &a, &b, &mut got, COL_BLOCK);
+                matmul_f32_cols_block(m, k, n, j0, j1, &a, &b, &mut got, COL_BLOCK, Epi::Plain);
                 for i in 0..m {
                     for jj in 0..n {
                         if jj >= j0 && jj < j1 {
@@ -1006,9 +1180,9 @@ mod cols_exp {
             let mut want = vec![f32::NAN; m * n];
             matmul_f32_stream_ref(m, k, n, &a, &b, &mut want);
             let mut cols = vec![f32::NAN; m * n];
-            matmul_f32_cols_block(m, k, n, 0, n, &a, &b, &mut cols, COL_BLOCK);
+            matmul_f32_cols_block(m, k, n, 0, n, &a, &b, &mut cols, COL_BLOCK, Epi::Plain);
             let mut pack = vec![f32::NAN; m * n];
-            matmul_f32_packed(m, k, n, &a, &b, &mut pack);
+            matmul_f32_packed(m, k, n, &a, &b, &mut pack, Epi::Plain);
             for i in 0..m * n {
                 assert_eq!(
                     cols[i].to_bits(),
@@ -1021,6 +1195,73 @@ mod cols_exp {
                     "打包 {m}×{k}×{n} @ {i}"
                 );
             }
+        }
+    }
+
+    /// 融合路径（`api` 层 `matmul_scaled_into` 的内核）必须与"未融合参考"**逐位一致**。
+    ///
+    /// 参考实现（口径的定义）：先把 `acc = A·B` 算进独立缓冲（走同一条 [`matmul_f32`]），
+    /// 再 `C = beta.mul_add(C_old, alpha * acc)`——两次舍入（`alpha·acc` 一次、FMA 一次）。
+    /// 融合路径只是把这一步搬进内核收尾，表达式**一模一样**，所以是逐位而不是容差。
+    ///
+    /// 覆盖三种收尾（`Plain` / `Scale` / `Fma`）× 三条路径（打包 / 列块 / 流式）×
+    /// 有列尾与无列尾的形状。`k > 384` 时打包路径会分块 k：`beta == 0` 仍融合（末块才缩放），
+    /// `beta != 0` 退回二遍法——两种都必须在表里逐位对上。
+    #[test]
+    fn scaled_bit_exact_against_two_pass_reference() {
+        let mut rng = Lcg(0x5ca1_ed01);
+        let cases: &[(usize, usize, usize)] = &[
+            (1, 1, 1),
+            (3, 5, 33),
+            (4, 4, 32),
+            (5, 7, 40),
+            (16, 33, 17),
+            (33, 65, 31),
+            (32, 64, 96),     // 打包（小 k）
+            (100, 64, 4096),  // 打包：宽薄
+            (100, 64, 19147), // 列块：极宽 n + 小 k
+            (256, 512, 512),  // 打包 + k 分块（k > 384）
+            (100, 448, 1024), // 打包 + k 分块
+        ];
+        for &(m, k, n) in cases {
+            let a: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
+            let c0: Vec<f32> = (0..m * n).map(|_| rng.f64() as f32).collect();
+            for &(alpha, beta) in &[
+                (1.0f32, 0.0f32),
+                (1.5, 0.0),
+                (-0.25, 0.0),
+                (1.0, 1.0),
+                (1.5, 0.5),
+                (0.75, -1.25),
+            ] {
+                // 参考：acc 走同一条 matmul，再按契约表达式收尾。
+                let mut acc = vec![0f32; m * n];
+                matmul_f32(m, k, n, &a, &b, &mut acc);
+                let want: Vec<f32> = acc
+                    .iter()
+                    .zip(c0.iter())
+                    .map(|(&x, &old)| beta.mul_add(old, alpha * x))
+                    .collect();
+                let mut got = c0.clone();
+                matmul_f32_scaled(m, k, n, alpha, beta, &a, &b, &mut got);
+                for i in 0..m * n {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "{m}×{k}×{n} alpha={alpha} beta={beta} @ {i}: got {} want {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+            // `beta == 0` 不读 C：把 C 填成 NaN，结果里不许出现 NaN。
+            let mut got = vec![f32::NAN; m * n];
+            matmul_f32_scaled(m, k, n, 1.5, 0.0, &a, &b, &mut got);
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "{m}×{k}×{n}: beta == 0 时读了 C（NaN 传播）"
+            );
         }
     }
 }

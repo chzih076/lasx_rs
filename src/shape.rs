@@ -665,6 +665,149 @@ impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> Prepared<P, T, 
     }
 }
 
+/// `alpha` 标量前缀（公式 DSL 的 `matmul!(y[M,N] = alpha * x[M,K] * w[K,N])`）落到这里。
+///
+/// **只对 `f32` 提供**：融合内核（`ops::matmul::Epi::Scale`）只在 f32 路径上，
+/// `f64` 没有对应内核——f64 要缩放请先 `mul` 再整体乘（语义一致，但**不融合**，
+/// 所以 `matmul!` 的标量前缀对 f64 是编译错误而不是静默走两遍法）。
+///
+/// 语义是 `out = alpha·(A·B)`（即 `beta = 0`）：`out` 被**完全覆盖**、旧值不被读取。
+/// 数值上等于"先按 [`Prepared::apply_into`] 算 `A·B` 再对结果整体乘 `alpha`"——融合只是把
+/// 这次乘法从单独一遍 elementwise 搬进输出那一遍，累加次序与向量宽度都没动，故**逐位相同**
+/// （`shape.rs` 的 `test_formula_dsl_scaled_matches_two_pass_bit_for_bit` 钉住这条）。
+impl<P: Policy, const K: usize, const N: usize> Prepared<P, f32, K, N> {
+    /// `alpha·(X[M×K]·self)`，输出新分配。
+    pub fn apply_scaled<const M: usize>(
+        &self,
+        alpha: f32,
+        x: &Mat<'_, f32, M, K>,
+    ) -> MatBuf<f32, M, N> {
+        let mut out = MatBuf::<f32, M, N>::new();
+        self.apply_scaled_into(alpha, x, &mut out);
+        out
+    }
+
+    /// 同上，写进调用方的缓冲（不分配）。
+    pub fn apply_scaled_into<const M: usize>(
+        &self,
+        alpha: f32,
+        x: &Mat<'_, f32, M, K>,
+        out: &mut MatBuf<f32, M, N>,
+    ) {
+        self.run_block_into_scaled(M, x.as_slice(), out.as_mut_slice(), alpha, None);
+    }
+
+    /// DYN 档（行数运行时）：输出新分配。
+    pub fn apply_scaled_dyn(&self, alpha: f32, x: &MatDyn<'_, f32, K>) -> MatBufDyn<f32, N> {
+        let mut out = MatBufDyn::<f32, N>::with_rows(x.rows());
+        self.apply_scaled_dyn_into(alpha, x, &mut out);
+        out
+    }
+
+    /// DYN 档写进调用方的缓冲（不分配）。
+    pub fn apply_scaled_dyn_into(
+        &self,
+        alpha: f32,
+        x: &MatDyn<'_, f32, K>,
+        out: &mut MatBufDyn<f32, N>,
+    ) {
+        assert_eq!(out.rows(), x.rows(), "输出行数必须等于输入行数");
+        self.run_block_into_scaled(x.rows(), x.as_slice(), out.as_mut_slice(), alpha, None);
+    }
+
+    /// [`Prepared::run_block_into`] 的融合版：逐行同构，每个行块走
+    /// [`MatmulPlan::run_rows_into_scaled`]。
+    ///
+    /// 多核下按行切仍然正确：缩放是**逐输出元素**的，行块之间不相交；每个元素仍只被缩放一次。
+    fn run_block_into_scaled(
+        &self,
+        rows: usize,
+        a: &[f32],
+        c: &mut [f32],
+        alpha: f32,
+        pooled: Option<&WorkerPool>,
+    ) {
+        if rows == 0 || N == 0 {
+            return;
+        }
+        // 契约同 `run_block_into`（`pool` 模块头第 3 条）：输入与输出不能是同一块内存。
+        debug_assert!(
+            a.as_ptr() as *const u8 != c.as_ptr() as *const u8,
+            "输入与输出指向同一块内存：宏/封装层必须保证输入输出是不同变量（契约 3）"
+        );
+        let threads = P::threads(rows, K, N);
+        if threads <= 1 {
+            self.plan.run_rows_into_scaled(a, c, alpha);
+            return;
+        }
+        let pool = match pooled {
+            Some(p) => p,
+            None => crate::pool::global(),
+        };
+        let per_thread = rows.div_ceil(threads).max(4);
+        let block_rows = per_thread.div_ceil(4) * 4;
+        pool.for_each_row_block_mut_picked(
+            rows,
+            4,
+            [(c, N)],
+            crate::pool::Pick::Blocked { block_rows },
+            |start, block, [cb]| {
+                let ab = &a[start * K..(start + block) * K];
+                self.plan.run_rows_into_scaled(ab, cb, alpha);
+            },
+        );
+    }
+}
+
+/// `Mat` 侧的 `alpha` 标量前缀入口（DSL 的 `matmul!(y[M,N] = alpha * x[M,K] * w[K,N])`）。
+///
+/// 与 [`Prepared`] 那批是同一条路径的两种写法：`mul_scaled_into` 内部是
+/// `rhs.prepare().apply_scaled_into(...)`（与 [`Mat::mul_into`] 对 `apply_into` 的关系一致）。
+impl<'a, const A: usize, const B: usize> Mat<'a, f32, A, B> {
+    /// 推理写法：`self` 是权重 `A×B`，`x` 是 `M×A` → `alpha·(x·self)`，输出新分配。
+    pub fn apply_scaled<const M: usize>(
+        &self,
+        alpha: f32,
+        x: &Mat<'_, f32, M, A>,
+    ) -> MatBuf<f32, M, B> {
+        self.prepare().apply_scaled(alpha, x)
+    }
+
+    /// `alpha·(self·rhs)`，输出新分配。
+    pub fn mul_scaled<const N: usize>(
+        &self,
+        alpha: f32,
+        rhs: &Mat<'_, f32, B, N>,
+    ) -> MatBuf<f32, A, N> {
+        rhs.apply_scaled(alpha, self)
+    }
+
+    /// 同上，写进已有输出（不分配）。
+    pub fn mul_scaled_into<const N: usize>(
+        &self,
+        alpha: f32,
+        rhs: &Mat<'_, f32, B, N>,
+        out: &mut MatBuf<f32, A, N>,
+    ) {
+        rhs.prepare().apply_scaled_into(alpha, self, out);
+    }
+
+    /// DYN 档：`self` 是权重，`x` 的行数运行时；输出新分配。
+    pub fn apply_scaled_dyn(&self, alpha: f32, x: &MatDyn<'_, f32, A>) -> MatBufDyn<f32, B> {
+        self.prepare().apply_scaled_dyn(alpha, x)
+    }
+
+    /// DYN 档写进已有输出（不分配）。
+    pub fn apply_scaled_dyn_into(
+        &self,
+        alpha: f32,
+        x: &MatDyn<'_, f32, A>,
+        out: &mut MatBufDyn<f32, B>,
+    ) {
+        self.prepare().apply_scaled_dyn_into(alpha, x, out);
+    }
+}
+
 impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> std::fmt::Debug
     for Prepared<P, T, K, N>
 {
@@ -1086,5 +1229,91 @@ mod tests {
 
         // ③ 同一个 plan 复用的直接证据：打包字节数只算一次（`prepare()` 之外不再打包）
         assert_eq!(p.packed_bytes(), K * N * 4);
+    }
+
+    /// `alpha` 标量前缀（`matmul!(y[M,N] = alpha * x[M,K] * w[K,N])`）：与"先算再整体乘"**逐位一致**。
+    ///
+    /// 融合只是把 `alpha` 从单独一遍 elementwise 搬进输出那一遍，累加次序与向量宽度没动，
+    /// 所以这里是逐位而不是容差。覆盖静态 / DYN / 无输出 / plan 形态 / 权重在左 / 字面量标量。
+    /// f32 之外没有 scaled 内核：对 f64 写标量前缀是**编译错误**（`*_scaled*` 方法只在
+    /// `Mat<f32,…>` / `Prepared<…, f32, …>` 上），这是有意的边界，见 `docs/ops.md` 的用法条目。
+    #[test]
+    fn test_formula_dsl_scaled_matches_two_pass_bit_for_bit() {
+        const M: usize = 33; // 行尾（4 行微块之后）+ 列尾都覆盖到
+        const K: usize = 64;
+        const N: usize = 48;
+        let alpha = 1.5f32;
+        let weights = f32s(K * N, 0x5151);
+        let batch = f32s(M * K, 0x5252);
+        let w = Mat::<f32, { K }, { N }>::new(&weights).unwrap();
+        let x = Mat::<f32, { M }, { K }>::new(&batch).unwrap();
+
+        // 参考（口径的定义）：先算 `A·B`，再整体乘 `alpha`
+        let plain = crate::api::matmul(M, K, N, &batch, &weights).unwrap();
+        let mut want = plain.clone();
+        for v in want.iter_mut() {
+            *v *= alpha;
+        }
+
+        // 静态档（带输出）：`x.mul_scaled_into(alpha, &w, &mut y)`
+        let mut y = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(y[M, N] = alpha * x[M, K] * w[K, N]);
+        assert_eq!(bits_f32(y.as_slice()), bits_f32(&want), "静态：alpha 前缀");
+
+        // 手写形态（对照：宏生成的调用与它同形）
+        let mut hand = MatBuf::<f32, { M }, { N }>::new();
+        x.mul_scaled_into(alpha, &w, &mut hand);
+        assert_eq!(
+            bits_f32(hand.as_slice()),
+            bits_f32(y.as_slice()),
+            "宏 vs 手写 mul_scaled_into"
+        );
+
+        // DYN 档：`w.apply_scaled_dyn_into(alpha, &xd, &mut yd)`
+        let xd = MatDyn::<f32, { K }>::new(&batch).unwrap();
+        let mut yd = MatBufDyn::<f32, { N }>::with_rows(M);
+        crate::matmul!(yd[m, N] = alpha * xd[m, K] * w[K, N]);
+        assert_eq!(bits_f32(yd.as_slice()), bits_f32(&want), "DYN：alpha 前缀");
+
+        // 无输出（新分配）：`x.mul_scaled(alpha, &w)`
+        let expr = crate::matmul!(alpha * x[M, K] * w[K, N]);
+        assert_eq!(
+            bits_f32(expr.as_slice()),
+            bits_f32(&want),
+            "无输出：alpha 前缀"
+        );
+
+        // plan 形态（右操作数不带方括号）：`p.apply_scaled_into(alpha, &x, &mut y)`
+        let p = w.prepare();
+        let mut yp = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(yp[M, N] = alpha * x[M, K] * p);
+        assert_eq!(bits_f32(yp.as_slice()), bits_f32(&want), "plan：alpha 前缀");
+        let mut ypd = MatBufDyn::<f32, { N }>::with_rows(M);
+        crate::matmul!(ypd[m, N] = alpha * xd[m, K] * p);
+        assert_eq!(
+            bits_f32(ypd.as_slice()),
+            bits_f32(&want),
+            "plan + DYN：alpha 前缀"
+        );
+        let expr_p = crate::matmul!(alpha * x[M, K] * p);
+        assert_eq!(
+            bits_f32(expr_p.as_slice()),
+            bits_f32(&want),
+            "plan 无输出：alpha 前缀"
+        );
+
+        // 权重在左的读法：`alpha * w[K,N] * x[M,K]`
+        let mut ywl = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(ywl[M, N] = alpha * w[K, N] * x[M, K]);
+        assert_eq!(
+            bits_f32(ywl.as_slice()),
+            bits_f32(&want),
+            "权重在左：alpha 前缀"
+        );
+
+        // 字面量标量：`alpha = 1` 时逐位退化成不带前缀的形态
+        let mut y1 = MatBuf::<f32, { M }, { N }>::new();
+        crate::matmul!(y1[M, N] = 1.0 * x[M, K] * w[K, N]);
+        assert_eq!(bits_f32(y1.as_slice()), bits_f32(&plain), "alpha = 1 退化");
     }
 }

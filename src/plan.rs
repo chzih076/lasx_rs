@@ -103,6 +103,7 @@
 
 use crate::aligned::AlignedVec;
 use crate::api::Error;
+use crate::ops::matmul::Epi;
 use crate::view::MatRef;
 
 /// 一种元素类型的打包矩阵乘内核（本 crate 只实现 `f32` 与 `f64`）。
@@ -170,11 +171,11 @@ impl PackedKernel for f32 {
         c: &mut [Self],
         m4: usize,
     ) {
-        crate::ops::matmul::matmul_f32_packed_rows(k, n, jb, nc, packed, a, c, m4);
+        crate::ops::matmul::matmul_f32_packed_rows(k, n, jb, nc, packed, a, c, m4, Epi::Plain);
     }
 
     fn row_tail(a_row: &[Self], c_row: &mut [Self], b: &[Self], k: usize, cols: usize) {
-        crate::ops::matmul::row_tail_range_f32(a_row, c_row, b, k, cols, 0, cols);
+        crate::ops::matmul::row_tail_range_f32(a_row, c_row, b, k, cols, 0, cols, Epi::Plain);
     }
 }
 
@@ -434,6 +435,63 @@ impl<T: PackedKernel> MatmulPlan<T> {
             });
         }
         Ok(a.len() / self.k)
+    }
+}
+
+impl MatmulPlan<f32> {
+    /// 与 [`Self::run_rows_into`] 同，但把 `alpha` **融进输出那一遍**：`C = alpha·(A·B)`。
+    ///
+    /// `alpha` 走 `ops::matmul::Epi::Scale`：k 分块中间的块照旧写**部分和**（不缩放），
+    /// 只有最后一个 k 块在 store 前乘 `alpha`——所以累加次序与 [`Self::run_rows_into`]
+    /// 完全一致，结果**逐位等于**"先算 `A·B` 再整体乘 `alpha`"，但省掉了那一整遍对 `C`
+    /// 的读写。`C` 的旧值**不被读取**（`beta = 0` 语义：输出被完全覆盖）。
+    ///
+    /// 这是公式 DSL 的 `matmul!(y = alpha * x * w)` 落到的最底层；`f64` 没有对应内核，
+    /// 所以本方法只对 `f32` 存在（`f64` 要缩放请先 `run_into` 再整体乘）。
+    pub(crate) fn run_rows_into_scaled(&self, a: &[f32], c: &mut [f32], alpha: f32) {
+        let rows = a.len() / self.k;
+        assert_eq!(
+            c.len(),
+            rows * self.n,
+            "块内 C 的长度应为 rows × n（{}×{}）",
+            rows,
+            self.n
+        );
+        if rows == 0 || self.n == 0 {
+            return;
+        }
+        let m4 = rows / 4 * 4;
+        let epi = crate::ops::matmul::Epi::Scale(alpha);
+        for panel in &self.panels {
+            crate::ops::matmul::matmul_f32_packed_rows(
+                self.k,
+                self.n,
+                panel.jb,
+                panel.nc,
+                &panel.packed,
+                a,
+                c,
+                m4,
+                epi,
+            );
+        }
+        if let Some(tail) = &self.tail {
+            let cols = self.n - self.n_strip;
+            for i in 0..rows {
+                let a_row = &a[i * self.k..(i + 1) * self.k];
+                let c_row = &mut c[i * self.n + self.n_strip..(i + 1) * self.n];
+                crate::ops::matmul::row_tail_range_f32(
+                    a_row,
+                    c_row,
+                    tail.as_slice(),
+                    self.k,
+                    cols,
+                    0,
+                    cols,
+                    epi,
+                );
+            }
+        }
     }
 }
 
