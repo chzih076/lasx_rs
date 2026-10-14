@@ -8,6 +8,11 @@ name: Git Panel CI
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # **超时**（2026-10-14 加）：实测到一次卡死——run 1791966652 的 "Format check" 成功后整条 run
+    # 再没推进（最终被面板标为 interrupted），期间后面的 run 全部排队等待，队列里还留下一条
+    # 永不被调度的孤儿条目（run 1791966932，`steps: []`、日志 412 B）。加超时后单条 run 最迟
+    # 30 分钟结束，不会无限期占住执行槽。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - name: Format check (rustfmt, nightly)
