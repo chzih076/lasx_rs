@@ -11,22 +11,23 @@
 //! 就是一次点积，直接复用 [`crate::ops::dot_i8`]。**位精确因此是可证明的**：整数累加精确、
 //! 与顺序无关（i32 回绕只在 `k > 133 000` 时可达，与 `dot_i8` 同一语义），出口一次乘法。
 //!
-//! **LASX-only**（与 N1/N3 一致，见 `docs/ops.md` §3.2）。
+//! **LASX-only**（与 N1/N3 批次一致：无降级分支，无 LASX 的 CPU 上直接执行 LASX 指令）。
 //!
 //! # 与 `gemv_i8` 的关系（为什么两个都要）
 //!
 //! `gemv_i8` 是 `m = 1` 的特例，但它**每算一个 token 就把权重从内存里重读一遍**（带宽受限，
 //! 实测 10.7–12.4 GB/s ≈ 单流锚点）。批量把限制**从带宽换成算力**：权重在 L2 里被 `m` 个
 //! token 复用，`m = 192` 时同一个前向的权重流量从 192×118 MB 降到 118 MB。
-//! 依据与账见 `docs/dev.md` §21.6/§21.7、数据见 §7.9。
+//! **但要摆清**：整条 int8 路径的绝对速度仍打不过 f32 GEMM（实测反转），批量只为把
+//! `gemv_i8` 的带宽瓶颈换掉，不是"int8 全面更快"。
 //!
 //! # 循环顺序（有意写死）
 //!
 //! `t` 外层、`o` 内层：固定一个 token 时把 `W` 整片扫一遍（`n×k` 字节），**全部 token 扫的是
-//! 同一片 `W`** ⇒ `W` 驻 L2 被复用（`docs/dev.md` §21.6 的账按这个前提算）。
+//! 同一片 `W`** ⇒ `W` 驻 L2 被复用（上面的流量账按这个前提算）。
 //! 交换顺序会让 `X` 那一侧变成重读，`X` 小、`W` 大，所以不换。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -52,7 +53,7 @@ pub(crate) fn matmul_i8(
         let y_row = &mut y[t * n..t * n + n];
         for o in 0..n {
             let acc = crate::ops::dot_i8::dot_i8(&w[o * k..o * k + k], x_row);
-            // 两个 scale 先乘成一个（一次舍入）再乘 —— 与 `gemv_i8` 同一出口契约（§2.13/§2.14）
+            // 两个 scale 先乘成一个（一次舍入）再乘 —— 与 `gemv_i8` 同一出口契约
             y_row[o] = (acc as f32) * (scale_w[o] * sx);
         }
     }

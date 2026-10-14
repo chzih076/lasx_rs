@@ -18,7 +18,7 @@
 //!   `sqrt` 与标量 `sqrt` 是否逐位相同"这个问题。
 //!
 //! 开方与倒数用**精确指令**（`f32::sqrt` + `1.0/x`），不用 `frsqrte`/`frecipe` 估算 +
-//! 牛顿迭代——`docs/dev.md` §13.1 已实测本机估算指令比精确除法**更慢**（6.8 周期 vs 4.0），
+//! 牛顿迭代——本机实测估算指令比精确除法**更慢**（6.8 周期 vs 4.0），
 //! 这条结论在这里直接复用，不重测。
 //!
 //! # 数值契约
@@ -33,7 +33,7 @@
 //! **不在契约内**：`eps = 0` 且整行全零 ⇒ `ms + eps = 0` ⇒ `inv = +inf` ⇒ `out = 0·inf = NaN`。
 //! 这是定义域问题（RMSNorm 的 `eps` 就是为此存在的），`api` 层要求 `eps > 0`。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

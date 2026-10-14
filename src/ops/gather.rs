@@ -5,15 +5,15 @@
 //! LASX 循环更快也更容易验证**（无需处理列尾、无需位精确论证：拷贝没有舍入）。
 //! 所以本模块没有 `F32x8`，也没有降级分支（它不依赖任何 ISA 扩展）。
 //!
-//! 存在理由：外部契约（ONNX 图上 `Gather` 34 处：词/段/位置嵌入），
-//! 以及 `docs/platform.md` §4.2 对"怎么取"的决策：库侧给两种口径——
+//! 存在理由：外部契约（ONNX 图上 `Gather` 34 处：词/段/位置嵌入），而"怎么取"有多种
+//! 口径，所以库侧把两种都给出来——
 //!
 //! - [`gather_rows`]：f32 表，纯行拷贝；
 //! - [`gather_rows_i8`]：int8 表 + **每行**一个 scale，取行时就地反量化
 //!   （`out[i][j] = table[ids[i]][j] as f32 * scales[ids[i]]`）。
 //!
-//! **"嵌入表存 f32 还是 int8"不是本库的决定**（见 §4.2）：这里只保证两种口径都正确、
-//! 边界的责任清楚。id 越界在 `api`/`ffi` 层被拒（`docs/ops.md` §2.17）。
+//! **"嵌入表存 f32 还是 int8"不是本库的决定**：这里只保证两种口径都正确、
+//! 边界的责任清楚。id 越界在 `api`/`ffi` 层被拒，本层只做 debug 断言。
 //!
 //! # 数值契约
 //!
@@ -43,7 +43,7 @@ pub(crate) fn gather_rows(table: &[f32], ids: &[usize], row_len: usize, out: &mu
 
 /// int8 表 + **每行** scale 的按 id 取行并反量化。
 ///
-/// `scales` 长度 = 表行数（每行一个 scale，`docs/ops.md` §2.12 的 per-row 约定）。
+/// `scales` 长度 = 表行数（每行一个 scale，即 per-row 量化约定）。
 ///
 /// # Panics
 /// 同 [`gather_rows`]，外加 `scales.len() == table.len() / row_len`；这里只做 debug 断言。

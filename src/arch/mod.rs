@@ -154,7 +154,7 @@ pub fn lasx_force_lsx_thread(force: bool) {
 ///
 /// 两条实测过的坑：
 ///
-/// - `available_parallelism()` 在本机是**系统调用，68.9 µs/次**（`docs/dev.md` §19.10），
+/// - `available_parallelism()` 在本机是**系统调用，68.9 µs/次**，
 ///   所以这里用 `OnceLock` 缓存——**不要在热路径调用**（池只在构造时读一次）。
 /// - sysfs 列出的是**整机**的 CPU，不认识 cpuset：所以 `physical` 与 `logical` 取小，
 ///   在受限容器里表现为"物理核数被逻辑预算截断"。

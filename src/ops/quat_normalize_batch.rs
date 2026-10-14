@@ -8,7 +8,7 @@
 //!
 //! LASX 缺失时走 LSX 128 位路径。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -51,7 +51,7 @@ pub(super) fn normalize_lasx(
         let mask = lasx_xvfcmp_clt_d(n, tiny);
         let bits = |v: m256d| std::mem::transmute::<m256d, m256i>(v);
         let unbits = |v: m256i| std::mem::transmute::<m256i, m256d>(v);
-        // 4 个分量同分母 ⇒ **只做一次除法**，其余用乘法（见 docs/dev.md §13.6）
+        // 4 个分量同分母 ⇒ **只做一次除法**，其余用乘法（三条路径同式才逐位一致）
         let inv = lasx_xvfdiv_d(lasx::splat_f64(1.0), n);
         // 退化 lane：andn 清成 +0.0；w 再 or 上 1.0 的位型 ⇒ (1,0,0,0)
         let wo = unbits(lasx_xvor_v(
@@ -191,7 +191,7 @@ mod tests {
                 z.as_mut_ptr(),
                 n as i32,
             );
-            // 内核现在用"1 次除法 + 乘法"（docs/dev.md §13.6），与精确除法的参考差 ≤ 2 ulp，
+            // 内核现在用"1 次除法 + 乘法"，与精确除法的参考差 ≤ 2 ulp，
             // 所以这里比紧相对误差；逐位一致性由 LASX/LSX/尾部的路径间测试保证。
             for i in 0..n {
                 for (got, want_v, name) in [

@@ -2,10 +2,10 @@
 //!
 //! **LASX-only**：没有降级分支，无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
 //!
-//! # 分层：为什么 `cos`/`sin` 是**输入**（设计见 `docs/dev.md` §20.6）
+//! # 分层：为什么 `cos`/`sin` 是**输入**
 //!
 //! `rope` 的角度 `θ_i = pos · freq_base^(−2i/n_dims)` **不依赖数据**（只跟位置和维度有关），
-//! 一次前向里每层每位置算一次就够；而"每个元素都要算"的 `exp`（`docs/dev.md` §20.3）相反，
+//! 一次前向里每层每位置算一次就够；而"每个元素都要算"的 `exp` 相反，
 //! 必须逐元素算。
 //! 所以这里照 llama.cpp 的分工：表由 [`rope_tables`] 预先算好（标量、f64 算角度），
 //! 内核只做旋转——位精确承诺因此落在**旋转**上，表的生成明确**不在**承诺内（依赖平台 libm）。
@@ -55,7 +55,7 @@
 //! NeoX 走满 SIMD。要快的 GptJ 有两条路（都不做）：把表按 π 预重排（会把表与 mode 绑死，
 //! 破坏"一张表两种 mode"的接口）、或者自己写跨 lane 的 `xvpermi_q` 组合。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

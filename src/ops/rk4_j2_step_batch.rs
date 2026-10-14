@@ -2,7 +2,7 @@
 //!
 //! LASX 缺失时整体退化为纯标量。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -188,7 +188,7 @@ unsafe fn j2_accel_vec(
             lasx_xvfadd_d(lasx_xvfmul_d(vy, vy), lasx_xvfmul_d(vz, vz)),
         );
         let vrm = lasx_xvfsqrt_d(vrm2);
-        // 1 次除法 + 乘法推导（与 j2_accel_batch 的 LASX/标量路径同式，见 docs/dev.md §13）
+        // 1 次除法 + 乘法推导（与 j2_accel_batch 的 LASX/标量路径同式，三条路径才逐位一致）
         let vone = lasx::splat_f64(1.0);
         let vinv2 = lasx_xvfdiv_d(vone, vrm2);
         let vinvrm = lasx_xvfmul_d(vinv2, vrm);

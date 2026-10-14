@@ -2,7 +2,7 @@
 //!
 //! **LASX-only**：没有降级分支，无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
 //!
-//! # 位精确构造（设计见 `docs/dev.md` §20.4）
+//! # 位精确构造
 //!
 //! 逐元素、**无归约**，所以不存在 softmax 那种"两种结合次序"的问题：只要标量与向量跑的是
 //! 同一串 op，就逐位相同。本实现靠三件事保证这点：
@@ -19,9 +19,9 @@
 //! ```
 //!
 //! `x < −88` 时 `exp` 的上界夹取让分母饱和在 `≈ e^88`，输出是 `x/e^88`（绝对值 ≤ 1e-35，
-//! 对 f32 无实际影响）；`±inf` 不在契约内（见 `docs/ops.md` §2.8）。
+//! 对 f32 无实际影响）；`±inf` 不在契约内。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -125,7 +125,7 @@ mod tests {
     }
 
     /// 数值：与 f64 参考的误差。`silu` 的输出在负侧会小到"相对误差无意义"，所以
-    /// 断言用**绝对**误差，并且按区间分别卡（实测包络，见 `docs/ops.md` §2.8）。
+    /// 断言用**绝对**误差，并且按区间分别卡（实测包络）。
     #[test]
     fn test_accuracy_vs_f64_reference() {
         let mut worst_abs = 0f64;

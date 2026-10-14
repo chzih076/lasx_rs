@@ -1,9 +1,10 @@
 //! int8 对称量化的**生产端与反量化**：`amax` / `absmax_rows`、`quantize_i8_*`、`dequantize_i8*`。
 //!
-//! 这一族是 `docs/ops.md` §12.3 **N3 批次**的基础（消费端是 `gemv_i8` 与 `dot_i8`）。
-//! 设计记录见 `docs/dev.md` §21；本文件的注释只写**实现契约**。
+//! 这一族是 **N3 批次**（int8 推理）的生产端，消费端是 `gemv_i8` 与 `dot_i8`。
+//! 本文件的注释只写**实现契约**，设计记录不进代码。
 //!
-//! **LASX-only**：没有降级分支（与 N1 批次一致，见手册 Caveats 与 `docs/ops.md` §3.2）。
+//! **LASX-only**：没有降级分支（与 N1 批次一致），无 LASX 的 CPU 上直接执行 LASX 指令
+//! （见手册 Caveats）。
 //!
 //! # 数值契约（调用方必须照此实现参考版才逐位一致）
 //!
@@ -47,7 +48,7 @@
 //!   而这一族只在残差/归一化的出口用；现在按"先正确再谈速度"取标量，**未做向量化**
 //!   （也不声称它慢——没有实测就不写结论）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

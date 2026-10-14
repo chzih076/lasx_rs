@@ -2,7 +2,7 @@
 //!
 //! LASX 缺失时走 LSX 128 位路径。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -66,7 +66,7 @@ fn j2_accel_batch_lasx(
         // **只做一次除法**：有了 1/|r|²，其余倒数用乘法推出来
         //   invrm = (1/|r|²)·|r| = 1/|r|，inv3 = (1/|r|²)·(1/|r|) = 1/|r|³，
         //   inv5 = inv3·(1/|r|²) = 1/|r|⁵，zr2 = z²·(1/|r|²)
-        // 比"三次除法"多 ~2 ulp 舍入（有意，见 docs/dev.md §13）；三条路径同式 ⇒ 仍逐位一致。
+        // 比"三次除法"多 ~2 ulp 舍入（有意）；三条路径同式 ⇒ 仍逐位一致。
         let vone = lasx::splat_f64(1.0);
         let vinv2 = unsafe { lasx_xvfdiv_d(vone, vrm2) };
         let vinvrm = unsafe { lasx_xvfmul_d(vinv2, vrm) };
@@ -148,7 +148,7 @@ fn j2_accel_batch_lsx(
             )
         };
         let vrm = unsafe { lsx_vfsqrt_d(vrm2) };
-        // 与 LASX / 标量路径**同式**：1 次除法 + 乘法推导（docs/dev.md §13）
+        // 与 LASX / 标量路径**同式**：1 次除法 + 乘法推导
         let vone = lsx::splat_f64(1.0);
         let vinv2 = unsafe { lsx_vfdiv_d(vone, vrm2) };
         let vinvrm = unsafe { lsx_vfmul_d(vinv2, vrm) };

@@ -15,7 +15,7 @@
 //!
 //! LASX 缺失时走 LSX 128 位路径。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -160,7 +160,7 @@ fn normalize_lsx(w: m128d, x: m128d, y: m128d, z: m128d) -> (m128d, m128d, m128d
         let mask = lsx_vfcmp_clt_d(n, lsx::splat_f64(super::quat_normalize_batch::DEGENERATE));
         let bits = |v: m128d| std::mem::transmute::<m128d, m128i>(v);
         let unbits = |v: m128i| std::mem::transmute::<m128i, m128d>(v);
-        // 同分母 ⇒ 1 次除法（与 LASX/标量路径同式，见 docs/dev.md §13.6）
+        // 同分母 ⇒ 1 次除法（与 LASX/标量路径同式，三条路径才逐位一致）
         let inv = lsx_vfdiv_d(lsx::splat_f64(1.0), n);
         let wo = unbits(lsx_vor_v(
             lsx_vandn_v(mask, bits(lsx_vfmul_d(w, inv))),
@@ -256,7 +256,7 @@ mod tests {
                 2.0 * (y * z + w * x),
                 1.0 - 2.0 * (x * x + y * y),
             ];
-            // 与精确除法参考比紧相对误差（内核用"1 次除法 + 乘法"，见 docs/dev.md §13.6）
+            // 与精确除法参考比紧相对误差（内核用"1 次除法 + 乘法"）
             for k in 0..9 {
                 assert!(
                     rel_err(m[k][i], r[k]) < 1e-15,

@@ -8,7 +8,7 @@
 //!
 //! LASX 缺失时走 LSX 128 位路径。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -49,7 +49,7 @@ fn sq_lasx(vx: m256d, vy: m256d, vz: m256d) -> m256d {
 ///
 /// 为什么不用分支/比较混合：这条路径一分钱都不多花（除法反正要算），也不需要
 /// "按 lane 选值"的第二条指令；而**必须**清零是因为 `0 · inf = NaN`——
-/// 契约要求零向量单位化输出 `(0,0,0)`（`docs/ops.md` §2.4）。
+/// 契约要求零向量单位化输出 `(0,0,0)`（本文件的"零向量约定"）。
 #[inline]
 fn recip_masked_lasx(n: m256d) -> m256d {
     unsafe {

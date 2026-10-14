@@ -4,7 +4,7 @@
 //!
 //! 与 [`crate::ops::rms_norm`] 的关系：**同一套行归约骨架**（8 个 per-lane 累加器 +
 //! 固定次序两两归约 + 列尾补齐），差别只有两处——LayerNorm 要**减均值**、并且有**偏置 `b`**。
-//! 它存在的理由是外部契约：ONNX 图上 `LayerNormalization` 17 处（`docs/platform.md` §4）。
+//! 它存在的理由是外部契约：ONNX 图上 `LayerNormalization` 出现 17 处。
 //!
 //! # 位精确构造（沿用 `softmax_rows`/`rms_norm` 的两条做法）
 //!
@@ -39,7 +39,7 @@
 //! **不在契约内**：`eps = 0` 且整行同值（`ss = 0`）⇒ `inv = +inf` ⇒ `0·inf = NaN`
 //! （与 `rms_norm` 同理，`api` 层要求 `eps > 0`）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

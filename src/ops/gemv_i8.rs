@@ -7,7 +7,7 @@
 //! y[o] = (Σ_i W[o,i]·x[i]) · (scale_w[o] · scale_x)      // i32 累加，出口乘两个 scale 的积
 //! ```
 //!
-//! **LASX-only**（与 N1 批次一致，见 `docs/ops.md` §3.2）。
+//! **LASX-only**（与 N1 批次一致：无降级分支，无 LASX 的 CPU 上直接执行 LASX 指令）。
 //!
 //! # 为什么可以复用 `dot_i8`
 //!
@@ -17,14 +17,14 @@
 //!
 //! # 数值契约
 //!
-//! 1. **累加是整数精确的**：`acc = Σ W·x`（i64 中间累加，返回 i32；`m`/`k` 在
-//!    `docs/ops.md` §12.3 N3 的形状范围内不会回绕：`k ≤ 133 000` 时 `127²·k < 2³¹`）。
+//! 1. **累加是整数精确的**：`acc = Σ W·x`（i64 中间累加，返回 i32；在 N3 的形状范围内
+//!    不会回绕：`k ≤ 133 000` 时 `127²·k < 2³¹`）。
 //! 2. **出口一次乘法**：`y = (acc as f32) · (sw[o] · sx)`——先把两个 scale **乘成一个**
 //!    （f32 一次舍入），再与 `acc` 相乘。参考实现必须同样写 `(acc as f32) * (sw * sx)`，
 //!    写成 `(acc as f32 * sw) * sx` 是两次舍入，不保证逐位一致。
 //! 3. 未量化的偏置/残差不在本内核内（调用方自己在 f32 域加）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

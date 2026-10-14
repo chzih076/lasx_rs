@@ -1,9 +1,9 @@
 //! 测试共用的夹具与度量（仅在 `cfg(test)` 下编译）。
 //!
 //! 这里的参考实现是**独立**于算子内部标量兜底的另一套写法，故意不复用，
-//! 避免"自己证明自己"（这条测试纪律见 `docs/dev.md` §4）。
+//! 避免"自己证明自己"（用同一份代码对拍自己，等于没测）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]

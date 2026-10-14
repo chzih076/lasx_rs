@@ -4,7 +4,7 @@
 //! 一次算 4 行 × 16 列（16 个 4 通道累加器），同一段 B 被 4 行复用。
 //! 不做 B 转置、不做跨 lane 水平归约。
 //!
-//! v2：把 f32 侧验证过的**打包 + k 分块**照搬过来（见 `docs/dev.md` §8.2）。
+//! v2：把 f32 侧验证过的**打包 + k 分块**照搬过来。
 //! 原路径（`rows4_f64`）每次 k 步都要按 `n` 跨距读 B，B 被 `m/4` 遍重复读；
 //! 打包后 B 变成 16 列一条带的连续内存，再把 k 切成 `K_CHUNK` 步的块、**k 块在外、
 //! 行块在内**，让每个 k 块的条带与 A 的 4 行、C 的 4×16 一起待在 L1 里。
@@ -15,7 +15,7 @@
 //!
 //! **LASX-only**：没有降级分支，无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -26,7 +26,7 @@ use std::arch::loongarch64::*;
 /// 打包路径的 `m` 下限：打包要走两遍 B（读+写），只有行块足够多时才摊得掉。
 pub(crate) const PACK_MIN_M: usize = 32;
 /// 打包路径的 `k` 下限。f64 侧**没有**列块路径可退，所以配合 k 分块后下限可以比 f32
-/// 更激进地取 64（重标定数据见 `docs/dev.md` §8.4：`256×64×4096` 11.2 → 28.6–30.2、
+/// 更激进地取 64（重标定实测：`256×64×4096` 11.2 → 28.6–30.2、
 /// `128×128×2048` 11.1 → 27.7）；小的方阵由 `PACK_MIN_WORK` 挡住
 /// （128³ 只有 2.1 M < 8 M，仍走流式）。
 pub(crate) const PACK_MIN_K: usize = 64;
@@ -34,8 +34,8 @@ pub(crate) const PACK_MIN_K: usize = 64;
 pub(crate) const PACK_MIN_WORK: u128 = 8_000_000;
 
 /// k 分块的 L1 预算与块长：条带是 `k×16×8` 字节，超过 `L1_BUDGET` 就分块。
-/// 数值来自 f32 侧的条带扫描（24–48 KB 最优、正好等于 L1 的 64 KB 时开始掉，
-/// 见 `docs/dev.md` §8.3），f64 条带同口径。
+/// 数值来自 f32 侧的条带扫描（24–48 KB 最优、正好等于 L1 的 64 KB 时开始掉），
+/// f64 条带同口径。
 pub(crate) const L1_BUDGET: usize = 48 * 1024;
 pub(crate) const K_CHUNK: usize = 256;
 
@@ -63,7 +63,7 @@ pub(crate) fn matmul_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: 
     matmul_f64_stream(m, k, n, a, b, c);
 }
 
-/// 原始的流式次序（`docs/dev.md` §8.5 的 A/B 基准，也是小形状的生产路径）。
+/// 原始的流式次序（也是小形状的生产路径与打包路径的 A/B 基准）。
 pub(crate) fn matmul_f64_stream(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     let mut i = 0;
     while i + 4 <= m {
@@ -314,7 +314,7 @@ pub(crate) fn matmul_f64_packed_rows(
 ///
 /// 与 f32 侧 [`crate::ops::matmul::pack_b`] 同构：4 条带一组、每条带 16 个 `f64`
 /// （128 B = 4 条 256 位向量）。用向量拷贝而不是 `copy_from_slice`——后者落进通用
-/// memcpy（对齐剥离 + 分支），打包吞吐差约 1.6×（数据见 `docs/dev.md` §8.2.1）。
+/// memcpy（对齐剥离 + 分支），打包吞吐差约 1.6×。
 #[inline]
 pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
     let strips = nc / 16;

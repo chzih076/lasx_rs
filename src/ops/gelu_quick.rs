@@ -11,9 +11,9 @@
 //! | `lasx_gelu_quick` | `x·σ(1.702x)` | ggml `GELU_QUICK` |
 //! | `lasx_gelu_erf` | `0.5x(1+erf(x/√2))` | PyTorch `gelu`（默认） |
 //!
-//! 本文件只有 quick 形式，erf 形式在 `ops::gelu_erf`（设计见 `docs/dev.md` §20.4 第 3 条）。
+//! 本文件只有 quick 形式，erf 形式在 `ops::gelu_erf`。
 //!
-//! # 位精确构造（设计见 `docs/dev.md` §20.4）
+//! # 位精确构造
 //!
 //! 与 `silu` 共用骨架：逐元素、无归约，公式写**直接除法**而不是 `x·(1/den)`，
 //! 门控分母用 [`crate::ops::nn_math`] 那一份。差别只有常系数：先把 `c·x` 乘出来再进 `exp`。
@@ -24,7 +24,7 @@
 //! y   = x / den        // 单次舍入
 //! ```
 
-// 本文件豁免 `clippy::undocumented_unsafe_blocks`（策略见 `docs/dev.md` §17）：
+// 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX intrinsic"，同一组前提在
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
@@ -126,7 +126,7 @@ mod tests {
         assert!(gelu_quick_seq(f32::NEG_INFINITY).is_infinite());
     }
 
-    /// 数值：与 f64 参考的误差（实测包络，见 `docs/ops.md` §2.8）。
+    /// 数值：与 f64 参考的误差（实测包络）。
     #[test]
     fn test_accuracy_vs_f64_reference() {
         let (mut worst_abs, mut worst_rel) = (0f64, 0f64);
