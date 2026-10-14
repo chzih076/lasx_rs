@@ -95,10 +95,16 @@ pub(crate) fn softmax_rows(
     cols: usize,
     out: &mut [f32],
 ) {
+    // **`cols == 0` 是合法的空操作**：没有任何元素可写，直接返回。
+    // 依据 FFI 契约（`ffi::nn::tests::test_softmax_rows_ffi` 明确要求"cols = 0：什么都不写、不崩"）。
+    // 这里**不能**用 `debug_assert!(cols > 0)`：debug 构建下它会 panic/abort，而 release 只是恰好
+    // 绕过断言——同一输入两种 profile 行为不同，比断言本身更危险（实测：debug 下整套测试 SIGABRT）。
+    if cols == 0 {
+        return;
+    }
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(out.len(), rows * cols);
     debug_assert!(mask.is_empty() || mask.len() == rows * cols);
-    debug_assert!(cols > 0);
 
     let vs = lasx::splat_f32(scale);
     let vscale = vs;

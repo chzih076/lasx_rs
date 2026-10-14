@@ -372,8 +372,10 @@ mod tests {
         // SAFETY: k=0 时 a 为空、x 为空。
         unsafe { gemv_f16(&[], &[], 3, 0, &mut y0) };
         assert!(y0.iter().all(|&v| v == 0.0));
-        // SAFETY: m=0。
-        unsafe { gemv_f16(&[], &[], 0, 4, &mut []) };
+        // SAFETY: m=0 且 k=0 ⇒ 三条长度前提都自洽（`a.len()==0`、`x.len()==0==k`、`y.len()==0==m`）。
+        // 注意：写成 `k = 4` 会**违反本函数的文档契约 `x.len() == k`**——release 跳过断言看似通过，
+        // debug 下 panic（实测：整套 debug 测试因此失败）。
+        unsafe { gemv_f16(&[], &[], 0, 0, &mut []) };
     }
 
     /// 退化：`n = 0` ⇒ `0.0`；`inf × 0` 是 NaN（定义域问题，写进契约）。

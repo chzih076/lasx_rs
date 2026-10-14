@@ -199,14 +199,34 @@ pub extern "C" fn lasx_rope(
     };
     let n = rows * cols;
     let tables = rows * (n_dims / 2);
-    // SAFETY: FFI 约定——见函数文档的 # Safety。
-    unsafe {
-        let x = std::slice::from_raw_parts(x, n);
-        let out = std::slice::from_raw_parts_mut(out, n);
-        let cos = std::slice::from_raw_parts(cos, tables);
-        let sin = std::slice::from_raw_parts(sin, tables);
-        crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, m, out);
-    }
+    // SAFETY: FFI 约定——见函数文档的 `# Safety`。**零长一律走 `&[]`/`&mut []`**：
+    // `from_raw_parts` 即使长度 0 也要求指针**非空且对齐**，而零行 / `n_dims == 0`（合法：整块
+    // 复制、等于不旋转）时调用方可能传空指针（`test_rope_ffi_zero_dims_copies` 正是这种输入）
+    // ——debug 构建的前置条件检查会直接 `abort`（非展开 panic，整套测试 SIGABRT），release 则
+    // 静默 UB。
+    let x = if n == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(x, n) }
+    };
+    let cos = if tables == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(cos, tables) }
+    };
+    let sin = if tables == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(sin, tables) }
+    };
+    let out = if n == 0 {
+        &mut [][..]
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(out, n) }
+    };
+    // SAFETY: 形状由 `rope_shape` 解算（不合法已在上面 return；`rows*cols` 与 `rows*(n_dims/2)`
+    // 都不溢出），四个切片都已按各自长度构造（零长走 `&[]`/`&mut []`，绝不由空指针构造）。
+    unsafe { crate::ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, m, out) };
 }
 
 /// RoPE 的形状/mode 解算：`(rows, cols, n_dims, mode)`；不合法返回 `None`。
