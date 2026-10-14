@@ -678,9 +678,10 @@ impl SimdPath {
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LASX 齐全），6000 系列都支持 LASX，
 不为 3000 及以下机型付这份复杂度（决策记录见 `docs/dev.md` §20.1）。
 
-**N3 批次（int8 推理，7 个新符号）同样 LASX-only**（`lasx_amax`、`lasx_absmax_rows`、
-`lasx_quantize_i8_per_tensor`、`lasx_quantize_i8_per_row`、`lasx_dequantize_i8`、
-`lasx_dequantize_i8_rows`、`lasx_gemv_i8`；契约见 §2.12/§2.13）：沿用 N1 的取舍，
+**N3 批次（int8 推理，8 个新符号，逐项见 §4.3 清单）同样 LASX-only**（`lasx_amax`、
+`lasx_absmax_rows`、`lasx_quantize_i8_per_tensor`、`lasx_quantize_i8_per_row`、
+`lasx_dequantize_i8`、`lasx_dequantize_i8_rows`、`lasx_gemv_i8`、`lasx_matmul_i8`；
+契约见 §2.12/§2.13）：沿用 N1 的取舍，
 无 LASX 的 CPU 上会执行 LASX 指令（见 §15 Caveats 与 README 的同一条警告）。
 新符号一律**追加**，原始 15 个（§4.1）的签名与语义不变。
 
@@ -792,7 +793,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
 `lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
 `lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`、
-`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`，以及 N3 的 7 个：
+`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`，以及 N3 的 8 个：
 `lasx_amax_checked`、`lasx_absmax_rows_checked`、`lasx_quantize_i8_per_tensor_checked`、
 `lasx_quantize_i8_per_row_checked`、`lasx_dequantize_i8_checked`、
 `lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`、`lasx_matmul_i8_checked`，
@@ -1934,8 +1935,8 @@ Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在
 4. 性能结论按进程级交替 A/B、≥3 轮、丢弃首轮、取中位数：**已做**（3 轮轮间差 ≤1%，表见
    `docs/dev.md` §7）；其中**端到端 10–20 ms 的立项目标被实测推翻**（只算了权重流量、漏了序列里每个
    token 都要过一遍权重），目标已改成分档（`docs/dev.md` §21.6）；
-5. C ABI 只追加不修改（**§4.1** 的原始 15 个 `lasx_*` 符号签名与语义永不改动）：N3 的 7 个符号
-   + 7 个 `_checked` 变体都是**追加**，且测试断言 C 路径与 Rust `api` 路径逐位一致；
+5. C ABI 只追加不修改（**§4.1** 的原始 15 个 `lasx_*` 符号签名与语义永不改动）：N3 的 8 个符号
+   + 8 个 `_checked` 变体（§4.3/§4.4 清单）都是**追加**，且测试断言 C 路径与 Rust `api` 路径逐位一致；
 6. **给出 per-tensor / per-token / per-channel 三种模式的误差对照**——该选择直接决定 int8 能否使用。
 
 **启动前应确认**（见 `docs/dev.md` §21.6）：`gemv_i8` 在真实形状上的倍数、per-token 量化的
