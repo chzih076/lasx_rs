@@ -637,6 +637,22 @@ pub fn dispatch_overhead() {
                 poolg.threads(),
                 crate::timing::fmt_t(tg)
             );
+            // **第三臂：`prepare()` 一次 + `apply_into` 复用**——库文档在 `apply_dyn_into` 上写着
+            // "内部仍会打包一次；**反复用请走 `Mat::prepare`**"。`matmul!` 生成的 `mul_into` 每次
+            // 都 `rhs.prepare().apply_into(...)`（`src/shape.rs:488`）⇒ 每次调用打包一次 B。
+            // 这一臂量"把准备阶段 hoist 出循环"能省多少（与 RoPE 的 hoist 表同型）。
+            let plan = w.prepare();
+            let reused = timeit(|| {
+                plan.apply_into(&x, &mut yb);
+                let _ = black_box(yb.as_slice()[0]);
+            });
+            println!(
+                "| **准备阶段 hoist**（{M}³） | `matmul!` 每次 {} | `prepare()` 复用 {} | 省 **{:.0}%** | 池化 {} |",
+                crate::timing::fmt_t(dsl),
+                crate::timing::fmt_t(reused),
+                100.0 * (dsl.as_secs_f64() - reused.as_secs_f64()).max(0.0) / dsl.as_secs_f64(),
+                crate::timing::fmt_t(direct)
+            );
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
