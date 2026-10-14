@@ -739,6 +739,42 @@ pub fn dispatch_overhead() {
                         / stream1.as_secs_f64()
                 );
             }
+            // **L3 带宽假设的判别（效率 ∝ m）**：若瓶颈是"每个线程各读一遍整份共享面板 B"，则
+            // B 固定、计算随 m 线性涨 ⇒ **效率应随 m 上升**。k=768、n=3072 固定、12 线程，
+            // 效率 = (单线程时间 / 12) ÷ 12 线程实测。
+            {
+                let (kk, nn) = (768usize, 3072usize);
+                let b3: Vec<f32> = (0..kk * nn).map(|i| (i % 13) as f32 * 0.0625).collect();
+                let pool12b = WorkerPool::new(12);
+                for &mm in &[192usize, 384, 768, 1536] {
+                    let a3: Vec<f32> = (0..mm * kk).map(|i| (i % 17) as f32 * 0.0625).collect();
+                    let mut a3m = a3.clone();
+                    let mut c3 = vec![0f32; mm * nn];
+                    let t1 = timeit(|| {
+                        lasx_matmul(
+                            mm as i32,
+                            kk as i32,
+                            nn as i32,
+                            a3.as_ptr(),
+                            b3.as_ptr(),
+                            c3.as_mut_ptr(),
+                        );
+                        let _ = black_box(c3[0]);
+                    });
+                    let t12 = timeit(|| {
+                        parallel::matmul_f32(&pool12b, mm, kk, nn, &mut a3m, &b3, &mut c3).unwrap();
+                        let _ = black_box(c3[0]);
+                    });
+                    let gf = 2.0 * (mm as f64) * (kk as f64) * (nn as f64) / 1e9;
+                    println!(
+                        "| **m 扫描**（k={kk}, n={nn}, 12 线程） | m={mm} | 1 线程 {} | 12 线程 {} | **{:.1} GFLOP/s，效率 {:.0}%** |",
+                        crate::timing::fmt_t(t1),
+                        crate::timing::fmt_t(t12),
+                        gf / t12.as_secs_f64(),
+                        100.0 * (t1.as_secs_f64() / 12.0) / t12.as_secs_f64()
+                    );
+                }
+            }
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
