@@ -24,7 +24,7 @@
 //!
 //! 数值契约（**不是**"差不多"）：`out = e · (1/Σ)`，`e = exp(clamp(scale·x + mask − max))`，
 //! `exp` 用 `exp2` 的 6 次多项式 + magic 数取整；向量路径与标量模拟**逐位一致**
-//! （完整 op 序列与推导见 [`crate::ops`] 的 `softmax_rows` 模块文档）。
+//! （完整 op 序列与推导见 `softmax_rows` 模块文档）。
 
 // 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，不逐块重复）：
 // 这里的 unsafe 都是"在刚校验过长度的切片上调用 LASX/LSX intrinsic"，同一组前提在
