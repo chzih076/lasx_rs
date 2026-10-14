@@ -1910,7 +1910,7 @@ mod tests {
         // 界取 1e-2（1.65× 余量）。f32 路径同口径 ~1.4e-6 作对照，两者差三个数量级。
         assert!(
             worst_q <= 1e-2,
-            "int8 管线 ∞-相对误差 {worst_q:.3e} 超过标准 1e-2（见 docs/ops.md §2.15）"
+            "int8 管线 ∞-相对误差 {worst_q:.3e} 超过标准 1e-2"
         );
         assert!(worst_f32 <= 1e-5, "f32 对照路径异常：{worst_f32:.3e}");
     }
@@ -2813,7 +2813,7 @@ mod tests {
         );
         assert!(
             eq.is_finite() && eq <= 5e-3,
-            "合成 {L} 层栈的 int8 ∞-相对误差 {eq:.3e} 超过 5e-3（见 docs/ops.md §2.15）"
+            "合成 {L} 层栈的 int8 ∞-相对误差 {eq:.3e} 超过 5e-3"
         );
         assert!(ef <= 1e-4, "纯 f32 对照异常：{ef:.3e}");
         assert!(
