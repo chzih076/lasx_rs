@@ -26,12 +26,12 @@ Four workload classes are covered:
   tests: `lasx_ballistic_step` uses different association orders in its vector and scalar branches,
   and `lasx_axpy` permits a difference of at most 1 ulp.
 - **Matrix multiplication** — three bitwise-identical paths (packed, column-block, streaming) with
-  packing and k-chunking; single-threaded f32 512³ reaches 60.9 GFLOP/s, which is **87%** of this
-  machine's microkernel ceiling (2.00 FMA/cycle with A-broadcast, i.e. 70.3 GFLOP/s), and 97% at
-  64³ (streaming, no packing). Same-day cross-section against OpenBLAS 0.3.34: `docs/dev.md`.
-- **Resident worker pool** — amortizes dispatch across calls: 8.15× on a 12-thread n = 2^18 step,
-  and in a multi-satellite multi-step propagation it is **2.55×** faster than creating threads per
-  step and **8.09×** faster than single-threaded.
+  packing and k-chunking; single-threaded f32 512³ reaches 61.5 GFLOP/s, which is **88%** of this
+  machine's microkernel ceiling (2.00 FMA/cycle with A-broadcast, i.e. 70.3 GFLOP/s), and 95% at
+  64³. Same-day cross-section against OpenBLAS 0.3.34: `docs/dev.md`.
+- **Resident worker pool** — amortizes dispatch across calls: 8.62× on a 12-thread n = 2^18 step,
+  and in a multi-satellite multi-step propagation it is **2.24×** faster than creating threads per
+  step and **8.08×** faster than single-threaded.
 - **Interface layers** — `view::MatRef`/`MatMut` turn shape and stride into objects validated once
   at construction; `plan::MatmulPlan` packs `B` once and reuses it (read-only, `Arc`-shareable);
   the `shape` layer encodes shapes in the type system with compile-time checks;
@@ -68,26 +68,28 @@ runs (rationale and impact: `docs/dev.md`).
 
 ## Measured performance
 
-The figures below come from a single continuous collection on one Loongson-3B6000 on
-**2026-09-25** (background load ≈2–3; single-threaded results pinned to one core, thread-related
-results unpinned). The complete tables, the methodology, and the exact traffic conventions are in
-**[docs/dev.md](docs/dev.md)**, which is the single authoritative location for performance data;
+The figures below were re-measured on one Loongson-3B6000 on **2026-10-15** using the
+**variance method**: **6 rounds per group** (first round discarded, median of the remaining 5),
+process-level; single-threaded tables pinned, thread-related tables unpinned. Grading follows
+`docs/dev.md` §6.4 (the desktop here idles at load ≈2.5–3, so nearly all rounds are grade B and
+usable as official numbers). **Per-number ranges, per-round loadavg and the full conventions are in
+[docs/dev.md](docs/dev.md) §7**, the single authoritative location for performance data;
 comparisons of compile-time constants and thresholds (k-chunking, column-block width, scheduling)
 live in the respective design sections.
 
 | Item | Result |
 |---|---|
-| FMA throughput ceiling (16 independent chains, registers only) | **140.2 GFLOP/s** (3.98/cycle); LSX 69.3 (2.00×) |
-| Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s) |
-| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s (same-day, `docs/dev.md`) |
-| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s (same-day, `docs/dev.md`) |
-| `lasx_matmul` via `parallel`, 12 threads | 5.06× / 5.34× at 128³ / 512³ (323.8 / 302.1 GFLOP/s) |
-| Single-stream / two-stream / 12-thread read (32 MiB) | 12.0 / 10.4 / 22.0 GB/s |
-| `lasx_softmax_rows` / `lasx_rms_norm` | 5.22–7.00 / 12.01–18.38 GB/s |
-| `lasx_silu` / `lasx_gelu_quick` / `lasx_gelu_erf` | 4.74–9.20 / 4.55–8.61 / 4.09–5.51 GB/s |
-| `lasx_rope` (NeoX, LASX path) | 28.6–71.9 GB/s |
-| `lasx_dot_f16` / `lasx_gemv_f16` | 41.8–68.5 / 3.75–48.2 GB/s |
-| Resident pool vs threads-per-step (reused across 200 steps) | 37.36 ms vs 95.37 ms (**2.55×**; single-threaded 302.28 ms) |
+| FMA throughput ceiling (16 independent chains, registers only) | **139.4 GFLOP/s** (3.96/cycle, range 130.9–140.1); LSX 69.6 (2.00×) |
+| Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s; from §6.3's `kernel_probe`, not re-measured) |
+| `lasx_matmul` f32 64³ / 256³ / 512³ | 66.9 / 62.7 / **61.5** GFLOP/s |
+| `lasx_matmul_f64` 128³ / 512³ | 30.6 / 30.9 GFLOP/s |
+| `lasx_matmul` via `parallel`, 12 threads | 5.89× / 5.51× at 128³ / 512³ (393.4 / 331.5 GFLOP/s) |
+| Single-stream / two-stream / 12-thread read (32 MiB) | 10.7 / 9.6 / 18.5 GB/s |
+| `lasx_softmax_rows` / `lasx_rms_norm` | 4.95–6.72 / 12.16–18.29 GB/s |
+| `lasx_silu` / `lasx_gelu_quick` / `lasx_gelu_erf` | 3.88–9.18 / 4.54–8.61 / 3.59–4.93 GB/s |
+| `lasx_rope` (NeoX, LASX path) | 33.3–71.7 GB/s |
+| `lasx_dot_f16` / `lasx_gemv_f16` | 38.1–68.3 / 4.2–64.7 GB/s |
+| Resident pool vs threads-per-step (reused across 200 steps) | 37.47 ms vs 83.81 ms (**2.24×**; single-threaded 302.69 ms) |
 
 Comparisons against OpenBLAS 0.3.34 (single-threaded) on the same machine, together with the
 per-shape root-cause analysis, are in `docs/dev.md`.
