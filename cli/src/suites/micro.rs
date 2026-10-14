@@ -653,6 +653,36 @@ pub fn dispatch_overhead() {
                 100.0 * (dsl.as_secs_f64() - reused.as_secs_f64()).max(0.0) / dsl.as_secs_f64(),
                 crate::timing::fmt_t(direct)
             );
+            // **派发/屏障开销的判别实验**（§7.11 ⑩ 的调度假设）：**同一份活儿**（192 行 × 3072 列）
+            // 切成 **N 次** `for_each_row_block_mut` 派发 vs **1 次**。`matmul_f32_picked` 是
+            // **逐面板派发**（每面板一次整队 + 屏障），所以"每次派发的固定成本"直接乘上面板数。
+            // 闭包用 `black_box` 保证真跑（别再用"空闭包"——那会被优化掉，我早前踩过）。
+            {
+                let (nr, stride) = (192usize, 3072usize);
+                let mut buf = vec![0f32; nr * stride];
+                let pool12 = WorkerPool::new(12);
+                for &nseg in &[1usize, 4, 8, 16, 24] {
+                    let rows_per = nr / nseg;
+                    let t = timeit(|| {
+                        for s in 0..nseg {
+                            let off = s * rows_per * stride;
+                            let seg = &mut buf[off..off + rows_per * stride];
+                            pool12.for_each_row_block_mut(
+                                rows_per,
+                                4,
+                                [(seg, stride)],
+                                |_start, _rows, [d]| {
+                                    let _ = black_box(d[0]);
+                                },
+                            );
+                        }
+                    });
+                    println!(
+                        "| 派发切分 | **{nseg} 次派发**（每次 {rows_per} 行，12 线程） | {} | — |",
+                        crate::timing::fmt_t(t)
+                    );
+                }
+            }
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
