@@ -683,6 +683,30 @@ pub fn dispatch_overhead() {
                     );
                 }
             }
+            // **打包成本单独量**（公开 API）：m 取 4 ⇒ 计算只有 4×768×3072（可忽略），而 B 仍是
+            // 768×3072 = **9.44 MB** ⇒ `matmul_f32_packed` 的时间 ≈ **打包 B 一遍的成本**。
+            // 这是判断"主线程打包 vs worker 计算的重叠（双缓冲）够不够"的关键输入：
+            // 若打包 ≥ 单面板计算，worker 在面板边界必然空转（调度问题的一种）。
+            {
+                let (mp, kp, np) = (4usize, 768usize, 3072usize);
+                let ap: Vec<f32> = (0..mp * kp).map(|i| (i % 17) as f32 * 0.0625).collect();
+                let bp: Vec<f32> = (0..kp * np).map(|i| (i % 13) as f32 * 0.0625).collect();
+                let stream = timeit(|| {
+                    let v = lasx_rs::api::matmul(mp, kp, np, &ap, &bp).unwrap();
+                    let _ = black_box(v[0]);
+                });
+                let packed = timeit(|| {
+                    let v = lasx_rs::api::matmul_f32_packed(mp, kp, np, &ap, &bp).unwrap();
+                    let _ = black_box(v[0]);
+                });
+                println!(
+                    "| **打包 B 的成本**（m=4、B=9.44 MB） | 自动路径 {} | `f32_packed` {} | 差 **{:.0}%** | — |",
+                    crate::timing::fmt_t(stream),
+                    crate::timing::fmt_t(packed),
+                    100.0 * (packed.as_secs_f64() - stream.as_secs_f64()).abs()
+                        / stream.as_secs_f64()
+                );
+            }
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
