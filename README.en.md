@@ -10,7 +10,7 @@ Four workload classes are covered:
 |---|---|
 | Reductions and dense linear algebra | `dot`, `sum`, `axpy`, `matmul` (f32 / f64) |
 | Quantized dot products | int8, GGUF-style Q4 |
-| int8 inference (N3 batch) | quantization/dequantization producers (`amax`, per-tensor/per-row `quantize_i8`, `dequantize_i8`) plus `gemv_i8`/`matmul_i8`. **Measured**: for batched shapes f32 GEMM is actually faster — decision rule in [docs/ops.md](docs/ops.md) §5.15 |
+| int8 inference (N3 batch) | quantization/dequantization producers (`amax`, per-tensor/per-row `quantize_i8`, `dequantize_i8`) plus `gemv_i8`/`matmul_i8`. **Measured**: for batched shapes f32 GEMM is actually faster — decision rule in [docs/ops.md](docs/ops.md) |
 | Batch physics and attitude/geometry | J2 gravity acceleration, RK4 step, ballistic step, 3-component norm, quaternion rotation/DCM, … |
 | NN operators (N1 batch) | row-wise softmax, RMSNorm, SiLU, GELU (sigmoid approximation and erf form), RoPE, f16-weight GEMV |
 
@@ -28,7 +28,7 @@ Four workload classes are covered:
 - **Matrix multiplication** — three bitwise-identical paths (packed, column-block, streaming) with
   packing and k-chunking; single-threaded f32 512³ reaches 60.9 GFLOP/s, which is **87%** of this
   machine's microkernel ceiling (2.00 FMA/cycle with A-broadcast, i.e. 70.3 GFLOP/s), and 97% at
-  64³ (streaming, no packing). Same-day cross-section against OpenBLAS 0.3.34: `docs/dev.md` §8.5.
+  64³ (streaming, no packing). Same-day cross-section against OpenBLAS 0.3.34: `docs/dev.md`.
 - **Resident worker pool** — amortizes dispatch across calls: 8.15× on a 12-thread n = 2^18 step,
   and in a multi-satellite multi-step propagation it is **2.55×** faster than creating threads per
   step and **8.09×** faster than single-threaded.
@@ -46,7 +46,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 218 lib tests + 5 macro tests + 17 doc tests (2 ignored)
+cargo test --workspace --release         # 219 lib tests + 5 macro tests + 17 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -62,14 +62,14 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 `.cargo/config.toml` sets `rustflags = ["-C", "target-feature=+lasx"]`, so the default artifacts
 assume LASX support. Two measurement rules apply to the benchmarks: **single-threaded kernel tables
 are measured pinned to one core, thread-related tables are measured unpinned**, in two separate
-runs (rationale and impact: `docs/dev.md` §7).
+runs (rationale and impact: `docs/dev.md`).
 
 ## Measured performance
 
 The figures below come from a single continuous collection on one Loongson-3B6000 on
 **2026-09-25** (background load ≈2–3; single-threaded results pinned to one core, thread-related
 results unpinned). The complete tables, the methodology, and the exact traffic conventions are in
-**[docs/dev.md §7](docs/dev.md)**, which is the single authoritative location for performance data;
+**[docs/dev.md](docs/dev.md)**, which is the single authoritative location for performance data;
 comparisons of compile-time constants and thresholds (k-chunking, column-block width, scheduling)
 live in the respective design sections.
 
@@ -77,8 +77,8 @@ live in the respective design sections.
 |---|---|
 | FMA throughput ceiling (16 independent chains, registers only) | **140.2 GFLOP/s** (3.98/cycle); LSX 69.3 (2.00×) |
 | Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s) |
-| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s (same-day, `docs/dev.md` §8.5) |
-| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s (same-day, `docs/dev.md` §8.5) |
+| `lasx_matmul` f32 64³ / 256³ / 512³ | 68.6 / 63.3 / **60.9** GFLOP/s (same-day, `docs/dev.md`) |
+| `lasx_matmul_f64` 128³ / 512³ | 31.3 / 31.4 GFLOP/s (same-day, `docs/dev.md`) |
 | `lasx_matmul` via `parallel`, 12 threads | 5.06× / 5.34× at 128³ / 512³ (323.8 / 302.1 GFLOP/s) |
 | Single-stream / two-stream / 12-thread read (32 MiB) | 12.0 / 10.4 / 22.0 GB/s |
 | `lasx_softmax_rows` / `lasx_rms_norm` | 5.22–7.00 / 12.01–18.38 GB/s |
@@ -88,12 +88,12 @@ live in the respective design sections.
 | Resident pool vs threads-per-step (reused across 200 steps) | 37.36 ms vs 95.37 ms (**2.55×**; single-threaded 302.28 ms) |
 
 Comparisons against OpenBLAS 0.3.34 (single-threaded) on the same machine, together with the
-per-shape root-cause analysis, are in `docs/dev.md` §8.5.
+per-shape root-cause analysis, are in `docs/dev.md`.
 
-> How to read these numbers: the tables in §7 are a cross-section of one continuous collection and
+> How to read these numbers: the tables above are a cross-section of one continuous collection and
 > are **only comparable within that run**. Cross-run comparisons require re-measurement; observed
 > window-to-window variation reaches 40%, so "run before, run after" cannot establish whether a
-> change is faster — use process-level alternation (`docs/dev.md` §6.4).
+> change is faster — use process-level alternation (`docs/dev.md`).
 
 ## Operator overview
 
@@ -109,22 +109,21 @@ per-shape root-cause analysis, are in `docs/dev.md` §8.5.
 | Memory | `lasx_alloc` (32-byte aligned; no matching deallocator is exported) |
 
 C signatures, semantics, numerical contracts, and the "who enforces this" annotation for every
-operator are in `docs/ops.md` (§4 symbol table, §2.x contracts, §5.x usage). The safe Rust API is
-`lasx_rs::api` (32 `pub fn`), alongside `lasx_rs::view`, `lasx_rs::plan`, `lasx_rs::shape`,
-`lasx_rs::pool`, and `lasx_rs::parallel`.
+operator are in `docs/ops.md`. The safe Rust API is `lasx_rs::api` (32 `pub fn`), alongside
+`lasx_rs::view`, `lasx_rs::plan`, `lasx_rs::shape`, `lasx_rs::pool`, and `lasx_rs::parallel`.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 75-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule (§5.15) |
-| [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data (§7)**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
+| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 75-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule |
+| [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 | [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
 
 The division of labour between the two documents is a hard rule: **contracts and usage live in
-`docs/ops.md`, performance data lives in `docs/dev.md` §7, and any given number appears exactly
-once**. Cross-document references are always written as `docs/xxx.md §N`, which makes them
-mechanically checkable.
+`docs/ops.md`, performance data lives in `docs/dev.md`, and any given number appears exactly
+once**. Cross-document references are always written as a document name plus a section number,
+which makes them mechanically checkable.
 
 ## Repository
 
