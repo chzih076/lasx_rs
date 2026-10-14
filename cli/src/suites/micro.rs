@@ -610,6 +610,8 @@ pub fn dispatch_overhead() {
             let mut yb = MatBuf::<f32, { M }, { N }>::new();
             let mut yc = vec![0f32; M * N];
             let pool12 = WorkerPool::new(12);
+            let pool24 = WorkerPool::new(24);
+            let poolg = lasx_rs::pool::global();
             let mut xm = xv2.clone();
             let dsl = timeit(|| {
                 matmul!(yb[M, N] = x[M, K] * w[K, N]);
@@ -619,6 +621,22 @@ pub fn dispatch_overhead() {
                 parallel::matmul_f32(&pool12, M, K, N, &mut xm, &wv, &mut yc).unwrap();
                 let _ = black_box(yc[0]);
             });
+            // **池线程数三臂对照**：全局池（本机 24 线程，DSL 走的就是它）vs 显式 12 vs 显式 24。
+            let t24 = timeit(|| {
+                parallel::matmul_f32(&pool24, M, K, N, &mut xm, &wv, &mut yc).unwrap();
+                let _ = black_box(yc[0]);
+            });
+            let tg = timeit(|| {
+                parallel::matmul_f32(poolg, M, K, N, &mut xm, &wv, &mut yc).unwrap();
+                let _ = black_box(yc[0]);
+            });
+            println!(
+                "| 池线程数 @ {M}³ | 12 线程 {} | 24 线程 {} | **全局（{} 线程）{}** | — |",
+                crate::timing::fmt_t(direct),
+                crate::timing::fmt_t(t24),
+                poolg.threads(),
+                crate::timing::fmt_t(tg)
+            );
             // 位精确对拍：两条路必须逐位一致（否则它们不是同一个内核）
             let mut bits_ok = true;
             for (i, v) in yc.iter().enumerate() {
