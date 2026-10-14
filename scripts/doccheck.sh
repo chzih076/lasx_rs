@@ -127,6 +127,22 @@ if [ "$actual" -gt 0 ]; then
              docs/*.md README.md README.en.md 2>/dev/null)
 fi
 
+# ---- ⑤ 引用噪音：同一文档里同一 `§X` 被引用 >12 次 ----
+# 本次系统性整理的目标是"别到处引用"（用户要求）。实测：同文档内同一目标的重复指向会滚到
+# 20+ 次（`docs/dev.md §7.9` 曾 **24** 次、`docs/ops.md §7.9` 17 次），修掉后再加门禁——
+# 本仓库的既有教训是"**没有门禁的规范会复发**"（`doccheck` 抓过 4 次结构性破坏）。
+# 阈值 12：整理后当前最高为 `docs/dev.md §6.3` 的 10 次，留 2 次余量。
+for f in docs/dev.md docs/ops.md docs/platform.md README.md README.en.md AGENTS.md; do
+  [ -f "$f" ] || continue
+  while IFS= read -r hit; do
+    n="${hit%% *}"
+    ref="${hit##* }"
+    if [ "${n:-0}" -gt 12 ] 2>/dev/null; then
+      note "NOISE $f: $ref 被引用 $n 次（>12）"
+    fi
+  done < <(grep -oE '§[0-9]+(\.[0-9]+)*' "$f" | sort | uniq -c | sed 's/^ *//')
+done
+
 if [ "$findings" -eq 0 ]; then
   echo "doccheck: OK（引用 / 表格列数 / 符号数 一致）"
 else
