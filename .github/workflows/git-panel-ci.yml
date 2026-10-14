@@ -23,3 +23,8 @@ jobs:
         run: cargo +nightly test --workspace --release
       - name: Clippy (zero warnings guard)
         run: cargo +nightly clippy --workspace --all-targets -- -D warnings
+      # **rustdoc 零告警**（2026-10-14 加）：README 记录了这条命令，而它此前**不在 CI 里** ⇒
+      # 一次注释重写把说明改成 intra-doc link `` [`crate::ops`] ``（私有项）后，`cargo doc -D warnings`
+      # 变红而 build/test/clippy 全绿——这类回归只能由 rustdoc 自己抓到（实测：全工作区几秒）。
+      - name: Rustdoc (zero warnings guard)
+        run: RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --workspace
