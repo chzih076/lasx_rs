@@ -343,18 +343,68 @@ impl WorkerPool {
         }
     }
 
-    /// 按 `available_parallelism` 建池。
+    /// 按**物理核数**建池（读不到 sysfs 就退回 `available_parallelism`）。
     ///
-    /// 注意它给的是**逻辑**核数（本机 24 = 12 物理核 ×2 SMT）；超线程对这类带宽受限的
-    /// 批量内核没有额外收益，也不会更差（`docs/dev.md` §3.1 与 §7.7 的线程扫描）。
+    /// 为什么不是 `available_parallelism()`（它给**逻辑**核数，本机 24 = 12 物理核 ×2 SMT）：
+    /// 2026-10-04 三臂实测（`256×256×256`，load 3.48–3.52）——**12 线程 101.7 / 100.8 µs、
+    /// 24 线程 163.9 / 135.1 µs、全局池（24 线程）144.1 / 186.6 µs** ⇒ 超线程在这类批量内核上
+    /// **更差**（SMT 兄弟互抢 L1/L2）。这与本函数旧注释"没有额外收益，**也不会更差**"相反——
+    /// 旧说法来自 §3.1/§7.7 的宽松扫描，已被本次更严格的三臂对照推翻。
+    /// **影响面**：`global()` = 本函数 ⇒ 所有走自动并行路径的调用方（`api::matmul`、`api::gemv`、
+    /// 各 `_batch`、以及公式 DSL `matmul!`）都受益；后者原先因此有 **45%** 的缺口。
+    ///
+    /// 想固定线程数仍用 [`WorkerPool::new`] / [`init_global`]（本函数只改**默认**）。
     pub fn auto() -> Self {
-        Self::new(
+        Self::new(physical_cores().unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|v| v.get())
-                .unwrap_or(1),
-        )
+                .unwrap_or(1)
+        }))
     }
+}
 
+/// Linux sysfs 里数**物理核**：同一核的 SMT 兄弟共享 `thread_siblings_list`，
+/// 取每份清单的第一个线程号作为"核"的标识、去重计数。
+///
+/// 读不到/解析不出就返回 `None`（调用方退回 `available_parallelism`）——本项目只支持
+/// loongarch64/Linux，但仍保留回退，免得在没有 sysfs 的环境里退化成单线程。
+fn physical_cores() -> Option<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..1024u32 {
+        let path = format!("/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list");
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // 形如 `0,12` / `0-1` / `0,12,24,36`：取第一个线程号当核标识
+        if let Some(first) = s.trim().split([',', '-']).next()
+            && !first.trim().is_empty()
+        {
+            seen.insert(first.trim().to_string());
+        }
+    }
+    (!seen.is_empty()).then_some(seen.len())
+}
+
+#[cfg(test)]
+mod physical_cores_tests {
+    use super::physical_cores;
+
+    /// 本机（Loongson-3B6000）是 12 物理核 ×2 SMT ⇒ sysfs 检测应给 12，而
+    /// `available_parallelism()` 给 24。**两者必须在合理范围内**，且检测值 ≤ 逻辑核数。
+    #[test]
+    fn physical_cores_is_plausible_and_within_logical() {
+        let logical = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        if let Some(phys) = physical_cores() {
+            assert!(phys >= 1, "物理核数至少为 1");
+            assert!(phys <= logical, "物理核 {phys} 不应超过逻辑核 {logical}");
+        }
+        // 读不到 sysfs 时 `physical_cores()` 为 None ⇒ 上一条不执行（回退路径由 `auto()` 覆盖）
+    }
+}
+
+impl WorkerPool {
     /// 池内线程数。
     pub fn threads(&self) -> usize {
         self.threads
