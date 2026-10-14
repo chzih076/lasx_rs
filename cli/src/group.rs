@@ -55,6 +55,8 @@ pub enum Group {
     Align,
     /// 每次调用的分派/探测开销。
     DispatchOverhead,
+    /// 指令级微基准：LSX/LASX 的延迟与吞吐、`SimdPath::detect()` 的每调用成本、极小 n 的 `dot` 四路对照。
+    Lat,
     /// 池在核数附近的表现（记录 `loadavg` 的对照测量，见 `docs/dev.md` §7.9）。
     PoolScaling,
     /// 8 线程下降的判别实验（换工作集 / 换调度策略）。
@@ -93,6 +95,7 @@ impl Group {
         Group::ThreadScaling,
         Group::Align,
         Group::DispatchOverhead,
+        Group::Lat,
         Group::PoolScaling,
         Group::PoolAttribution,
         Group::Scenario,
@@ -128,6 +131,7 @@ impl Group {
             Group::ThreadScaling => "mt",
             Group::Align => "align",
             Group::DispatchOverhead => "dispatch",
+            Group::Lat => "lat",
             Group::PoolScaling => "pool_scaling",
             Group::PoolAttribution => "pool_attribution",
             Group::Scenario => "scenario",
@@ -142,6 +146,7 @@ impl Group {
                 | Group::ThreadScaling
                 | Group::Align
                 | Group::DispatchOverhead
+                | Group::Lat
                 | Group::Scenario
                 | Group::Plan
         )
