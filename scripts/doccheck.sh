@@ -112,6 +112,19 @@ if [ "$actual" -gt 0 ]; then
   done < <(grep -HoE '[0-9]+ 个导出符号' docs/*.md README.md README.en.md 2>/dev/null)
 fi
 
+# ---- ④ 符号数的**其它写法** ----
+# 实例：`README.md` 的文档索引曾写"**75 个符号总表**"，而正文/`ops.md` 都是 81 —— 它**逃过 ③**
+# （③ 只匹配"个导出符号"）。这里查"**总量口径**"的别名写法：数字后紧跟 总表/一览/汇总/总数/共。
+# **不**用"个符号"泛匹配：文档里合法存在"N3 的 7 个符号"这类**子集**描述，泛匹配会误报
+# （实测：加宽后立刻误报 `docs/ops.md` 的"N3 的 7 个符号"一条）。
+if [ "$actual" -gt 0 ]; then
+  while IFS= read -r hit; do
+    f="${hit%%:*}"
+    n=$(printf '%s' "$hit" | sed 's/^[^:]*://; s/ 个.*//')
+    [ "$n" = "$actual" ] || note "COUNT $f: 文档写 '$n 个符号总表/汇总'，源码实际 $actual"
+  done < <(grep -HoE '[0-9]+ 个符号(总表|一览|汇总|总数|共)' docs/*.md README.md README.en.md 2>/dev/null)
+fi
+
 if [ "$findings" -eq 0 ]; then
   echo "doccheck: OK（引用 / 表格列数 / 符号数 一致）"
 else
