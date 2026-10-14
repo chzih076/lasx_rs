@@ -147,7 +147,7 @@ use crate::pool::WorkerPool;
 /// 打包/分块方案：`K/N` 是 const，所以这些全在 **const 求值**里定死。
 ///
 /// 运行期只剩"常数驱动的循环"，没有阈值分支、没有形状判断。常量来源与算子层一致
-/// （L2 预算 2 MiB、L1 预算 48 KiB、条带 32 列 f32；见 `docs/dev.md` §8）。
+/// （L2 预算 2 MiB、L1 预算 48 KiB、条带 32 列 f32）。
 pub struct Layout<const K: usize, const N: usize>;
 
 impl<const K: usize, const N: usize> Layout<K, N> {
@@ -356,7 +356,7 @@ impl<T: Copy + Default, const C: usize> MatBufDyn<T, C> {
 
 /// `Auto` 决定并行前要求的最小工作量（**乘加次数** = `m × k × n`）。
 ///
-/// 实测（`K=N=256`、12 线程、与单线程逐位对照，见 `docs/dev.md` §19.2）：
+/// 实测（`K=N=256`、12 线程、与单线程逐位对照）：
 ///
 /// | 形状 | 工作量 | 池/单线程 |
 /// |---|---|---|
@@ -405,7 +405,7 @@ pub fn auto_threads(rows: usize, k: usize, n: usize, machine: usize) -> usize {
 /// |---|---|
 /// | [`Auto`] | 按 [`auto_threads`] 的实测判据（默认） |
 /// | [`Single`] | 强制单线程：**完全不碰池**（不会因为用了一次 `Single` 就建出线程池） |
-/// | [`Exact<N>`] | 强制 `N` 个线程，**不设工作量门限**——这是显式选择，开销是真实开销（小形状上它可能比单线程慢几倍，见 `docs/dev.md` §19.2） |
+/// | [`Exact<N>`] | 强制 `N` 个线程，**不设工作量门限**——这是显式选择，开销是真实开销（小形状上它可能比单线程慢几倍） |
 ///
 /// 实现方式是"切几个行块"，而不是"池开几个线程"：块数 = 想要的线程数，池用自己
 /// 那批 worker 去领这些块，多出来的 worker 自然没活干。
@@ -452,7 +452,7 @@ impl Policy for Single {
     }
 }
 
-/// 强制 `N` 个线程（提示：小形状上派活比干活贵，见 `docs/dev.md` §19.2）。
+/// 强制 `N` 个线程（提示：小形状上派活比干活贵）。
 pub struct Exact<const N: usize>;
 
 impl<const N: usize> Policy for Exact<N> {
@@ -471,8 +471,8 @@ impl<const N: usize> Policy for Exact<N> {
 /// # 并行
 ///
 /// 策略由类型参数 `P` 决定（见 [`Policy`]）。并行走的是"**同一份打包面板 + 按行切**"：
-/// 面板在构造时打包一次、之后所有线程共享只读，**不重复打包**（这正是
-/// `docs/dev.md` §13.7 那个多核病理的正解）。想用自己管的池时走 `apply_pooled`。
+/// 面板在构造时打包一次、之后所有线程共享只读，**不重复打包**——多核争用那个病理的正解
+/// （否则每个线程各打包一整份 B，内存流量按线程数翻倍）。想用自己管的池时走 `apply_pooled`。
 pub struct Prepared<P: Policy, T: PackedKernel, const K: usize, const N: usize> {
     plan: MatmulPlan<T>,
     policy: std::marker::PhantomData<P>,
@@ -772,7 +772,7 @@ mod tests {
     }
 
     /// `K` 对不上是**编译期**错误——这条测试是"能编译"本身，见下方 trybuild 式的注释。
-    /// （真正的反例在 `docs/dev.md` §19 里留了报错样本。）
+    /// （真正的反例是一段人工核对的编译报错输出：`K` 写错时编译器直接拒绝编译。）
     #[test]
     fn test_static_shapes_are_checked_by_types() {
         let a = f32s(6 * 4, 1);
@@ -925,7 +925,7 @@ mod tests {
     /// 公式 DSL 的**正面路径**：宏生成的代码进 CI 回归（静态 + DYN + 无输出，逐位对照）。
     ///
     /// 负面路径（诊断）没法在这里测：`trybuild` 要引依赖，与"零第三方依赖"冲突。
-    /// 所以负面路径用**人工核对的编译输出**守着，transcript 记在 `docs/dev.md §19.8`。
+    /// 所以负面路径用**人工核对的编译输出**守着。
     #[test]
     fn test_formula_dsl_matches_api_bit_for_bit() {
         const M: usize = 32;
