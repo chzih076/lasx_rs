@@ -26,9 +26,23 @@ const SMALL_N: usize = 24;
 #[inline]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     if a.len() < SMALL_N {
+        // **累加次序与原 `zip` 版逐字一致**（严格顺序的单累加器）：4 路展开只为消除边界检查、
+        // 让 LLVM 展开取指/取数，**不改变任何一次加法的顺序** ⇒ 结果与原版**逐位相同**。
+        // 为什么改：原 `zip` 版在 n=8 时 **11 ns**，而 bench 的标量参考（普通索引循环）只要
+        // **6 ns**——即"我们的回退比 LLVM 自动向量化的标量循环慢近一倍"，实测比值 0.55×。
+        let n = a.len().min(b.len());
         let mut acc = 0f32;
-        for (&x, &y) in a.iter().zip(b) {
-            acc += x * y;
+        let mut i = 0;
+        while i + 4 <= n {
+            acc += a[i] * b[i];
+            acc += a[i + 1] * b[i + 1];
+            acc += a[i + 2] * b[i + 2];
+            acc += a[i + 3] * b[i + 3];
+            i += 4;
+        }
+        while i < n {
+            acc += a[i] * b[i];
+            i += 1;
         }
         return acc;
     }
