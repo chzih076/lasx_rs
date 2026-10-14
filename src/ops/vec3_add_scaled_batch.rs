@@ -47,6 +47,36 @@ fn vec3_add_scaled_batch_lasx(
     let n = ax.len();
     let vs = lasx::splat_f64(s);
     let mut i = 0;
+    // **2 路展开（8 样本/迭代）**：与 `axpy` 同一手法——逐元素运算**没有归约** ⇒ 展开**不改变任何
+    // 数值**（每样本仍是同一条 `lasxvfmadd_d`），按构造逐位安全；只为摊薄循环开销、提高访存并行度。
+    // 只做 2 路：本核每样本读 6 个 f64、写 3 个，4 路展开要 24 个向量寄存器，压力过大。
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` ⇒ 两组访存分别落在 [i,i+4)、[i+4,i+8)，都在 `n` 之内；
+        // 九个切片长度一致（`api` 入口已校验），输出是新分配、与输入不重叠。
+        unsafe {
+            let p = i;
+            let q = i + 4;
+            let vax0 = lasx::load_f64x4(ax.as_ptr().add(p));
+            let vay0 = lasx::load_f64x4(ay.as_ptr().add(p));
+            let vaz0 = lasx::load_f64x4(az.as_ptr().add(p));
+            let vbx0 = lasx::load_f64x4(bx.as_ptr().add(p));
+            let vby0 = lasx::load_f64x4(by.as_ptr().add(p));
+            let vbz0 = lasx::load_f64x4(bz.as_ptr().add(p));
+            let vax1 = lasx::load_f64x4(ax.as_ptr().add(q));
+            let vay1 = lasx::load_f64x4(ay.as_ptr().add(q));
+            let vaz1 = lasx::load_f64x4(az.as_ptr().add(q));
+            let vbx1 = lasx::load_f64x4(bx.as_ptr().add(q));
+            let vby1 = lasx::load_f64x4(by.as_ptr().add(q));
+            let vbz1 = lasx::load_f64x4(bz.as_ptr().add(q));
+            lasx::store_f64x4(ox.as_mut_ptr().add(p), lasx_xvfmadd_d(vs, vbx0, vax0));
+            lasx::store_f64x4(oy.as_mut_ptr().add(p), lasx_xvfmadd_d(vs, vby0, vay0));
+            lasx::store_f64x4(oz.as_mut_ptr().add(p), lasx_xvfmadd_d(vs, vbz0, vaz0));
+            lasx::store_f64x4(ox.as_mut_ptr().add(q), lasx_xvfmadd_d(vs, vbx1, vax1));
+            lasx::store_f64x4(oy.as_mut_ptr().add(q), lasx_xvfmadd_d(vs, vby1, vay1));
+            lasx::store_f64x4(oz.as_mut_ptr().add(q), lasx_xvfmadd_d(vs, vbz1, vaz1));
+        }
+        i += 8;
+    }
     while i + 4 <= n {
         let vax = unsafe { lasx::load_f64x4(ax.as_ptr().add(i)) };
         let vay = unsafe { lasx::load_f64x4(ay.as_ptr().add(i)) };
