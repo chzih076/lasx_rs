@@ -111,7 +111,9 @@ static int G_split_tight;
  * （静态等分时先做完的工人只能干等最慢的那个）。**只改 driver，不动库**。 */
 static int G_split_tight_dyn;
 static atomic_int G_tight_next; /* 动态认领：下一个待领的行块号 */
-static int G_tight_blk = 8;     /* 动态认领的块大小（行） */
+static int G_tight_blk = 12;    /* 动态认领的块大小（行）；`--dyn-blk=N` 可扫（§7.10 ⑩ 扫描的胜者） */
+static int G_spin_limit = 200;  /* 等握手时"先转多少圈再让出"；`--spin=N` 可扫（§7.10 ⑩ 混合等待胜者） */
+static int G_wait_yield;        /* `--wait=yield`：完全不让转，每圈直接 sched_yield */
 /* 本装置是否真的起了 worker（只有起了才允许去等屏障——`omp` 档不起 worker，
  * 早期版本让 JOIN_WORKERS 去等**未初始化**的 `pthread_barrier_t`，整进程挂死过一次）。 */
 static int G_workers_created;
@@ -173,7 +175,9 @@ static void run_lasx(void *c) {
         }
         int spins = 0;
         while (atomic_load_explicit(&G_tight_done, memory_order_acquire) < G_nt) {
-            if (++spins > 4000) {
+            /* **混合等待**（实验 B 的扫描维度）：先转 `G_spin_limit` 圈再让出；
+             * `--wait=yield` 时每圈都让出（纯让出，不烧 CPU）。 */
+            if (G_wait_yield || ++spins > G_spin_limit) {
                 sched_yield();
                 spins = 0;
             }
@@ -256,7 +260,7 @@ static void *worker_fn(void *arg) {
         for (;;) {
             int spins = 0;
             while (atomic_load_explicit(&G_tight_go, memory_order_acquire) == seen) {
-                if (++spins > 4000) { /* 长等时让出 CPU，别把机器烧了 */
+                if (G_wait_yield || ++spins > G_spin_limit) { /* 长等时让出 CPU，别把机器烧了 */
                     sched_yield();
                     spins = 0;
                 }
@@ -562,6 +566,20 @@ int main(int argc, char **argv) {
                         s);
                 return 2;
             }
+        } else if (!strncmp(a, "--dyn-blk=", 10)) {
+            /* 实验 B 扫描：动态认领的块大小（行） */
+            const int v = atoi(a + 10);
+            if (v > 0) {
+                G_tight_blk = v;
+            }
+        } else if (!strncmp(a, "--spin=", 7)) {
+            /* 实验 B 扫描：混合等待"先转多少圈再让出" */
+            const int v = atoi(a + 7);
+            if (v >= 0) {
+                G_spin_limit = v;
+            }
+        } else if (!strcmp(a, "--wait=yield")) {
+            G_wait_yield = 1;
         } else if (!strncmp(a, "--iters=", 8)) {
             iters = atoi(a + 8);
         } else if (!strncmp(a, "--seed=", 7)) {

@@ -49,6 +49,7 @@ cases=(
   "m192x768x3072-f32-cols|f32|192|768|3072|12|cols|nopin"
   "m192x768x3072-f32-plan|f32|192|768|3072|12|plan|nopin"
   "m192x768x3072-f32-tight|f32|192|768|3072|12|plan-tight|nopin"
+  "m192x768x3072-f32-tight-dyn|f32|192|768|3072|12|plan-tight-dyn|nopin"
   "m192x768x3072-f32-omp|f32|192|768|3072|12|omp|nopin"
   "m192x768x3072-f32-threaded|f32|192|768|3072|12|threaded|nopin"
   "w256x64x4096-f32-1t|f32|256|64|4096|1|rows|pin"
