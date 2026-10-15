@@ -61,6 +61,14 @@ jobs:
       # 规则与自查清单见 `docs/c-abi.md` §9.1。退出码 2（环境/用法问题）按失败处理。
       - name: C ABI naming convention
         run: bash scripts/namecheck.sh
+      # **剖析装置不许腐烂**（2026-10-15 加）：`scripts/profile_lasx.sh` 是 perf 剖析的唯一入口，
+      # 但它只能在**真机 + 用户态权限**下跑（本机 `perf_event_paranoid=2`；uncore/内核帧还要更低）。
+      # CI **不跑 perf**（runner 上多半没权限，计数也不可当正式数），只做两件便宜事：
+      # **语法可解析** + **用法自述存在** —— 避免"到真正要剖析时才发现脚本被改坏"。
+      - name: Profiling harness sanity (syntax + usage)
+        run: |
+          bash -n scripts/profile_lasx.sh
+          grep -q '用法' scripts/profile_lasx.sh
       # **跨库对照装置必须能编译**（2026-10-15 加）：`scripts/bench_openblas.c` 是对外对照的**唯一
       # 可复现装置**（旧 §7.10 的数字曾因"驱动不在仓库里"而无法复现、只能标历史）。CI **不跑计时**
       # （计时需要安静窗口，见 `docs/dev.md` §6.4 的 A/B/C 分级），只保证**装置不腐烂**：
