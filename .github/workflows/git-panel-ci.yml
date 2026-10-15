@@ -101,3 +101,8 @@ jobs:
         run: |
           make -C examples/c FALLBACK=1
           ./examples/c/quickstart
+          # 多核用法两种：调用方线程 + 计划复用（`plan`）、便利层（`run_threaded`）。
+          # 两者都**自验位精确**并**打印实际线程数** —— 后者的意义是防"静默退化成串行"
+          # （`rows` 那个 1.08× 扩展比就是静默退化的典型）。
+          ./examples/c/matmul_mt_caller
+          ./examples/c/matmul_mt_convenience
