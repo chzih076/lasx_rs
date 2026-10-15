@@ -22,6 +22,7 @@
 pub mod axpy;
 pub mod ballistic_step;
 pub mod batch_distance2d;
+pub mod cmatmul;
 pub mod cross3_batch;
 pub mod dot;
 pub mod dot_f16;

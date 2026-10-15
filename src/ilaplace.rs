@@ -582,3 +582,89 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use std::time::Instant;
+
+    /// **逆变换性能（默认 `#[ignore]`）**：**指数和**（DSL 两条实矩阵乘）与**含 `F` 求值**两种口径。
+    ///
+    /// 跑法：`cargo test --release -p lasx_rs --lib diag_ilaplace_perf -- --ignored --nocapture`
+    #[ignore = "逆变换性能：指数和 vs 含 F 求值"]
+    #[test]
+    fn diag_ilaplace_perf() {
+        const J: usize = 256;
+        const N: usize = 512;
+        const NB: usize = 8;
+        let ts: Vec<f64> = (0..J).map(|j| 0.01 + j as f64 * 0.015).collect();
+        let p = DubnerAbate {
+            t_end: 12.0,
+            a: 1.0,
+            n: N,
+            f0: 0.0,
+        };
+        let fre: Vec<f64> = (0..N * NB)
+            .map(|i| ((i % 17) as f64) * 0.125 - 1.0)
+            .collect();
+        let fim: Vec<f64> = (0..N * NB)
+            .map(|i| ((i % 13) as f64) * 0.0625 - 0.5)
+            .collect();
+        let fs: Vec<OneOverSPlus> = (0..NB)
+            .map(|b| OneOverSPlus {
+                theta: 1.0 + b as f64,
+            })
+            .collect();
+        let cx_flop = 8.0 * J as f64 * N as f64 * NB as f64; // 两条实矩阵乘 = 2·(2JNB) = 8JNB？见下
+
+        // 只算指数和（不含 F）
+        let t0 = Instant::now();
+        let mut iters = 0;
+        let mut mx = 0.0f64;
+        while t0.elapsed().as_secs_f64() < 0.05 {
+            let t1 = Instant::now();
+            let _ = exponential_sum_f64::<J, N, NB>(p, &ts, &fre, &fim);
+            let d = t1.elapsed().as_secs_f64();
+            if d > mx {
+                mx = d;
+            }
+            iters += 1;
+        }
+        let sum_ms = t0.elapsed().as_secs_f64() / iters.max(1) as f64;
+        // 含 F 求值（NB 个 OneOverSPlus）
+        let t0 = Instant::now();
+        let mut iters2 = 0;
+        let mut mx2 = 0.0f64;
+        while t0.elapsed().as_secs_f64() < 0.05 {
+            let t1 = Instant::now();
+            let _ = invert_batch_f64::<J, N, NB, _>(p, &ts, &fs);
+            let d = t1.elapsed().as_secs_f64();
+            if d > mx2 {
+                mx2 = d;
+            }
+            iters2 += 1;
+        }
+        let full_ms = t0.elapsed().as_secs_f64() / iters2.max(1) as f64;
+        // 两条实矩阵乘的实数 FLOP = 2 × (2·J·N·NB) = 4·J·N·NB；复数乘加按 8 FLOP 计 ⇒ 8·J·N·NB
+        println!(
+            "形状 J×N×NB = {J}×{N}×{NB}；单次复数乘加按 8 FLOP 计 ⇒ 总 {:.3} GFLOP",
+            cx_flop / 1e9
+        );
+        println!(
+            "① 只指数和（**不含 F**）：{:.4} ms  {:.2} 复数 GFLOP/s  iters={iters} ms_max={:.3} ms",
+            sum_ms * 1e3,
+            cx_flop / sum_ms / 1e9,
+            mx * 1e3
+        );
+        println!(
+            "② 含 F 求值（NB 个 `1/(s+θ)`）：{:.4} ms  {:.2} 复数 GFLOP/s  iters={iters2} ms_max={:.3} ms",
+            full_ms * 1e3,
+            cx_flop / full_ms / 1e9,
+            mx2 * 1e3
+        );
+        println!(
+            "⇒ F 求值占比 ≈ {:.1}%（`F` 贵时主导成本在 `F`，不在矩阵乘）",
+            (full_ms - sum_ms) / full_ms * 100.0
+        );
+    }
+}

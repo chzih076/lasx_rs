@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**260 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**267 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,6 +342,13 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
+- **复数矩阵乘 5 个 + 2 个诊断**（`src/ops/cmatmul.rs`，2026-10-16 加，A 阶）：
+  `direct_matches_four_real_matmul_bitwise`（**直算 vs 4 条实矩阵乘的组合逐位一致**——位精确契约）、
+  `routes_agree_within_tolerance`（两路线互比 + 与逐元素参考，f32/f64 各 8 个形状含 `k=1`/`n=1`/
+  非 4 倍 rows/非 32 倍 n）、`complex_identities`（`A·I=A` 逐位、`i·i=−1`）、`zero_dim_shapes`、
+  `large_shape_and_buffer_reuse`（`192×768×3072` 复用输出缓冲）；诊断（`#[ignore]`）：
+  `ops::cmatmul::perf::diag_cmatmul_routes`（直算 vs Karatsuba vs 实矩阵乘基准）与
+  `ilaplace::perf::diag_ilaplace_perf`（指数和 vs 含 `F`）。表示/路线/契约差异见 `docs/ops.md` §9.06。
 - 池契约 2 个：`shape::pool_init_tests::small_shapes_do_not_construct_a_pool`（**CI 跑**，线程本地
   建池计数 + "计数器活着"的正对照，见 ⑫）与 `pool::global_pool_contract_tests::init_global_first_use_then_frozen`
   （`#[ignore]`，需 `--test-threads=1` 串行跑：首次成功 / 之后 `false` / 线程数 = 物理核）。
@@ -379,7 +386,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 260 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 267 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
