@@ -101,6 +101,21 @@ lasx_rs/
 
 注释与提交信息用中文；提交信息写清"动机 + 实测数据 + 被否掉的选项"。
 
+**已裁决（2026-10-15）**：下面 5 条曾按"一词一义"提出来，逐条裁决为**保留**——规范是给人读的，
+不是给整齐用的。
+
+- **① `batch_distance2d` 保留**：C ABI **只追加不改**（改名即破坏兼容），且 `docs/c-abi.md §9.1`
+  已定 `lasx_<domain>_<op>` 的读法（`batch` 在前 = domain 为 `batch`、op 为 `distance2d`）⇒ 合规；
+  Rust `api::batch_distance2d` 与 FFI 同名，C 用户按名映射不会错位，这比"后缀整齐"值钱。
+- **② `ballistic_step` 保留**：同上（`lasx_ballistic_step` 不能改名）。批量语义由模块头与文档说明，
+  不靠名字后缀。
+- **③ 按行三拼法保留**（`per_token` / `per_channel` / `_rows` 与 `per_row` 并存）：这是**有意别名**
+  ——同一个内核按调用方的词汇给不同语义名（`api.rs` 已写明），别名比强行统一更贴近使用者。
+- **④ 一 op 三名保留**（`Mat::mul*` / `Prepared::apply*` / `MatmulPlan::run*`）：这是**分层**，
+  不是命名不一致——`shape` 的便捷层、冻结的预打包层、`plan` 的按行执行层，各司其职。
+- **⑤ 显式 `_f32` 保留（允许例外）**：规则是"f32 默认省略后缀"（`dot` / `sum` / `axpy`），但
+  **与 `matmul_f64` / `matmul_i8` 这类兄弟并列出现**时允许写成 `matmul_f32`，以便与兄弟对读。
+
 **零依赖**：`Cargo.toml` 没有任何第三方依赖；稳定工具链不可用（需要 `#![feature(stdarch_loongarch)]`）。
 
 ---
