@@ -324,6 +324,49 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
   约 20–25 s；**CI 从不跑基准**（基准受负载影响，不适合当门禁）。
 - 提交纪律：中文提交信息；一次改动一个主题；**必须写明受控 A/B 的读数与口径**；被否掉的方案也要记（§10）。
 
+### 5.1 平台绑定与防呆（2026-10-15）
+
+**这不是提升可移植性，而是让错误显式**：本库是 LoongArch LASX/LSX 的**指令集绑定**
+（`src/` 里大量文件直接用 intrinsic/内联汇编，**0 处标量兜底**），所以"用错平台"必须在
+**编译期/安装期**就带着一句人话失败，而不是退化成运行期静默错结果、或埋在几十条
+"目标不支持该指令"里。
+
+**五道防线**（按触发顺序）：
+
+| # | 位置 | 挡什么 / 怎么挡 |
+|---|---|---|
+| 1 | `build.rs` | 判**目标架构**（`CARGO_CFG_TARGET_ARCH`）：非 `loongarch64` ⇒ 打印人话并 `exit(1)`。判的是**目标**，所以 `cargo check --target loongarch64` 的交叉检查照常通过（`.github/workflows/ci.yml` 的 `cross-check` job 正是这条路径） |
+| 2 | `src/lib.rs`、`cli/src/main.rs` | `#[cfg(not(target_arch = "loongarch64"))] compile_error!(…)`：给**绕过构建脚本**的场景兜底（vendored 源码、直接调 rustc） |
+| 3 | `include/lasx_rs.h` 顶部 | `#error` + 逃生阀 `LASX_RS_ALLOW_FOREIGN_ARCH`（**只关掉编译期检查，不会让运行时可用**） |
+| 4 | `scripts/install.sh` | `LC_ALL=C readelf -h` 核对 `Machine:` 是 LoongArch，不符 ⇒ **拒绝安装**；`readelf` 缺失 ⇒ 降级为告警 |
+| 5 | `examples/c/Makefile` | `uname -m` 非 `loongarch64` ⇒ `$(error …)`；`FOREIGN=1` 显式覆盖（并定义头里的逃生阀） |
+
+**为什么以构建脚本为主、`compile_error!` 只兜底**：`compile_error!` **不会中止**这次编译——
+rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时，它先冒出 **35 条**内在函数/
+目标特性错误，那句人话被埋在第 361 行；构建脚本先退出后，整个输出只剩 **1 条**。这条经验对
+任何"想用一个 `compile_error!` 表达平台要求"的 crate 都成立。
+
+**第 4 道防线为什么必须 `LC_ALL=C`**：`readelf` 的**字段名**会被本地化（本机是"系统架构:"
+而不是"Machine:"），不钉 locale 的 `grep 'Machine:'` 会**永远匹配不到**——也就是"校验看起来
+在跑、其实每次都通过"。这是防呆本身最容易出的错：**校验不能是假的**。
+
+**必须区分的两件事**（检测手段与失败时机都不同，别混写）：
+
+| | **错架构**（x86 / arm …） | **LSX-only 机型（无 LASX）**，如 2K3000 / 3B6000M |
+|---|---|---|
+| 构建 / 安装 | 被上面 5 道防线挡住 ⇒ **根本出不来** | 正常构建、正常安装、正常运行 |
+| 危险 | 产物完全不可用（不是"慢一点"） | 仅调 `[LASX-only]` 符号时 SIGILL |
+| 手段 / 时机 | 编译期 + 安装期（构建脚本 / `compile_error!` / `#error` / `readelf`） | **运行时**：`lasx_has_lasx()`（C）/ `SimdPath::detect()`（Rust）先问再调 |
+
+一句话：**"错架构"是编译/安装期问题（防呆）；"无 LASX"是运行时问题（先问再调）**。
+C 侧的能力语义与 `[LASX-only]` 清单见 `docs/c-abi.md` §2.6/§6 与 `docs/ops.md` §3.2/§3.3。
+
+**实测（2026-10-15，本机 Loongson-3B6000）**：本机构建不受影响；C 头 `#error` 用
+`#undef __loongarch__` 的 `/tmp` 探针复现（加逃生阀则通过）；用 `/tmp` 探针造
+`e_machine=62`（x86-64）的最小 ELF 冒充产物 ⇒ `install.sh` 拒绝安装（exit 1）；真产物照常装上；
+`cargo +nightly check -p lasx_rs -Zbuild-std --target x86_64-unknown-linux-gnu` 的错误数
+**36 → 1**；`nm -D` 仍 87、`scripts/check_header.c` 仍 0 项失败、`examples/c` 两条路径都跑通。
+
 ---
 
 ## 6. 性能方法学与机器上限

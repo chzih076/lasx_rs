@@ -57,6 +57,19 @@ PKG_CONFIG_PATH=/tmp/stage/lib/pkgconfig pkg-config --cflags --libs lasx_rs
 失败即退出，且**校验都在写入之前**（不留半套安装）；`readelf` 可用时还会核对产物 SONAME，
 不对就拒绝安装。
 
+**错架构会被挡住**（本库只在 LoongArch64 上构建/安装，见 §2.6）：在非 LoongArch64 上
+`cargo build` 得到的是一条人话，而**不是**几十条"目标不支持该指令"：
+
+```text
+error: failed to run custom build command for `lasx_rs v0.1.0`
+  --- stderr
+  lasx_rs 是 LoongArch LASX/LSX 指令集绑定实现（手写内联汇编/内在函数），不是可移植标量库。
+  当前构建目标是 `x86_64`，不是 LoongArch64，已停止。请在本机 LoongArch64 上构建，或改用其它后端。
+```
+
+`install.sh` 另用 `readelf -h` 核对**产物架构**：把非 LoongArch 的 `.so` 装进 prefix 会被
+**拒绝安装**（同样打印人话）。
+
 ### 2.2 四种链接方式
 
 ```bash
@@ -142,6 +155,40 @@ final free_ = lib.lookupFunction<Void Function(Pointer<Float> p, Int32 n),
 
 if (hasLasx() == 0) { /* 只剩 LSX 路径：别调 [LASX-only] */ }
 ```
+
+### 2.6 平台绑定与防呆：**错架构 ≠ 无 LASX**
+
+这是两个完全不同的问题，**检测手段与失败时机都不一样**，不要混：
+
+| | **错架构**（x86 / arm …） | **LSX-only 机型（无 LASX）**，如 2K3000 / 3B6000M |
+|---|---|---|
+| 构建 / 安装 | **被挡住**：编译期与安装期就失败，产物根本出不来 | **正常**：能构建、能安装、能运行 |
+| 危险在哪 | 产物完全不可用（不是"慢一点"） | 只在调标了 `[LASX-only]` 的符号时：执行 LASX 指令 ⇒ **SIGILL** |
+| 谁负责 | 本库的防线（下面五道） | **调用方**：运行时先问 `lasx_has_lasx()` 再调（§6） |
+| 失败时机 | 编译期、安装期 | 运行期（调用那一行） |
+
+一句话：**"错架构"是编译/安装期问题（防呆）；"无 LASX"是运行时问题（`lasx_has_lasx()` 先问再调）**。
+`[LASX-only]` 的完整清单与降级分类见 `docs/ops.md` §3.2/§3.3。
+
+**五道防线**（按触发顺序）：
+
+| # | 位置 | 挡什么 / 怎么挡 |
+|---|---|---|
+| 1 | `build.rs` | 判**目标架构**（`CARGO_CFG_TARGET_ARCH`）：非 `loongarch64` ⇒ 打印人话并 `exit(1)`。因为判的是**目标**，`cargo check --target loongarch64` 的交叉检查照常通过 |
+| 2 | `src/lib.rs`、`cli/src/main.rs` | `#[cfg(not(target_arch = "loongarch64"))] compile_error!(…)`：给**绕过构建脚本**的场景兜底（vendored 源码、直接调 rustc） |
+| 3 | `include/lasx_rs.h` 顶部 | `#if !defined(__loongarch__) && !defined(LASX_RS_ALLOW_FOREIGN_ARCH)` ⇒ `#error`：C 侧**编译期**就红 |
+| 4 | `scripts/install.sh` | `LC_ALL=C readelf -h` 核对 `Machine:` 是 LoongArch，不符 ⇒ **拒绝安装**；`readelf` 缺失 ⇒ 降级为告警 |
+| 5 | `examples/c/Makefile` | `uname -m` 非 `loongarch64` ⇒ `$(error …)`；`FOREIGN=1` 显式覆盖 |
+
+**为什么以构建脚本为主、`compile_error!` 只兜底**：`compile_error!` **不会中止**这次编译——
+rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时，它先冒出 **35 条**"目标不支持该
+指令 / 找不到 intrinsic"，那句人话被埋在第 361 行；构建脚本先退出后，整个输出只剩 **1 条**。
+
+**交叉编译 / 文档生成 / 头文件语法检查怎么办**（逃生阀）：
+
+- C 头：显式定义 `LASX_RS_ALLOW_FOREIGN_ARCH` 即跳过那道 `#error`——**它只关掉编译期检查，
+  不会让运行时可用**（产物仍是 LoongArch 机器码，得在 LoongArch64 上跑）。
+- 示例：`make -C examples/c FOREIGN=1`（Makefile 会同时定义上面那个宏）。
 
 ---
 
@@ -335,6 +382,9 @@ if (hasLasx() == 0) { /* 只剩 LSX 路径：别调 [LASX-only] */ }
 ## 6. 能力与降级：先 `lasx_has_lasx()` 再调
 
 `lasx_has_lasx()` 回答的是"**此刻能不能安全调 `[LASX-only]`**"：
+
+> 这一节管的是**运行期**的能力问题（**无 LASX** 的 LSX-only 机型）；**错架构**（x86 等）是
+> 另一件事，在编译/安装期就被挡住，见 §2.6——两者的检测手段与失败时机都不同。
 
 ```c
 /* ✅ 正确：先问能力，再决定走哪条路 */
