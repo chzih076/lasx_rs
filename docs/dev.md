@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**280 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**285 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -350,6 +350,13 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   doctest**（`CMat::<2,3>` 乘 `CMat::<4,5>` 编不过）进 CI 文档测试步骤；**逆变换性能表在
   `J×N×NB=256×1024×512` 重做**（`ilaplace::perf::diag_ilaplace_perf`）：只指数和 19.40 ms /
   55.34 复数 GFLOP·s，含 `F` 32.83 ms（`F` 占 40.9%）。见 `docs/ops.md` §9.07。
+- **`s^k` 折进核 vs 后乘 5 个**（`src/laplace.rs::weighted_tests`，2026-10-16 加）：
+  `weighted_k0_bitwise_same_as_plain`（**`k=0` 与旧核逐位一致**——f32/f64 `to_bits()`；实现上直接委派
+  `kernels64`）、`folded_vs_postmultiply_difference_is_roundoff`（折进核 vs 后乘 **最大绝对差 8.88e-16、
+  相对 6.62e-16**，并断言**两者不逐位** ⇒ 契约差异声明）、`weighted_k1_k2_three_analytic_cases`
+  （`k=1/2` 三组解析 `s^kF`）、`weighted_round_trip_through_inverse`（加权核 → 减初值 → 逆变换：
+  8.6e-5…9.7e-4）、`weighted_k3_and_large_s`（`k=3` 可跑 + **核量级随 `|s|^k` 放大**：
+  `k=0` 7.81e-3 → `k=2` 7.81e1，**1.0e4×**@`|s|≈112`）。路线分工与契约见 `docs/ops.md` §9.09。
 - **导数定理（运算微积分）4 个**（`src/laplace.rs::derivative_tests`，2026-10-16 加）：
   `derivative_theorem_three_analytic_cases`（`e^{−2t}`/`sin(3t)`/`t` 三组 `L{f″}` 解析对照，
   实虚部，<1e-12；并断言通用式与二阶特化**逐位一致**）、
@@ -407,7 +414,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 280 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 285 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

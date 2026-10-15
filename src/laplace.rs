@@ -102,6 +102,127 @@ fn kernels64(
     (kc, ks, fell_back)
 }
 
+/// **带权核（把 `s^k` 折进核矩阵）**：`Kc[j,i] = w_i·dt·Re(s_j^k·e^{−s_j t_i})`、
+/// `Ks[j,i] = w_i·dt·−Im(s_j^k·e^{−s_j t_i})`（与 [`kernels64`] 同一符号约定：`Im F = −Ks·f`）。
+///
+/// - `s_j = σ_j + iω_j`；`z = s_j^k·e^{−s_j t}` ⇒
+///   `Re z = e^{−σt}[Re(s^k)cos(ωt) + Im(s^k)sin(ωt)]`、
+///   `Im z = e^{−σt}[Im(s^k)cos(ωt) − Re(s^k)sin(ωt)]`；
+/// - **`k = 0` 时直接委派 [`kernels64`]** ⇒ 与旧核**逐位一致**（回归锚点，测试 `weighted_k0_bitwise_same_as_plain`）；
+/// - **分工**：**核只管 `s^k·F`**（在积分里）；**导数定理的初值项 `Σ s^{n−1−k}f⁽ᵏ⁾(0⁺)` 不在积分里
+///   ⇒ 仍由 `derivative*_spectrum_*` 逐节点减**（见 `docs/ops.md` §9.08）。
+/// - **限制**：核元素量级随 `|s|^k` 放大 ⇒ **核自身的动态范围变大**（见 §9.08 的经验界）。
+fn kernels64_weighted(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    kind: Weighting,
+    k: u32,
+) -> (Vec<f64>, Vec<f64>, bool) {
+    if k == 0 {
+        return kernels64(sig, om, dt, n, kind);
+    }
+    let (w, fell_back) = kind.weights(n);
+    let m = sig.len();
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    for j in 0..m {
+        // `s^k`（逐节点复幂；k 小则展开）
+        let (mut pr, mut pi) = (1.0f64, 0.0f64);
+        for _ in 0..k {
+            let (nr, ni) = (pr * sig[j] - pi * om[j], pr * om[j] + pi * sig[j]);
+            pr = nr;
+            pi = ni;
+        }
+        for i in 0..n {
+            let t = i as f64 * dt;
+            let e = (-sig[j] * t).exp() * w[i] * dt;
+            let (c, s) = ((om[j] * t).cos(), (om[j] * t).sin());
+            // `Re z`、`−Im z`（符号约定与 `kernels64` 一致：`Im F = −Ks·f`）
+            kc[j * n + i] = e * (pr * c + pi * s);
+            ks[j * n + i] = e * (pr * s - pi * c);
+        }
+    }
+    (kc, ks, fell_back)
+}
+
+/// **加权（把 `s^k` 折进核）`f32` 批量正变换**：核按 `s_j^k` 加权，其余与
+/// [`laplace_batch_f32_with`] 完全相同（同一分平面复数路径、同两条 `matmul!`、同批量 `[K,N]`）。
+///
+/// **契约**：`k = 0` 与 [`laplace_batch_f32`] **逐位一致**；`k ≥ 1` 与"算完 `F` 再逐节点乘
+/// `s^k`"**不逐位一致**（舍入次序不同）——后者见 `derivative*_spectrum_*`/文档 §9.08。
+pub fn laplace_batch_f32_weighted<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    k: u32,
+) -> (Vec<f32>, Vec<f32>) {
+    laplace_batch_f32_weighted_with::<M, N, NB>(sig, om, dt, f, Weighting::Trapezoid, k).0
+}
+
+/// 同 [`laplace_batch_f32_weighted`]，但**指定权重方案**；返回 `(Re, Im, 是否回退梯形)`。
+pub fn laplace_batch_f32_weighted_with<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    kind: Weighting,
+    k: u32,
+) -> ((Vec<f32>, Vec<f32>), bool) {
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc64, ks64, fell_back) = kernels64_weighted(sig, om, dt, N, kind, k);
+    let kc: Vec<f32> = kc64.iter().map(|&v| v as f32).collect();
+    let ks: Vec<f32> = ks64.iter().map(|&v| v as f32).collect();
+    let mkc = Mat::<f32, M, N>::new(&kc).expect("Kc 长度 = M×N");
+    let mks = Mat::<f32, M, N>::new(&ks).expect("Ks 长度 = M×N");
+    let mf = Mat::<f32, N, NB>::new(f).expect("f 长度 = N×NB");
+    let mut re = MatBuf::<f32, M, NB>::new();
+    let mut im = MatBuf::<f32, M, NB>::new();
+    matmul!(re[M, NB] = mkc[M, N] * mf[N, NB]);
+    matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
+    let re = re.as_slice().to_vec();
+    let im = im.as_slice().iter().map(|&v| -v).collect();
+    ((re, im), fell_back)
+}
+
+/// **加权（把 `s^k` 折进核）`f64` 批量正变换**（同 `f32` 版语义与契约）。
+pub fn laplace_batch_f64_weighted<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f64],
+    k: u32,
+) -> (Vec<f64>, Vec<f64>) {
+    laplace_batch_f64_weighted_with::<M, N, NB>(sig, om, dt, f, Weighting::Trapezoid, k).0
+}
+
+/// 同 [`laplace_batch_f64_weighted`]，但**指定权重方案**；返回 `(Re, Im, 是否回退梯形)`。
+pub fn laplace_batch_f64_weighted_with<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f64],
+    kind: Weighting,
+    k: u32,
+) -> ((Vec<f64>, Vec<f64>), bool) {
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc, ks, fell_back) = kernels64_weighted(sig, om, dt, N, kind, k);
+    let mkc = Mat::<f64, M, N>::new(&kc).expect("Kc 长度 = M×N");
+    let mks = Mat::<f64, M, N>::new(&ks).expect("Ks 长度 = M×N");
+    let mf = Mat::<f64, N, NB>::new(f).expect("f 长度 = N×NB");
+    let mut re = MatBuf::<f64, M, NB>::new();
+    let mut im = MatBuf::<f64, M, NB>::new();
+    matmul!(re[M, NB] = mkc[M, N] * mf[N, NB]);
+    matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
+    let re = re.as_slice().to_vec();
+    let im = im.as_slice().iter().map(|&v| -v).collect();
+    ((re, im), fell_back)
+}
+
 /// `f32` 批量正变换：`f` 是 `N×NB`（**列主序的 N 条信号按列排**……实际用行主序 `[N][NB]`），
 /// 返回 `(Re, Im)`，各为 `M×NB` 行主序。**含核心的 `matmul!` 调用**。
 pub fn laplace_batch_f32<const M: usize, const N: usize, const NB: usize>(
@@ -923,6 +1044,224 @@ pub fn derivative2_spectrum_f64(
     d1: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     derivative_spectrum_f64(2, s_re, s_im, fre, fim, &[f0, d1])
+}
+
+#[cfg(test)]
+mod weighted_tests {
+    use super::*;
+
+    const M: usize = 3;
+    const N: usize = 64;
+    const NB: usize = 1;
+
+    fn nodes() -> (Vec<f64>, Vec<f64>) {
+        let sig = vec![1.0f64, 2.0, 3.0];
+        let om = vec![0.0f64, 0.5, 1.0];
+        (sig, om)
+    }
+
+    fn signal(dt: f64, a: f64) -> Vec<f64> {
+        (0..N).map(|i| (-a * i as f64 * dt).exp()).collect()
+    }
+
+    /// **① `k=0` 逐位回归**（加权入口必须与旧入口逐位一致）——f32 与 f64 都测。
+    #[test]
+    fn weighted_k0_bitwise_same_as_plain() {
+        let dt = 1.0 / 32.0;
+        let (sig, om) = nodes();
+        let f32v: Vec<f32> = signal(dt, 1.0).iter().map(|&x| x as f32).collect();
+        let (pr, pi) = laplace_batch_f32::<M, N, NB>(&sig, &om, dt, &f32v);
+        let (wr, wi) = laplace_batch_f32_weighted::<M, N, NB>(&sig, &om, dt, &f32v, 0);
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&pr), bits(&wr), "f32 k=0 实部不逐位");
+        assert_eq!(bits(&pi), bits(&wi), "f32 k=0 虚部不逐位");
+        let f64v = signal(dt, 1.0);
+        let (pr, pi) = laplace_batch_f64::<M, N, NB>(&sig, &om, dt, &f64v);
+        let (wr, wi) = laplace_batch_f64_weighted::<M, N, NB>(&sig, &om, dt, &f64v, 0);
+        let bits64 = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits64(&pr), bits64(&wr), "f64 k=0 实部不逐位");
+        assert_eq!(bits64(&pi), bits64(&wi), "f64 k=0 虚部不逐位");
+    }
+
+    /// **③ 三组解析对照（k=1/2）**：`L{f′}=sF−f(0)`、`L{f″}=s²F−s f(0)−f′(0)`。
+    /// 折进核拿到 `s^k·F`，再逐节点减初值项（**分工**：核管积分里的 `s^kF`）。
+    #[test]
+    fn weighted_k1_k2_three_analytic_cases() {
+        // 采样加长到 t_max=8（dt=1/64）⇒ 梯形误差 ~2e-4，远小于 5e-3 的判据
+        const NN: usize = 512;
+        let dt = 1.0 / 64.0;
+        let (sig, om) = nodes();
+        for &(name, a, w0, f0, d1) in &[
+            ("e^{-2t}", 2.0f64, 2.0f64, 1.0f64, -2.0f64),
+            ("e^{-1t}", 1.0, 1.0, 1.0, -1.0),
+            ("e^{-3t}", 3.0, 3.0, 1.0, -3.0),
+        ] {
+            let f: Vec<f64> = (0..NN).map(|i| (-a * i as f64 * dt).exp()).collect();
+            let (sr, si) = laplace_batch_f64_weighted::<M, NN, NB>(&sig, &om, dt, &f, 2);
+            // 解析 s²F（F=1/(s+a)）与初值项
+            let mut worst = 0.0f64;
+            for j in 0..M {
+                let (sg, omg) = (sig[j], om[j]);
+                let d = (sg + a) * (sg + a) + omg * omg;
+                let (fr, fi) = ((sg + a) / d, -omg / d);
+                let (s2r, s2i) = (sg * sg - omg * omg, 2.0 * sg * omg);
+                let (wr, wi) = (
+                    s2r * fr - s2i * fi - sg * f0 - d1,
+                    s2r * fi + s2i * fr - omg * f0,
+                );
+                // 加权核给的 s²F 应≈解析 s²F（NB=0 那列）
+                let (er, ei) = (sr[j * NB], si[j * NB]);
+                let s2fr = s2r * fr - s2i * fi;
+                let s2fi = s2r * fi + s2i * fr;
+                worst = worst.max((er - s2fr).abs() / s2fr.abs().max(1.0));
+                worst = worst.max((ei - s2fi).abs() / s2fi.abs().max(1.0));
+                // 减初值后 = L{f″}
+                let gr = er - sg * f0 - d1;
+                let gi = ei - omg * f0;
+                assert!(
+                    ((gr - wr).abs() + (gi - wi).abs()) / (wr.abs() + wi.abs()).max(1e-12) < 5e-3,
+                    "{name}: L{{f″}} 不符"
+                );
+            }
+            assert!(
+                worst < 5e-3,
+                "{name}: 加权核 vs 解析 s²F 差 {worst:e}（w0={w0}）"
+            );
+        }
+    }
+
+    /// **② 折进核 vs 后乘**：同一 f、同批节点，`s²F` 的**最大绝对/相对差**（预期 ~1e-16，不是 0）。
+    #[test]
+    fn folded_vs_postmultiply_difference_is_roundoff() {
+        let dt = 1.0 / 128.0;
+        let (sig, om) = nodes();
+        let f = signal(dt, 1.0);
+        let (fr, fi) = laplace_batch_f64::<M, N, NB>(&sig, &om, dt, &f);
+        let (wr, wi) = laplace_batch_f64_weighted::<M, N, NB>(&sig, &om, dt, &f, 2);
+        let mut worst_abs = 0.0f64;
+        let mut worst_rel = 0.0f64;
+        for j in 0..M {
+            let (s2r, s2i) = (sig[j] * sig[j] - om[j] * om[j], 2.0 * sig[j] * om[j]);
+            for b in 0..NB {
+                let (ar, ai) = (
+                    s2r * fr[j * NB + b] - s2i * fi[j * NB + b],
+                    s2r * fi[j * NB + b] + s2i * fr[j * NB + b],
+                );
+                let e = (wr[j * NB + b] - ar).abs().max((wi[j * NB + b] - ai).abs());
+                worst_abs = worst_abs.max(e);
+                worst_rel = worst_rel.max(e / ar.abs().max(ai.abs()).max(1e-30));
+            }
+        }
+        println!("折进核 vs 后乘：最大绝对差 {worst_abs:.3e}，最大相对差 {worst_rel:.3e}");
+        assert!(
+            worst_abs < 1e-12,
+            "两者差异应在舍入量级，实测 {worst_abs:e}"
+        );
+        // **不逐位**（舍入次序不同）——这正是文档要声明的契约差异
+        assert_ne!(
+            wr.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            {
+                let mut v = Vec::new();
+                for j in 0..M {
+                    let (s2r, s2i) = (sig[j] * sig[j] - om[j] * om[j], 2.0 * sig[j] * om[j]);
+                    for b in 0..NB {
+                        v.push((s2r * fr[j * NB + b] - s2i * fi[j * NB + b]).to_bits());
+                    }
+                }
+                v
+            },
+            "两者竟然逐位一致——契约声明需要改写"
+        );
+    }
+
+    /// **边界**：`k=3` 可跑且与解析 `s³F` 一致；大 `|s|` 下核的动态范围（如实记录量级）。
+    #[test]
+    fn weighted_k3_and_large_s() {
+        // 采样加长到 t_max = 8（消除截断误差），dt=1/64 ⇒ 梯形误差 ~O(dt²)
+        const NN: usize = 512;
+        let dt = 1.0 / 64.0;
+        let sig = vec![1.0f64];
+        let om = vec![0.5f64];
+        let f: Vec<f64> = (0..NN).map(|i| (-(i as f64 * dt)).exp()).collect();
+        for k in [1u32, 2, 3] {
+            let (r, i) = laplace_batch_f64_weighted::<1, NN, 1>(&sig, &om, dt, &f, k);
+            // 解析 s^k/(s+1)
+            let s = (sig[0], om[0]);
+            let (mut pr, mut pi) = (1.0f64, 0.0f64);
+            for _ in 0..k {
+                let (nr, ni) = (pr * s.0 - pi * s.1, pr * s.1 + pi * s.0);
+                pr = nr;
+                pi = ni;
+            }
+            let d = (s.0 + 1.0) * (s.0 + 1.0) + s.1 * s.1;
+            let (fr, fi) = ((s.0 + 1.0) / d, -s.1 / d);
+            let (wr, wi) = (pr * fr - pi * fi, pr * fi + pi * fr);
+            let e = ((r[0] - wr).abs() + (i[0] - wi).abs()) / (wr.abs() + wi.abs()).max(1e-12);
+            assert!(e < 5e-2, "k={k} 加权核 vs 解析 s^kF 差 {e:e}");
+        }
+        // 大 |s|：核元素量级随 |s|^k 放大（记录，不设"安全区"承诺）
+        let big_sig = vec![100.0f64];
+        let big_om = vec![50.0f64];
+        let (kc, ks, _) = kernels64_weighted(&big_sig, &big_om, dt, N, Weighting::Trapezoid, 0);
+        let base = kc
+            .iter()
+            .fold(0.0f64, |m, v| m.max(v.abs()))
+            .max(ks.iter().fold(0.0f64, |m, v| m.max(v.abs())));
+        let (kc2, ks2, _) = kernels64_weighted(&big_sig, &big_om, dt, N, Weighting::Trapezoid, 2);
+        let k2 = kc2
+            .iter()
+            .fold(0.0f64, |m, v| m.max(v.abs()))
+            .max(ks2.iter().fold(0.0f64, |m, v| m.max(v.abs())));
+        let ratio = k2 / base.max(1e-300);
+        println!(
+            "核元素最大量级：k=0 {base:.3e}，k=2 {k2:.3e}，放大 {ratio:.3e}×（|s|≈{:.0}）",
+            (big_sig[0] * big_sig[0] + big_om[0] * big_om[0]).sqrt()
+        );
+        assert!(ratio > 1.0, "折进 k=2 后核量级应放大，实测 {ratio:e}");
+    }
+
+    /// **④ 端到端往返**：加权核（k=2）→ 减初值 → 库内逆变换 ⇒ 与解析 `f″` 比。
+    #[test]
+    fn weighted_round_trip_through_inverse() {
+        use crate::ilaplace::{ComplexFn, DubnerAbate, invert_batch_f64};
+        let a = 1.0f64;
+        /// `G(s) = s²F(s) − s·f0 − d1`（`F` 解析 `1/(s+a)`）。
+        struct G {
+            a: f64,
+            f0: f64,
+            d1: f64,
+        }
+        impl ComplexFn for G {
+            fn eval(&self, re: f64, im: f64) -> (f64, f64) {
+                let d = (re + self.a) * (re + self.a) + im * im;
+                let (fr, fi) = ((re + self.a) / d, -im / d);
+                let (s2r, s2i) = (re * re - im * im, 2.0 * re * im);
+                let (pr, pi) = (s2r * fr - s2i * fi, s2r * fi + s2i * fr);
+                (pr - re * self.f0 - self.d1, pi - im * self.f0)
+            }
+        }
+        let p = DubnerAbate {
+            t_end: 12.0,
+            a: 1.0,
+            n: 512,
+            f0: a * a,
+        };
+        let g = G { a, f0: 1.0, d1: -a };
+        let ts = [0.5f64, 1.0, 2.0, 3.0];
+        let got = invert_batch_f64::<4, 512, 1, _>(p, &ts, &[g]);
+        println!("加权核 → 减初值 → 逆变换：");
+        let mut worst = 0.0f64;
+        for (j, &t) in ts.iter().enumerate() {
+            let want = a * a * (-a * t).exp();
+            let e = (got[j] - want).abs() / want;
+            worst = worst.max(e);
+            println!(
+                "  t={t}: 得到 {:.6}，解析 {want:.6}，相对误差 {e:.2e}",
+                got[j]
+            );
+        }
+        assert!(worst < 5e-3, "往返误差过大：{worst:e}");
+    }
 }
 
 #[cfg(test)]
