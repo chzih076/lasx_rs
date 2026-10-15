@@ -196,20 +196,18 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
     if gran >= 4 {
         // 行结构内核（矩阵乘）：块需对齐行粒度，让块边界落在微块边界上。
         //
-        // 静态 vs 动态是**实测**定的（本机 12 物理核 / 24 逻辑核）：
-        //   1024³ 24 线程：静态 345 → 动态 426 GFLOP/s（+23%）
-        //   1024³ 16 线程：静态 418 → 动态 375（−11%，块切碎后每块的面板复用变差）
-        //   512³  24 线程：静态 275 → 动态 255（−8%）
-        // 即：**线程数超过物理核（SMT 兄弟互相抢 L1/L2）且每线程仍有 ≥32 行**时，
-        // 块间方差才大到值得用原子领取；否则一个大块留在缓存里更好。
-        //
-        // **限定（2026-10-04）**：上面三个数是用**同一套台架**测的，而那套台架后来被证有
-        // **顺序效应**（同代码两臂"第一臂更慢"，对调后差距消失）且同代码臂摆动可达 **65%**。
-        // ⇒ **"物理核 vs SMT"的定性判据（`threads >= 20 &&
-        // per_thread >= 32`）仍然成立**（方向性、且在 512³/1024³ 上互证），但**具体百分比要按
-        // 那三条口径重测**（≥5 轮中位数 + 报离散度、load ≤3、逐臂交错）之后才可引用；
-        // 这里保留它们是为了记录"判据从哪来"，**不是因为它们精确**。
-        if threads >= 20 && per_thread >= 32 {
+        // 静态 vs 动态**这次是可信的实测**（`docs/dev.md` §7.10 ⑩ 的阈值表，2026-10-15）：
+        // **同进程交替**（静态 `RowBlock` 与动态 `Dynamic{block_rows=per/4}` 在同一进程里交替
+        // 跑、各取 ≥5 次中位数）⇒ **没有旧那套"顺序效应 / 同代码摆动 65%"的问题**，所以这次的
+        // 百分比可以引用。数据（k=768、n=2048、粒度 4）：
+        //   threads=12 per=32：静态 3.0956 → 动态 2.8706（**+7.8%**）
+        //   threads=12 per=64：静态 6.0054 → 动态 4.9469（**+21.4%**）
+        //   threads=24 per=16/32/64：+4.9% / +7.8% / +7.4%
+        //   threads=6  per=64：静态 3.6658 → 动态 3.9342（**−7%**：线程太少，抢不到均衡）
+        //   per ≤ 16（threads 12/24）与 per=8 全部：静态明显更好（动态慢 5–40%）
+        // ⇒ **判据（实测交叉点）：`per_thread ≥ 32` 且 `threads ≥ 12` 才用动态领取**；
+        //   否则静态等分（块留在缓存里、没有原子竞争）。
+        if per_thread >= 32 && threads >= 12 {
             return Pick::Dynamic {
                 block_rows: quarter(per_thread, gran),
             };
@@ -277,10 +275,12 @@ mod tests {
     #[test]
     fn pick_is_sane() {
         assert_eq!(pick_rows(1024, 1, 4), Pick::RowBlock);
-        // 实测收敛出的两条判据（见函数注释）
-        assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 });
-        assert_eq!(pick_rows(1024, 16, 4), Pick::RowBlock); // 16 线程静态更好
-        assert_eq!(pick_rows(512, 24, 4), Pick::RowBlock); // 每线程 22 行，太碎
+        // 2026-10-15 实测交叉点（§7.10 ⑩ 阈值表）：per_thread ≥ 32 且 threads ≥ 12 才动态
+        assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 }); // per=43
+        assert_eq!(pick_rows(1024, 16, 4), Pick::Dynamic { block_rows: 16 }); // per=64
+        assert_eq!(pick_rows(384, 12, 4), Pick::Dynamic { block_rows: 8 }); // per=32 边界上侧
+        assert_eq!(pick_rows(192, 12, 4), Pick::RowBlock); // per=16（LLM 形状）⇒ 静态
+        assert_eq!(pick_rows(512, 24, 4), Pick::RowBlock); // per=22，太碎
         assert_eq!(pick_rows(48, 16, 4), Pick::RowBlock);
         assert_eq!(pick_rows(1 << 20, 12, 1).name(), "dynamic");
     }

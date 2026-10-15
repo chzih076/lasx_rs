@@ -1341,3 +1341,76 @@ fn diag_tile_binding_vs_rows() {
         println!("相对行切 = {:.3}×（>1 表示绑定瓦片更快）", tr / tt);
     }
 }
+
+/// **H2 阈值表（默认 `#[ignore]`）**：扫"静态 `RowBlock` vs 动态 `Dynamic`"，找交叉点。
+///
+/// 网格：`threads ∈ {6,12,24}` × `per_thread ∈ {8,16,32,64}`（`m = threads × per_thread`，
+/// `k=768`、`n=2048`）；每格**同进程交替** `ROUNDS` 轮取中位数+极差；判据**先写死**：
+/// **动态比静态 ms 低 ≥3% 才判"该走动态"**，否则静态。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_static_vs_dynamic -- --ignored --nocapture`
+/// 分臂计数：`LASX_DIAG_ARM=static|dynamic`（这时只跑一条腿，便于 `perf stat`）。
+#[cfg(test)]
+#[ignore = "H2 阈值表：静态 vs 动态的交叉点扫描（不进 CI）"]
+#[test]
+fn diag_static_vs_dynamic_grid() {
+    use crate::aligned::AlignedVec;
+    use crate::pool::Pick;
+    use std::time::Instant;
+    const ROUNDS: usize = 5;
+    const K: usize = 768;
+    const N: usize = 2048;
+    let only = std::env::var("LASX_DIAG_ARM").unwrap_or_default();
+    let want_static = only.is_empty() || only == "static";
+    let want_dyn = only.is_empty() || only == "dynamic";
+    println!("threads per_thread    m  static_ms  dyn_ms   比值  判定");
+    for &threads in &[6usize, 12, 24] {
+        for &per in &[8usize, 16, 32, 64] {
+            let m = threads * per;
+            let a = AlignedVec::<f32>::fill_with(m * K, |i| ((i % 23) as f32 - 11.0) * 0.125);
+            let b = AlignedVec::<f32>::fill_with(K * N, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+            let plan = MatmulPlan::from_row_major(&b, K, N).unwrap();
+            let pool = WorkerPool::new(threads);
+            let blk = (per / 4).max(4);
+            let run = |c: &mut [f32], pick: Pick| {
+                pool.for_each_row_block_mut_picked(m, 4, [(c, N)], pick, |start, rows, [cb]| {
+                    plan.run_rows_into(&a[start * K..(start + rows) * K], cb);
+                });
+            };
+            let mut ts = Vec::new();
+            let mut td = Vec::new();
+            for _ in 0..ROUNDS {
+                if want_static {
+                    let mut c = AlignedVec::<f32>::new(m * N);
+                    let t0 = Instant::now();
+                    run(&mut c, Pick::RowBlock);
+                    ts.push(t0.elapsed().as_secs_f64());
+                }
+                if want_dyn {
+                    let mut c = AlignedVec::<f32>::new(m * N);
+                    let t0 = Instant::now();
+                    run(&mut c, Pick::Dynamic { block_rows: blk });
+                    td.push(t0.elapsed().as_secs_f64());
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let (s, d) = (med(&mut ts), med(&mut td));
+            if want_static && want_dyn {
+                let verdict = if d <= s * 0.97 { "动态" } else { "静态" };
+                println!(
+                    "{threads:7} {per:10} {m:5}  {:.4}  {:.4}  {:.3}  {verdict}",
+                    s * 1e3,
+                    d * 1e3,
+                    s / d
+                );
+            } else if want_static {
+                println!("{threads:7} {per:10} {m:5}  {:.4}  -", s * 1e3);
+            } else {
+                println!("{threads:7} {per:10} {m:5}  -  {:.4}", d * 1e3);
+            }
+        }
+    }
+}
