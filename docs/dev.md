@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**253 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**260 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -334,6 +334,14 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `bit_exact_both_weightings`（**两种权重各断言一次**位精确）、
   `simpson_fallback_and_boundaries`（`N<3`/偶数 `N` ⇒ **整段回退梯形** + 标记；`s=0`/`ω=0`）。
   用法与误差表见 `docs/ops.md` §9.0。
+- **逆变换 7 个**（`src/ilaplace.rs`，2026-10-16 加，**CI 跑**）：`minimal_one_over_s`（`F=1/s`
+  的最小验证——盯 `½`/`π/T`/`1/T` 三处系数）、`n_scan_after_jump_subtraction`（**扣除后 vs 未扣除
+  的 N 扫描并排**，断言扣除后 N=512 ≤1e-3 且远快于 1/N）、`analytic_exp_and_sin`（`1/(s+a)` 批量
+  + `sin(ω₀t)`，≤1e-3）、`t_zero_is_jump_average`（`t=0` 给 `f₀/2`，**不当 bug 修**）、
+  `cross_check_vs_bromwich`（与**独立** Bromwich 梯形积分结构互证）、
+  `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
+  `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
+  f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
 - 池契约 2 个：`shape::pool_init_tests::small_shapes_do_not_construct_a_pool`（**CI 跑**，线程本地
   建池计数 + "计数器活着"的正对照，见 ⑫）与 `pool::global_pool_contract_tests::init_global_first_use_then_frozen`
   （`#[ignore]`，需 `--test-threads=1` 串行跑：首次成功 / 之后 `false` / 线程数 = 物理核）。
@@ -371,7 +379,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 253 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 260 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
