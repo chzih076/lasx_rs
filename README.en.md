@@ -111,11 +111,19 @@ live in the respective design sections.
 > **384³ 60.6 vs 64.0 (−5.2%)**, **512³ 60.9 vs 64.9 (−6.2%)**; wide/thin `256×64×4096`
 > **61.7 vs 41.0 (+50%)**. **f64 is 4–15% behind overall** (64³ a tie; 256³/384³/512³ at
 > −7.5% / −4.4% / −6.3%; **the weakest structural point is f64 128³: 23.7 vs 28.1 G, −15%**).
-> **② Multi-threaded: how you split decides everything** — `192×768×3072` f32 @12 threads, and the
-> **C ABI does not export the thread pool**, so the caller splits: `rows` (the default, by output
-> row) **14.46 ms, scaling only 1.08× (≈ no parallelism)**; `cols` (pre-transposed plan)
-> **3.84 ms, scaling 4.09×**; OpenBLAS **2.46 ms (6.3×)** ⇒ **use the `cols`/pre-transposed split
-> from C** — with `rows` every thread re-packs the whole `B` and bandwidth saturates at once.
+> **② Multi-threaded: with today's C ABI you cannot have both bit-exactness and scaling** —
+> `192×768×3072` f32 @12 threads; the **C ABI does not export the thread pool**, so the caller must
+> split: **for bit-exactness you can only split by row (`rows`)** — **10/10 shapes bit-for-bit
+> identical** (including k=384/385/386 on both sides and non-divisible row blocks like m=7/13/100/1000)
+> — at the cost of **almost no scaling** (14.46 ms, **1.08×**). **`cols` (pre-transposed) is faster
+> (3.84 ms, 4.09×) but is not a bit-exact equivalent** — **6/10 shapes differ from the
+> single-threaded result** (it decomposes `Cᵀ=Bᵀ·Aᵀ` into small calls, so a size change changes the
+> in-library path) ⇒ **do not use `cols` where bit-exactness is required**.
+> Root cause: with `rows` every thread re-packs the whole `B` (**113 MB per call**) while the scatter
+> is only **9%** of the gap — what is missing is "**pack once + a shared panel**", which **today's
+> C ABI cannot express**: the effective C-side tier is ≈ **236 G** (Rust pool **310 G**, OpenBLAS
+> **2.46 ms / 368 G**). **The real C-side multi-core fix — a library-provided "pack once, reuse"
+> plan/pool entry — is being implemented**, and will be the recommended path once it lands.
 > **The older figure (Rust pool path) was ≈ a tie**: median **2.64 ms** (samples 2.42–3.79, range
 > **1.57×**) vs OpenBLAS **2.63 ms** (2.599–2.656, range **2%**) — the earlier "we are ~10% slower"
 > was withdrawn on that line, but **it is the Rust-pool convention and cannot be compared
