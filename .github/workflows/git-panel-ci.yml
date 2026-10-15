@@ -36,9 +36,16 @@ jobs:
         run: |
           so=target/release/liblasx_rs.so
           n=$(nm -D "$so" | grep -c ' T lasx_')
-          d=$(grep -oE '[0-9]+ 个导出符号' docs/ops.md | head -1 | grep -oE '[0-9]+')
-          echo "cdylib 导出 lasx_* = $n；docs/ops.md §1 记 = $d"
-          [ "$n" = "$d" ] || { echo "::error::ABI 导出符号数与文档不一致"; exit 1; }
+          # 数据源**不再写死 ops.md**：C ABI 权威已搬到 `docs/c-abi.md`，而计数若散在多处就会漂
+          # （本会话已有 81 vs 83、218/220 vs 226 两次）。故改为**扫全部文档**，要求
+          # 「只出现一个值」且等于 `.so` 实测值 —— 单源与"残留旧数即红"同时成立。
+          d=$(grep -ohE '[0-9]+ 个导出符号|[0-9]+ exported symbols' docs/*.md README.md README.en.md \
+              | grep -oE '[0-9]+' | sort -u | tr '\n' ' ' | xargs)
+          echo "cdylib 导出 lasx_* = $n；文档记 = [${d:-<无>}]"
+          case "$d" in
+            "$n") echo "OK：ABI 符号数与文档一致（$n）" ;;
+            *) echo "::error::文档里的导出符号数 [$d] 与 cdylib 实测 [$n] 不一致（或出现了多个值）"; exit 1 ;;
+          esac
       # **逐符号原型校验**（2026-10-15 加）：上面的门禁只数**个数**，抓不到"原型漂移/参数次序错/
       # 少一个 `_checked` 变体"。`scripts/check_header.c` 把 83 个符号地址放进数组（编译期钉住个数）
       # 并逐个实调 41 个 `_checked`（断言 status 位置与取值域），另含融合缩放的行为断言。
