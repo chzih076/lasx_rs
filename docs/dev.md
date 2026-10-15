@@ -1,7 +1,9 @@
 # lasx_rs 开发文档：架构与性能
 
 > 面向**维护者与二次开发者**：内部分层、不可破坏的约定、测试与 CI、性能方法学与实测数据。
-> **算子语义与调用方法**（FFI/Rust API/池用法、87 个导出符号）见 [`docs/ops.md`](ops.md)；
+> **Rust API 与池用法**（算子语义、数值契约、`api`/`view`/`plan`/`shape`/`pool`）见
+> [`docs/ops.md`](ops.md)；**C ABI**（符号清单与逐符号原型、内存与安全模型、能力探测与降级、
+> ABI 稳定性）见 [`docs/c-abi.md`](c-abi.md)；
 > **平台给的外部约束**（LA664 勘误、内核生命周期）与由外部契约派生的待补项见
 > [`docs/platform.md`](platform.md)。
 
@@ -75,7 +77,7 @@ lasx_rs/
 | 层 | 职责 | 不变量 |
 |---|---|---|
 | `ops/` | 纯计算，吃 `&[T]` / `&mut [T]`，不碰裸指针 | 每条向量路径必须与标量参考**逐位一致** |
-| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **87 个导出符号**中原始 15 个的签名与语义永不改动 |
+| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | 导出符号中原始 15 个的签名与语义永不改动（清单与计数见 `docs/c-abi.md`） |
 | `api.rs` | 安全 Rust 接口，做长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
 | `view.rs` + `plan.rs` | 形状/跨距对象化与打包复用（纯 Rust，不导出符号） | 视图/计划只做布局与打包，不引入新的累加次序（§18.4） |
 | `pool.rs` + `parallel.rs` | 并行派活，切块必须与串行结果逐位一致 | 切块边界不得改变每个元素的累加次序 |

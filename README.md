@@ -149,7 +149,7 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 
 | 文档 | 内容 |
 |---|---|
-| [docs/c-abi.md](docs/c-abi.md) | **C ABI（唯一权威）**：87 个导出符号的完整清单与逐符号原型、内存与生命周期、安全模型（裸 vs `_checked`）、能力探测与降级、线程模型、ABI 稳定性策略、快速开始（四种链接方式） |
+| [docs/c-abi.md](docs/c-abi.md) | **C ABI（唯一权威）**：完整符号清单与逐符号原型、内存与生命周期、安全模型（裸 vs `_checked`）、能力探测与降级、线程模型、ABI 稳定性策略、快速开始（四种链接方式） |
 | [docs/ops.md](docs/ops.md) | **算子与用法（Rust 侧）**：数值契约与逐位确定性、降级覆盖分类、池与并行、矩阵视图/计划/形状层、NN 算子现状与缺口对照、int8/f32 判据；C ABI 见 `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 | [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |

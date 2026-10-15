@@ -142,7 +142,7 @@ and `lasx_rs::parallel`.
 
 | Document | Contents |
 |---|---|
-| [docs/c-abi.md](docs/c-abi.md) | **The C ABI (single authority)**: all 87 exported symbols with full prototypes, memory and lifetime, safety model (raw vs `_checked`), capability probe and degradation, threading model, ABI stability policy, and a getting-started section (four ways to link) |
+| [docs/c-abi.md](docs/c-abi.md) | **The C ABI (single authority)**: the full symbol list with prototypes, memory and lifetime, safety model (raw vs `_checked`), capability probe and degradation, threading model, ABI stability policy, and a getting-started section (four ways to link) |
 | [docs/ops.md](docs/ops.md) | **Operators and usage (Rust side)**: numerical contracts and bitwise determinism, degradation coverage, pool and parallelism, matrix view/plan/shape layers, NN operator status and gap comparison, int8-vs-f32 decision rule; for the C ABI see `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 | [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
