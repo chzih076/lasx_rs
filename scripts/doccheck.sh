@@ -113,17 +113,18 @@ if [ "$actual" -gt 0 ]; then
 fi
 
 # ---- ④ 符号数的**其它写法** ----
-# 实例：`README.md` 的文档索引曾写"**75 个符号总表**"、`README.en.md` 写"**the 75-symbol table**"，
-# 而正文/`ops.md` 都是 81 —— 两者都**逃过 ③**（③ 只匹配"个导出符号"）。这里查"**总量口径**"的
-# 别名写法（中文：数字后紧跟 总表/一览/汇总/总数/共；英文：`N`-symbol table/list/summary）。
+# 实例 1：`README.md` 的文档索引曾写"**75 个符号总表**"、`README.en.md` 写 "**the 75-symbol table**"。
+# 实例 2（加这条英文写法的直接原因）：加 C 入口把计数改成 83 时，**`README.en.md` 的
+# `81 exported symbols (41 plain + 40 checked)` 逃过了检查**（当时只覆盖"个符号…"与 `N-symbol table`），
+# 是 `readme-platform` 人工核对时抓到的 ⇒ 这里补上 `N exported symbols` 这一写法。
 # **不**用"个符号"泛匹配：文档里合法存在"N3 的 7 个符号"这类**子集**描述，泛匹配会误报
 # （实测：加宽后立刻误报 `docs/ops.md` 的"N3 的 7 个符号"一条）。
 if [ "$actual" -gt 0 ]; then
   while IFS= read -r hit; do
     f="${hit%%:*}"
-    n=$(printf '%s' "$hit" | sed 's/^[^:]*://; s/ 个.*//; s/-.*//')
-    [ "$n" = "$actual" ] || note "COUNT $f: 文档写 '$n 个符号总表/汇总'（或英文 $n-symbol），源码实际 $actual"
-  done < <(grep -HoE '[0-9]+ 个符号(总表|一览|汇总|总数|共)|[0-9]+-symbol (table|list|summary)' \
+    n=$(printf '%s' "$hit" | sed 's/^[^:]*://; s/ 个.*//; s/ exported.*//; s/-.*//')
+    [ "$n" = "$actual" ] || note "COUNT $f: 文档写 '$n 个符号总表/汇总'（或英文 $n-symbol / $n exported symbols），源码实际 $actual"
+  done < <(grep -HoE '[0-9]+ 个符号(总表|一览|汇总|总数|共)|[0-9]+-symbol (table|list|summary)|[0-9]+ exported symbols' \
              docs/*.md README.md README.en.md 2>/dev/null)
 fi
 
