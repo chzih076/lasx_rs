@@ -188,6 +188,105 @@ pub fn laplace_batch_f32_weighted_with<const M: usize, const N: usize, const NB:
     ((re, im), fell_back)
 }
 
+/// **等距递推核的显式判据（opt-in 路线的"安全区"）**：相位推进 `ω·Δt` 与步数 `N`。
+///
+/// 旋转递推的误差随**相位推进总量 `|ω|·Δt·N`** 与步数累积。安全区判据（**代码里显式**）：
+/// `|ω|·Δt ≤ RECURRENCE_MAX_PHASE_STEP` **且** `|ω|·Δt·N ≤ RECURRENCE_MAX_PHASE`。
+/// **超阈值立刻回退 `libm` 核**（见 [`laplace_batch_f32_recurrence`]），**不静默用错表**。
+pub const RECURRENCE_MAX_PHASE_STEP: f64 = 1.5;
+/// 相位推进总量上限（与上一条件同时满足才算安全）。
+/// **实测依据**（`stability_scan_phase_and_n`）：`|ω|·Δt ∈ {0.01,0.1,0.3,1.0,π/2}` ×
+/// `N ∈ {64,256,1024,4096}` 全网格掩码相对误差 **≤4.4e-14** ⇒ 安全区**很宽**；
+/// 阈值取 `1.5`（略小于扫描上限 π/2）与 `8192`（略大于扫描最大总量 6435）。
+pub const RECURRENCE_MAX_PHASE: f64 = 8192.0;
+
+/// 某一行 `(σ, ω)` 是否在递推安全区内（**显式判据**，供调用方自检与回退）。
+pub fn recurrence_safe(om: f64, dt: f64, n: usize) -> bool {
+    let step = om.abs() * dt;
+    step <= RECURRENCE_MAX_PHASE_STEP && step * n as f64 <= RECURRENCE_MAX_PHASE
+}
+
+/// **等距递推核**（(c) 路线）：`e^{−σ i Δt}` 逐次乘、`cos/sin(ω i Δt)` 旋转递推。
+/// **调用前须用 [`recurrence_safe`] 检查**；不安全请回退 [`kernels64`]。
+fn kernels64_recurrence(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    kind: Weighting,
+) -> (Vec<f64>, Vec<f64>, bool, bool) {
+    let (w, fell_back) = kind.weights(n);
+    let m = sig.len();
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    let mut all_safe = true;
+    for j in 0..m {
+        if !recurrence_safe(om[j], dt, n) {
+            all_safe = false;
+            // **回退**：该行用 libm 核（与 `kernels64` 同式）
+            for i in 0..n {
+                let t = i as f64 * dt;
+                let e = (-sig[j] * t).exp() * w[i] * dt;
+                kc[j * n + i] = e * (om[j] * t).cos();
+                ks[j * n + i] = e * (om[j] * t).sin();
+            }
+            continue;
+        }
+        let (row_kc, row_ks) = crate::fast_trig::recurrence_row(sig[j], om[j], dt, n, &w);
+        kc[j * n..(j + 1) * n].copy_from_slice(&row_kc);
+        ks[j * n..(j + 1) * n].copy_from_slice(&row_ks);
+    }
+    (kc, ks, fell_back, all_safe)
+}
+
+/// **`f32` 批量正变换（等距递推核，opt-in）**：接口与 [`laplace_batch_f32`] 一致（同一 `s`
+/// 节点、同一分平面、同一批量）。**契约：仅容差**（与 libm 核**不逐位一致**；最大误差界见
+/// `docs/ops.md` §9.10，安全区见 [`recurrence_safe`]）；**默认路线仍是 libm**。
+pub fn laplace_batch_f32_recurrence<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+) -> (Vec<f32>, Vec<f32>, bool) {
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc64, ks64, _fb, all_safe) = kernels64_recurrence(sig, om, dt, N, Weighting::Trapezoid);
+    let kc: Vec<f32> = kc64.iter().map(|&v| v as f32).collect();
+    let ks: Vec<f32> = ks64.iter().map(|&v| v as f32).collect();
+    let mkc = Mat::<f32, M, N>::new(&kc).expect("Kc 长度 = M×N");
+    let mks = Mat::<f32, M, N>::new(&ks).expect("Ks 长度 = M×N");
+    let mf = Mat::<f32, N, NB>::new(f).expect("f 长度 = N×NB");
+    let mut re = MatBuf::<f32, M, NB>::new();
+    let mut im = MatBuf::<f32, M, NB>::new();
+    matmul!(re[M, NB] = mkc[M, N] * mf[N, NB]);
+    matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
+    let re = re.as_slice().to_vec();
+    let im = im.as_slice().iter().map(|&v| -v).collect();
+    (re, im, all_safe)
+}
+
+/// **`f64` 批量正变换（等距递推核，opt-in）**：同 `f32` 版语义与契约。
+pub fn laplace_batch_f64_recurrence<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f64],
+) -> (Vec<f64>, Vec<f64>, bool) {
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc, ks, _fb, all_safe) = kernels64_recurrence(sig, om, dt, N, Weighting::Trapezoid);
+    let mkc = Mat::<f64, M, N>::new(&kc).expect("Kc 长度 = M×N");
+    let mks = Mat::<f64, M, N>::new(&ks).expect("Ks 长度 = M×N");
+    let mf = Mat::<f64, N, NB>::new(f).expect("f 长度 = N×NB");
+    let mut re = MatBuf::<f64, M, NB>::new();
+    let mut im = MatBuf::<f64, M, NB>::new();
+    matmul!(re[M, NB] = mkc[M, N] * mf[N, NB]);
+    matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
+    let re = re.as_slice().to_vec();
+    let im = im.as_slice().iter().map(|&v| -v).collect();
+    (re, im, all_safe)
+}
+
 /// **加权（把 `s^k` 折进核）`f64` 批量正变换**（同 `f32` 版语义与契约）。
 pub fn laplace_batch_f64_weighted<const M: usize, const N: usize, const NB: usize>(
     sig: &[f64],
@@ -333,6 +432,202 @@ pub fn reference_f32_with<const M: usize, const N: usize, const NB: usize>(
         }
     }
     (re, im)
+}
+
+#[cfg(test)]
+mod recurrence_tests {
+    use super::*;
+
+    /// **② 稳定边界扫描**：误差 vs `ω·Δt` 与 `N`（对 libm 核，掩码相对误差）。
+    /// 用来定 `RECURRENCE_MAX_PHASE_STEP` / `RECURRENCE_MAX_PHASE` 两个阈值。
+    #[test]
+    fn stability_scan_phase_and_n() {
+        let sig = [1.0f64];
+        let w = vec![1.0f64; 4096];
+        println!("递推误差 vs (相位推进 ω·Δt, 步数 N)：掩码相对误差（|ref| > 0.1·峰值）");
+        println!(
+            "{:>10} | {:>10} {:>10} {:>10} {:>10}",
+            "ω·Δt", "N=64", "N=256", "N=1024", "N=4096"
+        );
+        for &step in &[0.01f64, 0.1, 0.3, 1.0, std::f64::consts::FRAC_PI_2] {
+            let mut row = Vec::new();
+            for &n in &[64usize, 256, 1024, 4096] {
+                let dt = 0.01;
+                let om = step / dt;
+                let (br, ks) = {
+                    // libm 基线核（单行）
+                    let mut kc = vec![0.0f64; n];
+                    let mut ks = vec![0.0f64; n];
+                    for i in 0..n {
+                        let t = i as f64 * dt;
+                        let e = (-sig[0] * t).exp() * w[i] * dt;
+                        kc[i] = e * (om * t).cos();
+                        ks[i] = e * (om * t).sin();
+                    }
+                    (kc, ks)
+                };
+                let (rr, rs) = crate::fast_trig::recurrence_row(sig[0], om, dt, n, &w[..n]);
+                let peak = br
+                    .iter()
+                    .fold(0.0f64, |m, v| m.max(v.abs()))
+                    .max(ks.iter().fold(0.0f64, |m, v| m.max(v.abs())));
+                let mut worst = 0.0f64;
+                for i in 0..n {
+                    for (a, b) in [(br[i], rr[i]), (ks[i], rs[i])] {
+                        if b.abs() > 0.1 * peak {
+                            worst = worst.max((a - b).abs() / b.abs());
+                        }
+                    }
+                }
+                row.push(worst);
+            }
+            println!(
+                "{step:>10.3} | {:>10.2e} {:>10.2e} {:>10.2e} {:>10.2e}",
+                row[0], row[1], row[2], row[3]
+            );
+            // **安全区判据的实证**：阈值内应 ≤1e-9
+            if step <= RECURRENCE_MAX_PHASE_STEP {
+                for (idx, &n) in [64usize, 256, 1024, 4096].iter().enumerate() {
+                    if (step * n as f64) <= RECURRENCE_MAX_PHASE {
+                        assert!(
+                            row[idx] < 1e-9,
+                            "安全区内误差应 <1e-9：ω·Δt={step}, N={n}, 实测 {:e}",
+                            row[idx]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **① 入口契约**：opt-in 入口可用、返回 `all_safe` 标志；超出安全区时**该行回退 libm**
+    /// ⇒ 结果与 libm 路径**逐位一致**（回退行为可验证）。
+    #[test]
+    fn recurrence_entry_falls_back_outside_safe_zone() {
+        const M: usize = 1;
+        const N: usize = 512;
+        let dt = 0.01;
+        let f = vec![1.0f32; N];
+        // 安全区内：递推（只承诺容差）
+        let om_safe = [0.5f64];
+        let sig = [1.0f64];
+        let (r1, i1, safe1) = laplace_batch_f32_recurrence::<M, N, 1>(&sig, &om_safe, dt, &f);
+        assert!(safe1, "ω·Δt=0.005 应在安全区");
+        let (r0, i0) = laplace_batch_f32::<M, N, 1>(&sig, &om_safe, dt, &f);
+        let mut worst = 0.0f32;
+        for k in 0..M {
+            worst = worst.max((r1[k] - r0[k]).abs() / r0[k].abs().max(1e-30));
+            worst = worst.max((i1[k] - i0[k]).abs() / i0[k].abs().max(1e-30));
+        }
+        assert!(
+            worst < 1e-4,
+            "安全区内递推 vs libm 应 <1e-4，实测 {worst:e}"
+        );
+        // 安全区外（ω·Δt = 1.0）：该行**回退 libm** ⇒ 与 libm 路径**逐位一致**
+        let om_big = [2.0 / dt]; // ω·Δt = 2.0 > RECURRENCE_MAX_PHASE_STEP = 1.5
+        let (r2, i2, safe2) = laplace_batch_f32_recurrence::<M, N, 1>(&sig, &om_big, dt, &f);
+        assert!(!safe2, "ω·Δt=2.0 应在安全区外");
+        let (r0b, i0b) = laplace_batch_f32::<M, N, 1>(&sig, &om_big, dt, &f);
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&r2), bits(&r0b), "超安全区应逐位回退到 libm");
+        assert_eq!(bits(&i2), bits(&i0b));
+    }
+
+    /// **③ 真正的同源交替 A/B**：旧核（libm）vs 新核（递推），两个情景（小/大 NB）。
+    #[test]
+    #[ignore = "recon：递推核 vs libm 核 的真实交替 A/B（两情景）"]
+    fn diag_recurrence_vs_libm_ab() {
+        use std::time::Instant;
+        const M: usize = 64;
+        const N: usize = 1024;
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..M).map(|j| 0.5 + 0.05 * j as f64).collect();
+        // 全部行都在安全区内：ω·Δt ≤ 0.125 且 ω·Δt·N ≤ 32 ⇒ ω ≤ 0.03125
+        let om: Vec<f64> = (0..M).map(|j| (j % 8) as f64 * 0.003).collect();
+        for (label, nb) in [("小 NB", 2usize), ("大 NB", 64usize)] {
+            let f: Vec<f32> = vec![1.0f32; N * nb];
+            let mut rows: Vec<(f64, f64, i32, f64, String)> = Vec::new();
+            for pair in 0..6 {
+                let mut t = [0.0f64; 2];
+                let mut iters = 0i32;
+                let mut ms_max = 0.0f64;
+                for step in 0..2 {
+                    let which = (pair + step) % 2;
+                    let mut cnt = 0i32;
+                    let mut mx = 0.0f64;
+                    let t0 = Instant::now();
+                    while t0.elapsed().as_secs_f64() < 0.05 {
+                        let t1 = Instant::now();
+                        match (which, nb) {
+                            (0, 2) => {
+                                std::hint::black_box(laplace_batch_f32::<M, N, 2>(
+                                    &sig, &om, dt, &f,
+                                ));
+                            }
+                            (1, 2) => {
+                                std::hint::black_box(laplace_batch_f32_recurrence::<M, N, 2>(
+                                    &sig, &om, dt, &f,
+                                ));
+                            }
+                            (0, _) => {
+                                std::hint::black_box(laplace_batch_f32::<M, N, 64>(
+                                    &sig, &om, dt, &f,
+                                ));
+                            }
+                            _ => {
+                                std::hint::black_box(laplace_batch_f32_recurrence::<M, N, 64>(
+                                    &sig, &om, dt, &f,
+                                ));
+                            }
+                        }
+                        let d = t1.elapsed().as_secs_f64();
+                        if d > mx {
+                            mx = d;
+                        }
+                        cnt += 1;
+                    }
+                    t[which] = t0.elapsed().as_secs_f64() / cnt.max(1) as f64;
+                    iters = cnt;
+                    if mx > ms_max {
+                        ms_max = mx;
+                    }
+                }
+                let l1 = std::fs::read_to_string("/proc/loadavg")
+                    .ok()
+                    .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+                    .unwrap_or_default();
+                rows.push((t[0], t[1], iters, ms_max * 1e3, l1));
+            }
+            let med = |i: usize| -> f64 {
+                let mut v: Vec<f64> = rows[1..]
+                    .iter()
+                    .map(|r| if i == 0 { r.0 } else { r.1 })
+                    .collect();
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let (libm, rec) = (med(0), med(1));
+            for (i, r) in rows.iter().enumerate() {
+                println!(
+                    "{label} pair{} libm={:.4}ms rec={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                    i + 1,
+                    r.0 * 1e3,
+                    r.1 * 1e3,
+                    r.2,
+                    r.3,
+                    r.4,
+                    if i == 0 { " (dropped)" } else { "" }
+                );
+            }
+            println!(
+                "{label}（NB={nb}）中位：libm {:.4} ms｜递推 {:.4} ms（{:.2}×，{:+.1}%）",
+                libm * 1e3,
+                rec * 1e3,
+                rec / libm,
+                (rec - libm) / libm * 100.0
+            );
+        }
+    }
 }
 
 #[cfg(test)]

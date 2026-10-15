@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**289 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**292 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,6 +342,11 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
+- **递推核落地 3 个**（`src/laplace.rs::recurrence_tests`，2026-10-16 加）：`stability_scan_phase_and_n`
+  （**误差 vs `ω·Δt` × `N` 全表**，全网格 ≤4.4e-14 ⇒ **安全区很宽**，并实证阈值内 <1e-9）、
+  `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
+  诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
+  入口/判据/例外清单见 `docs/ops.md` §9.10.1。
 - **超越函数 recon 4 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**原型、opt-in、不改默认**）：
   `table_size_report`（共享表 **129 项 × 16 B = 2064 B**）、`accuracy_vs_libm`（(b) 表+多项式
   绝对 2.37e-10 / 掩码相对 1.39e-6 / f32 ULP 16；**(c) 等距递推 1.36e-17 / 5.47e-14 / ULP 0**）、
@@ -421,7 +426,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 289 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 292 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
