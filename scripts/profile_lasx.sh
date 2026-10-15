@@ -10,6 +10,13 @@
 #   * **一次挂太多事件会 "Some events weren't counted"（NMI watchdog）** ⇒ 本脚本**分批**，
 #     并且**先跑事件自检**（每个分批单独 `perf stat … -- true`）把"哪些真能计数"打出来。
 #
+# **降 `perf_event_paranoid` 不解锁 uncore/内核帧**（2026-10-15 用户授权后实测，见
+# `docs/dev.md` §7.10 ⑧-权限）：本机 **PMU 没有 uncore/内存控制器事件**（`perf list` 命中 0）、
+# **`kptr_restrict = 2`**、**无 vmlinux 调试符号** ⇒ 权限降到 1 也拿不到"L3/DRAM 实测字节"与
+# 内核帧；那条路要继续走得先满足"`kptr_restrict=0` + 内核 DWARF + 支持 uncore 的 PMU"。
+# 本脚本**只读**系统状态（记录 paranoid 值用于留痕），**不改任何系统设置**——系统设置不进仓库；
+# 那次实验用完已还原 `perf_event_paranoid = 2`（本文件只记"实测 + 已还原"这件事）。
+#
 # 用法：
 #   bash scripts/profile_lasx.sh [label] [reps]
 #     例：bash scripts/profile_lasx.sh p1 3
