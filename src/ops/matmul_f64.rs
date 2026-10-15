@@ -233,7 +233,7 @@ pub(crate) fn matmul_f64_packed(m: usize, k: usize, n: usize, a: &[f64], b: &[f6
             let s1 = (s0 + nc_strips).min(strips_total);
             let jb = s0 * 16;
             let nc = (s1 - s0) * 16;
-            pack_b_f64(k, n, jb, nc, b, &mut packed);
+            pack_b(k, n, jb, nc, b, &mut packed);
             // 面板打包好后交给公共入口（并行层复用同一个入口 ⇒ 打包只做一次、跨线程共享）
             matmul_f64_packed_rows(k, n, jb, nc, &packed, a, c, m4);
             s0 = s1;
@@ -251,7 +251,7 @@ pub(crate) fn matmul_f64_packed(m: usize, k: usize, n: usize, a: &[f64], b: &[f6
 
 /// 用**已打包**的列面板计算 `a_rows`/`c_rows` 对应的那些行（并行层复用的入口）。
 ///
-/// `packed` 是 [`pack_b_f64`] 的产物（`k × nc`，16 列条带主序）；`a_rows.len()/k` 是本块行数。
+/// `packed` 是 [`pack_b`] 的产物（`k × nc`，16 列条带主序）；`a_rows.len()/k` 是本块行数。
 /// 每行的列尾 `[n16, n)` 由调用方用 [`row_tail_f64`] 补。顺序版的 [`matmul_f64_packed`]
 /// 走的是同一个函数，所以并行与单线程**逐位一致**。
 #[allow(clippy::too_many_arguments)]
@@ -296,7 +296,7 @@ pub(crate) fn matmul_f64_packed_rows(
             }
             while i < m {
                 let c_row = &mut c_rows[i * n..(i + 1) * n];
-                row_tail_packed_f64(
+                row_tail_packed(
                     &a_rows[i * k + kb0..i * k + kb0 + kb],
                     strip,
                     c_row,
@@ -316,7 +316,7 @@ pub(crate) fn matmul_f64_packed_rows(
 /// （128 B = 4 条 256 位向量）。用向量拷贝而不是 `copy_from_slice`——后者落进通用
 /// memcpy（对齐剥离 + 分支），打包吞吐差约 1.6×。
 #[inline]
-pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
+pub(crate) fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], packed: &mut [f64]) {
     let strips = nc / 16;
     let mut s0 = 0;
     while s0 < strips {
@@ -331,7 +331,7 @@ pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], pa
                 // `MatmulPlan` 自己的面板缓冲，由类型系统保证（`&[f64]` 与 `&mut [f64]`
                 // 在安全代码里不可能别名）。
                 unsafe {
-                    copy_block16_f64(b.as_ptr().add(src), packed.as_mut_ptr().add(dst));
+                    copy_block16(b.as_ptr().add(src), packed.as_mut_ptr().add(dst));
                 }
             }
         }
@@ -344,7 +344,7 @@ pub(crate) fn pack_b_f64(k: usize, n: usize, jb: usize, nc: usize, b: &[f64], pa
 /// # Safety
 /// `src` 至少可读 16 个 `f64`，`dst` 至少可写 16 个 `f64`，且两者不重叠。
 #[inline]
-unsafe fn copy_block16_f64(src: *const f64, dst: *mut f64) {
+unsafe fn copy_block16(src: *const f64, dst: *mut f64) {
     // SAFETY: 调用方保证 `src` 可读、`dst` 可写各 16 个 `f64` 且不重叠（见上面的 `# Safety`）；
     // 8 次 `add` 的偏移都落在 0..16 内。
     unsafe {
@@ -463,7 +463,7 @@ fn tile4x16_chunk(
 
 /// 单行 × 16 列，B 从打包缓冲读（不足 4 行的尾部行）。
 #[inline]
-fn row_tail_packed_f64(a_row: &[f64], strip: &[f64], c_row: &mut [f64], first: bool, j: usize) {
+fn row_tail_packed(a_row: &[f64], strip: &[f64], c_row: &mut [f64], first: bool, j: usize) {
     let mut acc0 = lasx::zero_f64x4();
     let mut acc1 = lasx::zero_f64x4();
     let mut acc2 = lasx::zero_f64x4();

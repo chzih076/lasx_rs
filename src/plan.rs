@@ -195,7 +195,7 @@ impl PackedKernel for f64 {
         dst: &mut [Self],
     ) {
         match b.as_row_major_contiguous() {
-            Some(flat) => crate::ops::matmul_f64::pack_b_f64(k, n, jb, nc, flat, dst),
+            Some(flat) => crate::ops::matmul_f64::pack_b(k, n, jb, nc, flat, dst),
             None => pack_panel_gathered(jb, nc, Self::STRIP, b, dst),
         }
     }

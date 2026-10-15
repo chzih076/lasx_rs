@@ -341,7 +341,7 @@ pub fn matmul_f64(
         let cap = k * nc_strips * 16;
         let mut buf_a = vec![0f64; cap];
         let mut buf_b = vec![0f64; cap];
-        matmul64::pack_b_f64(k, n, panels[0].0, panels[0].1, b, &mut buf_a);
+        matmul64::pack_b(k, n, panels[0].0, panels[0].1, b, &mut buf_a);
         for (i, &(jb, nc)) in panels.iter().enumerate() {
             let next = panels.get(i + 1).copied();
             if i % 2 == 0 {
@@ -365,7 +365,7 @@ pub fn matmul_f64(
                     },
                     || {
                         if let Some((njb, nnc)) = next {
-                            matmul64::pack_b_f64(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
+                            matmul64::pack_b(k, n, njb, nnc, b, &mut buf_b[..k * nnc]);
                         }
                     },
                 );
@@ -390,7 +390,7 @@ pub fn matmul_f64(
                     },
                     || {
                         if let Some((njb, nnc)) = next {
-                            matmul64::pack_b_f64(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
+                            matmul64::pack_b(k, n, njb, nnc, b, &mut buf_a[..k * nnc]);
                         }
                     },
                 );

@@ -84,13 +84,22 @@ lasx_rs/
 | `arch/` | `transmute` 与 intrinsic 的唯一集中地 | 内核代码里不出现裸 `m256i` ↔ `m256` 转换 |
 | `cli/` / `examples/` | 只测量与演示，不参与生产路径 | 基准不得为"好看"而改口径 |
 
-命名规范（本仓库统一口径）：
+### 1.1 内部命名规范
 
-- 导出符号：`lasx_<算子>`，校验版 `lasx_<算子>_checked`；新增符号**只能追加**。
-- 内部函数：`<算子>`（`ops/` 内 `pub(crate)`），微内核常见后缀 `_lasx` / `_lsx` / `_packed` / `_chunk` / `_cols_block`。
-- 常量：路径阈值用 `PACK_MIN_*` / `COL_*` / `K_ALIGN*` / `L1_BUDGET` / `K_CHUNK`，一律带注释说明**实测来源**。
-- 测试：`test_<算子>_matches_reference`（数值）、`<路径>_bit_exact`（位精确）、`cols_bit_exact` 之类按路径命名。
-- 代码注释与提交信息用中文；提交信息写清"动机 + 实测数据 + 被否掉的选项"。
+一条总则：**名字写"它是什么"，不写"它怎么实现"**；下面每条都是它的推论。
+
+| 规则 | 内容 | 一句话理由 |
+|---|---|---|
+| 一算子一文件 | `src/ops/<op>.rs`，入口名 = 算子名 | 按算子名就能找到文件 |
+| 路径后缀 | `_lasx` / `_lsx` / `_scalar` **就是** ISA 路径；入口 `<op>` 内按 `SimdPath::detect()` 分派 | 看后缀就知道跑哪条指令流 |
+| 地形名照留 | `tile4x32*` = 4 行 × 32 列的微内核；`row_tail*` = 一行的列尾；`cols*` = 列块；`*_chunk` = k 分块；`*_packed` = 打包面板路径 | 地形是读者真正需要的信息，不是实现细节 |
+| 一词一义 | 同一概念只用一种拼法（批量 `_batch`、无分配版 `_into`、缩放 `*_scaled`）；f32/f64 兄弟模块对同一概念**同拼写** | 同一件事有两个名字，grep 就会漏 |
+| 不塞细节 | 不写位宽、展开因子、块大小、冗余 dtype（模块名已限定 dtype） | 改向量宽度不该连带改一片名字 |
+| 非分派后缀 | `_seq` / `_vec` 指"同一串 op 的标量写法 / 向量写法"（`nn_math`、`j2_accel_vec`），不是 ISA 分派 | 没有第二条 ISA 路径，叫 `_scalar` 反而误导 |
+| 导出与冻结 | 导出符号 `lasx_<算子>`（`_checked` = 校验版，**只能追加**）；冻结的三条接口（池的行块闭包、`Prepared::apply*`、`Policy::threads`）**名字不改**，要改先按 `AGENTS.md` 规则 3 记录 | C ABI 与 proc-macro 按字面名字引用 |
+| 常量与测试 | 阈值常量 `PACK_MIN_*` / `COL_*` / `K_ALIGN*` / `L1_BUDGET` / `K_CHUNK` 注明**实测来源**；测试 `test_<算子>_matches_reference`（数值）、`<路径>_bit_exact`（位精确） | 从名字能反查到测量记录 |
+
+注释与提交信息用中文；提交信息写清"动机 + 实测数据 + 被否掉的选项"。
 
 **零依赖**：`Cargo.toml` 没有任何第三方依赖；稳定工具链不可用（需要 `#![feature(stdarch_loongarch)]`）。
 
@@ -1889,7 +1898,7 @@ f64 只有两条（打包 / 流式），`m ≥ 32 && k ≥ 64 && m·k·n ≥ 8M`
 | `copy_from_slice` 已经够快 | 两种标量顺序 10.2–18.0 GB/s（**生产 `+lasx` 配置下也一样**），而纯读同一工作集有 23.4 GB/s | 否：见下面对照的机制 |
 | `copy_from_slice` 是"没向量化" | 反汇编（`objdump -d`，生产 `+lasx` 配置）显示它落进**通用 memcpy**：先按地址做对齐剥离与重叠检查，再按块起分支（`xvld` 与 `xvpermi.d/xvpickev.w/xvslt.du` 混在一起），每个 128 B 块都要走一遍 | 机制是"通用拷贝路径的对齐剥离/分支开销"，不是"完全不发向量指令"；显式按布局写才是干净内层循环 |
 | 32 字节对齐是硬要求（要不要换 `AlignedVec`） | 用对齐基址 + 8 种 `f32` 偏移（4–28 字节）做载入-存储往返：**全部逐位正确、未越界写** | 否：显式 `xvld/xvst` 容错非对齐（`arch::lasx` 的"与对齐无关"契约成立，实测覆盖到元素对齐） |
-| 显式 4 条 256 位载入/存储 | **21.7–46.0 GB/s**（同工作集纯读 23.4 GB/s，说明已贴住访存上限） | 是，`pack_b`/`pack_b_f64` 现在每个 128 B 块发 4×`load/store_f32x8` |
+| 显式 4 条 256 位载入/存储 | **21.7–46.0 GB/s**（同工作集纯读 23.4 GB/s，说明已贴住访存上限） | 是，`pack_b`（f32/f64 两侧同名）现在每个 128 B 块发 4×`load/store_f32x8` |
 | 一次处理几条带（1 条 vs 4 条） | 隔离探针里 1 条带在中等形状更快（256²：37.1 对 27.0 GB/s）；**端到端三轮只有宽 B 形状能分辨**：4 条带一组 58.1/53.6/53.7，1 条带 56.9/52.9/52.7（`128×512×8192`，+2%），其余形状在 ±1% 内 | 取 **4 条带一组**：读侧每行 512 B 连续，对宽 B 更友好；隔离探针的排序在真实内核里不成立，所以按端到端定 |
 
 端到端（`examples/matmul_ab` 与 `lasx_bench matmul` 双口径、进程级交替、丢弃首轮、3–5 轮中位数；
@@ -4665,7 +4674,7 @@ crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `
 | 8 | `src/ops/dot_f16.rs` 的 `dot_f16` 本体（**长体**：4 条累加链 + 尾部 lane 聚合） | **1** | ✅ 已显式化（2026-10-04） |
 | 9 | `src/ops/rk4_j2_step_batch.rs` 的 `j2_accel_vec`（长体，纯寄存器 J2 摄动加速度） | **1** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧清零** |
 | 10 | `yll/src/yll.rs` 的 `arg`（`*argv.add(idx)`）；**并把 `cli/src/main.rs` 的 allow 删掉**（实测 `cli/src` 的 `unsafe fn` 数为 **0** ⇒ 删后 `cargo build` 仍 0 告警，这就是"无债"的证据） | **1** | ✅ 已显式化（2026-10-04） |
-| 11 | `src/ops/matmul_f64.rs` 的 `copy_block16_f64`(14 处) + `src/ops/dot_i8.rs` 的 `step_pair`(10 处)；**并删掉 `src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明 `src/` 真的清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧真正清零** |
+| 11 | `src/ops/matmul_f64.rs` 的 `copy_block16`(14 处) + `src/ops/dot_i8.rs` 的 `step_pair`(10 处)；**并删掉 `src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明 `src/` 真的清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧真正清零** |
 | 12 | `yll/src/yll.rs` 剩 3（`arg_f64`/`arg_int`/`arg_arr_len`——体里既调本模块的 `unsafe fn`、又调 `unsafe extern` 的宿主函数，都收进 `unsafe {}`） | **3** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/yll.rs` 清零** |
 | 13 | `yll/src/convert.rs` 的 `read_array`（体最长：`arg_arr_len` + 逐元素 `yll_arr_get`/`yll_is_*`/`yll_as_*`）+ `read_f64`/`read_f32`/`read_i8`（体各一句） | **4** | ✅ 已显式化（2026-10-04）（**该文件 8 个里做了 4 个**） |
 | 14 | `yll/src/convert.rs` 的 `push_f64_array`/`push_f64_arrays`（宿主构造器，前提是"解释器线程内"） | **2** | ✅ 已显式化（2026-10-04）（**该文件剩 2**：`read_f64_soa`/`read_f64_soa_at`） |
