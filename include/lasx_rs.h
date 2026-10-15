@@ -71,6 +71,27 @@
 #ifndef LASX_RS_H
 #define LASX_RS_H
 
+/* ========================================================================
+ * 架构防呆：本头文件只对应 **LoongArch64** 的 C ABI
+ *
+ * `lasx_rs` 是 LoongArch LASX/LSX 的**指令集绑定**实现（手写内在函数/内联汇编），
+ * **不是可移植标量库**：在别的架构上编译/链接它没有意义，运行期更不可能可用。
+ * 所以这里在**编译期**直接拦下——错架构的 `#include` 会立刻得到一条人话，
+ * 而不是等到链接或运行时才发现。
+ *
+ * **逃生阀 `LASX_RS_ALLOW_FOREIGN_ARCH`**（给交叉编译 / 文档生成 / 头文件语法检查用）：
+ * 定义它即可跳过这道编译期检查。请**只**在这些场景用它——它**只关掉编译期检查**，
+ * 不会让运行时可用（库产物本身仍是 LoongArch 机器码，得在 LoongArch64 上运行）。
+ *
+ * 与之**不同**的另一件事：LSX-only 机型（**无 LASX**，如 2K3000/3B6000M）是
+ * **能构建、能运行**的，只是不能调标了 `[LASX-only]` 的符号（会 SIGILL）。那是运行期问题，
+ * 用 `lasx_has_lasx()` 防呆（见下面第 0 节）。**别把"错架构"和"无 LASX"混成一件事。**
+ * ======================================================================== */
+
+#if !defined(__loongarch__) && !defined(LASX_RS_ALLOW_FOREIGN_ARCH)
+#error "lasx_rs 仅提供 LoongArch64 的 C ABI（LASX/LSX 指令集绑定）。错架构请勿链接；如确需交叉编译请显式定义 LASX_RS_ALLOW_FOREIGN_ARCH。"
+#endif
+
 #include <stdint.h>
 
 #ifdef __cplusplus

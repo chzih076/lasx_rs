@@ -27,6 +27,21 @@ REPO    := $(abspath $(CURDIR)/../..)
 # pkg-config 找不到 lasx_rs 时的兜底：直接用仓库构建产物
 FALLBACK ?=
 
+# ---- 架构防呆：本示例只在 LoongArch64 上能编译/运行 ----
+# 头文件自己也有 `#error`（见 include/lasx_rs.h 顶部），这里把话说得更早、更具体。
+# FOREIGN=1：显式跳过检查（交叉编译 / 只做文档与语法检查的场景）——它会同时定义
+# `LASX_RS_ALLOW_FOREIGN_ARCH` 关掉头文件那道 `#error`。**只关编译期检查，运行时仍不可用。**
+HOST_ARCH := $(shell uname -m)
+CFLAGS_ARCH :=
+ifneq ($(HOST_ARCH),loongarch64)
+  ifeq ($(FOREIGN),1)
+    $(info [make] 非 LoongArch64（uname -m = $(HOST_ARCH)）但 FOREIGN=1：跳过架构防呆，仅用于交叉/文档场景)
+    CFLAGS_ARCH := -DLASX_RS_ALLOW_FOREIGN_ARCH
+  else
+    $(error [make] 本机架构是 "$(HOST_ARCH)"，不是 loongarch64：lasx_rs 是 LoongArch LASX/LSX 指令集绑定，示例只能在 LoongArch64 上编译/运行。确需交叉编译或在别的架构上做语法/文档检查时，显式加 FOREIGN=1（只关掉编译期检查，不会让运行时可用）)
+  endif
+endif
+
 PC_CFLAGS := $(shell $(PKG_CONFIG) --cflags lasx_rs 2>/dev/null)
 PC_LIBS   := $(shell $(PKG_CONFIG) --libs lasx_rs 2>/dev/null)
 PC_LIBDIR := $(shell $(PKG_CONFIG) --variable=libdir lasx_rs 2>/dev/null)
@@ -57,7 +72,7 @@ endif
 all: quickstart
 
 quickstart: quickstart.c $(SONAME_LINK)
-	$(CC) $(CFLAGS) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm
+	$(CC) $(CFLAGS) $(CFLAGS_ARCH) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm
 
 # 兜底分支才用得到：补齐 SONAME 需要的文件名（内容就是同一个文件）
 $(SONAME_LINK): $(REPO)/target/release/liblasx_rs.so

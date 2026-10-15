@@ -12,6 +12,14 @@
 //! 每个内核在同一个线程内运行（强制 LSX 的钩子是线程级的）。
 #![feature(stdarch_loongarch)]
 
+// 架构防呆（与 `src/lib.rs` 同一口径）：基准自身也直接用 LASX/LSX 内在函数，
+// 错架构上先用一句话说清原因，而不是让内在函数报一堆"目标不支持"。
+#[cfg(not(target_arch = "loongarch64"))]
+compile_error!(
+    "lasx_bench 是 lasx_rs 的基准 CLI，与库一样是 LoongArch LASX/LSX 指令集绑定，\
+     只能在 LoongArch64 上构建/运行（详见 lasx_rs 的编译期提示）。"
+);
+
 mod data;
 mod group;
 mod report;

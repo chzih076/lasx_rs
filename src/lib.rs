@@ -72,6 +72,31 @@
 // extern "C" FFI 函数按约定解引用传入裸指针（调用方保证有效），非 unsafe fn 语义
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+// ---------------------------------------------------------------------------
+// 架构防呆：错架构要"错得明显"
+//
+// 本 crate 是 LoongArch LASX/LSX 的**指令集绑定**实现——源码里直接用
+// `std::arch::loongarch64::*` 内在函数与内联汇编，**没有任何标量兜底**。不在编译期拦住的话，
+// 在 x86/arm 上构建会得到几十条"找不到 loongarch64 intrinsic / 目标不支持该指令"的噪音，
+// 真正的原因（用错平台了）反而被淹没。
+//
+// 这里给出**一条说清楚的话**。口径：这不是"提升了可移植性"，而是**让错误显式**——本库只在
+// LoongArch64 上构建/运行；依赖方请写成
+// `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会停在这一行
+// （**这是有意的**：把"用错平台"从运行期静默错结果收敛成编译期硬错误）。
+//
+// 与之**不同**的另一件事：LSX-only 机型（无 LASX，如 2K3000/3B6000M）**能构建也能运行**，
+// 只是不能调 `[LASX-only]` 符号——那是运行期问题，用 `lasx_has_lasx()`（C 侧）/
+// `SimdPath::detect()`（Rust 侧）防呆。两件事别混。
+// ---------------------------------------------------------------------------
+#[cfg(not(target_arch = "loongarch64"))]
+compile_error!(
+    "lasx_rs 是 LoongArch LASX/LSX 指令集绑定实现（手写内联汇编/内在函数），不是可移植标量库。\n\
+     请在本机 LoongArch64 上构建，或改用其它后端。\n\
+     依赖方请写成 `[target.'cfg(target_arch = \"loongarch64\")'.dependencies]`，\
+     否则 x86/arm 上的 CI 会停在这一行（有意为之）。"
+);
+
 pub mod aligned;
 pub mod api;
 pub mod arch;

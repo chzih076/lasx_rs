@@ -96,6 +96,30 @@ fi
 VERSION=$(grep -m1 '^version' "$ROOT/Cargo.toml" | cut -d'"' -f2)
 [ -n "$VERSION" ] || { printf '错误：读不出 Cargo.toml 的 version\n' >&2; exit 1; }
 
+# ---- 架构防呆：产物必须是 LoongArch 机器码 ----
+# lasx_rs 是 LASX/LSX 指令集绑定（不是可移植标量库）：把别的架构的产物装进系统 libdir
+# 是真实事故（调用方在 LoongArch 上 dlopen/链接一个 x86 .so ⇒ 报错信息通常很难懂）。
+# 与下面的 SONAME 校验同风格：readelf 可用就**拒绝安装**，不可用就降级为告警。
+if command -v readelf >/dev/null 2>&1; then
+  # `LC_ALL=C`：readelf 的**字段名**会被本地化（本机是"系统架构:"而不是"Machine:"），
+  # 钉住 C locale 才能稳定匹配；架构名本身（LoongArch）两种 locale 下都出现。
+  MACHINE=$(LC_ALL=C readelf -h "$SO" 2>/dev/null | grep -m1 'Machine:' || true)
+  case $MACHINE in
+    *LoongArch*) ;;
+    *)
+      printf '错误：%s 不是 LoongArch 产物（readelf 报：%s）\n' "$SO" "${MACHINE:-无法解析 ELF 头}" >&2
+      printf '      lasx_rs 只在 LoongArch64 上构建/运行，装错架构的产物没有意义，拒绝安装。\n' >&2
+      printf '      请在本机 LoongArch64 上跑 `cargo build --release` 后重试。\n' >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# C 头可选校验：架构防呆宏在不在（旧版头文件没有它 ⇒ 提示一下，不拒绝）
+if ! grep -q 'LASX_RS_ALLOW_FOREIGN_ARCH' "$HEADER"; then
+  printf '警告：%s 里没有架构防呆宏（LASX_RS_ALLOW_FOREIGN_ARCH）——可能是旧版头文件\n' "$HEADER" >&2
+fi
+
 if command -v readelf >/dev/null 2>&1; then
   GOT=$(readelf -d "$SO" | grep -m1 'SONAME' || true)
   case $GOT in
@@ -107,6 +131,8 @@ if command -v readelf >/dev/null 2>&1; then
       exit 1
       ;;
   esac
+else
+  printf '警告：没有 readelf，"产物架构 = LoongArch"与 SONAME 两项校验都跳过\n' >&2
 fi
 
 # ---- 安装（幂等）----
