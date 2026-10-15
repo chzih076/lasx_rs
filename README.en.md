@@ -17,7 +17,7 @@ Four workload classes are covered:
 ## Features
 
 - **Zero third-party dependencies** — only `core::arch::loongarch64` LASX/LSX intrinsics and std.
-- **81 exported symbols** (41 plain + 40 `_checked` variants taking a trailing `int *status`).
+- **83 exported symbols** (42 plain + 41 `_checked` variants taking a trailing `int *status`).
   The signatures and semantics of the original 15 `lasx_*` symbols are **frozen**; new capability
   is only ever appended. Both symbol families are backed by the same kernel implementations.
 - **Bitwise determinism** — for a given input, every path of an operator (LASX / LSX / scalar tail
@@ -92,7 +92,8 @@ live in the respective design sections.
 | Resident pool vs threads-per-step (reused across 200 steps) | 37.47 ms vs 83.81 ms (**2.24×**; single-threaded 302.69 ms) |
 
 Comparisons against OpenBLAS 0.3.34 (single-threaded) on the same machine, together with the
-per-shape root-cause analysis, are in `docs/dev.md`.
+per-shape root-cause analysis, are in `docs/dev.md`. **(See `docs/dev.md` §7.10: historical
+baseline, not covered by the 2026-10-15 variance-method re-measurement.)**
 
 > **Formula-DSL reuse note**: `matmul!`'s `mul_into` re-packs `B` on every call, so a layer loop
 > that reuses the same weight should hoist the preparation out of the loop (256³ measured
