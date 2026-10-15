@@ -362,13 +362,6 @@ mod tests {
         c.iter().map(|v| v.to_bits()).collect()
     }
 
-    /// `/proc/self/task` 里的线程数（Linux）。用来证明"不用便利层 = 不起线程"。
-    fn thread_count() -> usize {
-        std::fs::read_dir("/proc/self/task")
-            .map(|d| d.count())
-            .unwrap_or(0)
-    }
-
     /// 形状覆盖：k=384/385（打包路径 k 分块边界两侧）、`m` 不整除块大小、
     /// `rows` 不是 4 的倍数、`n` 不是 32 的倍数（列尾副本那条路）。
     const SHAPES: &[(usize, usize, usize, usize)] = &[
@@ -496,24 +489,64 @@ mod tests {
         lasx_matmul_plan_destroy(plan);
     }
 
-    /// **不用便利层时零进程级状态**：只走 `prepare` + `run` 不得新建线程。
+    /// **不用便利层时零进程级状态**：只走 `prepare` + `run` 不得**建池**。
     ///
     /// 这是"不引入全局池"的可执行证据（`docs/c-abi.md` 第 11.4 节）。
+    ///
+    /// 证据口径：**本线程的建池次数**（线程本地计数器），不是进程级线程数——`cargo test`
+    /// 默认并行，别的用例（`api::matmul` 会初始化进程级全局池）会把 `/proc/self/task`
+    /// 抬高 ⇒ 那种写法在并行框架下**必然 flaky**（CI run 1792063289 就是这么红的）。
+    /// 线程本地的"建池次数"恰好就是契约要证明的事：`prepare`/`run` 的代码路径里
+    /// 一次都不该碰 `WorkerPool::new`。
     #[test]
-    fn plan_path_spawns_no_threads() {
+    fn plan_path_does_not_construct_a_pool() {
         let (m, k, n) = (64usize, 128usize, 96usize);
         let a = data(m * k, 11);
         let b = data(k * n, 12);
-        let before = thread_count();
+        let before = crate::pool::pool_ctors_this_thread();
+
         let plan = lasx_matmul_prepare(k as i32, n as i32, b.as_ptr());
         assert!(!plan.is_null());
         let mut c = vec![0f32; m * n];
-        lasx_matmul_run(plan, m as i32, a.as_ptr(), c.as_mut_ptr());
+        // 按行切块多调几次（推荐用法）：每次都不该建池
+        for r0 in (0..m).step_by(7) {
+            let rows = 7.min(m - r0);
+            lasx_matmul_run(
+                plan,
+                rows as i32,
+                a[r0 * k..].as_ptr(),
+                c[r0 * n..].as_mut_ptr(),
+            );
+        }
         lasx_matmul_plan_destroy(plan);
-        let after = thread_count();
         assert_eq!(
-            before, after,
-            "prepare/run 不应新建线程（{before} -> {after}）"
+            crate::pool::pool_ctors_this_thread(),
+            before,
+            "prepare/run 不得走建池路径（契约：不用便利层 = 零进程级状态）"
         );
+
+        // **正对照**：便利层 `threads=2` 必须建池。没有这一步，上面那条断言可能因为
+        //"计数器根本没被触发"而**假绿**——这是结构性断言最容易犯的错。
+        let plan = lasx_matmul_prepare(k as i32, n as i32, b.as_ptr());
+        assert!(!plan.is_null());
+        let mut st = -1;
+        lasx_matmul_run_threaded_checked(
+            plan,
+            m as i32,
+            a.as_ptr(),
+            c.as_mut_ptr(),
+            2,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut st,
+        );
+        assert_eq!(st, LasxStatus::Ok as i32);
+        assert!(
+            crate::pool::pool_ctors_this_thread() > before,
+            "正对照失败：便利层 threads=2 应当建池（计数器没动 ⇒ 上面那条断言是假绿）"
+        );
+        lasx_matmul_plan_destroy(plan);
     }
 }

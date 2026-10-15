@@ -297,6 +297,9 @@ pub struct WorkerPool {
 impl WorkerPool {
     /// 建池，`threads` 至少为 1。
     pub fn new(threads: usize) -> Self {
+        // 测试用：记录**本线程**建过几次池（见 `POOL_CTORS_THIS_THREAD` 的注释）。
+        #[cfg(test)]
+        POOL_CTORS_THIS_THREAD.with(|c| c.set(c.get() + 1));
         let threads = threads.max(1);
         let shared = Arc::new(Shared {
             epoch: AtomicUsize::new(0),
@@ -965,6 +968,22 @@ impl Drop for WorkerPool {
 
 /// 进程级共享池的存储；[`global`] 与 [`init_global`] 共用同一个。
 static GLOBAL: std::sync::OnceLock<WorkerPool> = std::sync::OnceLock::new();
+
+// 测试用：**本线程**调用过多少次 `WorkerPool::new`（含 `auto()`/`global()` 的首次建池）。
+//
+// 为什么必须是**线程本地**：`cargo test` 默认并行跑，进程级计数器会被别的用例并发污染。
+// `src/ffi/matmul_plan.rs` 的"`prepare`/`run` 不得建池"契约测试用它做确定性证据
+// （进程级线程数、`/proc/self/task` 这类观察在并行测试里都不可用）。
+#[cfg(test)]
+thread_local! {
+    static POOL_CTORS_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程至今建过几次池（测试用；见 `POOL_CTORS_THIS_THREAD`）。
+#[cfg(test)]
+pub(crate) fn pool_ctors_this_thread() -> usize {
+    POOL_CTORS_THIS_THREAD.with(std::cell::Cell::get)
+}
 
 /// 进程级共享池：首次使用时就地建一个按 `available_parallelism` 配线程数的池。
 ///
