@@ -53,7 +53,7 @@ cargo test --workspace --release         # 229 个单元测试 + 6 个宏单测 
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
-# C 项目：安装后的编译/链接参数（见 docs/ops.md 的 §17.2 与 §18）
+# C 项目：安装后的编译/链接参数（见 docs/c-abi.md 的「快速开始」）
 pkg-config --cflags --libs lasx_rs
 
 # 基准：不带过滤跑全部套件，带子串只跑匹配套件
@@ -65,7 +65,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 ```
 
 ```c
-/* C 侧最短路径；完整心智模型（三层 / 裸 vs _checked / 线程 / 错误模型）见 docs/ops.md §18 */
+/* C 侧最短路径；完整心智模型（三层 / 裸 vs _checked / 线程 / 错误模型）见 docs/c-abi.md */
 if (lasx_has_lasx()) { /* 调 [LASX-only] 符号前先问：0 = 仅 LSX，直调会 SIGILL */ }
 float d = lasx_dot_checked(a, b, n, &st);            /* 默认 _checked：失败只写 status、不触碰输出 */
 if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));   /* 别硬编码 0..6 */
@@ -140,7 +140,8 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 | NN 侧 N1（8 个） | `lasx_softmax_rows`、`lasx_rms_norm`、`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16` |
 | 内存 | `lasx_alloc`（32 字节对齐；库内不导出对应的释放函数） |
 
-每个算子的 C 签名、语义、数值契约与"由谁守"见 `docs/ops.md`。安全 Rust API 见 `lasx_rs::api`
+每个算子的 C 签名与 C 侧调用契约（内存/安全模型/能力探测）见 [docs/c-abi.md](docs/c-abi.md)；
+语义、数值契约与"由谁守"见 `docs/ops.md`。安全 Rust API 见 `lasx_rs::api`
 （32 个 `pub fn`），另有 `lasx_rs::view` / `lasx_rs::plan` / `lasx_rs::shape` / `lasx_rs::pool` /
 `lasx_rs::parallel`。
 
@@ -148,12 +149,14 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **算子与用法**：87 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据 |
+| [docs/c-abi.md](docs/c-abi.md) | **C ABI（唯一权威）**：87 个导出符号的完整清单与逐符号原型、内存与生命周期、安全模型（裸 vs `_checked`）、能力探测与降级、线程模型、ABI 稳定性策略、快速开始（四种链接方式） |
+| [docs/ops.md](docs/ops.md) | **算子与用法（Rust 侧）**：数值契约与逐位确定性、降级覆盖分类、池与并行、矩阵视图/计划/形状层、NN 算子现状与缺口对照、int8/f32 判据；C ABI 见 `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 | [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |
 
-两份文档的分工是硬约定：**契约与用法在 `docs/ops.md`，性能数据在 `docs/dev.md`，
-同一份数字只存一处**。文档内所有跨文档引用都写成"文档名 + 节号"形式，可机械校验。
+文档分工是硬约定：**C ABI 在 `docs/c-abi.md`（符号清单与 C 侧契约只在那里维护）**，
+Rust 侧契约与用法在 `docs/ops.md`，性能数据在 `docs/dev.md`，**同一份数字只存一处**。
+文档内所有跨文档引用都写成"文档名 + 节号"形式，可机械校验。
 
 ## 仓库
 

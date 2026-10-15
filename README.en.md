@@ -52,7 +52,7 @@ cargo test --workspace --release         # 229 unit tests + 6 macro tests + 18 d
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
-# C projects: compile/link flags after install (see §17.2 and §18 in docs/ops.md)
+# C projects: compile/link flags after install (see "Getting started" in docs/c-abi.md)
 pkg-config --cflags --libs lasx_rs
 
 # Benchmarks: no filter runs every suite, a substring selects matching suites
@@ -65,7 +65,7 @@ cargo run --release --example matmul_ab -- 512 512 512 packed
 ```
 
 ```c
-/* Shortest path from C; full mental model (layers / raw vs _checked / threads / errors): docs/ops.md §18 */
+/* Shortest path from C; full mental model (layers / raw vs _checked / threads / errors): docs/c-abi.md */
 if (lasx_has_lasx()) { /* ask before calling [LASX-only]: 0 = LSX only, a direct call is SIGILL */ }
 float d = lasx_dot_checked(a, b, n, &st);            /* _checked by default: on failure status only, output untouched */
 if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));   /* never hardcode 0..6 */
@@ -132,21 +132,25 @@ baseline, not covered by the 2026-10-15 variance-method re-measurement.)**
 | NN, N1 batch (8) | `lasx_softmax_rows`, `lasx_rms_norm`, `lasx_silu`, `lasx_gelu_quick`, `lasx_gelu_erf`, `lasx_rope`, `lasx_dot_f16`, `lasx_gemv_f16` |
 | Memory | `lasx_alloc` (32-byte aligned; no matching deallocator is exported) |
 
-C signatures, semantics, numerical contracts, and the "who enforces this" annotation for every
-operator are in `docs/ops.md`. The safe Rust API is `lasx_rs::api` (32 `pub fn`), alongside
-`lasx_rs::view`, `lasx_rs::plan`, `lasx_rs::shape`, `lasx_rs::pool`, and `lasx_rs::parallel`.
+C signatures and the C-side calling contract (memory, safety model, capability probe) are in
+[docs/c-abi.md](docs/c-abi.md); per-operator semantics, numerical contracts, and the
+"who enforces this" annotation are in `docs/ops.md`. The safe Rust API is `lasx_rs::api`
+(32 `pub fn`), alongside `lasx_rs::view`, `lasx_rs::plan`, `lasx_rs::shape`, `lasx_rs::pool`,
+and `lasx_rs::parallel`.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 87-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule |
+| [docs/c-abi.md](docs/c-abi.md) | **The C ABI (single authority)**: all 87 exported symbols with full prototypes, memory and lifetime, safety model (raw vs `_checked`), capability probe and degradation, threading model, ABI stability policy, and a getting-started section (four ways to link) |
+| [docs/ops.md](docs/ops.md) | **Operators and usage (Rust side)**: numerical contracts and bitwise determinism, degradation coverage, pool and parallelism, matrix view/plan/shape layers, NN operator status and gap comparison, int8-vs-f32 decision rule; for the C ABI see `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 | [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
 
-The division of labour between the two documents is a hard rule: **contracts and usage live in
-`docs/ops.md`, performance data lives in `docs/dev.md`, and any given number appears exactly
-once**. Cross-document references are always written as a document name plus a section number,
+The division of labour is a hard rule: **the C ABI lives in `docs/c-abi.md`** (the symbol list and
+C-side contract are maintained only there), Rust contracts and usage live in `docs/ops.md`, and
+performance data lives in `docs/dev.md` — **any given number appears exactly once**.
+Cross-document references are always written as a document name plus a section number,
 which makes them mechanically checkable.
 
 ## Repository

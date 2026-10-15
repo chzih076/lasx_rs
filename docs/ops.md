@@ -7,7 +7,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，87 个导出符号（46 个裸版本 + 41 个 `_checked` 变体） |
+| 适用代码版本 | `master`；导出符号的计数、完整清单与逐符号原型见 [`docs/c-abi.md`](c-abi.md)（C ABI 的唯一权威） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 平台约束的位置 | **不在本文档**：硬件勘误（LA664 原子操作丢失更新）、内核分支生命周期、消费 ONNX 契约引出的缺口与承诺边界，都在 [`docs/platform.md`](platform.md)——**调用方通常无需读它**（勘误的命中点在库内部，库侧已自带 `_db` 与回归测试） |
@@ -29,7 +29,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（87 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status`；另有 4 个运行时元信息符号 |
+| `lasx_rs::ffi`（`extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status`；另有 4 个运行时元信息符号。**C 侧权威说明见 [`docs/c-abi.md`](c-abi.md)** |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -731,200 +731,65 @@ C 侧**不必**读 `cpucfg`：`int lasx_has_lasx(void)`（§4.8）返回的正�
 （`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（87 个）
+## 4. 导出符号总表（C ABI 的权威说明见 `docs/c-abi.md`）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**46 个未带 `_checked`
-的 `lasx_*` + 41 个 `lasx_*_checked` = 87**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
-`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
-各与其 checked 变体；**N3 批次加了 int8 推理的 8 个**，见 §4.3；
-**ONNX 契约补充加了 `lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` 各与其
-checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约；
-**2026-10-15 又加了 4 个运行时元信息/内存符号**（`lasx_has_lasx`、`lasx_version`、
-`lasx_status_message`、`lasx_free`，见 §4.8、§3.2/§3.4/§10））。
+> **这一节的内容已搬到 [`docs/c-abi.md`](c-abi.md)**——那里是 C ABI 的唯一权威：完整符号清单
+> 与逐符号原型（含参数次序与 `[LASX-only]` 标注）、`_checked` 与状态码、内存与安全模型、
+> 能力探测、链路与 ABI 稳定性策略。本节只保留下面这些**指向**，让既有的 `§4.x` 引用仍能落到
+> 正确的话题上；**Rust 侧内容**（`api`/`view`/`plan`/`shape`/`pool`）不在搬迁范围内。
 
-**这些原型的权威副本是 `include/lasx_rs.h`**（随库一起安装的生产用 C 头文件）：`scripts/check_header.c`
-对 87 个符号逐个取地址（缺符号/改名/原型不匹配 ⇒ 编译或链接失败），并实调全部 41 个 `_checked`
-变体、融合缩放的行为断言，以及 §4.8 那 4 个符号的行为（版本/能力/状态串/alloc→free 配对）。C 侧用法：
-
-```c
-#include "lasx_rs.h"   /* cc -O2 -I<prefix>/include app.c -L<prefix>/lib -llasx_rs -lm */
-int st;
-lasx_matmul_scaled_checked(m, k, n, 1.0f, a, b, 0.0f, c, &st);   /* st == LASX_OK */
-```
+- 归约/稠密/量化/物理/内存 16 个裸符号 → `docs/c-abi.md` 第 3.1 节
+- 批量姿态与几何 7 个 → 第 3.2 节
+- NN 侧 N1 批次 8 个 → 第 3.3 节
+- int8 推理 N3 批次 8 个 → 第 3.4 节
+- ONNX 契约补充 3 个 → 第 3.5 节
+- 运行时元信息与内存归还 4 个 → 第 3.6 节
+- `_checked` 变体 41 个 → 第 3.7 节；状态码 0..6 → 第 3.8 节
+- 符号数清点、`nm -D` 自检、逐符号链接校验（`include/lasx_rs.h` + `scripts/check_header.c`）
+  → 第 10 节
 
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
-| 符号 | C 签名要点 | 语义 | 路径 |
-|---|---|---|---|
-| `lasx_dot` | `float(const float*, const float*, int)` | `Σ a[i]·b[i]` | LASX+LSX |
-| `lasx_sum` | `float(const float*, int)` | `Σ x[i]` | LASX-only |
-| `lasx_dot_f64` | `double(const double*, const double*, int)` | f64 点积 | LASX-only |
-| `lasx_axpy` | `void(float alpha, const float*, float*, int)` | `y += alpha·x`（原地） | LASX-only |
-| `lasx_matmul` | `void(int m, int k, int n, const float*, const float*, float*)` | `C=A·B`，行主序 | LASX-only |
-| `lasx_matmul_f64` | `void(int m, int k, int n, const double*, const double*, double*)` | f64 矩阵乘 | LASX-only |
-| `lasx_dot_i8` | `int(const int8_t*, const int8_t*, int)` | int8 点积，返回 i32 | LASX-only |
-| `lasx_dot_q4` | `double(const uint8_t*, const float*, const uint8_t*, const float*, int)` | Q4 量化点积 | LASX-only |
-| `lasx_alloc` | `float*(int n)` | 分配 32 字节对齐的未初始化 f32 缓冲 | — |
-| `lasx_norm3_batch` | `void(3×const double*, double*, int)` | `out=√(x²+y²+z²)` | LASX+LSX |
-| `lasx_vec3_add_scaled_batch` | `void(6×const double*, double s, 3×double*, int)` | `o=a+s·b`，三分量独立 | LASX+LSX |
-| `lasx_batch_distance2d` | `void(float px, float py, const float*, const float*, float*, int)` | `d=√(dx²+dy²)` | LASX+标量 |
-| `lasx_ballistic_step` | `void(6×float*, const float* k, int, float dt, float g)` | 批量弹道欧拉步（原地） | LASX+标量 |
-| `lasx_j2_accel_batch` | `void(3×const double* r, double mu, double j2, double re, 3×double*, int)` | J2 引力加速度 | LASX+LSX |
-| `lasx_rk4_j2_step_batch` | `void(6×double*, double mu, double j2, double re, double dt, int)` | RK4 J2 单步（原地） | LASX+标量 |
-
-长度 `n`/`m,k,n`/`n_bytes` 均为 C `int`（Rust `i32`）；标量参数按值传；输入 `*const`、
-输出 `*mut`。
+**已搬移**：完整原型、路径标注与长度契约见 [`docs/c-abi.md`](c-abi.md) 第 3.1 节。
+这 15 个符号的签名与语义**永不改动**（`lasx_alloc` 在其中，它没有 `_checked` 变体）。
 
 ### 4.2 批量姿态/几何 7 个
 
-| 符号 | C 签名要点 | 语义 | 路径 |
-|---|---|---|---|
-| `lasx_cross3_batch` | `void(6×const double*, 3×double*, int)` | `o = a × b` | LASX+LSX |
-| `lasx_unitize3_batch` | `void(3×const double*, 3×double*, int)` | `o = v/\|v\|`；零向量 → `(0,0,0)` | LASX+LSX |
-| `lasx_mat3_mul_vec3_batch` | `void(9×const double* m, 3×const double* v, 3×double*, int)` | `o = M·v`，`M` 行主序 | LASX+LSX |
-| `lasx_quat_normalize_batch` | `void(4×double* q, int)` | 原地单位化；`\|q\|<1e-15` → `(1,0,0,0)` | LASX+LSX |
-| `lasx_quat_mul_batch` | `void(8×const double*, 4×double*, int)` | Hamilton 积 `a⊗b` | LASX+LSX |
-| `lasx_quat_rotate_batch` | `void(4×const double* q, 3×const double* v, 3×double*, int)` | 先单位化，再 `o=R(q)·v`（体→惯） | LASX+LSX |
-| `lasx_quat_to_dcm_batch` | `void(4×const double* q, 9×double*, int)` | 四元数 → 3×3 DCM（行主序） | LASX+LSX |
+**已搬移**：完整原型与公共约定（四元数标量在前、体→惯、允许输出与输入别名）见
+[`docs/c-abi.md`](c-abi.md) 第 3.2 节；逐算子语义与数值约定见 §7 的表。
 
 ### 4.3 N3：int8 推理 8 个（`docs/dev.md` §21）
 
-| 符号 | C 签名要点 | 语义 | 路径 |
-|---|---|---|---|
-| `lasx_amax` | `float(const float*, int)` | `max_i \|x_i\|`（空输入 0，NaN 忽略） | LASX-only |
-| `lasx_absmax_rows` | `void(const float*, int rows, int cols, float*)` | 逐行最大绝对值（per-token / per-channel 的公共原语） | LASX-only |
-| `lasx_quantize_i8_per_tensor` | `float(const float*, int8_t*, int)` | 对称量化，**返回 scale** | LASX-only |
-| `lasx_quantize_i8_per_row` | `void(const float*, int8_t*, float*, int, int)` | 逐行量化（每行一个 scale） | LASX-only |
-| `lasx_dequantize_i8` | `void(const int8_t*, float, float*, int)` | `out = (q as f32)·scale` | LASX-only |
-| `lasx_dequantize_i8_rows` | `void(const int8_t*, const float*, float*, int, int)` | 逐行反量化 | LASX-only |
-| `lasx_gemv_i8` | `void(const int8_t* w, const float* sw, const int8_t* x, float sx, float* y, int m, int k)` | `y[o] = Σ w[o,i]·x[i] · (sw[o]·sx)` | LASX-only |
-| `lasx_matmul_i8` | `void(const int8_t* x, const int8_t* w, const float* sw, const float* sx, float* y, int m, int k, int n)` | `Y[t,o] = Σ x[t,i]·w[o,i] · (sw[o]·sx[t])`（批量；§2.14 说明它何时不划算） | LASX-only |
-
+**已搬移**：完整原型与路径见 [`docs/c-abi.md`](c-abi.md) 第 3.4 节。
 契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
 
 ### 4.4 `_checked` 变体 41 个
 
-每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
-一个 `int *status` 出参**：
-
-```c
-float  lasx_dot_checked(const float *a, const float *b, int n, int *status);
-void   lasx_matmul_checked(int m, int k, int n, const float *a, const float *b,
-                           float *c, int *status);
-double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb,
-                           const float *sb, int n_bytes, int *status);
-```
-
-41 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
-`lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
-`lasx_matmul_scaled_checked`（融合缩放，2026-10-15 追加）、
-`lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
-`lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
-`lasx_ballistic_step_checked`、`lasx_j2_accel_batch_checked`、
-`lasx_rk4_j2_step_batch_checked`、`lasx_cross3_batch_checked`、
-`lasx_unitize3_batch_checked`、`lasx_mat3_mul_vec3_batch_checked`、
-`lasx_quat_normalize_batch_checked`、`lasx_quat_mul_batch_checked`、
-`lasx_quat_rotate_batch_checked`、`lasx_quat_to_dcm_batch_checked`、
-`lasx_softmax_rows_checked`、`lasx_rms_norm_checked`、
-`lasx_silu_checked`、`lasx_gelu_quick_checked`、`lasx_gelu_erf_checked`、`lasx_rope_checked`、
-`lasx_dot_f16_checked`、`lasx_gemv_f16_checked`，以及 N3 的 8 个：
-`lasx_amax_checked`、`lasx_absmax_rows_checked`、`lasx_quantize_i8_per_tensor_checked`、
-`lasx_quantize_i8_per_row_checked`、`lasx_dequantize_i8_checked`、
-`lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`、`lasx_matmul_i8_checked`，
-以及 **ONNX 契约补充的 3 个**：`lasx_layer_norm_checked`、`lasx_gather_rows_checked`、
-`lasx_gather_rows_i8_checked`（共 **41 个**）。
-
-行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
-型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
-但校验仍执行）。校验顺序：`j2_accel`/`rk4_j2_step` 先判长度与物理常数，再转切片；
-`matmul*` 先判维度非负、再判乘积不溢出、最后转切片。C 层只能判**结构**（空指针、负长度、
-溢出、物理常数）；"数组真实长度是否与声明形状一致"只有知道长度的上层判得了，`BadShape`
-主要留给语言绑定。
+**已搬移**：规则（原型完全相同，只在末尾追加 `int *status`）、41 个名字与失败语义见
+[`docs/c-abi.md`](c-abi.md) 第 3.7 节与第 5 节。
 
 ### 4.5 状态码（`LasxStatus`）
 
-| 码 | 名称 | 含义 |
-|---|---|---|
-| 0 | `Ok` | 成功 |
-| 1 | `NullPointer` | 指针为空且长度非 0 |
-| 2 | `NegativeLength` | 长度参数为负 |
-| 3 | `BadShape` | 形状/长度自洽性不成立 |
-| 4 | `SizeOverflow` | 尺寸相乘溢出 |
-| 5 | `NonPositiveConstant` | `mu <= 0` 或 `re <= 0` |
-| 6 | `NonFiniteConstant` | `j2`/`dt` 为 NaN 或无穷 |
-
-Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32()` 供绑定层还原。
+**已搬移**：0..6 的码表、`lasx_status_message()` 的 C 侧用法见 [`docs/c-abi.md`](c-abi.md)
+第 3.8 节。Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32()` 供绑定层
+还原（见 §8）。
 
 ### 4.6 符号数清点
 
-| 类别 | 原始符号 | `_checked` | 小计 | 逐个清单 |
-|---|---|---|---|---|
-| 历史内核（归约/稠密/量化/物理） | 15 | 14 | 29 | §4.1 |
-| 批量姿态/几何 | 7 | 7 | 14 | §4.2 |
-| NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.4 的名单、§5.9–§5.13 的用法 |
-| N3（int8 推理 8 个） | 8 | 8 | 16 | §4.3、§5.14 的用法 |
-| ONNX 契约补充（3 个：`layer_norm` + `gather_rows` + `gather_rows_i8`） | 3 | 3 | 6 | 契约 §2.16/§2.17，来源 `docs/platform.md` §4 |
-| matmul 融合缩放（1 个，2026-10-15） | 1 | 1 | 2 | §4.7、§5.5 末段 |
-| 运行时元信息 + 内存归还（4 个，2026-10-15） | 4 | 0 | 4 | §4.8、§3.2/§3.4/§10 |
-| 合计 | **46** | **41** | **87** | — |
-
-**5 个原始符号没有 `_checked` 变体**，其余 41 个原始符号各有一个 checked 版本
-（46 − 5 = 41）：`lasx_alloc`（上表"历史内核"行的 15 / 14 之差就是它）与 §4.8 那 4 个
-（`lasx_free` 的入参只有"指针 + 长度"，本来就是 no-op 语义、没有可失败的结构校验；
-三个元信息符号没有长度/指针参数可校验，且**约定永不返回 NULL**）。
-原始 15 个的名字与语义始终不变。§3.2 给出 46 个原始符号的降级覆盖分类。
-
-清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
+**已搬移**：分组计数、`nm -D` 清点命令、以及"哪些符号没有 `_checked` 变体"见
+[`docs/c-abi.md`](c-abi.md) 第 3.0/3.6/3.7/10 节。§3.2 给出 46 个原始符号的降级覆盖分类。
 
 ### 4.7 融合缩放（1 个，2026-10-15 追加）
 
-| 符号 | C 签名要点 | 语义 | 路径 |
-|---|---|---|---|
-| `lasx_matmul_scaled` | `void(int m, int k, int n, float alpha, const float*, const float*, float beta, float*)` | `C = alpha·(A·B) + beta·C`（原地、行主序）；`beta == 0` **不读 `C`** | LASX-only（与 `lasx_matmul` 同路径） |
-
-`lasx_matmul_scaled_checked` 与它同签名、末尾多一个 `int *status`。数值口径与性能判据见
-§2.5 第 3 点与 §5.5 末段；决策与实测记录见 `docs/dev.md` §19.15。
+**已搬移**：`lasx_matmul_scaled` 的完整原型（CBLAS 次序 `m,k,n,alpha,a,b,beta,c`）见
+[`docs/c-abi.md`](c-abi.md) 第 3.1 节；数值口径见 §2.5 第 3 点与 §5.5 末段，决策与实测记录见
+`docs/dev.md` §19.15。
 
 ### 4.8 运行时元信息与内存归还（4 个，2026-10-15 追加）
 
-这 4 个符号是为**调用体验**加的：没有它们时，C 调用方只能"读 CPU 寄存器判断能不能调 +
-猜版本 + 把错误码 0..6 硬编码 + 赌一个释放函数能用"。
-
-| 符号 | C 签名要点 | 语义 | 谁守 |
-|---|---|---|---|
-| `lasx_has_lasx` | `int(void)` | 当前**生效路径**是否 LASX（1/0）= `SimdPath::detect().is_lasx()`；调 `[LASX-only]` 前必须问 | 与算子**同源**：`src/ffi/meta.rs` 直接返回 `detect()`；单测断言"force(true) ⇒ 0" |
-| `lasx_version` | `const char *(void)` | `CARGO_PKG_VERSION`，静态 NUL 结尾串，**永不为 NULL** | 单测断言非 NULL/NUL 结尾/与 `env!("CARGO_PKG_VERSION")` 一致 |
-| `lasx_status_message` | `const char *(int status)` | `0..6` 的中文说明；**任何未知码**返回"未知状态码"；**永不为 NULL** | 与 Rust `LasxStatus` 同表（`c_message()` 是唯一来源）；单测覆盖 0..6 与未知码 |
-| `lasx_free` | `void(float *p, int n)` | 归还 `lasx_alloc`；与它**共用同一 layout**；`p == NULL` 与 `n <= 0` 都是 no-op | 同一 `f32_layout()` 被两个函数共用（结构性），单测覆盖配对与两种 no-op |
-
-**用法（C）**：
-
-```c
-printf("lasx_rs %s\n", lasx_version());          /* ① 先知道版本 */
-if (!lasx_has_lasx()) {                           /* ② 再问能力（[LASX-only] 的安全前提） */
-    fprintf(stderr, "无 LASX 路径：不能调 lasx_dot/lasx_matmul/int8 内核\n");
-    return 2;
-}
-float *a = lasx_alloc(n);                         /* 32 字节对齐、未初始化 */
-int st;
-float d = lasx_dot_checked(a, b, n, &st);         /* ③ status 通道 */
-if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));
-lasx_free(a, n);                                  /* ④ 必须用它归还（不是 free()） */
-```
-
-**边界与诚实标注**：
-
-- `lasx_has_lasx()` 问的是**当前进程/线程的生效路径**，不是"这块 CPU 有没有 LASX"：
-  被 `lasx_force_lsx_thread` 降级时同样返回 0——这正是调用方需要的语义（能不能安全调）。
-  想拿"硬件有没有"用 Rust 侧 `arch::hardware()`（C ABI 不导出它）。
-- "无 LASX 分支"在**本机（含 LASX）无法实测**：`lasx_force_lsx_thread` 不导出给 C。
-  该分支的正确性由 Rust 单测守（`lasx_force_lsx_thread(true) ⇒ lasx_has_lasx() == 0`），
-  与 §3.3 记的"无 LASX 真机"是同一条诚实标注。
-- `lasx_version` / `lasx_status_message` 返回的是**静态数据**：不要 `free`、不要写它；
-  同一个参数多次调用返回同一指针。
-- `lasx_free` 的契约是"**同一个 `n`**"：`lasx_alloc` 与 `lasx_free` 共用 `f32_layout()`，
-  所以"同一 layout"由构造保证；传错的 `n`（非 0 且与分配时不同）仍会破坏堆——这条**只有约定**，
-  违反是 UB（与其它 `lasx_*` 裸符号同一档）。
+**已搬移**：`lasx_has_lasx` / `lasx_version` / `lasx_status_message` / `lasx_free` 的原型与语义见
+[`docs/c-abi.md`](c-abi.md) 第 3.6 节；"先问能力再调"的顺序见第 6 节；内存配对与
+"`free()` 不是 ABI 契约"见第 4 节。Rust 侧的对应面是 §3.1/§3.4/§10。
 
 
 ## 5. 归约、稠密与量化算子
@@ -1912,7 +1777,7 @@ for _ in 0..steps {
 
 ## 10. 对齐缓冲：`AlignedVec` 与 `lasx_alloc`
 
-`ALIGN = 64`：既是 LASX 要求的 32 字节的倍数，也让首地址落在缓存行边界上。
+Rust 侧用 `AlignedVec`（纯 Rust，不导出符号）：
 
 | 接口 | 说明 |
 |---|---|
@@ -1923,99 +1788,23 @@ for _ in 0..steps {
 | `Deref` / `DerefMut` | 可直接当 `&[T]` / `&mut [T]` 用（索引、`len()`、迭代、传参） |
 | `Clone` | 克隆后**重新计算对齐偏移**并复制数据 |
 
-```c
-float *lasx_alloc(int n);   // 保证 32 字节对齐、未初始化
-void   lasx_free(float *p, int n);   // 必须用它归还；n 传当初分配时的值
-```
-
-- `lasx_alloc` 用 `Layout::from_size_align(n*4, 32)` 分配，**保证 32 字节对齐**（普通 `Vec`
-  只保证 4 字节）。`n == 0` 返回"对齐但不可解引用"的非空悬垂指针；`n < 0` 因布局非法
-  而 abort/panic（这不是契约内用法）。
-- **归还必须用 `lasx_free(p, n)`**（`n` = 分配时那个值）：两个符号共用同一个
-  `f32_layout()`，"同一 layout"由构造成立，不必调用方自己拼 `Layout`。
-  **`free()` 不是契约**——本机恰好是 glibc malloc 只是实现细节。
-- **两种 no-op**（安全，不必在调用方特判）：`p == NULL`；`n <= 0`——后者包含
-  `lasx_alloc(0)` 返回的那个悬垂指针（它从来不是堆块，绝不能交给 `dealloc`）。
-- 契约边界：`n` 与分配时不同（非 0）会破坏堆，**只有约定、违反是 UB**（与其它裸符号同档）。
-
-C 侧配对写法（也是 `examples/c/quickstart.c` 的做法）：
-
-```c
-float *a = lasx_alloc(n);        /* 32 字节对齐、未初始化 */
-/* ... 用 a ... */
-lasx_free(a, n);                 /* 同一个 n */
-```
+**C 侧的 `lasx_alloc` / `lasx_free`**（32 字节对齐、未初始化；必须用 `lasx_free` 按同一个 `n`
+归还；`free()` 不是 ABI 契约；`p == NULL` / `n <= 0` 是安全 no-op）**见
+[`docs/c-abi.md`](c-abi.md) 第 4 节**——那里是这条契约的唯一权威。
 
 对齐只影响性能、不影响正确性：LASX 的 `xvld/xvst` 是 32 字节访问，起始地址不落在 32 字节
 边界时会跨缓存行。实测 glibc `malloc` 与 Dart FFI 的缓冲区只有约一半落在 32 字节边界上，
 **不要假设缓冲区天然对齐**；未对齐时结果照样正确，且仍明显快于 LSX 路径。想稳定拿到对齐
-内存：C 用 `lasx_alloc`（配 `lasx_free`）或 `posix_memalign(&p, 32, n)`，Rust 用 `AlignedVec`。
+内存：Rust 用 `AlignedVec`，C 用 `lasx_alloc`（配 `lasx_free`）或 `posix_memalign(&p, 32, n)`。
 量化对比见 `cargo run -p lasx_bench --release -- align`，完整数据详见 `docs/dev.md`。
 
 
 ## 11. FFI 用法（C / Dart）
 
-```c
-#include <stdint.h>
-
-/* 元信息与内存（§4.8）：先问它们，再调算子 */
-int         lasx_has_lasx(void);              /* 1 = 当前生效路径是 LASX；0 = 只剩 LSX */
-const char *lasx_version(void);               /* 永不为 NULL，静态串，不要 free */
-const char *lasx_status_message(int status);  /* 永不为 NULL；未知码给通用串 */
-float      *lasx_alloc(int n);                /* 32 字节对齐、未初始化 */
-void        lasx_free(float *p, int n);       /* n = 分配时那个值；NULL / n<=0 是 no-op */
-
-float lasx_dot(const float *a, const float *b, int n);            /* [LASX-only] */
-void  lasx_axpy(float alpha, const float *x, float *y, int n);    /* [LASX-only] */
-void  lasx_matmul(int m, int k, int n, const float *a, const float *b, float *c); /* [LASX-only] */
-void  lasx_norm3_batch(const double *xs, const double *ys, const double *zs,
-                       double *out, int n);                       /* LASX+LSX：两种机型都安全 */
-void  lasx_rk4_j2_step_batch(double *rx, double *ry, double *rz,
-                             double *vx, double *vy, double *vz,
-                             double mu, double j2, double re, double dt, int n);
-
-float a[1024], b[1024];
-float d = lasx_dot(a, b, 1024);   /* n 是 int（i32） */
-int st;
-float d2 = lasx_dot_checked(a, b, 1024, &st);
-if (st != LASX_OK) {              /* 不用硬编码 0..6： */
-    fprintf(stderr, "lasx_dot: %s (status=%d)\n", lasx_status_message(st), st);
-}
-
-float *buf = lasx_alloc(1024);    /* 32 字节对齐、未初始化 */
-/* ... 用 buf ... */
-lasx_free(buf, 1024);             /* 必须配对归还；free(buf) 不是契约 */
-```
-
-```dart
-final lib = DynamicLibrary.open('liblasx_rs.so');
-
-final lasxDot = lib.lookupFunction<
-    Float Function(Pointer<Float> a, Pointer<Float> b, Int32 n),
-    Float Function(Pointer<Float> a, Pointer<Float> b, int n)>('lasx_dot');
-
-final lasxAlloc = lib.lookupFunction<          // 32 字节对齐的输出缓冲
-    Pointer<Float> Function(Int32 n),
-    Pointer<Float> Function(int n)>('lasx_alloc');
-
-final lasxFree = lib.lookupFunction<           // 必须配对归还
-    Void Function(Pointer<Float> p, Int32 n),
-    void Function(Pointer<Float> p, int n)>('lasx_free');
-
-// 调 [LASX-only] 之前先问：0 = 当前只剩 LSX 路径（硬调会 SIGILL）
-final lasxHasLasx = lib.lookupFunction<Int32 Function(), int Function()>('lasx_has_lasx');
-if (lasxHasLasx() == 0) { /* 改用 LASX+LSX 的符号 */ }
-```
-
-`lookupFunction` 的泛型参数（Native 侧 / Dart 侧签名）必须与 C 签名完全一致，否则 UB；
-Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在调用期间读/写传入缓冲区，
-不持有任何指针（无回调、无异步），函数返回后即可安全释放输入/输出缓冲——但 `lasx_alloc`
-拿到的缓冲**只能**用 `lasx_free` 归还（见 §10）。长度必须与实际容量一致，指针不得悬垂或
-越界，`n` 不得为负——原始符号不做这些校验，误用即 UB。
-
-**调 `[LASX-only]` 之前的推荐顺序**（三行心智模型，完整说明见 §4.8）：
-`lasx_version()` 知道版本 → `lasx_has_lasx()` 决定能不能调 → 调算子后按
-`lasx_status_message(st)` 打日志。
+**已搬移**：C / C++ / Dart 的完整用法——四种链接方式与最小可运行程序、Dart 的
+`lookupFunction` 例子、长度/生命周期/别名规则、裸 vs `_checked`、能力探测顺序——见
+[`docs/c-abi.md`](c-abi.md)（第 2 节快速开始、第 4 节内存、第 5 节安全模型、第 6 节能力与降级）。
+Rust 侧调用方式见 §8 与 §9。
 
 
 ## 12. NN 算子：当前状态与候选
@@ -2263,7 +2052,7 @@ cp target/release/liblasx.so yll/
 `lib.ylh` 补声明、`cargo build --release -p lasx_yll` 后拷 `liblasx.so`。
 
 ```bash
-# 导出符号自检：期望 87 行（46 原始 + 41 checked）= 87 个导出符号
+# 导出符号自检：期望行数 = docs/c-abi.md 记的导出符号计数（本文不再复述该数）
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```
@@ -2274,22 +2063,20 @@ nm -D --defined-only target/release/liblasx_rs.so \
 1. **降级覆盖不全**：历史 7 个 LASX-only 内核（`matmul`、`matmul_f64`、`axpy`、`sum`、`dot_f64`、
    `dot_i8`、`dot_q4`）在 LSX-only CPU 上会 SIGILL，不会自动降级；N1/N3 与 2026-10-15 追加的
    `matmul_scaled`、`layer_norm`/`gather_rows*` 同样按 §3.2 的分类（前者 LASX-only，后两者不涉及
-   SIMD），完整分类见 §3.2。**C 侧可以在调用前用 `lasx_has_lasx()`（§4.8）判断**，返回 0 时
-   只能调 LASX+LSX 的符号。
+   SIMD），完整分类见 §3.2。**C 侧的自我保护（先问 `lasx_has_lasx()`）见 [`docs/c-abi.md`](c-abi.md)
+   第 6 节。**
 2. **仅标量降级**：`ballistic_step`、`batch_distance2d`、`rk4_j2_step_batch` 的非 LASX
    分支是全标量循环，没有 LSX 128 位向量路径。
 3. **两处不逐位一致的例外**：`ballistic_step` 向量/标量的 `|v|²` 结合序不同（物理一致，有绝对
    误差测试守护）；`axpy` 向量/标量尾至多差 1 ulp（FMA vs 分离乘加，无逐位守护）。
-4. **`lasx_free` 的 `n` 必须与分配时一致**：`lasx_alloc`/`lasx_free` 共用同一 layout
-   （见 §10），所以"layout 对得上"由构造成立；但 `n` 传错（非 0 且不同）会破坏堆——
-   这条**只有约定**，违反是 UB。`p == NULL` 与 `n <= 0` 是安全的 no-op，不必特判。
-5. **原始符号长度参数无负数/零防护**：`n` 为 `i32` 后立即 `as usize`，负数变成巨大 usize，
-   `from_raw_parts` 长度超界即 UB；`lasx_alloc` 对负 `n` 会 panic。必须保证 `n ≥ 0` 且与缓冲区
-   实际容量一致。
+4. **`lasx_free` 的 `n` 必须与分配时一致**：契约与两种 no-op 见 [`docs/c-abi.md`](c-abi.md) 第 4 节
+   （"layout 对得上"由构造成立；`n` 传错——非 0 且与分配时不同——会破坏堆，**只有约定**，违反是 UB）。
+5. **原始符号长度参数无负数/零防护**：C 侧安全模型见 [`docs/c-abi.md`](c-abi.md) 第 5 节
+   （裸 = 零校验、误用即 UB；需要错误通道就用 `_checked`）。
 6. **f32 矩阵乘无 f64 落盘**：`lasx_matmul` 在 f32 累加器内直接累积，长 k 维误差大于点积；
    高精度用 `lasx_matmul_f64`。
 7. **`dot_q4` 的 scale 长度约定**：`sa`/`sb` 长度必须 ≥ `ceil(n_bytes/32)`，按 32 字节组对齐；
-   非 32 倍数时最后不足组按 `j/32` 索引。
+   非 32 倍数时最后不足组按 `j/32` 索引（原型见 [`docs/c-abi.md`](c-abi.md) 第 3.1 节）。
 8. **`dot_i8` 结果截断**：内部 i64 累加精确，返回 `as i32` 会回绕；业务上 n 应远小于约 13.3 万。
 9. **`dot` 的小规模路径**：n < 24 用 f32 单精度累加，与 n ≥ 24 的 f64 分块公式不同，跨边界不
    保证逐位连续。
@@ -2298,7 +2085,7 @@ nm -D --defined-only target/release/liblasx_rs.so \
     必须自行复位；池化路径的 worker 不受调用线程钩子影响。
 11. **对齐与内存布局**：向量加载/存储用偏移 0，LoongArch 允许非对齐访问，源码未显式声明对齐
     要求；SOA/数组布局假设连续无填充，跨语言调用方必须保证元素类型与步长严格匹配（f32=4 字节、
-    f64=8 字节）。
+    f64=8 字节）。C 侧的对齐与别名规则见 [`docs/c-abi.md`](c-abi.md) 第 4 节。
 
 
 ## 16. 待确认、已修正与文档约定
@@ -2370,220 +2157,73 @@ nm -D --defined-only target/release/liblasx_rs.so \
 
 ### 17.1 构建产物
 
-```bash
-cargo build --release
-```
-
-`[lib] crate-type = ["cdylib", "rlib", "staticlib"]` 一次产出三种，**同一份数值实现**
-（不存在"动态库版和静态库版结果不同"）：
-
-| 产物 | 路径 | 给谁 |
-|---|---|---|
-| 动态库 | `target/release/liblasx_rs.so` | C / Dart 等 FFI 调用方（SONAME 已固定，见 §17.4） |
-| 静态库 | `target/release/liblasx_rs.a` | 不想带 `.so` 的 C 消费者 |
-| Rust 库 | `target/release/liblasx_rs.rlib` | Rust 依赖（`lasx_rs = "0.1"` 用的就是这个） |
+**已搬移**：一次构建的三种产物（`cdylib` / `staticlib` / `rlib`）与各自用途见
+[`docs/c-abi.md`](c-abi.md) 第 2.1 节。
 
 ### 17.2 安装
 
-```bash
-# 装进系统目录（或先装进暂存目录看一眼布局）
-scripts/install.sh --prefix=/usr/local
-scripts/install.sh --prefix=/tmp/stage          # 空格形式等价
-CARGO_TARGET_DIR=/tmp/build scripts/install.sh --prefix=/tmp/stage
-```
-
-脚本（`set -eu`）装这几样，**幂等**——重复执行只覆盖它们、用 `ln -sf` 重建链接：
-
-| 相对 `<prefix>` | 内容 |
-|---|---|
-| `lib/liblasx_rs.so.<version>` | 动态库本体（`<version>` = `Cargo.toml` 的 version，如 `0.1.0`） |
-| `lib/liblasx_rs.so.0` | 符号链接 → 本体；**运行时**按 SONAME 找这个名字 |
-| `lib/liblasx_rs.so` | 符号链接 → 本体；**链接期** `-llasx_rs` 找这个名字 |
-| `lib/liblasx_rs.a` | 静态库 |
-| `lib/pkgconfig/lasx_rs.pc` | pkg-config 元数据（由 `lasx_rs.pc.in` 生成，`prefix`/`Version` 已替换） |
-| `include/lasx_rs.h` | C 头（**由仓库提供**，87 个原型；脚本不生成头文件） |
-
-失败即退出、且**校验都在写入之前**（不留半套安装）：缺 `liblasx_rs.so`/`.a` 会提示先
-`cargo build --release`；缺 `include/lasx_rs.h` 会直接报错（可用 `LASX_RS_HEADER=<path>` 指向
-别处）；`readelf` 可用时会核对产物的 SONAME，不对就拒绝安装。
+**已搬移**：`scripts/install.sh --prefix=…` 的用法、装到 `<prefix>` 的六个文件、"失败即退出 +
+装前校验（含 SONAME 核对）"见 [`docs/c-abi.md`](c-abi.md) 第 2.1 节。
 
 ### 17.3 链接与运行
 
-```bash
-# ① 动态链接（推荐）：rpath 写进可执行文件，运行期不必设 LD_LIBRARY_PATH
-cc example.c -o example -I/usr/local/include -L/usr/local/lib -llasx_rs -Wl,-rpath,/usr/local/lib
-
-# ② 动态链接但不设 rpath：运行前给 loader 指路（或装到系统目录后 ldconfig）
-cc example.c -o example -I/usr/local/include -L/usr/local/lib -llasx_rs
-LD_LIBRARY_PATH=/usr/local/lib ./example
-
-# ③ 静态链接（不带 .so；静态库的数学函数要自己带 -lm）
-cc example.c -o example -I/usr/local/include /usr/local/lib/liblasx_rs.a -lm
-
-# ④ pkg-config
-PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --cflags --libs lasx_rs
-```
-
-```c
-#include <lasx_rs.h>   /* 87 个原型；契约见 §2.5–§2.17，符号清单见 §4 */
-
-if (!lasx_has_lasx()) {                            /* §4.8：调 [LASX-only] 前先问 */
-    fprintf(stderr, "lasx_rs %s：无 LASX 路径\n", lasx_version());
-    return 2;
-}
-float a[16], b[16], c[16];
-lasx_matmul(4, 4, 4, a, b, c);                     /* C = A·B（历史符号，签名永不改） */
-lasx_matmul_scaled(4, 4, 4, 1.5f, a, b, 0.5f, c);  /* C = 1.5·A·B + 0.5·C（§4.7/§5.5） */
-```
-
-完整的可编译示例在 `examples/c/`（`quickstart.c` + `Makefile`，`make run`；用 pkg-config
-找库，找不到时自动兜底到 `target/release`）。
+**已搬移**：四种链接方式（动态 + rpath / 动态 + `LD_LIBRARY_PATH` / 静态 `.a` / pkg-config 驱动）、
+最小程序与 `examples/c/` 的实测输出见 [`docs/c-abi.md`](c-abi.md) 第 2.2–2.4 节。
 
 ### 17.4 SONAME 与文件名布局
 
-- **SONAME 固定为 `liblasx_rs.so.0`**，由 `build.rs` 的
-  `cargo:rustc-cdylib-link-arg=-Wl,-soname,liblasx_rs.so.0` 写入（只作用于 cdylib；rlib /
-  staticlib / 测试不受影响，也没有引入任何构建依赖）。
-- 因此**构建产物名**是 `liblasx_rs.so`，而**安装后**是 `liblasx_rs.so.<version>` +
-  `liblasx_rs.so.0` + `liblasx_rs.so` 三个名字：第一个给"想固定到具体版本"的打包脚本，
-  第二个是 loader 运行期真正要找的名字，第三个只给链接器。
-- 自检两条（`docs/dev.md` §22.7 有同样的命令）：
-
-```bash
-readelf -d target/release/liblasx_rs.so | grep -i soname   # → Library soname: [liblasx_rs.so.0]
-nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # → 87
-```
+**已搬移**：SONAME `liblasx_rs.so.0` 的来源（`build.rs`）、构建产物名 vs 安装后的三个名字、
+`readelf` / `nm` 自检见 [`docs/c-abi.md`](c-abi.md) 第 9 节与第 2.1 节。
 
 ### 17.5 ABI 兼容规则（什么时候可以动 major）
 
-本库对 C ABI 的承诺写在 §4.1/§4.7：**符号只追加、不改签名与语义**；现有 87 个符号里，
-最初的 15 个（§4.1）永不改动。由此得到可执行的规则：
-
-| 变更 | 允许？ | major |
-|---|---|---|
-| 追加新符号（含 `_checked` 变体与元信息符号，如 2026-10-15 的 `lasx_matmul_scaled` 与同日的 4 个元信息符号） | 允许 | **不变**（仍 `liblasx_rs.so.0`） |
-| 修 bug 导致数值结果变化（仍在逐位承诺内） | 允许 | 不变 |
-| 改已有符号的**签名**、语义，或删除符号 | 破坏 ABI | **+1** |
-| 改 `LasxStatus` 的码值 / 结构布局、改调用约定 | 破坏 ABI | **+1** |
-
-**major 变更时要一起改三处**：`build.rs` 的 SONAME、`scripts/install.sh` 的 `SONAME` 变量、
-本节与 §4 的规则表；并按 `AGENTS.md` 规则 3 先在 `docs/dev.md` 记一笔。
-0.x 阶段 major 恒为 0（`Cargo.toml` 是 0.1.0），语义是"**尚未承诺二进制兼容**"，但"只追加"
-这条实践已经在遵守；升到 1.0 之后 major 才承担真正的兼容承诺。不同 major 的库可以**并存**
-（`liblasx_rs.so.0` 与 `liblasx_rs.so.1` 互不覆盖）。
+**已搬移**：只追加不改、major 变更条件、要同改的三处、0.x 的语义与"不同 major 并存"——
+见 [`docs/c-abi.md`](c-abi.md) 第 9 节（那是 C ABI 承诺的唯一权威）。
 
 ### 17.6 `_checked` 变体的 `status` 语义
 
-每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，只在末尾追加
-`int *status` 出参**（清单见 §4.4）。C 侧调用约定：
-
-```c
-int st;
-lasx_matmul_scaled_checked(m, k, n, alpha, a, b, beta, c, &st);
-if (st != LASX_OK) { /* st 给出原因；此时输出缓冲未被触碰 */ }
-```
-
-| 码 | 名称 | 含义 |
-|---|---|---|
-| 0 | `Ok` | 成功 |
-| 1 | `NullPointer` | 指针为空且长度非 0 |
-| 2 | `NegativeLength` | 长度参数为负 |
-| 3 | `BadShape` | 形状/长度自洽性不成立（**留给知道真实长度的上层**，如语言绑定） |
-| 4 | `SizeOverflow` | 尺寸相乘溢出 |
-| 5 | `NonPositiveConstant` | `mu <= 0` 或 `re <= 0` |
-| 6 | `NonFiniteConstant` | `j2`/`dt` 为 NaN 或无穷 |
-
-- **失败时**：只写状态，返回安全中性值（数值型 `0.0`/`0`，`void` 型不写输出）——**不触碰输出
-  缓冲**，所以调用方可以把出参留在原地重试。
-- `status` 可传 `NULL`：表示"不关心原因"，但**校验仍然执行**（避免 UB）。
-- C 层只能判**结构**（空指针、负长度、溢出、物理常数）；"数组真实长度是否与声明形状一致"
-  只有知道长度的上层判得了。
+**已搬移**：调用约定、失败时的行为（只写状态、返回中性值、不触碰输出、`status` 可为 NULL）、
+0..6 状态码表见 [`docs/c-abi.md`](c-abi.md) 第 3.7、3.8、5 节。
 
 ---
 
 ## 18. C 调用者心智模型
 
-这一节回答**"该用哪个入口"**。读完它 + §4.8 那四个元信息符号，C 侧就不会踩三类坑：
-直调 `[LASX-only]` 导致 SIGILL、把错误码 0..6 硬编码、用 `free()` 归还 `lasx_alloc`。
+**已搬移**：本节整节搬到 [`docs/c-abi.md`](c-abi.md)——C 调用者的心智模型现在是那份文档的第
+1–9 节（读者与范围、快速开始、符号参考、内存、安全模型、能力与降级、数值契约、线程模型、
+ABI 稳定性策略）。下面保留小节标题与对应落点，供既有引用使用。
 
 ### 18.1 三层与它们的关系
 
-| 层 | 谁用 | 稳定性 | 免分配孪生 |
-|---|---|---|---|
-| **C ABI**（`lasx_*` 与 `*_checked`，清单见 §4） | C / Dart 等 FFI 调用方 | **冻结**：最初 15 个符号的签名与语义永不改，新增只追加（§17.5） | **没有** |
-| Rust `api`（§8） | Rust 调用方 | 随版本演进（语义兼容） | **有**：每个分配版都有 `_into` 孪生 |
-| `ops` 内核层 | 库内部与基准 | 不承诺 | 无 |
-
-**C 侧没有 `_into` 版本**——那是 Rust `api` 的东西。C 侧的"复用缓冲"就是**调用方自己管理一块
-内存反复传进裸入口**：库既不分配，也不替你释放。
+→ [`docs/c-abi.md`](c-abi.md) 第 1 节（范围）与第 9 节（稳定性：C ABI 冻结/只追加；
+Rust `api` 侧见本文 §8）。
 
 ### 18.2 裸 vs `_checked`：默认用 `_checked`
 
-| | 裸（如 `lasx_dot`） | `_checked`（如 `lasx_dot_checked`） |
-|---|---|---|
-| 校验 | **零校验**：长度/空指针违反契约即 **UB**（读写越界） | 只做**结构**校验（空指针、负长度、溢出、物理常数） |
-| 失败通道 | 没有 | `status` 出参；**失败只写状态、返回中性值、不触碰输出**（§17.6） |
-| 开销 | 最低 | 一次分支（热路径上可测） |
-
-**默认用 `_checked`**；只有在**热路径**且**长度已在调用点证明**时才改用裸符号（例如外层校验过
-一次、内层循环里不再重复校验）。
+→ [`docs/c-abi.md`](c-abi.md) 第 5 节（对照表 + "该用哪个"的判据）。
 
 ### 18.3 LASX-only vs 可降级：先问再调
 
-只有 3 个内核带标量降级；**其余 LASX-only 符号没有 `has_lasx()` 检查、也没有降级分支**，
-在只有 LSX 的机型（如 `3B6000M`/`LA364E`）上直调会 **SIGILL**，不会自动降级（§3.3）。
-
-```c
-/* ✅ 正确：先问能力，再决定走哪条路 */
-if (!lasx_has_lasx()) {
-    fprintf(stderr, "无 LASX 路径：改用你自己的标量实现\n");
-    return 1;
-}
-float d = lasx_dot_checked(a, b, n, &st);   /* 从这行起，[LASX-only] 符号才是安全的 */
-
-/* ❌ 错误：不问就调；LSX-only 机器上是 SIGILL，不是"自动降级" */
-float d = lasx_dot(a, b, n);
-```
-
-`lasx_has_lasx()` 问的是**当前生效路径**（尊重 `lasx_force_lsx_thread`，§3.4），不是"这块 CPU
-有没有 LASX"——这正是调用方需要的语义（"此刻能不能安全调"）。
+→ [`docs/c-abi.md`](c-abi.md) 第 6 节（正/误两段对照代码、LASX-only 清单、机型对照）。
 
 ### 18.4 位精确承诺与两处例外
 
-按 §2.5 的口径：同一算子、同一输入，**各路径（LASX / LSX / 标量尾 / 打包 / k 分块 / 并行切块）
-逐位一致**，测试用 `to_bits()` 比对。**例外仅两处**（均有测试与文档）：
-`lasx_ballistic_step` 的向量/标量分支结合序不同（物理一致），`lasx_axpy` 允许 1 ulp 以内差异。
-跨语言要的判据是"**同输入两次运行逐位一致**"，不是"与某个参考实现逐位一致"。
+→ [`docs/c-abi.md`](c-abi.md) 第 7 节（以 §2.5 的表述为准；另见本文 §2.1/§2.5）。
 
 ### 18.5 内存归属：`lasx_alloc` 与 `lasx_free` 必须配对
 
-- `lasx_alloc(n)` 拿到的缓冲**只能用 `lasx_free(p, n)` 归还**：两者共用同一 `f32_layout()`，
-  且必须是**同一个 `n`**（§10）。
-- **`free()` 不是 ABI 契约**（头文件里已不再写"本机 glibc 下 `free()` 可用"）：换分配器 /
-  换运行库之后再用 `free()` 就是 UB。
-- `p == NULL` 与 `n <= 0` 对 `lasx_free` 是 no-op；传错的 `n`（非 0 且与分配时不同）会破坏堆
-  ——这条**只有约定**，违反是 UB。
+→ [`docs/c-abi.md`](c-abi.md) 第 4 节（配对、同一个 `n`、"`free()` 不是 ABI 契约"、两种 no-op）。
 
 ### 18.6 线程模型
 
-- 各入口**线程安全**：没有逐调用的全局可变状态；输出缓冲归调用方，别让多线程共享同一块。
-- `lasx_force_lsx_thread` 是**线程局部**的、**且不导出给 C**（§3.4）：它只改当前线程的路径，
-  仅供测试/实验，不会影响其它线程。
+→ [`docs/c-abi.md`](c-abi.md) 第 8 节（无逐调用全局状态；C ABI 不导出线程池；
+`lasx_force_lsx_thread` 是 Rust API、线程局部、仅测试用）。
 
 ### 18.7 错误模型
 
-- 状态码 0..6 的含义见 §17.6；**失败时只写状态、返回中性值、不触碰输出**，所以可以原地重试。
-- `status` 可传 `NULL`（不关心原因），但**校验仍然执行**。
-- 打印一律用 `lasx_status_message(st)`（0..6 与未知码都给静态串、永不 NULL），**不要硬编码**。
+→ [`docs/c-abi.md`](c-abi.md) 第 3.8 与第 5 节（状态码、`lasx_status_message`、失败不触碰输出）。
 
 ### 18.8 决策表："想做 X ⇒ 用 Y"
 
-| 想做的事 | 用哪个 |
-|---|---|
-| 要稳（默认） | `*_checked` + `lasx_status_message(st)` |
-| 要快，且长度已在调用点证明 | 裸 `lasx_*` |
-| 热循环里复用缓冲 | Rust：`*_into` 孪生；**C：调用方自己的内存 + 裸入口** |
-| 不确定目标机型有没有 LASX | 先 `lasx_has_lasx()`；为 0 就走自己的标量实现 |
-| 想知道库版本 | `lasx_version()`（静态串，**不要 free**） |
-| 打印/记录错误 | `lasx_status_message(status)`（别硬编码 0..6） |
-| 要排查"结果对不对" | 同输入跑两次逐位比对（§2.5）；A/B 口径见 `docs/dev.md` §6.4 |
+→ [`docs/c-abi.md`](c-abi.md) 第 1–9 节：决策表的每条在那里都有对应小节（要稳用 `_checked`、
+热循环复用缓冲、先问能力、版本串与状态串的用法）。
