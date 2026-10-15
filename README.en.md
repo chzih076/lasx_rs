@@ -147,10 +147,11 @@ live in the respective design sections.
 > 3.0986 ms, so caching bought **+14.6%**). Its **new costs, please note**: **concurrent
 > `run_threaded` on the *same* plan shares one pool ⇒ dispatch serialises** (use separate plans, or
 > `parallel::*` with your own pool, for real parallelism), and **changing `threads` rebuilds the pool**.
-> **Old figure (window-tainted — do not use)**: the earlier "convenience path is 2.15× slower"
-> (5.3131 vs 2.4671 ms) was a **cross-window reading from a bad window** (2.70 ms in-process); per the
-> new rule in `docs/dev.md` §6.4 ("**any 'N×' claim must be re-checked same-process**") it stays only
-> as an old-ledger note.
+> **All older figures are not citable**: the earlier "convenience path N× slower / we are ~10% slower"
+> numbers were **cross-process / bad-window** readings (old values live in **git history**:
+> `git log -p docs/dev.md`). Per the rule in `docs/dev.md` §6.4 ("**any 'N×' claim must be
+> re-checked same-process**") they are **old ledger only**; this file and `docs/dev.md` keep
+> **current conventions and conclusions only**.
 
 > **Formula-DSL reuse note**: `matmul!`'s `mul_into` re-packs `B` on every call, so a layer loop
 > that reuses the same weight should hoist the preparation out of the loop (256³ measured
