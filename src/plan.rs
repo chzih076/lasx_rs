@@ -459,6 +459,64 @@ impl<T: PackedKernel> MatmulPlan<T> {
         Ok(())
     }
 
+    /// **列瓦片内核（crate 内部，H1/H2 实验用）**：只算列区间 `[col0, col1)` 覆盖的整条带。
+    ///
+    /// **不是公开 API**（`pub(crate)`）：只为 `docs/dev.md §7.10 ⑨/⑩` 的实验服务——让实验能
+    /// "每个线程只算自己那段列"，从而量出"worker↔列瓦片绑定"到底能不能降片上流量。
+    /// 位精确性由 `src/parallel.rs` 的实验测试逐位断言（与 `api::matmul`、整块跑比对）。
+    ///
+    /// 语义：`col0`/`col1` 必须**条带对齐**（`STRIP` 的整数倍；`col1 == n` 例外，它负责列尾）；
+    /// 列段是 `[0, n)` 的划分 ⇒ 每个输出元素仍只被算一次、沿 `k` 的累加次序不变。
+    /// 实现是把面板打包缓冲**按条带切一段**（内核按 `packed[s·k·STRIP …]` 索引 ⇒ 子切片 +
+    /// 调整 `jb`/`nc` 等价于"只算这几条带"）。
+    ///
+    /// `#[cfg(test)]`：只给实验测试用，不进发布构建（不发散、不增 API、不增 ABI）。
+    #[cfg(test)]
+    pub(crate) fn run_cols_unchecked(&self, col0: usize, col1: usize, a: &[T], c: &mut [T]) {
+        let rows = a.len() / self.k;
+        debug_assert_eq!(c.len(), rows * self.n, "块内 C 的长度应为 rows × n");
+        debug_assert!(
+            col0.is_multiple_of(T::STRIP) && (col1 == self.n || col1.is_multiple_of(T::STRIP)),
+            "列段边界必须条带对齐"
+        );
+        if rows == 0 || self.n == 0 || col0 >= col1 {
+            return;
+        }
+        let m4 = rows / 4 * 4;
+        let strip = T::STRIP;
+        let s_lo = col0.div_ceil(strip); // 全局条带号（含）
+        let s_hi = col1 / strip; // 全局条带号（不含）
+        for panel in &self.panels {
+            let p_lo = panel.jb / strip;
+            let p_hi = p_lo + panel.nc / strip;
+            let a0 = s_lo.max(p_lo);
+            let a1 = s_hi.min(p_hi);
+            if a0 >= a1 {
+                continue; // 这段列与该面板不相交
+            }
+            let off = (a0 - p_lo) * self.k * strip;
+            T::packed_rows(
+                self.k,
+                self.n,
+                a0 * strip,
+                (a1 - a0) * strip,
+                &panel.packed[off..],
+                a,
+                c,
+                m4,
+            );
+        }
+        // 列尾 `[n_strip, n)`：不属于条带体系，交给"覆盖到 n 的那一段"
+        if let (true, Some(tail)) = (col1 >= self.n, &self.tail) {
+            let cols = self.n - self.n_strip;
+            for i in 0..rows {
+                let a_row = &a[i * self.k..(i + 1) * self.k];
+                let c_row = &mut c[i * self.n + self.n_strip..(i + 1) * self.n];
+                T::row_tail(a_row, c_row, tail.as_slice(), self.k, cols);
+            }
+        }
+    }
+
     /// 从 `a` 的长度推 `m`：必须是 `k` 的整数倍。
     fn rows_of(&self, op: &'static str, a: &[T]) -> Result<usize, Error> {
         if !a.len().is_multiple_of(self.k) {

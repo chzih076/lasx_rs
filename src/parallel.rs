@@ -1210,3 +1210,134 @@ fn diag_pool_vs_plan() {
     );
     println!("线程数 = {}，形状 = {m}×{k}×{n}", pool.threads());
 }
+
+/// **实验 A（H1 可行性；默认 `#[ignore]`，不进 CI）**：worker ↔ 列瓦片**手工绑定**的对照实验。
+///
+/// 目的：上一版"瓦片在外 + 池按行分发"从原理上降不了流量（每个 worker 仍走过每个瓦片）。
+/// 这里在**测试内**用手工线程把"列瓦片"绑到线程上：`n_tiles = ⌈n/256⌉` 个瓦片、每个线程
+/// 恰好负责**一个瓦片 × 全部行** ⇒ 每个线程只读自己那段列的面板（理论上面板读量 = B 一遍）。
+/// **只加 crate 内部方法、不动公开 API、不动池接口**。
+///
+/// 跑法：
+/// ```text
+/// cargo test --release -p lasx_rs --lib diag_tile_binding -- --ignored --nocapture
+/// LASX_DIAG_ARM=rows|tile   # 只跑一条腿（便于分臂上 perf stat 取计数）
+/// ```
+///
+/// 判据（**先写死**）：若 `llc-loads` 明显下降而墙钟不降 ≥10% ⇒ 判定"片上流量不是绑定项"，
+/// 停止追 H1；墙钟降 ≥10% 才值得谈"要不要动冻结的池接口"。
+#[cfg(test)]
+#[ignore = "实验用：手工绑定的列瓦片 vs 行切，同进程交替计时（不进 CI）"]
+#[test]
+fn diag_tile_binding_vs_rows() {
+    use crate::aligned::AlignedVec;
+    use std::time::Instant;
+    const TILE: usize = 256;
+    let (m, k, n) = (192usize, 768usize, 3072usize);
+    let a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.125);
+    let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+    let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+    let pool = WorkerPool::new(12);
+    let threads = pool.threads();
+    let flop = 2.0 * m as f64 * k as f64 * n as f64;
+
+    // 手工"worker ↔ 瓦片"驱动：每个线程一个瓦片、负责**全部行**（只读自己那段列的面板）。
+    //
+    // **安全性说明（仅本实验测试）**：各线程写的是**互不相交的列区间**（列段是 `[0,n)` 的划分，
+    // 列尾只由"覆盖到 n 的那一段"负责），所以让它们共享同一块 `C` 是安全的；Rust 类型系统
+    // 表达不了"同一缓冲上互不相交的列区间"（`&mut` 不能并发），这里用**裸指针**跨
+    // `thread::scope` 传地址，并把前提写在这里。**这段只在 `#[ignore]` 的实验测试里**。
+    let n_tiles = n.div_ceil(TILE);
+    let mut cols: Vec<(usize, usize)> = (0..n_tiles)
+        .map(|t| {
+            let c0 = t * TILE;
+            let mut c1 = (c0 + TILE).min(n);
+            if c1 < n {
+                c1 = c1 / 32 * 32;
+            }
+            (c0, c1)
+        })
+        .collect();
+    while cols.len() < threads {
+        cols.push((n, n)); // 线程多于瓦片时补空区间
+    }
+    let cols_for_run = cols.clone();
+    // 参数显式传 `plan`/`a` 的**引用**：不为省事用 `move` 闭包（那会把它们搬进闭包 ⇒ 只能用一次）
+    let tiled = |c: &mut [f32], plan: &MatmulPlan<f32>, a: &[f32]| {
+        let base = c.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            for &(c0, c1) in cols_for_run.iter().take(threads) {
+                s.spawn(move || {
+                    // SAFETY: 见上面的"安全性说明"——各线程写的列区间**互不相交**（列段是
+                    // `[0,n)` 的划分），且 `thread::scope` 结束前所有线程都已 join，期间没有别的
+                    // 可变借用。（前缀必须是 ASCII 的 `SAFETY:`，clippy 才认。）
+                    let cbuf = unsafe { std::slice::from_raw_parts_mut(base as *mut f32, m * n) };
+                    plan.run_cols_unchecked(c0, c1, a, cbuf);
+                });
+            }
+        });
+    };
+
+    let only = std::env::var("LASX_DIAG_ARM").unwrap_or_default();
+    let want_rows = only.is_empty() || only == "rows";
+    let want_tile = only.is_empty() || only == "tile";
+    let mut t_rows = Vec::new();
+    let mut t_tile = Vec::new();
+    for _ in 0..7 {
+        if want_rows {
+            let mut c = AlignedVec::<f32>::new(m * n);
+            let t0 = Instant::now();
+            matmul_f32_plan(&pool, &plan, m, &a, &mut c).unwrap();
+            t_rows.push(t0.elapsed().as_secs_f64());
+            if only.is_empty() {
+                let want = crate::api::matmul(m, k, n, &a, &b).unwrap();
+                assert_eq!(
+                    c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "行切路线不逐位（不该发生）"
+                );
+            }
+        }
+        if want_tile {
+            let mut c = AlignedVec::<f32>::new(m * n);
+            let t0 = Instant::now();
+            tiled(&mut c, &plan, &a);
+            t_tile.push(t0.elapsed().as_secs_f64());
+            // **位精确断言**（实验档也守）：与 api::matmul 逐位比。
+            // 只在"整跑"时断言：`LASX_DIAG_ARM` 分臂时**不**算参考（那是单线程调用，会把
+            // perf 计数污染得没法用——分臂计数就是为了量这条腿）。
+            if only.is_empty() {
+                let want = crate::api::matmul(m, k, n, &a, &b).unwrap();
+                assert_eq!(
+                    c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "手工绑定的列瓦片与 api::matmul 不逐位"
+                );
+            }
+        }
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    if want_rows {
+        let t = med(&mut t_rows);
+        println!(
+            "行切 matmul_f32_plan      = {:.4} ms = {:.1} GFLOP/s",
+            t * 1e3,
+            flop / t / 1e9
+        );
+    }
+    if want_tile {
+        let t = med(&mut t_tile);
+        println!(
+            "绑定瓦片 tiled(手工绑定)  = {:.4} ms = {:.1} GFLOP/s（瓦片 {TILE} 列 × {threads} 线程）",
+            t * 1e3,
+            flop / t / 1e9
+        );
+    }
+    if want_rows && want_tile {
+        let (tr, tt) = (med(&mut t_rows), med(&mut t_tile));
+        println!("相对行切 = {:.3}×（>1 表示绑定瓦片更快）", tr / tt);
+    }
+}

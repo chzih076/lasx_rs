@@ -106,6 +106,12 @@ static int G_split_omp;
  * 用途见 `docs/dev.md` §7.10 ⑦：把"C 调用方驱动的 plan 路径"从"每次调用一次屏障"的
  * 台架成本里解放出来，量出真实可得的每调用时间。 */
 static int G_split_tight;
+/* **实验 B（H2）**：`--split=plan-tight-dyn` —— 在 tight 握手上换成"**动态认领小行块 +
+ * 主线程也认领**"。目的（`docs/dev.md` §7.10 ⑩）：压掉 `worker_fn` 里那 40–48% 的自旋/空转
+ * （静态等分时先做完的工人只能干等最慢的那个）。**只改 driver，不动库**。 */
+static int G_split_tight_dyn;
+static atomic_int G_tight_next; /* 动态认领：下一个待领的行块号 */
+static int G_tight_blk = 8;     /* 动态认领的块大小（行） */
 /* 本装置是否真的起了 worker（只有起了才允许去等屏障——`omp` 档不起 worker，
  * 早期版本让 JOIN_WORKERS 去等**未初始化**的 `pthread_barrier_t`，整进程挂死过一次）。 */
 static int G_workers_created;
@@ -147,7 +153,24 @@ static void run_lasx(void *c) {
          * （`time_once` 外面量的墙钟含握手本身，所以这个数仍是"含最小握手的每调用时间"。） */
         G_c = c;
         atomic_store_explicit(&G_tight_done, 0, memory_order_relaxed);
+        atomic_store_explicit(&G_tight_next, 0, memory_order_relaxed);
         atomic_fetch_add_explicit(&G_tight_go, 1, memory_order_release);
+        if (G_split_tight_dyn) {
+            /* **实验 B**：主线程也认领（与工人同一个原子计数器）⇒ 13 个参与者。 */
+            for (;;) {
+                const int b = atomic_fetch_add_explicit(&G_tight_next, 1, memory_order_relaxed);
+                const int b0 = b * G_tight_blk;
+                if (b0 >= G_m) {
+                    break;
+                }
+                int b1 = b0 + G_tight_blk;
+                if (b1 > G_m) {
+                    b1 = G_m;
+                }
+                lasx_matmul_run(G_plan, b1 - b0, (const float *)G_a + (size_t)b0 * G_k,
+                                (float *)G_c + (size_t)b0 * G_n);
+            }
+        }
         int spins = 0;
         while (atomic_load_explicit(&G_tight_done, memory_order_acquire) < G_nt) {
             if (++spins > 4000) {
@@ -243,7 +266,23 @@ static void *worker_fn(void *arg) {
                 break;
             }
             const double t0 = now_s();
-            if (r0 < r1) {
+            if (G_split_tight_dyn) {
+                /* **实验 B**：动态认领小行块——先做完的工人去领下一块，而不是干等最慢者。
+                 * 主线程（`run_lasx`）也参与认领 ⇒ 13 个干活的人 + 空转时间更少。 */
+                for (;;) {
+                    const int b = atomic_fetch_add_explicit(&G_tight_next, 1, memory_order_relaxed);
+                    const int b0 = b * G_tight_blk;
+                    if (b0 >= G_m) {
+                        break;
+                    }
+                    int b1 = b0 + G_tight_blk;
+                    if (b1 > G_m) {
+                        b1 = G_m;
+                    }
+                    lasx_matmul_run(G_plan, b1 - b0, (const float *)G_a + (size_t)b0 * G_k,
+                                    (float *)G_c + (size_t)b0 * G_n);
+                }
+            } else if (r0 < r1) {
                 lasx_matmul_run(G_plan, r1 - r0, (const float *)G_a + (size_t)r0 * G_k,
                                 (float *)G_c + (size_t)r0 * G_n);
             }
@@ -512,9 +551,15 @@ int main(int argc, char **argv) {
             } else if (!strcmp(s, "plan-tight")) {
                 G_split_plan = 1;
                 G_split_tight = 1; /* 常驻线程 + 原子自旋握手（握手最小化） */
+            } else if (!strcmp(s, "plan-tight-dyn")) {
+                G_split_plan = 1;
+                G_split_tight = 1;
+                G_split_tight_dyn = 1; /* 实验 B：动态认领 + 主线程参与 */
             } else {
                 fprintf(stderr,
-                        "bench_openblas: --split 只支持 rows|cols|plan|threaded|omp（收到 %s）\n", s);
+                        "bench_openblas: --split 只支持 rows|cols|plan|threaded|omp|plan-tight|"
+                        "plan-tight-dyn（收到 %s）\n",
+                        s);
                 return 2;
             }
         } else if (!strncmp(a, "--iters=", 8)) {
