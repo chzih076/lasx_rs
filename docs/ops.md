@@ -1950,6 +1950,12 @@ f̃(t) ≈ (e^{a t}/T)·[ ½F̃(a) + Σ_{k=1..N} Re{ F̃(a + i kπ/T)·e^{i kπ 
 |---|---|---|
 | `Route::Direct` | **4**：`Re=Ar·Br−Ai·Bi`、`Im=Ar·Bi+Ai·Br` | **每条乘积与对应实矩阵乘逐位一致** —— 测试 `direct_matches_four_real_matmul_bitwise`（与 4 条实内核的组合**逐位**比对）；和/差按 IEEE 逐元素 |
 | `Route::Karatsuba`（**默认**） | **3**：`k1=(Ar+Ai)(Br+Bi)`、`k2=ArBr`、`k3=AiBi` | **只承诺容差**（`k1` 多一次加法、组合次序不同）⇒ **不承诺**与直算逐位；测试 `routes_agree_within_tolerance` + 本文档声明 |
+| `Route::Fused`（**B1，规划中，尚未实现**） | **1 个交错微内核**（Gauss 3 乘全在 LASX 寄存器内） | **只承诺容差**：累加次序与 `Direct`/`Karatsuba` **都不同**（交错布局 + 寄存器内组合）⇒ **不承诺**与任何一条逐位；验收测试 `fused_*`（一旦落地） |
+
+**边界矩阵（三条路线共用，缺一个都不许出货）**：`k=1`、`n=1`、`m/k/n` 不整除、
+**非 4 倍 rows**、**非 32 倍 n**、大方阵、零维（`m/n/k=0`）。
+现状：`Direct`/`Karatsuba` 已覆盖（`SHAPES` 8 例 + `zero_dim_shapes`）；
+**`Fused` 落地时必须把同一套矩阵原样跑一遍**（交错布局最容易在这些边界上出错）。
 
 **"完全 SIMD"的判据**：**每一次复数乘加都由 LASX 实矩阵乘内核完成、无标量回退** ——
 **两条路线都满足**（4 条 / 3 条乘积都走 `ops::matmul::matmul_f32`/`matmul_f64`）；

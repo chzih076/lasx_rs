@@ -22,6 +22,19 @@ use super::matmul as rmath;
 use super::matmul_f64 as rmath64;
 
 /// 复数矩阵乘的实现路线。
+///
+/// # 三条路线的契约表（**谁逐位、谁容差** —— 出货前必须对齐）
+///
+/// | 路线 | 实现 | 位精确契约 | 守它的测试 |
+/// |---|---|---|---|
+/// | [`Route::Direct`] | 4 条实矩阵乘 + 组合 | **各乘积与对应实矩阵乘逐位一致** | `direct_matches_four_real_matmul_bitwise` |
+/// | [`Route::Karatsuba`]（默认） | 3 条实矩阵乘 + 组合 | **仅容差**（`k1` 多一次加法、组合次序不同） | `routes_agree_within_tolerance` |
+/// | `Fused`（**B1 规划中，尚未实现**） | 1 个交错微内核（Gauss 3 乘在 LASX 寄存器内） | **仅容差**（累加次序与上两条都不同） | 落地后 `fused_*` |
+///
+/// # 边界矩阵（三条路线共用，缺一个都不许出货）
+/// `k=1`、`n=1`、`m/k/n` 不整除、**非 4 倍 rows**、**非 32 倍 n**、大方阵、零维（`m/n/k=0`）。
+/// `Direct`/`Karatsuba` 已由 `tests::SHAPES`（8 例）+ `zero_dim_shapes` 覆盖；
+/// **`Fused` 落地时必须原样跑同一套矩阵**（交错布局最容易在这些边界上出错）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Route {
     /// **直算 4 条**实矩阵乘（位精确契约最强；`N=192×768×3072` 实测 57.4 复数 GFLOP/s）。
