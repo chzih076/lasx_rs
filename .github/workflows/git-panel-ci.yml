@@ -61,6 +61,16 @@ jobs:
       # 规则与自查清单见 `docs/c-abi.md` §9.1。退出码 2（环境/用法问题）按失败处理。
       - name: C ABI naming convention
         run: bash scripts/namecheck.sh
+      # **跨库对照装置必须能编译**（2026-10-15 加）：`scripts/bench_openblas.c` 是对外对照的**唯一
+      # 可复现装置**（旧 §7.10 的数字曾因"驱动不在仓库里"而无法复现、只能标历史）。CI **不跑计时**
+      # （计时需要安静窗口，见 `docs/dev.md` §6.4 的 A/B/C 分级），只保证**装置不腐烂**：
+      # 静态链 `liblasx_rs.a`（免得踩 SONAME 符号链接）+ `pkg-config` 取 OpenBLAS。
+      - name: Cross-library harness compiles (OpenBLAS)
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -Iinclude scripts/bench_openblas.c \
+              target/release/liblasx_rs.a $(pkg-config --cflags --libs openblas) \
+              -lm -lpthread -ldl -o /tmp/bench_openblas_ci
+          /tmp/bench_openblas_ci --impl=both --dtype=f32 --m=64 --k=64 --n=64 --threads=1 >/dev/null
       # **文档计数 vs 实测**（2026-10-15 加）：文档里记的库单测数曾漂成 218/220 而实测 226
       # （`docs/dev.md §4` 的增量清单自身也只加得出 ~214）⇒ 与上面两条同思路：
       # **文档承诺 vs 产物实测**。口径：4 处必须给出**同一个**数，且等于 `--list` 实测值。
