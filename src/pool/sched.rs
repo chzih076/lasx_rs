@@ -280,6 +280,7 @@ mod tests {
         assert_eq!(pick_rows(1024, 16, 4), Pick::Dynamic { block_rows: 16 }); // per=64
         assert_eq!(pick_rows(384, 12, 4), Pick::Dynamic { block_rows: 8 }); // per=32 边界上侧
         assert_eq!(pick_rows(192, 12, 4), Pick::RowBlock); // per=16（LLM 形状）⇒ 静态
+        assert_eq!(pick_rows(256, 12, 4), Pick::RowBlock); // per=22（宽薄 256×64×4096）⇒ 静态（与旧判据同）
         assert_eq!(pick_rows(512, 24, 4), Pick::RowBlock); // per=22，太碎
         assert_eq!(pick_rows(48, 16, 4), Pick::RowBlock);
         assert_eq!(pick_rows(1 << 20, 12, 1).name(), "dynamic");

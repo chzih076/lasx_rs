@@ -1018,6 +1018,30 @@ impl std::fmt::Debug for WorkerPool {
     }
 }
 
+/// 本轮的自旋上限：生产 = [`SPIN_LIMIT`]；`#[cfg(test)]` 下可被
+/// [`set_spin_limit_for_test`] 覆盖，供"H2 等待策略扫描"在同一进程里交替对照
+/// （`docs/dev.md` §7.10 ⑩）。
+fn spin_limit() -> u32 {
+    #[cfg(test)]
+    {
+        let v = SPIN_LIMIT_OVERRIDE.load(Ordering::Relaxed);
+        if v != 0 {
+            return v;
+        }
+    }
+    SPIN_LIMIT
+}
+
+/// 测试用：设置自旋上限（`0` = 恢复默认），返回旧值。
+#[cfg(test)]
+pub(crate) fn set_spin_limit_for_test(v: u32) -> u32 {
+    SPIN_LIMIT_OVERRIDE.swap(v, Ordering::Relaxed)
+}
+
+/// 测试用的自旋上限覆盖值（`0` = 用 [`SPIN_LIMIT`]）。
+#[cfg(test)]
+static SPIN_LIMIT_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// worker 主循环：自适应等待新代次 → 取出本轮入口 → 执行 → 计数。
 fn worker_loop(sh: Arc<Shared>, i: usize) {
     let mut seen = 0usize;
@@ -1028,7 +1052,7 @@ fn worker_loop(sh: Arc<Shared>, i: usize) {
                 return;
             }
             spins += 1;
-            if spins < SPIN_LIMIT {
+            if spins < spin_limit() {
                 std::hint::spin_loop();
                 continue;
             }

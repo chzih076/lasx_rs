@@ -1414,3 +1414,70 @@ fn diag_static_vs_dynamic_grid() {
         }
     }
 }
+
+/// **H2 等待策略扫描（默认 `#[ignore]`）**：库内 `SPIN_LIMIT ∈ {128,1024,4096}`（同进程交替）。
+///
+/// 判据**先写死**（沿用 driver 那条）：**自旋占比再降 ≥8pp 且 ms 降 ≥2%** 才算"该改"；
+/// 否则结论就是"**不必改**"。自旋占比用 `perf record` 另测（本测试只出 ms）。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_spin_limit -- --ignored --nocapture`
+#[cfg(test)]
+#[ignore = "H2 等待策略扫描：SPIN_LIMIT 三档同进程交替（不进 CI）"]
+#[test]
+fn diag_spin_limit() {
+    use crate::aligned::AlignedVec;
+    use std::time::Instant;
+    const ROUNDS: usize = 5;
+    let (m, k, n) = (768usize, 768usize, 2048usize); // 大形状（走动态认领）
+    let a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.125);
+    let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+    let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+    let pool = WorkerPool::new(12);
+    // `LASX_SPIN_LIMIT=<n>` 时只跑那一档：便于 `perf record` 单臂取自旋占比。
+    let all = [128u32, 1024, 4096];
+    let only: Vec<u32> = match std::env::var("LASX_SPIN_LIMIT") {
+        Ok(v) => all
+            .iter()
+            .copied()
+            .filter(|&x| Some(x) == v.parse::<u32>().ok())
+            .collect(),
+        Err(_) => all.to_vec(),
+    };
+    let limits = only.as_slice();
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); limits.len()];
+    for _ in 0..ROUNDS {
+        for (idx, &lim) in limits.iter().enumerate() {
+            crate::pool::set_spin_limit_for_test(lim);
+            let mut c = AlignedVec::<f32>::new(m * n);
+            let t0 = Instant::now();
+            matmul_f32_plan(&pool, &plan, m, &a, &mut c).unwrap();
+            samples[idx].push(t0.elapsed().as_secs_f64());
+            // 位精确：每轮都与单线程比（与等待策略无关，但必须守）
+            let want = crate::api::matmul(m, k, n, &a, &b).unwrap();
+            assert_eq!(
+                c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "SPIN_LIMIT={lim} 时与 api::matmul 不逐位"
+            );
+        }
+    }
+    crate::pool::set_spin_limit_for_test(0); // 恢复默认
+    let flop = 2.0 * m as f64 * k as f64 * n as f64;
+    let mut base = 0.0;
+    for (idx, &lim) in limits.iter().enumerate() {
+        let mut v = samples[idx].clone();
+        v.sort_by(f64::total_cmp);
+        let med = v[v.len() / 2];
+        if idx == 0 {
+            base = med;
+        }
+        println!(
+            "SPIN_LIMIT={lim:<5} ms 中位数={:.4} 极差={:.4}-{:.4} GFLOP/s={:.1} 相对首档={:.3}×",
+            med * 1e3,
+            v[0] * 1e3,
+            v[v.len() - 1] * 1e3,
+            flop / med / 1e9,
+            base / med
+        );
+    }
+}

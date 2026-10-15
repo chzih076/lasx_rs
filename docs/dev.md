@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**238 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**239 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -315,6 +315,9 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 - 阈值 1 个（`#[ignore]`）：`parallel::diag_static_vs_dynamic_grid`——**H2 阈值表**（剖析小节 ⑩）：
   扫 `threads × per_thread` 网格，同进程交替 `Pick::RowBlock` vs `Pick::Dynamic`，判据"动态赢
   ≥3% 才算动态"；配 `LASX_DIAG_ARM=static|dynamic` 可分臂上 `perf stat`。
+- 等待 1 个（`#[ignore]`）：`parallel::diag_spin_limit`——**H2 等待策略扫描**（剖析小节 ⑩）：
+  同进程交替 `SPIN_LIMIT ∈ {128,1024,4096}`（测试用覆盖钩子 `pool::set_spin_limit_for_test`，
+  生产默认值不动）；配 `LASX_SPIN_LIMIT=<n>` 可分臂上 `perf record` 取自旋占比。
 
 > **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
 > **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
@@ -349,7 +352,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 238 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 239 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -1956,9 +1959,29 @@ pthread 档每次
    **为什么 driver 侧 +12% 没能搬过来**：driver 的"静态"是 **12 块 × 16 行 = 每 worker 恰好一块**
    （无抢活余地），而库内 `Pick::RowBlock` 给的是 **48 块 × 4 行 = 每 worker 4 块**（本身已细）
    ⇒ 库内原本就没有那么大的负载不均可捡。**这条差异正是"driver 结论不能直接搬进库"的实例。**
-3. **等待策略（`SPIN_LIMIT` 扫描）：本轮未做，如实记为"未测、未改"。** 库内现状是
-   "自旋 `SPIN_LIMIT = 1024` 次 → `park`（`Condvar`）"，与 driver 那次的"长自旋 + `sched_yield`"
-   **不同构**（那里 200 圈赢 4000 圈，不能直接推到这里）；要下结论必须另做实测（下一步）。
+3. **等待策略（`SPIN_LIMIT` 扫描）：结论"不必改"。** 库内上下文（大形状 `768×768×2048` @12、
+   走动态认领）扫 `SPIN_LIMIT ∈ {128, 1024, 4096}`，**同进程交替 ≥5 次**
+   （`src/parallel.rs` 的 `diag_spin_limit` + 测试用覆盖钩子 `set_spin_limit_for_test`；
+   **生产默认值不变**）：
+
+| `SPIN_LIMIT` | ms 中位数（极差） | GFLOP/s | `worker_loop` 自耗时（`perf record`） |
+|---|---|---|---|
+| 128 | 6.5995（6.0126–11.6976） | 366.1 | 未进 top（<0.5%） |
+| **1024（现默认）** | **6.4073（6.1402–9.8094）** | **377.1** | 未进 top（<0.5%） |
+| 4096 | 6.4629（6.2157–7.4891） | 373.8 | 0.76% |
+
+   判据（先写死：自旋占比再降 ≥8pp **且** ms 降 ≥2%）**没有任何一档满足**（1024 已最优，
+   另两档反而慢 0.9–3.0%）⇒ **判定"不必改"，默认 1024 保持**。
+   **为什么 driver 那次（200 圈赢 4000 圈、自旋占 60%）推不过来**：① 库内等不到就 **`park`
+   （`Condvar`）**，不是 `sched_yield` 死转；② 库内每 worker 4 块，干活期间几乎没人空转；
+   ③ 实测 `worker_loop` 自耗时 **<0.76%**（driver 那边 60%）⇒ **没有可捡的自旋**。负结论 + 依据留档。
+
+4. **宽薄 `256×64×4096` 不退化（改前 vs 改后，同源 6 轮丢首轮）**：`w256x64x4096-f32-12t-plan`
+   改后中位 **0.6254 ms / 214.6 G**（极差 0.6209–0.6586、`iters` 159–170、`ms_max` 2.4–3.5；
+   逐轮 loadavg 3.11–4.76 ⇒ 混合 B/C 窗口）；**改前记录 0.6355 ms / 211.2 G**（见 ⑥ 里那张表）
+   ⇒ **−1.6%（在 ±2% 不退化线内）**；与 OpenBLAS 同轮只差 **2.8%**（0.6085 ms / 220.6 G）。
+   **并且按构造就没变**：`pick_rows(256, 12, 4)`（`per_thread = 22 < 32`）**新旧判据都返回静态**
+   ⇒ 该形状的策略一字未动（`pick_is_sane` 里已加断言固定这一点）⇒ **不需要为宽薄收窄判据**。
 
 
 **OpenBLAS 在方阵上的多线程数（@12 线程，供参考）**——本轮装置已能同形对照，但我们只测了
