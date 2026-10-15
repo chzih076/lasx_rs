@@ -87,6 +87,12 @@ static int G_stop;
 /* 非 ABI 的测试模式（见下面 run_scan/run_verify 的注释）：scan / verify / no-scatter */
 static int G_mode_scan, G_mode_verify, G_no_scatter;
 static int G_ms[16], G_nms;
+/* `--split=plan`：**打包一次 + 调用方线程**（本库新 ABI 的正面路径）。
+ * `G_plan` 在建池前 prepare 一次（成本单独打印成 OBPLAN），worker 里改调 `lasx_matmul_run`。
+ * `--split=threaded`：便利层 `lasx_matmul_run_threaded`（库内派发，不另起 worker）。 */
+static int G_split_plan, G_split_threaded;
+static lasx_matmul_plan *G_plan;
+static int G_plan_threads;
 
 static double now_s(void) {
     struct timespec t;
@@ -117,10 +123,15 @@ static void fill_rand_f64(double *p, size_t n, uint64_t seed) {
 
 /* ---- 一次计算：两条实现各一处（无重复分支）---- */
 static void run_lasx(void *c) {
-    if (G_nt > 1) { /* 多线程档：常驻 worker 行切分（见文件头第 4 条） */
+    if (G_split_threaded && G_plan != NULL) {
+        /* 便利层：库内派发（调用方不另起 worker；`G_plan_threads` 就是 --threads） */
+        lasx_matmul_run_threaded(G_plan, G_m, (const float *)G_a, (float *)c, G_plan_threads);
+    } else if (G_nt > 1) { /* 多线程档：常驻 worker 行切分（见文件头第 4 条） */
         G_c = c;
         pthread_barrier_wait(&G_start);
         pthread_barrier_wait(&G_end);
+    } else if (G_plan != NULL) { /* --split=plan + 单线程：计划路径 */
+        lasx_matmul_run(G_plan, G_m, (const float *)G_a, (float *)c);
     } else if (G_is_f64) {
         lasx_matmul_f64(G_m, G_k, G_n, (const double *)G_a, (const double *)G_b, (double *)c);
     } else {
@@ -201,7 +212,10 @@ static void *worker_fn(void *arg) {
                 r1 = G_m;
             }
             if (r0 < r1) {
-                if (G_is_f64) {
+                if (G_plan != NULL) { /* --split=plan：计划已打包好 B，这里只算自己那段行 */
+                    lasx_matmul_run(G_plan, r1 - r0, (const float *)G_a + (size_t)r0 * G_k,
+                                    (float *)G_c + (size_t)r0 * G_n);
+                } else if (G_is_f64) {
                     lasx_matmul_f64(r1 - r0, G_k, G_n, (const double *)G_a + (size_t)r0 * G_k,
                                     (const double *)G_b, (double *)G_c + (size_t)r0 * G_n);
                 } else {
@@ -323,18 +337,39 @@ static int run_verify(void) {
         }
     }
     G_split_cols = save;
-    printf("OBVERIFY dtype=%s m=%d k=%d n=%d threads=%d seq_split=%s rows=%s cols=%s\n",
+    /* ③ **计划路径**（本库新 ABI 的正面路径）：prepare 一次 + 同一套 worker 按行切，
+     * worker 的 rows 分支会自动改调 `lasx_matmul_run`。f32 才有计划句柄。 */
+    int plan_ok = 1, plan_na = 0;
+    if (G_is_f64) {
+        plan_na = 1;
+    } else {
+        lasx_matmul_plan *pl = lasx_matmul_prepare(G_k, G_n, (const float *)G_b);
+        if (pl == NULL) {
+            plan_ok = 0;
+        } else {
+            G_plan = pl;
+            G_split_cols = 0;
+            memset(got, 0xA5, esz * cn);
+            G_c = got;
+            run_lasx(got);
+            plan_ok = memcmp(ref, got, esz * cn) == 0;
+            G_plan = NULL;
+            lasx_matmul_plan_destroy(pl);
+        }
+    }
+    printf("OBVERIFY dtype=%s m=%d k=%d n=%d threads=%d seq_split=%s rows=%s plan=%s cols=%s\n",
            G_is_f64 ? "f64" : "f32", G_m, G_k, G_n, G_nt > 0 ? G_nt : 1,
            seq_ok ? "bitexact" : "MISMATCH", rows_ok ? "bitexact" : "MISMATCH",
+           plan_na ? "n/a" : (plan_ok ? "bitexact" : "MISMATCH"),
            cols_ok ? "bitexact" : "MISMATCH");
     fflush(stdout);
-    const int ok = seq_ok && rows_ok && cols_ok;
+    const int ok = seq_ok && rows_ok && plan_ok && cols_ok;
     if (!ok) {
         fprintf(stderr,
                 "bench_openblas: 位精确**不通过**（m=%d k=%d n=%d threads=%d seq=%s rows=%s "
-                "cols=%s）——切分与单线程参考不一致，拒绝进入计时。\n",
+                "plan=%s cols=%s）——切分与单线程参考不一致，拒绝进入计时。\n",
                 G_m, G_k, G_n, G_nt, seq_ok ? "ok" : "MISMATCH", rows_ok ? "ok" : "MISMATCH",
-                cols_ok ? "ok" : "MISMATCH");
+                plan_na ? "n/a" : (plan_ok ? "ok" : "MISMATCH"), cols_ok ? "ok" : "MISMATCH");
     }
     free(ref);
     free(got);
@@ -344,9 +379,9 @@ static int run_verify(void) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "用法：%s --impl=lasx|openblas|both [--dtype=f32|f64] --m=M --k=K --n=N [--threads=N] "
-            "[--iters=N] [--seed=U64] [--tol=F] [--split=rows|cols] [--no-scatter]\n"
+            "[--iters=N] [--seed=U64] [--tol=F] [--split=rows|cols|plan|threaded] [--no-scatter]\n"
             "      %s --mode=scan --k=K --n=N --ms=192,384,768,1536,3072   # 单线程扫 m（拟合打包成本）\n"
-            "      %s --mode=verify --m=M --k=K --n=N --threads=N          # 位精确自检（rows/cols）\n",
+            "      %s --mode=verify --m=M --k=K --n=N --threads=N          # 位精确自检（rows/plan/cols）\n",
             argv0, argv0, argv0);
 }
 
@@ -376,8 +411,13 @@ int main(int argc, char **argv) {
                 G_split_cols = 1;
             } else if (!strcmp(s, "rows")) {
                 G_split_cols = 0;
-            } else {
-                fprintf(stderr, "bench_openblas: --split 只支持 rows|cols（收到 %s）\n", s);
+            } else if (!strcmp(s, "plan")) {
+                G_split_plan = 1; /* 打包一次 + 调用方线程（本库新 ABI 的正面路径） */
+            } else if (!strcmp(s, "threaded")) {
+                G_split_plan = 1;
+                G_split_threaded = 1; /* 便利层：库内派发 */
+            } else {                fprintf(stderr, "bench_openblas: --split 只支持 rows|cols|plan|threaded（收到 %s）\n",
+                        s);
                 return 2;
             }
         } else if (!strncmp(a, "--iters=", 8)) {
@@ -469,8 +509,30 @@ int main(int argc, char **argv) {
     G_a = A;
     G_b = B;
 
-    /* 多线程档：起常驻 worker（一次，不在计时循环里反复建线程） */
-    if (threads > 1) {
+    /* `--split=plan` / `--split=threaded`：**打包 B 一次**（`lasx_matmul_prepare`），
+     * 成本单独打印成 OBPLAN（不进计时——它就是"计划"该摊掉的那部分）。 */
+    if (G_split_plan) {
+        if (G_is_f64) {
+            fprintf(stderr, "bench_openblas: --split=plan 目前只有 f32（计划句柄是 f32 版）\n");
+            return 2;
+        }
+        const double t0 = now_s();
+        int st = -1;
+        G_plan = lasx_matmul_prepare_checked(G_k, G_n, (const float *)B, &st);
+        const double dt = (now_s() - t0) * 1e3;
+        if (G_plan == NULL) {
+            fprintf(stderr, "bench_openblas: lasx_matmul_prepare_checked 失败（status=%d）\n", st);
+            return 2;
+        }
+        G_plan_threads = threads;
+        printf("OBPLAN dtype=%s k=%d n=%d threads=%d split=%s prepare_ms=%.4f\n", dtype, G_k, G_n,
+               threads, G_split_threaded ? "threaded" : "plan", dt);
+        fflush(stdout);
+    }
+
+    /* 多线程档：起常驻 worker（一次，不在计时循环里反复建线程）。
+     * `--split=threaded` 不走 worker（库内派发），所以这里不起池。 */
+    if (threads > 1 && !G_split_threaded) {
         /* **两种切分的参数都要备好**：`--mode=verify` 会在同一个进程里来回切 rows/cols，
          * 只备一种会让另一种用到未初始化的 rows/cols_per_thread（本装置曾在 verify 里
          * 因此报出假 MISMATCH——记在这里当教训）。*/

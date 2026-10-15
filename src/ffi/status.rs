@@ -18,6 +18,32 @@
 // **函数级 SAFETY 段**里统一说明；逐块重复注释只会把真正的不变量淹没。
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+/// 校验失败即写状态并提前返回。把各包装里重复的样板收敛到一处。
+///
+/// 放在这里（而不是 `checked.rs`）是因为 [`super::matmul_plan`] 也要用——宏只留一份。
+macro_rules! or_fail {
+    // `void` 版：提前 `return`（写成 `return ();` 会被 clippy 判为多余）
+    ($expr:expr, $status:expr, ()) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                e.write($status);
+                return;
+            }
+        }
+    };
+    ($expr:expr, $status:expr, $ret:expr) => {
+        match $expr {
+            Ok(v) => v,
+            Err(e) => {
+                e.write($status);
+                return $ret;
+            }
+        }
+    };
+}
+pub(crate) use or_fail;
+
 /// `lasx_*_checked` 的状态码。`0` 为成功，其余为失败原因。
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

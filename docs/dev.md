@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**229 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**235 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -298,7 +298,13 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 - C ABI 调用体验那批 3 个（§19.16）：`lasx_has_lasx` 与 `detect()` 逐点对应且 `force(true) ⇒ 0`
   1 个、`lasx_version` 非 NULL/NUL 结尾/与 `CARGO_PKG_VERSION` 一致 1 个、
   `lasx_status_message` 覆盖 0..6 与未知码均非 NULL 1 个（`lasx_free` 的配对与两种 no-op
-  并进了既有的 `src/ffi/memory.rs` 用例，未增条数）。
+  并进了既有的 `src/ffi/memory.rs` 用例，未增条数）；
+- **计划句柄那批 6 个（§19.17）**：`run_block_into` 与整块逐位一致（覆盖 k=384/385 两侧、
+  `m` 不整除、`rows` 非 4 的倍数、`n` 非 32 的倍数）1 个 + 按块入口的形状错误 1 个
+  （`src/plan.rs`）；`parallel::matmul_f32_plan_with_stats` 与 `api::matmul` 逐位一致且统计量自洽
+  1 个（`src/parallel.rs`）；FFI 侧 3 个（`src/ffi/matmul_plan.rs`）——`run`/便利层与
+  `lasx_matmul` 逐位一致（1/0 线程都覆盖）、`_checked` 状态码与"失败不触碰输出"、
+  **只走 prepare+run 不新建线程**（`/proc/self/task` 前后相等，§19.17 的"零进程级状态"证据）。
 
 > **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
 > **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
@@ -333,7 +339,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 229 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 235 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -1438,6 +1444,81 @@ loadavg 逐轮 3.15/2.68/2.80）⇒ **散射不是主要成本**（9%）；把�
   `cols` 已经证明"尺寸一变小就可能换路径"。
 - 本节的装置与三个测试模式都在 `scripts/bench_openblas.c`（非 ABI，只用于测量）：
   `--mode=verify` 现在可以直接当"多线程切分是否位精确"的回归工具用。
+
+**⑥ 计划句柄落地后的四/五档对照（2026-10-15，ABI 追加 87→94 之后）**
+
+装置新增两档（`scripts/bench_openblas.c`，仍是**非 ABI** 的测量代码）：
+`--split=plan`（`lasx_matmul_prepare` 打包一次 + **调用方** pthread 按行切）、
+`--split=threaded`（便利层 `lasx_matmul_run_threaded`）；`--mode=verify` 现在把
+`plan` 也当一档**位精确断言**（计时前，见 (1)）。
+
+**(1) 位精确（计时前的断言，先过这一关）**——四档同形状对照（f32, threads=12）：
+
+| 形状 | `seq_split` | `rows` | **`plan`（新）** | `cols` |
+|---|---|---|---|---|
+| 100×384×257（k 边界下侧） | bitexact | bitexact | **bitexact** | MISMATCH |
+| 100×385×257（k 边界上侧） | bitexact | bitexact | **bitexact** | MISMATCH |
+| 192×768×3072 / 64³ | bitexact | bitexact | **bitexact** | bitexact |
+
+⇒ **计划句柄在所有测试形状上都与单线程 `lasx_matmul` 逐位一致**（含 `cols` 做不到的那些形状）；
+`include/lasx_rs.h` 侧的 `scripts/check_header.c` 也把这件事当行为断言（40×384/385×257，按 7 行
+切块 + 便利层 1/0 线程）。
+
+**(2) `192×768×3072` f32 @12（6 轮丢首轮取中位数；判据顺序仍是位精确 > 速度）**
+
+| 档 | ms 中位数（极差） | GFLOP/s | 扩展比 | 位精确 |
+|---|---|---|---|---|
+| `rows`（每线程各调 `lasx_matmul`） | 14.7316（8.4591–14.8369） | 61.5 | 1.06× | ✅ |
+| `cols`（预转置 + 按列切） | 4.2838（3.7463–5.7197） | 211.5 | 3.66× | ⚠️ 6/10 形状不逐位 |
+| **`plan`（打包一次 + 调用方线程）** | **3.6972（3.6771–3.9756）** | **245.0** | **4.24×** | ✅ |
+| `threaded`（便利层，池现建现拆） | 6.9757（4.3608–7.8619） | 129.9 | 2.25× | ✅ |
+| （对方）OpenBLAS @12 | 2.4714（2.4571–2.5499） | 366.6 | 6.34× | ✅ |
+
+**口径**：单线程同形状同窗口基准 **15.67 ms**（57.7 G）作扩展比分母；逐轮 loadavg 与分级——
+r1 `3.30/3.28`(B，丢弃)、r2 `4.29/3.63`(B)、r3 `4.34/3.72`(B)、r4 `4.21/3.84`(B)、
+r5 `4.79/4.23`(**C**)、r6 `5.89/4.61`(**C**) ⇒ 中位数窗口 = **3 轮 B + 2 轮 C**；
+`OBCHECK` 各档 `max_rel = 1.343e-06`（阈值 1e-3）全部 ok=yes。
+**独立复跑**（`SETTLE=90`、只跑 plan 两档的 6 轮）得到 **3.7293 ms / 242.9 G**（4 轮 C + 2 轮 B）
+⇒ **243–245 G 是稳定可复现的中位数**，不是抽到的好签。
+
+**(3) 结论（**没到 310 G，如实写**）**
+
+- 计划句柄把 C 侧从 **62.6 G（1.06×）推到 245 G（4.24×）**，**超过"现有有效档 236 G"**
+  （`cols`），而且**位精确**——即：新增的 ABI 同时拿下了"更快"和"更可信"。
+- 但**没有到 310 G**：245/310 ≈ **79%**；离 OpenBLAS 的 366.6 G 还差 **1.50×**。
+  **"有望贴近 310"只是预期，本轮不作为结论。**
+  - 顺带一个**非正式**观察（单次采样，不进结论）：同机较早窗口里 `examples/c/matmul_mt_caller`
+    实测 2.954 ms = **306.6 GFLOP/s** ⇒ "245 还是 307"很受窗口影响；两次正式复跑（各 6 轮）
+    都是 243–245 G，所以**正式数取 245 G**。
+- **宽薄 `256×64×4096` f32 @12**：`plan` **0.6355 ms（211.2 G）** / OpenBLAS 0.6122 ms（219.2 G）
+  ⇒ **只慢 3.7%（基本打平）**；同一形状 `cols` 是 1.0095 ms（132.9 G，慢 60%）⇒ 计划路径对这种
+  "k 小、n 宽"的形状同样有效。
+
+**(4) 与 Rust 池的差距：**同窗口**实测 + 根因判断（这是"没到 310 G"的账）**
+
+同一时间窗里跑 `cargo run -p lasx_bench --release -- mt`（Rust 池，`parallel::matmul_f32`）：
+
+| 同一窗口 `192×768×3072` f32 | 1 线程 | 12 线程 | 12 线程 GFLOP/s | 12 线程扩展/效率 |
+|---|---|---|---|---|
+| Rust 池（`mt` 套件） | 15.95 ms | **2.73 ms** | **331.9** | 5.84× / 49% |
+| C 计划句柄（本轮 ⑥） | 15.67 ms | 3.6972 ms | 245.0 | 4.24× / 35% |
+
+⇒ **池比"计划 + 调用方线程"快 1.35×（同窗口、同形状、两边都位精确），所以差距不只是窗口。**
+根因判断（**由代码结构 + 字节账推出，不是直接实验**，但数量级吻合）：
+
+- 池是**面板在外、行块在内**（`parallel.rs`：`for panel in panels { pool.for_each_row_block_*(…) }`）
+  ⇒ 12 个 worker **同一时刻读同一块面板**（`k×nc×32` ≈ 2 MB，留在 L2/L3 里共享）⇒ 每次调用
+  的面板读量 ≈ **9.4 MB（B 一遍）**。
+- 计划句柄的 `run` 是**行块在外、面板在内**（`plan.rs`：每个块 `for panel in &self.panels`）
+  ⇒ **每个调用方块都要把全部面板读一遍**（9.4 MB × 12 块 ≈ **113 MB/调用**）。
+  两边的差（≈104 MB）按本机 ~100 GB/s 折算 ≈ **1 ms**，与实测差（3.70 − 2.73 = 0.97 ms）吻合。
+- ⇒ **一个"按块"的 API 结构上到不了池的数**：要再进一步，需要 (a) **面板粒度**的入口
+  （`run_panel(plan, panel, rows, a, c)` + 调用方面板在外循环），或 (b) 直接导出池入口（提案里的
+  (B)），或 (c) 调用方按列再切 + 每列一个计划（今天就能表达，但计划数与调用复杂度都上去了）。
+  **这三条都属新 ABI/新形态，本轮未做**——等用户定夺（结论与账目都在这里，方便决策）。
+- **便利层（`threaded`，129.9 G）明显慢于调用方驱动**：池**每次调用现建现拆**（12 个线程
+  的创建/回收进了计时）。这是"不用它就零进程级状态"的代价，已写进 `docs/c-abi.md` 第 11.2/11.4 节
+  ——**热循环请用 `lasx_matmul_run` + 调用方自己的线程/池**。Rust 侧想复用池就用 `WorkerPool`。
 
 **OpenBLAS 在方阵上的多线程数（@12 线程，供参考）**——本轮装置已能同形对照，但我们只测了
 `192×768×3072`/`256×64×4096` 两个带线程的形状；要补方阵 × 线程网格，直接加 case 跑
@@ -3808,11 +3889,60 @@ error: `dot!` 只认受支持的 dtype 组合
 | `lasx_status_message()` 覆盖 0..6 + 未知码且非 NULL | 单测（0..6、±边界、`i32::MIN/MAX`）；`check_header.c` 实测 -1..8 |
 | `lasx_free` 与 `lasx_alloc` 同 layout | **构造保证**（同一个 `f32_layout()`）+ 单测（配对、两种 no-op） |
 | `lasx_free(p, n)` 的 `n` 必须等于分配时的值 | **只有约定**；违反（非 0 且不同）破坏堆 = UB，已在 `docs/ops.md` §15 第 4 条点名 |
-| 87 个符号一个不少 / 原型不漂 | `scripts/check_header.c` 对 87 个逐个取地址（编译期钉住 `LASX_SYMBOL_COUNT`）+ CI 的 ABI 门禁（`nm -D` 计数） |
+| 94 个符号一个不少 / 原型不漂 | `scripts/check_header.c` 对 94 个逐个取地址（编译期钉住 `LASX_SYMBOL_COUNT`）+ CI 的 ABI 门禁（`nm -D` 计数） |
 
 **诚实标注**：`examples/c` 的"无 LASX"分支在**本机（含 LASX）无法实测**（`lasx_force_lsx_thread`
 不导出给 C），与 `docs/ops.md` §3.3 那条"无 LASX 真机"是同一类限制；该分支的正确性由 Rust 单测守。
 显式示例的实测输出见本轮的 CI/汇报（`make run` 打印版本、能力、算子结果与归还）。
+
+### 19.17 计划句柄：把"打包一次"变成 ABI 能力（2026-10-15）
+
+**起因**（用户："C ABI 不导出线程池这个问题确实要讨论和处理"，随后追加"**不要死板的线程池**，
+且配套设施要一起上"）：§7.10 ⑤ 已经验穿根因——`lasx_matmul` 每次调用都重打包整个 B，C 侧
+"每线程各调一次"的扩展比只有 **1.08×**，天花板 ≈236 G。**先量后决**：定位/验证/对照都做完
+才动 ABI。
+
+**决策：加"计划句柄"（打包一次 + 调用方驱动线程），便利层可选、可调、可不用。**
+理由（按优先级）：
+
+1. **治根因**：打包从"每次调用"提到"每次计划"，这是 1.08× → 4× 的那笔账；
+2. **不夺线程控制权**：`lasx_matmul_run` 一次算**一个行块**，线程怎么开、块怎么切由调用方定
+   （OpenMP / 线程池 / 协程 / 纯串行都行）——这是"不死板"的实现方式：库**没有**把"库内固定池"
+   做成唯一路径，也**不读环境变量**；
+3. **零进程级状态**：不用便利层就没有全局池/`atexit`/lazy init；便利层也是**每次调用现建现拆**；
+4. **位精确可守**：计划走同一条按块内核（每个输出元素仍沿 k 单升序），因此与 `lasx_matmul`
+   逐位一致——而"调用方自己拼 `cols`"做不到（6/10 形状不逐位，§7.10 ⑤）。
+
+**落地（7 个新符号，87→94；只追加，`lasx_matmul` 行为一字不改）**：
+
+| 层 | 符号 | 说明 |
+|---|---|---|
+| Rust | `plan::MatmulPlan::run_block_into`、`parallel::matmul_f32_plan{,_with_stats}` | C 只是它的投影（"不只 C 能多核"） |
+| C 底座 | `lasx_matmul_prepare{,_checked}`、`lasx_matmul_run{,_checked}`、`lasx_matmul_plan_destroy` | 5 个：prepare 复制打包 B、句柄只读可并发 `run`、`destroy(NULL)` 空操作 |
+| C 便利层 | `lasx_matmul_run_threaded{,_checked}` | 2 个：`threads<=0` 自动物理核 / `1` 串行 / `N` 夹到物理核；动态取块；`_checked` 回填"实际 worker 数 / 块数 / 最慢与最快块毫秒" |
+
+**命名上的一个门禁故事**：`§9.1` 保留了库级词根 `free`（白名单已有 `lasx_free`），所以释放
+函数只能叫 `lasx_matmul_plan_destroy`——`lasx_matmul_plan_free` 会被 `scripts/namecheck.sh`
+直接拦下。名字是**规则定出来的**，不是随手挑的。
+
+| 契约 | 由什么守 |
+|---|---|
+| `run` / 便利层与单线程 `lasx_matmul` **逐位一致** | Rust 单测（`plan.rs` 含 k=384/385 两侧与不整除块；`parallel.rs` 含 LLM 形状）+ FFI 单测（1/0 线程都覆盖）+ `scripts/check_header.c` 的两个形状实测 + `scripts/bench_openblas.c --mode=verify` 的 `plan` 档 |
+| `prepare` 复制并打包 B ⇒ 调用方随后可释放 `b` | 实现（`from_row_major` 自持面板）+ 单测（`prepare` 后仍能跑出正确结果） |
+| 句柄只读 ⇒ 可跨线程并发 `run` | 类型系统（`&self`，无内部可变状态）+ `plan.rs` 的 `plan_is_shareable_across_threads` |
+| **不用便利层时零进程级状态** | FFI 单测 `plan_path_spawns_no_threads`（`/proc/self/task` 前后相等） |
+| `destroy(NULL)` 空操作；重复释放/用后即用 = UB | 前者实现 + 单测；后者**只有约定**，已在 `docs/c-abi.md` 第 11.3 节点名 |
+| 94 个符号一个不少 / 原型不漂 | `scripts/check_header.c`（`LASX_SYMBOL_COUNT` 编译期钉住 + 逐符号地址）+ CI 的 `nm -D` 计数 + `namecheck`/`doccheck` |
+
+**已知取舍（如实记，不粉饰）**：
+- 便利层**每次调用现建现拆线程池**，实测比"调用方驱动"慢一截（§7.10 ⑥ 的 `threaded` 档
+  129.9 G vs `plan` 档 245.0 G）；这是"不用它就零进程级状态"的代价，热循环请用 `run` +
+  自己的线程/池。Rust 侧想把池留下来复用，直接用 `WorkerPool`（`docs/ops.md` §4.9）。
+- **"按块"的粒度到不了池的吞吐**：池是"面板在外、行块在内"（同窗口实测 331.9 G，§7.10 ⑥ (4)），
+  而计划句柄的每个调用方块都要把全部面板读一遍。要再进一步需要**面板粒度入口**或**导出池**
+  ——**本轮未做**，账目留在 §7.10 ⑥ 的 (4)，等用户定夺。
+- 计划常驻内存 ≈ `k·n·4` 字节（`192×768×3072` 时 9 MB）；`n % 32 != 0` 时另存一小段列尾副本。
+- 只有 **f32** 有计划句柄（f64 按需再追加 `*_f64`，append-only 允许）。
 
 ## 20. NN 侧 N1 批次：算子契约与依据
 

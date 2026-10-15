@@ -12,7 +12,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，**87 个导出符号**（46 个裸符号 + 41 个 `_checked` 变体） |
+| 适用代码版本 | `master`，**94 个导出符号**（50 个裸符号 + 44 个 `_checked` 变体） |
 | 权威原型 | [`include/lasx_rs.h`](../include/lasx_rs.h)（手写、随库安装；机器校验见第 10 节） |
 | 读者 | C / C++ 调用方，以及用 `dlopen`/`lookupFunction` 的其它语言绑定（Dart 例见 2.5） |
 | 与源码同源 | 第 3 节的清单与参数次序逐条对照 `src/ffi/*.rs` 的 `pub extern "C" fn`；个数由 CI 门禁核对 |
@@ -192,7 +192,7 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 
 ---
 
-## 3. 完整符号参考（87 = 46 裸 + 41 `_checked`）
+## 3. 完整符号参考（94 = 50 裸 + 44 `_checked`）
 
 ### 3.0 怎么读这一节
 
@@ -298,9 +298,9 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 | `lasx_status_message` | `const char *lasx_status_message(int status)` | 状态码的静态说明串；未知码给通用串；**永不为 NULL**、不要 free |
 | `lasx_free` | `void lasx_free(float *p, int n)` | 归还 `lasx_alloc` 的缓冲（`n` 必须是分配时那个值）；`p==NULL` 与 `n<=0` 是安全 no-op |
 
-### 3.7 `_checked` 变体（41 个名字）
+### 3.7 `_checked` 变体（44 个名字）
 
-规则见 3.0：**同一个原型 + 末尾 `int *status`**。41 个名字（分组与 3.1–3.5 对应）：
+规则见 3.0：**同一个原型 + 末尾 `int *status`**。44 个名字（分组与 3.1–3.5、3.9 对应）：
 
 - 归约/稠密/量化/物理/内存：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
   `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_scaled_checked`、
@@ -320,10 +320,13 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
   `lasx_matmul_i8_checked`（8）
 - ONNX 补充：`lasx_layer_norm_checked`、`lasx_gather_rows_checked`、
   `lasx_gather_rows_i8_checked`（3）
+- 计划句柄（3.9）：`lasx_matmul_prepare_checked`、`lasx_matmul_run_checked`、
+  `lasx_matmul_run_threaded_checked`（3）
 
-**5 个裸符号没有 `_checked` 变体**（46 − 41 = 5）：`lasx_alloc`、`lasx_free` 与三个元信息
-符号——它们的入参里没有"可失败的结构"，`lasx_free` 的 `p==NULL`/`n<=0` 本来就是安全 no-op，
-元信息符号约定永不返回 NULL。
+**6 个裸符号没有 `_checked` 变体**（50 − 44 = 6）：`lasx_alloc`、`lasx_free` 与三个元信息
+符号——它们的入参里没有"可失败的结构"（`lasx_free` 的 `p==NULL`/`n<=0` 本来就是安全 no-op，
+元信息符号约定永不返回 NULL）；外加 `lasx_matmul_plan_destroy`（`void` + 只接受句柄/`NULL`，
+没有可取的状态码，见 3.9）。
 
 ### 3.8 状态码（`lasx_status_message` 的输入，也是 `status` 出参的取值域）
 
@@ -339,6 +342,29 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 
 打印请一律用 `lasx_status_message(st)`（0..6 与未知码都给静态串、**永不 NULL**），不要把
 0..6 硬编码进调用方；Rust 侧同一个表的另一面见 `docs/ops.md` §4.5。
+
+### 3.9 计划句柄（7 个符号 = 4 裸 + 3 `_checked`，2026-10-15 追加）
+
+`lasx_matmul` 每次调用都要把整个 `B` 重新打包；多核下"每线程各调一次"⇒ 打包量 = 线程数 × B。
+计划把这次打包**提到调用之前**，线程怎么开、块怎么切由调用方决定（详细心智模型与线程语义
+见第 11 节）。
+
+| 符号 | C 原型 | 语义 |
+|---|---|---|
+| `lasx_matmul_prepare` | `lasx_matmul_plan *lasx_matmul_prepare(int k, int n, const float *b)` | 把 B（行主序 `k×n`）**复制并打包**一次；失败返回 `NULL`。**不透明句柄**：只当 token 传 |
+| `lasx_matmul_prepare_checked` | 同上 + `int *status` | 校验 k/n 非负 → `k×n` 不溢出 → `b` 非空 → 计划构造 |
+| `lasx_matmul_run` | `void lasx_matmul_run(const lasx_matmul_plan *plan, int rows, const float *a, float *c)` | 算**一个行块**（`rows×k` → `rows×n`；`a`/`c` 指向该块首行）。同一 plan 可被多线程并发调用 |
+| `lasx_matmul_run_checked` | 同上 + `int *status` | 校验 plan 非空 → `rows` 非负 → `rows×k`/`rows×n` 不溢出 → `a`/`c` 非空；**失败不触碰 `c`** |
+| `lasx_matmul_run_threaded` | `void lasx_matmul_run_threaded(const lasx_matmul_plan *plan, int m, const float *a, float *c, int threads)` | **便利层**：库内派发算整块；`threads<=0` = 自动物理核、`1` = 串行、`N` = N worker（夹到物理核） |
+| `lasx_matmul_run_threaded_checked` | 同上 + `int *threads_out, int *chunks_out, double *ms_max_out, double *ms_min_out, int *status` | 四个出参都可 `NULL`；**执行自检**：实际 worker 数 / 块数 / 最慢与最快一块的毫秒数 |
+| `lasx_matmul_plan_destroy` | `void lasx_matmul_plan_destroy(lasx_matmul_plan *plan)` | 释放（`NULL` 合法空操作；**重复释放或用后即用 = UB**） |
+
+**类型**：`lasx_matmul_plan` 是**不透明指针类型**（只有前置声明，无字段、无 `sizeof` 承诺、
+不可解引用、不可复制内容）。
+
+**命名说明（§9.1 的机械门禁在这里起了作用）**：释放函数叫 `_destroy` 而不是 `_free`——`free`
+是 §9.1 保留给**库级**符号的词根（白名单里已有 `lasx_free`），算子级名字用它会被
+`scripts/namecheck.sh` 拦下。
 
 ---
 
@@ -478,7 +504,7 @@ float d = lasx_dot(a, b, n);
 
 ### 9.1 命名规范（只管**未来新增**）
 
-**为什么只管未来**：已发布的 87 个符号**只追加不改名**——改名即破坏 ABI（见上一节）。所以本节
+**为什么只管未来**：已发布的 94 个符号**只追加不改名**——改名即破坏 ABI（见上一节）。所以本节
 只约束新增符号，既有情况见文末"历史例外"表。规则由
 [`scripts/namecheck.sh`](../scripts/namecheck.sh) 机械校验（CI 单列一步，用法见脚本头部注释）。
 
@@ -506,8 +532,9 @@ void lasx_Dot_fast_checked(const float *a, const float *b, int n, int *status);
 ③ 是不是库级符号？是就进白名单并改上面说的三处；④ 参数次序照规则 6（`status` 最后）；
 ⑤ 是否沿用了既有词根（`n`/`out`/`c`/`_i8`…），别新造同义词。
 
-**历史例外（审计于 2026-10-15）**：**零违规**——87 个符号在"形态 / 后缀 / 孪生 / 库级"四类审计上
-全部通过（`bash scripts/namecheck.sh` ⇒ `OK（87 个符号，0 例外）`）。下表只记"不是违规、但需要
+**历史例外（审计于 2026-10-15）**：**零违规**——94 个符号在"形态 / 后缀 / 孪生 / 库级"四类审计上
+全部通过（`bash scripts/namecheck.sh` ⇒ `OK（94 个符号，0 例外）`；当日追加"计划句柄"7 个后复跑，
+仍是零违规——新符号照样要在同一套规则下过）。下表只记"不是违规、但需要
 知道的读法与白名单"，**没有为了凑表而编的例外**：
 
 | 项 | 情况 | 为什么不改 |
@@ -522,7 +549,7 @@ void lasx_Dot_fast_checked(const float *a, const float *b, int n, int *status);
 
 | 守什么 | 谁在守 | 怎么守 |
 |---|---|---|
-| **逐符号原型一致**（87 个都在、参数次序对） | [`scripts/check_header.c`](../scripts/check_header.c) | 把**全部 87 个符号的地址**放进数组（缺符号/改名/原型漂移 ⇒ 编译或链接失败），再逐个实调 41 个 `_checked`（断言 `status` 位置与取值域），并含融合缩放/能力探测/`alloc`↔`free` 的行为断言 |
+| **逐符号原型一致**（94 个都在、参数次序对） | [`scripts/check_header.c`](../scripts/check_header.c) | 把**全部 94 个符号的地址**放进数组（缺符号/改名/原型漂移 ⇒ 编译或链接失败），再逐个实调 44 个 `_checked`（断言 `status` 位置与取值域），并含融合缩放/能力探测/`alloc`↔`free`/**计划句柄位精确**的行为断言 |
 | **导出符号个数 = 本文写的数** | panel CI「ABI symbol count」 | 数**产物**的动态符号表 `nm -D target/release/liblasx_rs.so`（而不是数源码），与文档里的计数比对 |
 | **本文与 ops.md 的计数/表格不再各写一份** | `scripts/doccheck.sh` | 符号计数写法必须与源码实际数量一致；表格列数一致；`§` 引用可解析；同一 `§X` 引用 ≤12 次 |
 | **调用体验真的能跑** | panel CI「C example (compile + run)」 | `make -C examples/c FALLBACK=1 && ./examples/c/quickstart`（编译**并运行** 2.4 那个程序） |
@@ -543,3 +570,92 @@ make -C examples/c FALLBACK=1 && ./examples/c/quickstart                 # 调�
 **维护规则**：新增/删除/改名任何导出符号时，**同一提交**里改四处——`include/lasx_rs.h`、
 本文第 3 节的清单与计数、`docs/ops.md` 里指向本文的指针（若它带数字）、README 的文档索引；
 `scripts/check_header.c` 的地址数组由 CI 的「C header vs ABI」步骤强制对齐。
+
+---
+
+## 11. 计划与句柄：打包一次，线程交给你
+
+### 11.1 为什么需要它
+
+`lasx_matmul` 每次调用都要把**整个 `B` 重新打包**（`O(k·n)`）。多核下如果让每个线程各调一次
+`lasx_matmul`，打包量就是 `线程数 × B`（`192×768×3072` 时 12 线程 ≈ 113 MB）——带宽打满，
+实测 12 线程扩展比只有 **1.08×**。计划句柄把这次打包**提到调用之前**：
+
+```c
+lasx_matmul_plan *plan = lasx_matmul_prepare(k, n, b);   /* 打包一次（复制 b） */
+
+#pragma omp parallel for                                  /* 线程由你决定 */
+for (int r0 = 0; r0 < m; r0 += blk) {
+    int rows = (m - r0 < blk) ? (m - r0) : blk;
+    lasx_matmul_run(plan, rows, a + (size_t)r0 * k, c + (size_t)r0 * n);
+}
+
+lasx_matmul_plan_destroy(plan);
+```
+
+实测（同机同形状，见 `docs/dev.md` §7.10 ⑥）：这条路径把 `192×768×3072` f32 @12 线程从
+**61.5 GFLOP/s**（每线程各自打包，扩展比 1.06×）提到 **245 GFLOP/s**（4.24×），且
+**与单线程 `lasx_matmul` 逐位一致**。**没到 Rust 池的 331.9 G**（同窗口实测）——差的账是
+"面板在外/行块在内"的循环次序（按块 API 结构上到不了），详见 `docs/dev.md` §7.10 ⑥ 的 (4)；
+便利层因为每次现建现拆池，实测 129.9 G（**热循环请用 `lasx_matmul_run`**）。
+
+### 11.2 两种用法（选一个，或都不选）
+
+| | 谁开线程 | 适合 | 入口 |
+|---|---|---|---|
+| **① 调用方驱动**（推荐） | **你**：OpenMP / 线程池 / `std::thread` / 协程 / 纯串行都行 | 热循环、已有线程池、要和别的算子共用线程 | `lasx_matmul_run` |
+| **② 便利层** | 库（每次调用现建现拆） | 一次性调用、只想一行搞定 | `lasx_matmul_run_threaded` |
+
+`examples/c/matmul_mt_caller.c` 与 `examples/c/matmul_mt_convenience.c` 就是这两档的可编译样板
+（都打印实际用了几个线程，并自己验一遍位精确）。
+
+### 11.3 生命周期 / 所有权 / 重入
+
+| 事项 | 契约 |
+|---|---|
+| 谁拥有 plan | **调用方**：`prepare` 造、`plan_destroy` 释放 |
+| `b` 的生命周期 | `prepare` **复制并打包** `b` ⇒ 返回后你可以释放/改写 `b` |
+| plan 可变吗 | `prepare` 之后**只读**。`run` 只借用 `&plan`，不写 plan |
+| **并发** | **同一个 plan 可以被多个线程并发 `run`**（各写自己的那块 `c`）——这是主用法 |
+| 不能并发 | `prepare` / `plan_destroy` 不得与同一 plan 的 `run` 并发（调用方同步） |
+| `destroy(NULL)` | 合法空操作 |
+| **重复 destroy / destroy 之后再用** | **UB**（`_checked` 也检查不了） |
+| 内存 | ≈ `k·n·4` 字节（打包面板）+ `n % 32 != 0` 时的一小段列尾副本 |
+
+### 11.4 线程语义（`lasx_matmul_run_threaded` 的 `threads`）
+
+| 取值 | 含义 |
+|---|---|
+| `<= 0` | **自动**：取物理核数（`arch::parallelism().physical`，SMT 兄弟算一个核） |
+| `1` | **串行**：不建线程、不走池（与 `run` 等价，另带统计量） |
+| `N > 1` | `N` 个 worker；**超过物理核会夹到物理核** |
+| 环境变量 | **不读任何环境变量**（隐式配置不可测）；线程数一律由参数给 |
+
+**零进程级状态**：不用便利层就没有任何全局池、没有 `atexit`、没有 lazy init；用了也只是
+**每次调用现建现拆**（所以热循环里请用 ①）。`run` 这条路径**完全不涉及线程**。
+
+### 11.5 执行自检：确认没有静默退化成串行
+
+"开了 12 个线程却只跑出单线程速度"是本库踩过的真实坑（见 11.1）。所以便利层的 `_checked`
+版会回填四个观测量（都可传 `NULL`）：
+
+```c
+int used = -1, chunks = -1;
+double ms_max = -1, ms_min = -1;
+lasx_matmul_run_threaded_checked(plan, m, a, c, 0, &used, &chunks, &ms_max, &ms_min, &st);
+/* used == 1        ⇒ 这次是串行跑的（别以为并行了） */
+/* ms_max/ms_min 大 ⇒ 长尾（块负载不均或机器被抢） */
+```
+
+调用方要用**自己的**线程（①）时，自检就在你手里（每块自己计时）；`scripts/bench_openblas.c`
+的 `--mode=verify` 则是"这套切分到底逐不逐位"的现成回归工具。
+
+### 11.6 位精确与它纠正过的一条建议
+
+- `lasx_matmul_run`（含按行切块）与 `lasx_matmul_run_threaded` 都与单线程 `lasx_matmul`
+  **逐位一致**：每个输出元素仍沿 `k` 单累加器升序，切块位置/线程数/`rows` 是否为 4 的倍数
+  都不改变累加次序。回归证据：`scripts/bench_openblas.c --mode=verify`（`rows`/`plan`/`cols`
+  三档 + `seq_split`）、`scripts/check_header.c` 的计划句柄断言。
+- **它同时纠正过一条已发布建议**：早先本节写过"多线程请用**预转置 + 按列切**（`cols`）"。
+  那是**错的**——`cols` 把 `Cᵀ = Bᵀ·Aᵀ` 拆成小尺寸调用，尺寸一变库内路径就变，实测
+  **6/10 形状与单线程参考不逐位**。**位精确优先于速度**：要位精确就用计划句柄或 `rows` 切块。

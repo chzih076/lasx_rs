@@ -4,8 +4,8 @@
  * 生产用头文件：与库产物 `liblasx_rs.so`（SONAME `liblasx_rs.so.0`）/ `liblasx_rs.a`
  * 配套安装。**权威说明见 `docs/c-abi.md`**——C 侧的符号清单、逐符号原型、内存与安全模型、
  * 能力探测与降级、线程模型、ABI 稳定性策略都在那一份里，读它即可，不必再翻别处。
- * **本文件是手写并逐符号校验的**——权威符号清单是 `docs/c-abi.md` 第 3 节（87 个：
- * 46 个裸符号 + 41 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
+ * **本文件是手写并逐符号校验的**——权威符号清单是 `docs/c-abi.md` 第 3 节（94 个：
+ * 50 个裸符号 + 44 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
  * 每一个符号取地址（缺符号/改名/原型不匹配会在编译或链接期失败），并实测若干行为。
  *
  * 编译提示（C / C++ 均可 include）：
@@ -216,6 +216,70 @@ void lasx_matmul_scaled(
 
 void lasx_matmul_scaled_checked(int m, int k, int n, float alpha, const float *a,
                                 const float *b, float beta, float *c, int *status);
+
+/* ------------------------------------------------------------------------
+ * 1.1 矩阵乘**计划句柄**：把 B 打包一次，之后按块/按线程反复用
+ *
+ * 动机（docs/dev.md §7.10 ⑤ 有实测）：lasx_matmul 每次调用都要把**整个 B 重新打包**，
+ * 多线程下"每个线程各调一次 lasx_matmul" ⇒ 打包量 = 线程数 × B，12 线程实测扩展比只有
+ * 1.08×。计划把这笔开销提到调用之前；**线程怎么开、块怎么切由调用方决定**。
+ *
+ * 线程模型（两档，可以只用第一档；库**不**把"库内固定池"当唯一路径）：
+ *   ① **调用方驱动（推荐）**：`lasx_matmul_run(plan, rows, a + r0*k, c + r0*n)`，用你自己的
+ *      线程池 / OpenMP / std::thread / 协程 / 单线程串行都行。同一个 plan 可以被多个线程
+ *      **并发**调用（各写自己的 c）——prepare 之后 plan 是**只读**的。
+ *   ② **便利层**：`lasx_matmul_run_threaded(..., threads)`，库内派发；`threads <= 0` = 自动取
+ *      物理核、`1` = 串行（不建线程）、`N` = N 个 worker（超物理核夹到物理核），动态取块。
+ *      池**每次调用现建现拆** ⇒ **不用它就完全零进程级状态**（无全局池、不读环境变量、无 atexit）。
+ *      热循环里想省这笔开销就用 ①。
+ *
+ * 生命周期 / 所有权（**契约**）：
+ *   - `prepare` 会**复制并打包** `b`：返回后调用方可以释放 `b`；plan 归调用方所有；
+ *   - plan 在 prepare 之后**只读**：可跨线程共享、可反复 run，直到 destroy；
+ *   - `lasx_matmul_plan_destroy(NULL)` 是合法空操作；**重复 destroy、或 destroy 之后再用 = UB**；
+ *   - `prepare_checked` 失败返回 `NULL` 且只写 `status`（`status` 可传 `NULL`）。
+ *
+ * 位精确：`run` / `run_threaded` 与单线程 `lasx_matmul` **逐位一致**（每个输出元素仍沿 k
+ * 单累加器升序；切块位置、线程数、`rows` 是否为 4 的倍数都不改变累加次序）。
+ *
+ * 内存：约 `k*n*4` 字节（打包面板），`n` 不是 32 的倍数时另加一小段列尾副本。
+ * ------------------------------------------------------------------------ */
+
+/** 不透明计划句柄：只能当 token 传，**不要**解引用 / `sizeof` / 复制其内容。 */
+typedef struct lasx_matmul_plan lasx_matmul_plan;
+
+/* 打包 B（行主序 k×n）一次并返回计划句柄；失败返回 NULL（要原因用 _checked）。
+ * 长度契约：b 至少 k*n 个 f32。 */
+lasx_matmul_plan *lasx_matmul_prepare(int k, int n, const float *b);
+
+/* lasx_matmul_prepare 的 _checked 变体。校验顺序：k/n 非负 → k×n 不溢出 → b 非空 →
+ * 计划构造（k*n 与 b 的可用长度不符只有调用方判得了，见 docs/c-abi.md §11）。 */
+lasx_matmul_plan *lasx_matmul_prepare_checked(int k, int n, const float *b, int *status);
+
+/* 用计划算**一个行块**：a 是该块的 rows×k、c 是该块的 rows×n（都行主序、都指向块首）。
+ * rows == 0 是合法空操作；rows 与 4 无关；同一 plan 可被多线程并发调用不同块。 */
+void lasx_matmul_run(const lasx_matmul_plan *plan, int rows, const float *a, float *c);
+
+/* lasx_matmul_run 的 _checked 变体：plan 非空 → rows 非负 → rows×k / rows×n 不溢出 →
+ * a/c 非空且长度约定；**失败时不触碰 c**。 */
+void lasx_matmul_run_checked(const lasx_matmul_plan *plan, int rows, const float *a, float *c,
+                             int *status);
+
+/* 便利层：库内派发，算整块 C[m*n] = A[m*k]*B。
+ * threads <= 0 = 自动（物理核）、1 = 串行、N = N 个 worker（夹到物理核）。 */
+void lasx_matmul_run_threaded(const lasx_matmul_plan *plan, int m, const float *a, float *c,
+                              int threads);
+
+/* _checked + **执行自检**出参（四个都可传 NULL）：
+ *   threads_out 这次实际用的 worker 数（1 = 串行）——用它确认**没有静默退化成串行**；
+ *   chunks_out  实际执行块数；ms_max_out / ms_min_out 最慢 / 最快一块的毫秒数。 */
+void lasx_matmul_run_threaded_checked(const lasx_matmul_plan *plan, int m, const float *a, float *c,
+                                      int threads, int *threads_out, int *chunks_out,
+                                      double *ms_max_out, double *ms_min_out, int *status);
+
+/* 释放计划（NULL 合法；重复释放 / 用后即用 = UB）。
+ * 名字用 _destroy 而不是 _free：`free` 是 §9.1 保留给库级符号的词根（白名单已有 lasx_free）。 */
+void lasx_matmul_plan_destroy(lasx_matmul_plan *plan);
 
 /* 语义：C[m*n] = A[m*k] * B[k*n]（f64，行主序）。路径：[LASX-only]。
  * 精度：全程 f64，相对 f64 参考 <1e-12。

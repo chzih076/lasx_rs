@@ -47,8 +47,11 @@ cases=(
   "s512^3-f64|f64|512|512|512|1|rows|pin"
   "m192x768x3072-f32-rows|f32|192|768|3072|12|rows|nopin"
   "m192x768x3072-f32-cols|f32|192|768|3072|12|cols|nopin"
+  "m192x768x3072-f32-plan|f32|192|768|3072|12|plan|nopin"
+  "m192x768x3072-f32-threaded|f32|192|768|3072|12|threaded|nopin"
   "w256x64x4096-f32-1t|f32|256|64|4096|1|rows|pin"
   "w256x64x4096-f32-12t-cols|f32|256|64|4096|12|cols|nopin"
+  "w256x64x4096-f32-12t-plan|f32|256|64|4096|12|plan|nopin"
 )
 
 cmp_le() { # $1 <= $2 ?

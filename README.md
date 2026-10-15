@@ -16,7 +16,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ## 特点
 
 - **零第三方依赖**：仅 `core::arch::loongarch64` 的 LASX/LSX intrinsic 与 std。
-- **87 个导出符号**（46 个裸版本 + 41 个带 `int *status` 的 `_checked` 版本）。
+- **94 个导出符号**（50 个裸版本 + 44 个带 `int *status` 的 `_checked` 版本）。
   最初的 15 个 `lasx_*` 符号签名与语义**永不改动**，新增能力一律追加；
   另有 `*_checked` 变体提供结构化错误码，两者走同一条内核实现。
 - **位精确**：同一算子的 LASX / LSX / 标量尾 / 打包 / k 分块 / 并行切块等全部路径，对同一输入
@@ -49,7 +49,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 229 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 235 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 

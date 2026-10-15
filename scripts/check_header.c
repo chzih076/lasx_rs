@@ -1,16 +1,19 @@
 /*
  * check_header.c — `include/lasx_rs.h` 与 `liblasx_rs.so` 的**逐符号 ABI 校验**。
  *
- * 四件事：
- *   ① 把**全部 87 个符号**（46 裸 + 41 `_checked`，docs/ops.md §4）的地址放进一个数组
+ * 五件事：
+ *   ① 把**全部 94 个符号**（50 裸 + 44 `_checked`，docs/ops.md §4）的地址放进一个数组
  *      ⇒ 任何一个缺失/改名/未声明都会在**编译期或链接期**失败（不是"运行时才发现"）；
- *   ② 逐符号**调用**所有 41 个 `_checked`（零长度/NULL 入参 ⇒ 校验路径必然执行），
+ *   ② 逐符号**调用**所有 44 个 `_checked`（零长度/NULL 入参 ⇒ 校验路径必然执行），
  *      断言状态码被写进末尾的 `int *status` 且落在 `[0, 6]` ⇒ 同时校验了
  *      "`status` 是最后一个参数"这条 ABI 约定；
  *   ③ 实测融合缩放的三条行为（§5.5 末段、§2.5 第 3 点）：
  *      alpha=1,beta=0 与 `lasx_matmul` **逐位一致**；beta=0 时**不读 c**（NaN 探针）；
  *      `_checked` 空指针 ⇒ 状态非 0 且**不触碰输出**；
- *   ④ 实测运行时元信息与内存归还（§4.8）：`lasx_version` / `lasx_status_message` 非 NULL、
+ *   ④ 实测**计划句柄**（docs/c-abi.md 的"计划与句柄"一节）的三条行为：调用方按行切块、
+ *      便利层 `threads=1`、便利层 `threads=0`（自动）**都与单线程 `lasx_matmul` 逐位一致**，
+ *      外加句柄生命周期（`destroy(NULL)` 空操作）与 `_checked` 的边界状态码；
+ *   ⑤ 实测运行时元信息与内存归还（§4.8）：`lasx_version` / `lasx_status_message` 非 NULL、
  *      `lasx_has_lasx()` 与状态码范围、`lasx_alloc`→写→`lasx_free` 配对 + 两种 no-op。
  *
  * 编译（在仓库根目录；`target/release/liblasx_rs.so` 必须已构建）：
@@ -36,13 +39,14 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* ① 全部 87 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
+/* ① 全部 94 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
 /* ------------------------------------------------------------------ */
 
-#define LASX_SYMBOL_COUNT 87
+#define LASX_SYMBOL_COUNT 94
 
 static void *const g_syms[] = {
     /* --- §4.1 归约 / 稠密 / 量化 / 物理 --- */
@@ -138,6 +142,15 @@ static void *const g_syms[] = {
     (void *)lasx_gather_rows_checked,
     (void *)lasx_gather_rows_i8,
     (void *)lasx_gather_rows_i8_checked,
+    /* --- 矩阵乘"计划句柄"（docs/c-abi.md 的"计划与句柄"一节）---
+     * `lasx_matmul_plan` 是**不透明类型**：这里只取函数地址，绝不解引用句柄。 */
+    (void *)lasx_matmul_prepare,
+    (void *)lasx_matmul_prepare_checked,
+    (void *)lasx_matmul_run,
+    (void *)lasx_matmul_run_checked,
+    (void *)lasx_matmul_run_threaded,
+    (void *)lasx_matmul_run_threaded_checked,
+    (void *)lasx_matmul_plan_destroy,
 };
 
 /* 数量在**编译期**钉住：漏写/多写一个都会在这里失败。 */
@@ -366,6 +379,124 @@ static void meta_and_memory_checks(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ④ 计划句柄：位精确 + 生命周期（docs/c-abi.md 的"计划与句柄"一节）  */
+/* ------------------------------------------------------------------ */
+
+/* 每个形状：参考（单线程整块） vs ①调用方按行切 ②便利层 threads=1 ③便利层 threads=0(自动) */
+static void plan_checks_shape(int m, int k, int n, int block) {
+    float *a = malloc(sizeof(float) * (size_t)m * k);
+    float *b = malloc(sizeof(float) * (size_t)k * n);
+    float *c_ref = malloc(sizeof(float) * (size_t)m * n);
+    float *c_cur = malloc(sizeof(float) * (size_t)m * n);
+    char what[128];
+    if (!a || !b || !c_ref || !c_cur) {
+        check(0, "plan_checks: malloc");
+        free(a); free(b); free(c_ref); free(c_cur);
+        return;
+    }
+    for (long i = 0; i < (long)m * k; i++) a[i] = (float)(i % 17) * 0.25f - 2.0f;
+    for (long i = 0; i < (long)k * n; i++) b[i] = 0.5f - (float)(i % 13) * 0.125f;
+
+    int st = 999;
+    lasx_matmul(m, k, n, a, b, c_ref); /* 参考：单线程整块 */
+
+    lasx_matmul_plan *plan = lasx_matmul_prepare_checked(k, n, b, &st);
+    snprintf(what, sizeof(what), "plan prepare(%dx%dx%d) status==0", m, k, n);
+    check(plan != NULL && st == LASX_OK, what);
+    if (plan == NULL) {
+        free(a); free(b); free(c_ref); free(c_cur);
+        return;
+    }
+
+    /* ① 调用方按行切块：块大小故意不整除（块首指针由调用方算） */
+    memset(c_cur, 0xA5, sizeof(float) * (size_t)m * n);
+    for (int r0 = 0; r0 < m; r0 += block) {
+        int rows = (m - r0 < block) ? (m - r0) : block;
+        lasx_matmul_run(plan, rows, a + (size_t)r0 * k, c_cur + (size_t)r0 * n);
+    }
+    snprintf(what, sizeof(what), "plan caller-split %d rows vs matmul (%dx%dx%d)", block, m, k, n);
+    check(memcmp(c_ref, c_cur, sizeof(float) * (size_t)m * n) == 0, what);
+
+    /* ② 便利层 threads=1（串行、不建线程） */
+    {
+        int used = -1, chunks = -1;
+        double mx = -1.0, mn = -1.0;
+        memset(c_cur, 0xA5, sizeof(float) * (size_t)m * n);
+        st = 999;
+        lasx_matmul_run_threaded_checked(plan, m, a, c_cur, 1, &used, &chunks, &mx, &mn, &st);
+        snprintf(what, sizeof(what), "plan threaded threads=1 status==0 && used==1 (%dx%dx%d)", m, k,
+                 n);
+        check(st == LASX_OK && used == 1, what);
+        snprintf(what, sizeof(what), "plan threaded threads=1 vs matmul (%dx%dx%d)", m, k, n);
+        check(memcmp(c_ref, c_cur, sizeof(float) * (size_t)m * n) == 0, what);
+    }
+
+    /* ③ 便利层 threads=0 = 自动（物理核）：结果仍须逐位一致，且要报告实际 worker 数 */
+    {
+        int used = -1, chunks = -1;
+        double mx = -1.0, mn = -1.0;
+        memset(c_cur, 0xA5, sizeof(float) * (size_t)m * n);
+        st = 999;
+        lasx_matmul_run_threaded_checked(plan, m, a, c_cur, 0, &used, &chunks, &mx, &mn, &st);
+        snprintf(what, sizeof(what),
+                 "plan threaded auto status==0 && used>=1 && chunks>=1 (%dx%dx%d)", m, k, n);
+        check(st == LASX_OK && used >= 1 && chunks >= 1, what);
+        printf("    [%dx%dx%d threads=0] used=%d chunks=%d ms_max=%.3f ms_min=%.3f\n", m, k, n, used,
+               chunks, mx, mn);
+        snprintf(what, sizeof(what), "plan threaded auto vs matmul (%dx%dx%d)", m, k, n);
+        check(memcmp(c_ref, c_cur, sizeof(float) * (size_t)m * n) == 0, what);
+    }
+
+    /* 生命周期 + 边界状态码 */
+    {
+        int bad = 999;
+        lasx_matmul_run_checked(NULL, 4, a, c_cur, &bad);
+        check(bad == LASX_NULL_POINTER, "plan run_checked(plan=NULL) -> NullPointer");
+        bad = 999;
+        lasx_matmul_run_checked(plan, -1, a, c_cur, &bad);
+        check(bad == LASX_NEGATIVE_LENGTH, "plan run_checked(rows=-1) -> NegativeLength");
+        bad = 999;
+        lasx_matmul_run_checked(plan, 4, NULL, c_cur, &bad);
+        check(bad == LASX_NULL_POINTER, "plan run_checked(a=NULL) -> NullPointer");
+        /* 失败不触碰输出：把 c 弄脏，长度错的那次调用之后应原样 */
+        {
+            float probe = c_cur[0];
+            bad = 999;
+            lasx_matmul_run_checked(plan, 4, a, NULL, &bad);
+            check(bad == LASX_NULL_POINTER && c_cur[0] == probe,
+                  "plan run_checked(c=NULL) fails without touching outputs");
+        }
+        bad = 999;
+        lasx_matmul_prepare_checked(-1, 8, b, &bad);
+        check(bad == LASX_NEGATIVE_LENGTH, "plan prepare_checked(k=-1) -> NegativeLength");
+        bad = 999;
+        lasx_matmul_prepare_checked(4, 8, NULL, &bad);
+        check(bad == LASX_NULL_POINTER, "plan prepare_checked(b=NULL) -> NullPointer");
+        /* 出参全 NULL + status=NULL 不得崩（裸入口语义） */
+        lasx_matmul_run_threaded(plan, m, a, c_cur, 2);
+        lasx_matmul_run_threaded_checked(plan, m, a, c_cur, 2, NULL, NULL, NULL, NULL, NULL);
+        lasx_matmul_run_checked(plan, 2, a, c_cur, NULL);
+        check(1, "plan NULL out-params / NULL status do not crash");
+        lasx_matmul_plan_destroy(NULL);
+        check(1, "plan destroy(NULL) is a no-op");
+        lasx_matmul_plan_destroy(plan);
+        check(1, "plan destroy(plan) returns without crashing");
+    }
+
+    free(a);
+    free(b);
+    free(c_ref);
+    free(c_cur);
+}
+
+static void plan_checks(void) {
+    /* k 取 384/385（打包路径的 k 分块边界两侧）；m=40 不被 7 整除；n=257 不是 32 的倍数
+     * ⇒ 同时覆盖"列尾副本"那条路。 */
+    plan_checks_shape(40, 384, 257, 7);
+    plan_checks_shape(40, 385, 257, 7);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     const size_t n_syms = sizeof(g_syms) / sizeof(g_syms[0]);
@@ -380,7 +511,7 @@ int main(void) {
             if (g_syms[i] == NULL) all_non_null = 0;
         }
         check(n_syms == LASX_SYMBOL_COUNT && all_non_null,
-              "all 87 symbol addresses resolved at link time");
+              "all 94 symbol addresses resolved at link time");
     }
 
     check(LASX_OK == 0 && LASX_NULL_POINTER == 1 && LASX_NEGATIVE_LENGTH == 2 &&
@@ -390,6 +521,7 @@ int main(void) {
 
     smoke_checked_symbols();
     behavior_checks();
+    plan_checks();
     meta_and_memory_checks();
 
     printf("\n%s：%d 项失败\n", g_failures == 0 ? "结论 OK" : "结论 FAIL", g_failures);

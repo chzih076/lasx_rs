@@ -18,10 +18,27 @@
 //! 数值一致性：这些函数只把**行/下标区间**分给不同线程，每个输出元素的计算过程与
 //! 单线程完全相同，因此结果与单线程**逐位一致**（有测试逐位对照）。
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use crate::api::{Error, checked_mul, expect_len};
 use crate::ops::matmul;
 use crate::ops::matmul_f64 as matmul64;
+use crate::plan::MatmulPlan;
 use crate::pool::sched::Pick;
+
+/// 一次并行执行的观测量（**执行自检**用；`docs/dev.md` §7.10 ⑤ 那种"静默退化"就靠它发现）。
+///
+/// 典型用法：`threads > 1` 时若 `chunks <= 1`，或"总耗时 ≈ 各块耗时之和"，说明这次并没有
+/// 真的并行起来（`lasx_matmul` 按行切那个 1.08× 扩展比就是这类退化的实例）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunStats {
+    /// 实际执行的块数。
+    pub chunks: usize,
+    /// 最慢一块的耗时（纳秒）。
+    pub ns_max: u64,
+    /// 最快一块的耗时（纳秒）。
+    pub ns_min: u64,
+}
 
 thread_local! {
     /// 双缓冲打包面板，**跨调用复用**。
@@ -108,6 +125,77 @@ pub fn matmul_f32_with_pick(
     pick: Pick,
 ) -> Result<(), Error> {
     matmul_f32_picked(pool, m, k, n, a, b, c, pick, "matmul_f32_with_pick")
+}
+
+/// **计划 + 池**：用已打包好 `B` 的 [`MatmulPlan`] 多线程算 `C[m×n] = A[m×k]·B`。
+///
+/// 与 [`matmul_f32`] 的区别只在 `B` 从哪来：这里 `B` 已经在 [`MatmulPlan`] 里**打包过一次**
+/// （`O(k·n)` 那笔开销被摊掉了），所以"同一个权重矩阵反复乘"不必每次重打包。分块方式由
+/// [`crate::pool::pick_rows`] 按工作量选（大 `m` 动态取块、小 `m` 静态等分），块内调计划的
+/// 按块入口，因此结果与 [`crate::plan::MatmulPlan::run_into`]、与 [`crate::api::matmul`]
+/// **逐位一致**（有测试逐位对照）。
+///
+/// # Errors
+/// `a.len() != m × plan.k()`、`c.len() != m × plan.n()`（[`Error::Shape`]），或尺寸相乘溢出
+/// `usize`（[`Error::Overflow`]）。
+pub fn matmul_f32_plan(
+    pool: &WorkerPool,
+    plan: &MatmulPlan<f32>,
+    m: usize,
+    a: &[f32],
+    c: &mut [f32],
+) -> Result<(), Error> {
+    matmul_f32_plan_with_stats(pool, plan, m, a, c).map(|_| ())
+}
+
+/// 同 [`matmul_f32_plan`]，但返回**执行自检**统计量（实际块数 + 最慢/最快一块的耗时）。
+///
+/// 这一版是给"确认没有静默退化成串行"用的：见 [`RunStats`]。
+///
+/// # Errors
+/// 同 [`matmul_f32_plan`]。
+pub fn matmul_f32_plan_with_stats(
+    pool: &WorkerPool,
+    plan: &MatmulPlan<f32>,
+    m: usize,
+    a: &[f32],
+    c: &mut [f32],
+) -> Result<RunStats, Error> {
+    const OP: &str = "matmul_f32_plan";
+    let (k, n) = (plan.k(), plan.n());
+    expect_len(OP, "a", a.len(), checked_mul(OP, "m×k", m, k)?)?;
+    expect_len(OP, "c", c.len(), checked_mul(OP, "m×n", m, n)?)?;
+    if m == 0 || n == 0 {
+        return Ok(RunStats {
+            chunks: 0,
+            ns_max: 0,
+            ns_min: 0,
+        });
+    }
+    // 行内核按 4 行复用 B ⇒ gran = 4（与 `matmul_f32` 同一判据）；
+    // `a` 是只读输入，按闭包约定用 `start*k` 自己切，不进池的可变数组列表。
+    let pick = crate::pool::pick_rows(m, pool.threads(), 4);
+    let chunks = AtomicUsize::new(0);
+    let ns_max = AtomicU64::new(0);
+    let ns_min = AtomicU64::new(u64::MAX);
+    pool.for_each_row_block_mut_picked(m, 4, [(c, n)], pick, |start, rows, [cb]| {
+        let t0 = std::time::Instant::now();
+        plan.run_rows_into(&a[start * k..(start + rows) * k], cb);
+        let dt = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        chunks.fetch_add(1, Ordering::Relaxed);
+        ns_max.fetch_max(dt, Ordering::Relaxed);
+        ns_min.fetch_min(dt, Ordering::Relaxed);
+    });
+    let chunks = chunks.load(Ordering::Relaxed);
+    Ok(RunStats {
+        chunks,
+        ns_max: ns_max.load(Ordering::Relaxed),
+        ns_min: if chunks == 0 {
+            0
+        } else {
+            ns_min.load(Ordering::Relaxed)
+        },
+    })
 }
 
 /// 两个 f32 入口的公共实现；`op` 只用于错误信息里的算子名。
@@ -1031,6 +1119,42 @@ mod tests {
                     "第 {round} 组：两次运行的输出不一致 @ {i}（LA664 勘误会表现为这种静默错块）"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod plan_threaded_tests {
+    use super::*;
+    use crate::aligned::AlignedVec;
+    use crate::plan::MatmulPlan;
+
+    /// **计划 + 池**：与单线程 `api::matmul` 逐位一致，统计量自洽。
+    ///
+    /// 形状覆盖 k=385（打包路径 k 分块边界上侧）、`m` 不整除块大小、`n` 不是 32 的倍数，
+    /// 以及 LLM 形状（多面板、面板大于 L2）。
+    #[test]
+    fn test_matmul_f32_plan_matches_serial_bit_for_bit() {
+        let pool = WorkerPool::new(7);
+        for &(m, k, n) in &[
+            (40usize, 385usize, 257usize),
+            (13, 769, 384),
+            (192, 768, 3072),
+            (64, 64, 64),
+        ] {
+            let a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.25);
+            let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.5);
+            let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+            let mut c = AlignedVec::<f32>::new(m * n);
+
+            let stats = matmul_f32_plan_with_stats(&pool, &plan, m, &a, &mut c).unwrap();
+            assert!(stats.chunks >= 1, "chunks={}", stats.chunks);
+            assert!(stats.ns_max >= stats.ns_min, "ns_max < ns_min");
+
+            let want = crate::api::matmul(m, k, n, &a, &b).unwrap();
+            let got_bits: Vec<u32> = c.as_slice().iter().map(|v| v.to_bits()).collect();
+            let want_bits: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_bits, want_bits, "{m}×{k}×{n} 计划+池与单线程不一致");
         }
     }
 }

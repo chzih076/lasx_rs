@@ -424,6 +424,41 @@ impl<T: PackedKernel> MatmulPlan<T> {
         }
     }
 
+    /// 只算**一个行块**并写进调用方的缓冲：`a` 是该块的 `rows × k`（`rows = a.len()/k`），
+    /// `c` 是该块的 `rows × n`。
+    ///
+    /// 语义就是 [`Self::run_into`] 的"按块版"：**同一个计划可以被多个线程并发调用**
+    /// （只有 `&self`，各线程写自己那块 `c`），这是 C ABI `lasx_matmul_run` 的 Rust 侧对应物——
+    /// 线程怎么开、块怎么切**由调用方决定**，库不夺控制权（OpenMP / `std::thread` / 协程均可）。
+    ///
+    /// 与"整块一次算完"（[`Self::run_into`]）**逐位一致**：每个输出元素仍是沿 `k`
+    /// 单累加器升序，切块不改变累加次序（`rows` 是否为 4 的倍数也不影响）。
+    ///
+    /// # Errors
+    /// - `a.len()` 不是 `k` 的整数倍；
+    /// - `c.len() != rows × n`；
+    /// - `rows×n` 溢出 `usize`。
+    pub fn run_block_into(&self, a: &[T], c: &mut [T]) -> Result<(), Error> {
+        let rows = self.rows_of("MatmulPlan::run_block_into", a)?;
+        let want = rows.checked_mul(self.n).ok_or(Error::Overflow {
+            op: "MatmulPlan::run_block_into",
+            what: "rows×n",
+        })?;
+        if c.len() != want {
+            return Err(Error::Shape {
+                op: "MatmulPlan::run_block_into",
+                what: "c",
+                expected: want,
+                got: c.len(),
+            });
+        }
+        if rows == 0 || self.n == 0 {
+            return Ok(());
+        }
+        self.run_rows_into(a, c);
+        Ok(())
+    }
+
     /// 从 `a` 的长度推 `m`：必须是 `k` 的整数倍。
     fn rows_of(&self, op: &'static str, a: &[T]) -> Result<usize, Error> {
         if !a.len().is_multiple_of(self.k) {
@@ -725,5 +760,64 @@ mod tests {
             bits_f32(&c),
             bits_f32(&crate::api::matmul(m, k, n, &a, &b).unwrap())
         );
+    }
+
+    /// `run_block_into`（**按块**入口）必须与整块 `run_into` 逐位一致，且覆盖：
+    /// k=384/385 两侧（打包路径的 k 分块边界）、`m` 不整除块大小、`rows` 不是 4 的倍数、
+    /// `n` 不是 32 的倍数（列尾副本那条路）。
+    #[test]
+    fn run_block_into_is_bit_exact_with_whole_run() {
+        for &(m, k, n, block) in &[
+            (40usize, 384usize, 257usize, 7usize),
+            (40, 385, 257, 7),
+            (100, 384, 96, 13),
+            (13, 769, 384, 5),
+            (7, 385, 13, 3),
+        ] {
+            let a: Vec<f32> = seq(m * k, 31).into_iter().map(|x| x as f32).collect();
+            let b: Vec<f32> = seq(k * n, 32).into_iter().map(|x| x as f32).collect();
+            let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+
+            let whole = plan.run(&a).unwrap();
+            let mut blocked = vec![0f32; m * n];
+            let mut r0 = 0;
+            while r0 < m {
+                let rows = block.min(m - r0);
+                plan.run_block_into(
+                    &a[r0 * k..(r0 + rows) * k],
+                    &mut blocked[r0 * n..(r0 + rows) * n],
+                )
+                .unwrap();
+                r0 += rows;
+            }
+            assert_eq!(
+                bits_f32(&whole),
+                bits_f32(&blocked),
+                "按块跑与整块跑不一致（m={m} k={k} n={n} block={block}）"
+            );
+            assert_eq!(
+                bits_f32(&whole),
+                bits_f32(&crate::api::matmul(m, k, n, &a, &b).unwrap()),
+                "计划与 api::matmul 不一致（m={m} k={k} n={n}）"
+            );
+        }
+    }
+
+    /// 按块入口的形状校验：`c` 长度不对、`a` 长度不是 k 的倍数都要报 `Shape`。
+    #[test]
+    fn run_block_into_reports_shape_errors() {
+        let (k, n) = (33usize, 17usize);
+        let b: Vec<f32> = seq(k * n, 41).into_iter().map(|x| x as f32).collect();
+        let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+        let a: Vec<f32> = seq(4 * k, 42).into_iter().map(|x| x as f32).collect();
+        let mut c = vec![0f32; 4 * n];
+        assert!(matches!(
+            plan.run_block_into(&a, &mut c[..4 * n - 1]),
+            Err(Error::Shape { what: "c", .. })
+        ));
+        assert!(matches!(
+            plan.run_block_into(&a[..4 * k - 1], &mut c),
+            Err(Error::Shape { what, .. }) if what.starts_with('a')
+        ));
     }
 }

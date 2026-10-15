@@ -15,31 +15,8 @@
 
 use super::status::{
     LasxStatus, checked_finite, checked_len, checked_mul, checked_positive, checked_slice,
-    checked_slice_mut,
+    checked_slice_mut, or_fail,
 };
-
-/// 校验失败即写状态并提前返回。把各包装里重复的样板收敛到一处。
-macro_rules! or_fail {
-    // `void` 版：提前 `return`（写成 `return ();` 会被 clippy 判为多余）
-    ($expr:expr, $status:expr, ()) => {
-        match $expr {
-            Ok(v) => v,
-            Err(e) => {
-                e.write($status);
-                return;
-            }
-        }
-    };
-    ($expr:expr, $status:expr, $ret:expr) => {
-        match $expr {
-            Ok(v) => v,
-            Err(e) => {
-                e.write($status);
-                return $ret;
-            }
-        }
-    };
-}
 
 /* ==================== 归约类 ==================== */
 

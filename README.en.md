@@ -17,7 +17,7 @@ Four workload classes are covered:
 ## Features
 
 - **Zero third-party dependencies** — only `core::arch::loongarch64` LASX/LSX intrinsics and std.
-- **87 exported symbols** (46 plain + 41 `_checked` variants taking a trailing `int *status`).
+- **94 exported symbols** (50 plain + 44 `_checked` variants taking a trailing `int *status`).
   The signatures and semantics of the original 15 `lasx_*` symbols are **frozen**; new capability
   is only ever appended. Both symbol families are backed by the same kernel implementations.
 - **Bitwise determinism** — for a given input, every path of an operator (LASX / LSX / scalar tail
@@ -48,7 +48,7 @@ Four workload classes are covered:
 ```bash
 # Requires nightly (#![feature(stdarch_loongarch)]) and a LoongArch machine
 cargo build --release                    # produces liblasx_rs.so + rlib
-cargo test --workspace --release         # 229 unit tests + 6 macro tests + 18 doc tests (2 ignored)
+cargo test --workspace --release         # 235 unit tests + 6 macro tests + 18 doc tests (2 ignored)
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 

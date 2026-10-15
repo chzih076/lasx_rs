@@ -744,7 +744,8 @@ C 侧**不必**读 `cpucfg`：`int lasx_has_lasx(void)`（§4.8）返回的正�
 - int8 推理 N3 批次 8 个 → 第 3.4 节
 - ONNX 契约补充 3 个 → 第 3.5 节
 - 运行时元信息与内存归还 4 个 → 第 3.6 节
-- `_checked` 变体 41 个 → 第 3.7 节；状态码 0..6 → 第 3.8 节
+- `_checked` 变体 44 个 → 第 3.7 节；状态码 0..6 → 第 3.8 节
+- 矩阵乘**计划句柄** 7 个（4 裸 + 3 `_checked`，多核的正确姿势）→ 第 3.9 节与第 11 节
 - 符号数清点、`nm -D` 自检、逐符号链接校验（`include/lasx_rs.h` + `scripts/check_header.c`）
   → 第 10 节
 
@@ -763,9 +764,9 @@ C 侧**不必**读 `cpucfg`：`int lasx_has_lasx(void)`（§4.8）返回的正�
 **已搬移**：完整原型与路径见 [`docs/c-abi.md`](c-abi.md) 第 3.4 节。
 契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
 
-### 4.4 `_checked` 变体 41 个
+### 4.4 `_checked` 变体 44 个
 
-**已搬移**：规则（原型完全相同，只在末尾追加 `int *status`）、41 个名字与失败语义见
+**已搬移**：规则（原型完全相同，只在末尾追加 `int *status`）、44 个名字与失败语义见
 [`docs/c-abi.md`](c-abi.md) 第 3.7 节与第 5 节。
 
 ### 4.5 状态码（`LasxStatus`）
@@ -778,6 +779,34 @@ C 侧**不必**读 `cpucfg`：`int lasx_has_lasx(void)`（§4.8）返回的正�
 
 **已搬移**：分组计数、`nm -D` 清点命令、以及"哪些符号没有 `_checked` 变体"见
 [`docs/c-abi.md`](c-abi.md) 第 3.0/3.6/3.7/10 节。本文 §3.2 给出 46 个原始符号的降级覆盖分类。
+
+### 4.9 计划句柄：Rust 侧怎么用（2026-10-15 追加）
+
+C 侧原型、生命周期与线程语义见 [`docs/c-abi.md`](c-abi.md) 第 3.9 节与第 11 节；**Rust 侧同一套
+语义**在这几个入口上（C 只是它的投影）：
+
+```rust
+use lasx_rs::plan::MatmulPlan;
+use lasx_rs::parallel;
+use lasx_rs::pool::WorkerPool;
+
+// ① 打包一次（权重矩阵反复用时最划算；返回后 b 可以释放）
+let plan = MatmulPlan::from_row_major(&b, k, n)?;
+
+// ②-A 调用方驱动（推荐）：只算一个行块，线程由你开 —— 同一个 plan 可被多线程并发借用
+plan.run_block_into(&a[r0 * k..(r0 + rows) * k], &mut c[r0 * n..(r0 + rows) * n])?;
+
+// ②-B 便利层：库内派发（线程数可调），并回填执行自检统计量
+let pool = WorkerPool::new(12);          // 0/负 语义在 Rust 侧用 `WorkerPool::auto()`
+let stats = parallel::matmul_f32_plan_with_stats(&pool, &plan, m, &a, &mut c)?;
+println!("chunks={} ms_max={:.3}", stats.chunks, stats.ns_max as f64 / 1e6);
+```
+
+- `MatmulPlan::run_block_into` 与 C 的 `lasx_matmul_run` 是同一件事；
+  `parallel::matmul_f32_plan{,_with_stats}` 对应 C 的 `lasx_matmul_run_threaded{,_checked}`。
+- 位精确同 C 侧：这些入口与 `api::matmul` **逐位一致**（`src/plan.rs` 有逐位测试）。
+- 线程数语义：C 侧 `<=0` 自动、`1` 串行、`N` 夹到物理核；Rust 侧用
+  `WorkerPool::new(n)` / `WorkerPool::auto()` 表达同一件事（**不读环境变量**）。
 
 ### 4.7 融合缩放（1 个，2026-10-15 追加）
 

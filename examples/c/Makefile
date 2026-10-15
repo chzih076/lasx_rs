@@ -69,10 +69,18 @@ else
   endif
 endif
 
-all: quickstart
+all: quickstart matmul_mt_caller matmul_mt_convenience
 
 quickstart: quickstart.c $(SONAME_LINK)
 	$(CC) $(CFLAGS) $(CFLAGS_ARCH) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm
+
+# 两个多核示例（计划句柄，docs/c-abi.md 的"计划与句柄"一节）：都要 -lpthread。
+# ① 调用方自己开线程 + plan 复用；② 便利层一行（并报告实际 worker 数）。
+matmul_mt_caller: matmul_mt_caller.c $(SONAME_LINK)
+	$(CC) $(CFLAGS) $(CFLAGS_ARCH) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm -lpthread
+
+matmul_mt_convenience: matmul_mt_convenience.c $(SONAME_LINK)
+	$(CC) $(CFLAGS) $(CFLAGS_ARCH) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm -lpthread
 
 # 兜底分支才用得到：补齐 SONAME 需要的文件名（内容就是同一个文件）
 $(SONAME_LINK): $(REPO)/target/release/liblasx_rs.so
@@ -82,10 +90,12 @@ $(SONAME_LINK): $(REPO)/target/release/liblasx_rs.so
 $(REPO)/target/release/liblasx_rs.so:
 	@echo "[make] 缺少 $@：请先在仓库根目录跑 \`cargo build --release\`" >&2; exit 1
 
-run: quickstart
+run: all
 	$(RUN_ENV) ./quickstart
+	$(RUN_ENV) ./matmul_mt_caller
+	$(RUN_ENV) ./matmul_mt_convenience
 
 clean:
-	rm -f quickstart
+	rm -f quickstart matmul_mt_caller matmul_mt_convenience
 
 .PHONY: all run clean
