@@ -461,6 +461,46 @@ float d = lasx_dot(a, b, n);
 - **0.x 的语义**：当前 `0.1.0`，major = 0 表示"**尚未承诺二进制兼容**"，但"只追加"这条实践
   已经在遵守。**不同 major 可以并存**（`liblasx_rs.so.0` 与未来的 `.so.1` 互不覆盖）。
 
+### 9.1 命名规范（只管**未来新增**）
+
+**为什么只管未来**：已发布的 87 个符号**只追加不改名**——改名即破坏 ABI（见上一节）。所以本节
+只约束新增符号，既有情况见文末"历史例外"表。规则由
+[`scripts/namecheck.sh`](../scripts/namecheck.sh) 机械校验（CI 单列一步，用法见脚本头部注释）。
+
+| # | 规则 | 要点 |
+|---|---|---|
+| 1 | 形态 `lasx_<domain>_<op>[_<qualifier>]` | `lasx_quat_to_dcm_batch`（domain `quat` / op `to_dcm` / qualifier `batch`）、`lasx_dot_i8`（qualifier 是类型） |
+| 2 | 全小写 + 下划线 | **无大写、无连续下划线、无首尾下划线**；数字允许（`lasx_j2_accel_batch`、`lasx_batch_distance2d`） |
+| 3 | **尾部后缀只允许 `_checked`** | "版本/口味"后缀（`_v2`、`_ex`、`_fast`、`_new`…）不许出现在新符号里；要区分就换 `<op>` 名，或用**语义/类型**限定词（`_batch`、`_rows`、`_i8`、`_f16` 这类是合法的） |
+| 4 | `_checked` 必须有同名裸孪生 | `lasx_dot` ↔ `lasx_dot_checked`；**反之不要求**：裸符号可以没有 `_checked` |
+| 5 | 库级符号只有白名单这 5 个 | `lasx_version`、`lasx_has_lasx`、`lasx_status_message`、`lasx_alloc`、`lasx_free`（逐个语义见 §3.6）。**新增库级符号必须同时改三处**：本表、§3.6、`scripts/namecheck.sh` 的白名单 |
+| 6 | 参数次序 | 维度（`m,k,n`）→ 标量（`alpha`,`beta`）→ 输入（`a`/`b`/`x`/`w`）→ 输出（`c`/`y`/`out`）→ **`status` 永远最后**（`_checked` 的 `status` 可传 `NULL`） |
+| 7 | 词根沿用既有约定 | 长度/批量维度一律 `n`；输出单值 `out`、矩阵/向量 `c`/`y`、多分量 `ox,oy,oz`；类型后缀 `_i8`/`_q4`/`_f16`/`_f64`。**别新造同义词**（`len`/`dst`/`total`…） |
+
+**正例 / 反例**（反例只用于说明规则，**不会**出现在产物里）：
+
+```c
+/* ✅ 正例：domain=quantize、op=i8_per_row；孪生 lasx_quantize_i8_per_row_checked */
+void lasx_quantize_i8_per_row(const float *x, int rows, int cols, float *out, int8_t *q, float *scale);
+
+/* ❌ 反例：一次踩三条 —— 大写（规则 2）、口味后缀 _fast（规则 3）、只有 _checked 没有裸孪生（规则 4） */
+void lasx_Dot_fast_checked(const float *a, const float *b, int n, int *status);
+```
+
+**新增符号前自查 5 条**：① 名字里有没有非法后缀？② 有 `_checked` 就必须有同名裸孪生；
+③ 是不是库级符号？是就进白名单并改上面说的三处；④ 参数次序照规则 6（`status` 最后）；
+⑤ 是否沿用了既有词根（`n`/`out`/`c`/`_i8`…），别新造同义词。
+
+**历史例外（审计于 2026-10-15）**：**零违规**——87 个符号在"形态 / 后缀 / 孪生 / 库级"四类审计上
+全部通过（`bash scripts/namecheck.sh` ⇒ `OK（87 个符号，0 例外）`）。下表只记"不是违规、但需要
+知道的读法与白名单"，**没有为了凑表而编的例外**：
+
+| 项 | 情况 | 为什么不改 |
+|---|---|---|
+| 库级 5 个（规则 5） | 不符合算子形态 `lasx_<domain>_<op>` | 它们是**白名单本身**（设计如此），不是例外；改名会破坏已发布 ABI |
+| `lasx_batch_distance2d` | `batch` 在**前**，而多数批量算子把它放尾部（`lasx_norm3_batch`） | **不算违规**：按规则 1 的读法是 domain=`batch`、op=`distance2d`；改名会破坏已发布 ABI |
+| 参数名的历史差异（`out` / `c` / `ox,oy,oz` / `table,ids,row_len`） | 各算子按自身语义取名，未完全统一 | 参数名**不影响二进制兼容**，但头文件已发布：改名只带来"头/源码/文档"漂移风险，没有收益 |
+
 ## 10. 这份文档如何保持为真
 
 文档里的承诺不是"写完就算"，下面这些机器会盯着；**任何一条红了都说明文档或代码漂了**：
@@ -471,6 +511,7 @@ float d = lasx_dot(a, b, n);
 | **导出符号个数 = 本文写的数** | panel CI「ABI symbol count」 | 数**产物**的动态符号表 `nm -D target/release/liblasx_rs.so`（而不是数源码），与文档里的计数比对 |
 | **本文与 ops.md 的计数/表格不再各写一份** | `scripts/doccheck.sh` | 符号计数写法必须与源码实际数量一致；表格列数一致；`§` 引用可解析；同一 `§X` 引用 ≤12 次 |
 | **调用体验真的能跑** | panel CI「C example (compile + run)」 | `make -C examples/c FALLBACK=1 && ./examples/c/quickstart`（编译**并运行** 2.4 那个程序） |
+| **新增符号的名字合规** | [`scripts/namecheck.sh`](../scripts/namecheck.sh)（CI 单列一步） | 从产物符号表校验四条：形态 `^lasx_[a-z0-9]+(_[a-z0-9]+)*$`、尾部后缀只允许 `_checked`、`_checked` 必须有裸孪生、库级只有白名单 5 个（规则见 §9.1） |
 | **实现没变** | panel CI 的 build/test/clippy/rustdoc 四步 | 全绿是硬门槛 |
 
 自检命令（本地随时可跑）：
@@ -480,6 +521,7 @@ gcc -O2 -Iinclude scripts/check_header.c target/release/liblasx_rs.a \
     -lm -lpthread -ldl -o /tmp/check_header && /tmp/check_header
 nm -D --defined-only target/release/liblasx_rs.so | grep -c ' T lasx_'   # 应等于本文的计数
 bash scripts/doccheck.sh                                                 # 引用/表格/计数
+bash scripts/namecheck.sh                                                # 命名规范（§9.1）
 make -C examples/c FALLBACK=1 && ./examples/c/quickstart                 # 调用体验
 ```
 
