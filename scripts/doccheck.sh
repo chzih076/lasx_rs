@@ -6,10 +6,15 @@
 #   ② 表格每行的列数与表头一致（Markdown 表格错列会静默渲染坏）；
 #   ③ 文档里的"导出符号数"与源码里 `extern "C" fn lasx_*` 的实际数量一致。
 #
-# 引用解析规则（与仓库既有写法一致）：
-#   - 同一句里点名了文档（`docs/dev.md §X`）⇒ 必须命中**那个**文档；
-#   - `本文 §X` ⇒ 当前文档；
-#   - 裸引用 ⇒ 任一文档里有这个编号即可（README/AGENTS 的既有写法）。
+# 引用解析规则（**按文档解析**，2026-10-15 收紧）：
+#   - 点名了文档（`docs/dev.md §X`、`docs/ops.md §X`）⇒ 必须命中**那个**文档（可跨文档）；
+#   - `本文 §X` / `本节 §X` ⇒ 当前文档；
+#   - **裸 `§X` ⇒ 必须在"引用所在文档"自己的编号集合里解析**，不能退而命中别的文档。
+#
+# 为什么裸引用必须按文档解析：编号集合若是"全部文档的并集"，一旦某个文档新增了同号小节
+# （例如 `docs/c-abi.md` 的 §1–10），别处裸写的 `§7` 就会**退而命中它**——引用"能解析"，
+# 但实际指向了错的文档 ⇒ 规则变松、漂移不会被发现。所以：裸 `§X` 只允许指本文件；
+# 要指别处就点名文档（这也是 `docs/dev.md` 文档规范里那条"跨文档引用必须点名"的机器强制。
 #
 # 用法：bash scripts/doccheck.sh [仓库根目录]；有发现时以非零退出。
 set -u
@@ -21,18 +26,31 @@ trap 'rm -rf "$T"' EXIT
 findings=0
 note() { echo "$1"; findings=$((findings + 1)); }
 
+# 文件路径 → 编号集合的 key（"按文档解析"要用：裸引用只在本文档的集合里找）
+doc_key() {
+  case "$1" in
+    docs/dev.md) echo dev ;;
+    docs/ops.md) echo ops ;;
+    docs/c-abi.md) echo cabi ;;
+    docs/platform.md) echo platform ;;
+    README.md) echo root ;;
+    README.en.md) echo rooten ;;
+    AGENTS.md) echo agents ;;
+  esac
+}
+
 # ---- 收集各文档的编号集合 ----
 sections() { grep -oE '^#{1,4} [0-9]+(\.[0-9]+)*' "$1" 2>/dev/null | sed 's/^#* //' | sort -u; }
 for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/c-abi.md cabi" "docs/platform.md platform" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
   f="${pair%% *}"; k="${pair##* }"
   [ -f "$f" ] && sections "$f" > "$T/$k"
 done
-all_sections() { cat "$T"/* 2>/dev/null | sort -u; }
 
 # ---- ① 引用 ----
 check_refs() {
-  local f="$1" line ref num prefix target
+  local f="$1" line ref num prefix target ln=0
   while IFS= read -r line; do
+    ln=$((ln + 1))
     # `manual §9.6` 这类是**外部手册**的编号，不是本文档体系（docs/dev.md §16 有说明）
     case "$line" in *'manual §'*) continue ;; esac
     for ref in $(printf '%s' "$line" | grep -oE '§[0-9]+(\.[0-9]+)*'); do
@@ -58,17 +76,15 @@ check_refs() {
         grep -bo 'docs/c-abi\.md\|docs/dev\.md\|docs/ops\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
       self_off=$(printf '%s' "$prefix" | grep -bo '本文\|本节' | tail -1 | cut -d: -f1)
       if [ -n "${self_off:-}" ] && { [ -z "${doc_off:-}" ] || [ "$self_off" -gt "$doc_off" ]; }; then
-        case "$f" in
-          docs/ops.md) target=ops ;;
-          docs/c-abi.md) target=cabi ;;
-          docs/dev.md) target=dev ;;
-          docs/platform.md) target=platform ;;
-        esac
+        target=$(doc_key "$f")
       fi
       if [ -z "$target" ]; then
-        all_sections | grep -qx "$num" || note "MISS $f: $ref（裸引用，任何文档都没有该编号）"
+        # 裸引用：**只在本文档自己的编号集合里**解析（见顶部"按文档解析"）
+        self_key=$(doc_key "$f")
+        grep -qx "$num" "$T/$self_key" 2>/dev/null ||
+          note "MISS $f:$ln: $ref（裸引用，本文档没有该编号；指向别的文档请点名文档）"
       else
-        grep -qx "$num" "$T/$target" 2>/dev/null || note "MISS $f: $ref -> $target"
+        grep -qx "$num" "$T/$target" 2>/dev/null || note "MISS $f:$ln: $ref -> $target"
       fi
     done
   done < "$f"

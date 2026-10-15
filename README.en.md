@@ -91,7 +91,7 @@ live in the respective design sections.
 | Item | Result |
 |---|---|
 | FMA throughput ceiling (16 independent chains, registers only) | **139.4 GFLOP/s** (3.96/cycle, range 130.9–140.1); LSX 69.6 (2.00×) |
-| Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s; from §6.3's `kernel_probe`, not re-measured) |
+| Microkernel ceiling (with A-broadcast) | **2.00 FMA/cycle** (f32 70.3, f64 35.2 GFLOP/s; from `docs/dev.md` §6.3's `kernel_probe`, not re-measured) |
 | `lasx_matmul` f32 64³ / 256³ / 512³ | 66.9 / 62.7 / **61.5** GFLOP/s |
 | `lasx_matmul_f64` 128³ / 512³ | 30.6 / 30.9 GFLOP/s |
 | `lasx_matmul` via `parallel`, 12 threads | 5.89× / 5.51× at 128³ / 512³ (393.4 / 331.5 GFLOP/s) |

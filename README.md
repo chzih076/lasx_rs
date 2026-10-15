@@ -110,7 +110,7 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 | 项 | 读数 |
 |---|---|
 | FMA 吞吐上限（16 条独立链，纯寄存器） | **139.4 GFLOP/s**（3.96 条/周期，极差 130.9–140.1）；LSX 69.6（2.00×） |
-| 微内核上限（含 A 标量广播） | **2.00 FMA/周期**（f32 70.3、f64 35.2 GFLOP/s；来自 §6.3 的 `kernel_probe`，本轮未重测） |
+| 微内核上限（含 A 标量广播） | **2.00 FMA/周期**（f32 70.3、f64 35.2 GFLOP/s；来自 `docs/dev.md` §6.3 的 `kernel_probe`，本轮未重测） |
 | `lasx_matmul` f32 64³ / 256³ / 512³ | 66.9 / 62.7 / **61.5** GFLOP/s |
 | `lasx_matmul_f64` 128³ / 512³ | 30.6 / 30.9 GFLOP/s |
 | `lasx_matmul`（`parallel`，12 线程） | 128³ / 512³ 加速 5.89× / 5.51×（393.4 / 331.5 GFLOP/s） |
