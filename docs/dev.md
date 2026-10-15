@@ -250,7 +250,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**226 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**229 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -268,7 +268,11 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   int8 的整模型级口径 1 个（合成 12 层栈，实测 7.250e-4 ≤ 5e-3，同上 §2.15）、
   激活的 `_into` 1 个（`silu`/`gelu_quick`/`gelu_erf` 免分配版逐位一致 + 错误路径，
   分配占比实测 10–15%）、`quat_to_dcm_batch` 的"api ≡ FFI"逐位对拍 1 个
-  （起因同节：两条入口快慢差 2.3×，先证明数值一致）。
+  （起因同节：两条入口快慢差 2.3×，先证明数值一致）；
+- C ABI 调用体验那批 3 个（§19.16）：`lasx_has_lasx` 与 `detect()` 逐点对应且 `force(true) ⇒ 0`
+  1 个、`lasx_version` 非 NULL/NUL 结尾/与 `CARGO_PKG_VERSION` 一致 1 个、
+  `lasx_status_message` 覆盖 0..6 与未知码均非 NULL 1 个（`lasx_free` 的配对与两种 no-op
+  并进了既有的 `src/ffi/memory.rs` 用例，未增条数）。
 
 > **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
 > **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
@@ -303,7 +307,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 226 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 229 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
