@@ -61,3 +61,10 @@ jobs:
           if [ "$(printf '%s\n' "$d" | wc -l)" != "1" ] || [ "$d" != "$n" ]; then
             echo "::error::文档单测计数与实测不一致（或多处不一致）"; exit 1
           fi
+      # **C 调用示例**（2026-10-15 加）：把 `examples/c/` 真编译**并运行**——它是"调用体验"的
+      # 可执行证据（查版本 → 查 `lasx_has_lasx()` 并分支 → 调算子 → 用 `lasx_status_message`
+      # 打印状态）。CI 里没有安装前缀，所以用 `FALLBACK=1` 直接链接 `target/release`。
+      - name: C example (compile + run)
+        run: |
+          make -C examples/c FALLBACK=1
+          ./examples/c/quickstart
