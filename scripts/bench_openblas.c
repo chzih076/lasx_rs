@@ -84,6 +84,9 @@ static pthread_t G_th[64];
 static pthread_barrier_t G_start, G_end;
 static void *G_c; /* 多线程档的当前输出缓冲 */
 static int G_stop;
+/* 非 ABI 的测试模式（见下面 run_scan/run_verify 的注释）：scan / verify / no-scatter */
+static int G_mode_scan, G_mode_verify, G_no_scatter;
+static int G_ms[16], G_nms;
 
 static double now_s(void) {
     struct timespec t;
@@ -168,19 +171,24 @@ static void *worker_fn(void *arg) {
                 if (G_is_f64) {
                     lasx_matmul_f64(w, G_k, G_m, (const double *)G_bt + (size_t)c0 * G_k,
                                     (const double *)G_at, (double *)ct);
-                    for (int r = 0; r < G_m; r++) {
-                        for (int j = 0; j < w; j++) {
-                            ((double *)G_c)[(size_t)r * G_n + c0 + j] =
-                                ((double *)ct)[(size_t)j * G_m + r];
-                        }
-                    }
                 } else {
                     lasx_matmul(w, G_k, G_m, (const float *)G_bt + (size_t)c0 * G_k,
                                 (const float *)G_at, (float *)ct);
-                    for (int r = 0; r < G_m; r++) {
-                        for (int j = 0; j < w; j++) {
-                            ((float *)G_c)[(size_t)r * G_n + c0 + j] =
-                                ((float *)ct)[(size_t)j * G_m + r];
+                }
+                if (!G_no_scatter) { /* --no-scatter 是**只测时间**的测试模式：结果无效 */
+                    if (G_is_f64) {
+                        for (int r = 0; r < G_m; r++) {
+                            for (int j = 0; j < w; j++) {
+                                ((double *)G_c)[(size_t)r * G_n + c0 + j] =
+                                    ((double *)ct)[(size_t)j * G_m + r];
+                            }
+                        }
+                    } else {
+                        for (int r = 0; r < G_m; r++) {
+                            for (int j = 0; j < w; j++) {
+                                ((float *)G_c)[(size_t)r * G_n + c0 + j] =
+                                    ((float *)ct)[(size_t)j * G_m + r];
+                            }
                         }
                     }
                 }
@@ -207,11 +215,139 @@ static void *worker_fn(void *arg) {
     return NULL;
 }
 
+/* ---- 非 ABI 的**测试模式**（只为"验穿根因"，不改变本装置测量的口径）----
+ *   --mode=scan   ：单线程扫 m（`--ms=192,384,…`），把 `ms(m) = a + b·m` 的**截距 a** 当
+ *                   "一次调用里打包 B + 固定开销"的量级（B 固定 = k×n），从而回答
+ *                   "B 被打包 12 次"值多少时间。
+ *   --mode=verify ：**位精确**：单线程 `lasx_matmul` 作参考，逐位比对"调用方 N 线程按行切"
+ *                   与"预转置 plan + 按列切"的结果（`memcmp`，即 to_bits 全等）。不一致 ⇒ exit 1。
+ *   --no-scatter  ：**只测时间、结果无效**：`--split=cols` 里跳过"散射回 C"那一步，
+ *                   用来把 236 G 拆成"（打包+计算）"与"散射"两部分。绝不用它出数值。
+ */
+
+/* 单线程扫 m：打印每个 m 的中位数与 GFLOP/s（供拟合 ms(a+b·m)） */
+static void run_scan(void) {
+    const size_t esz = G_is_f64 ? 8 : 4;
+    for (int i = 0; i < G_nms; i++) {
+        const int m = G_ms[i];
+        const size_t an = (size_t)m * G_k, cn = (size_t)m * G_n;
+        void *A = malloc(esz * an), *C = calloc(cn, esz);
+        if (!A || !C) {
+            fprintf(stderr, "scan: 分配失败（m=%d）\n", m);
+            exit(2);
+        }
+        if (G_is_f64) {
+            fill_rand_f64((double *)A, an, 20261015ull + 7);
+        } else {
+            fill_rand_f32((float *)A, an, 20261015ull + 7);
+        }
+        G_m = m;
+        G_a = A;
+        /* 热身 1 次 + 自适应迭代到 ~100 ms，取中位数（口径同装置的默认路径） */
+        run_lasx(C);
+        double one = time_once(1, C);
+        int it = (int)(0.100 / (one > 0 ? one : 1e-6));
+        if (it < 1) {
+            it = 1;
+        }
+        if (it > 200) {
+            it = 200;
+        }
+        double *s = malloc(sizeof(double) * (size_t)it);
+        for (int k = 0; k < it; k++) {
+            s[k] = time_once(1, C);
+        }
+        qsort(s, (size_t)it, sizeof(double), cmp_double);
+        const double med = (it % 2) ? s[it / 2] : 0.5 * (s[it / 2 - 1] + s[it / 2]);
+        printf("OBSCAN dtype=%s k=%d n=%d m=%d iters=%d ms_med=%.4f ms_min=%.4f gflops=%.2f\n",
+               G_is_f64 ? "f64" : "f32", G_k, G_n, m, it, med * 1e3, s[0] * 1e3,
+               2.0 * (double)m * (double)G_k * (double)G_n / med / 1e9);
+        fflush(stdout);
+        free(s);
+        free(A);
+        free(C);
+    }
+}
+
+/* 位精确：单线程参考 vs（rows 切分、cols 切分）。**要求 threads>1**（否则两条切法都退化成直接调用） */
+static int run_verify(void) {
+    const size_t esz = G_is_f64 ? 8 : 4, cn = (size_t)G_m * G_n;
+    void *ref = malloc(esz * cn), *got = malloc(esz * cn);
+    if (!ref || !got) {
+        fprintf(stderr, "verify: 分配失败\n");
+        return 2;
+    }
+    memset(ref, 0, esz * cn);
+    if (G_is_f64) {
+        lasx_matmul_f64(G_m, G_k, G_n, (const double *)G_a, (const double *)G_b, (double *)ref);
+    } else {
+        lasx_matmul(G_m, G_k, G_n, (const float *)G_a, (const float *)G_b, (float *)ref);
+    }
+    const int save = G_split_cols;
+    /* 先隔离"m 分块本身"：**无线程**、顺序地把 m 切成 2/3 块分别调，再与整块比。
+     * 如果这一步就 MISMATCH，说明差异与线程/并发无关，而是"每次调用的 m 不同会走不同内部路径"。 */
+    int seq_ok = 1;
+    for (int blocks = 2; blocks <= 3; blocks++) {
+        memset(got, 0, esz * cn);
+        for (int b = 0; b < blocks; b++) {
+            const int r0 = (int)((long long)G_m * b / blocks);
+            const int r1 = (int)((long long)G_m * (b + 1) / blocks);
+            if (r1 > r0) {
+                if (G_is_f64) {
+                    lasx_matmul_f64(r1 - r0, G_k, G_n, (const double *)G_a + (size_t)r0 * G_k,
+                                    (const double *)G_b, (double *)got + (size_t)r0 * G_n);
+                } else {
+                    lasx_matmul(r1 - r0, G_k, G_n, (const float *)G_a + (size_t)r0 * G_k,
+                                (const float *)G_b, (float *)got + (size_t)r0 * G_n);
+                }
+            }
+        }
+        if (memcmp(ref, got, esz * cn) != 0) {
+            seq_ok = 0;
+        }
+    }
+    int rows_ok = 0, cols_ok = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        G_split_cols = pass; /* 0 = rows，1 = cols */
+        memset(got, 0xA5, esz * cn);
+        if (pass == 0 && G_nt <= 1) { /* rows 档 threads=1 时退化为直接调用，跳过（无意义） */
+            continue;
+        }
+        G_c = got;
+        run_lasx(got);
+        const int same = memcmp(ref, got, esz * cn) == 0;
+        if (pass == 0) {
+            rows_ok = same;
+        } else {
+            cols_ok = same;
+        }
+    }
+    G_split_cols = save;
+    printf("OBVERIFY dtype=%s m=%d k=%d n=%d threads=%d seq_split=%s rows=%s cols=%s\n",
+           G_is_f64 ? "f64" : "f32", G_m, G_k, G_n, G_nt > 0 ? G_nt : 1,
+           seq_ok ? "bitexact" : "MISMATCH", rows_ok ? "bitexact" : "MISMATCH",
+           cols_ok ? "bitexact" : "MISMATCH");
+    fflush(stdout);
+    const int ok = seq_ok && rows_ok && cols_ok;
+    if (!ok) {
+        fprintf(stderr,
+                "bench_openblas: 位精确**不通过**（m=%d k=%d n=%d threads=%d seq=%s rows=%s "
+                "cols=%s）——切分与单线程参考不一致，拒绝进入计时。\n",
+                G_m, G_k, G_n, G_nt, seq_ok ? "ok" : "MISMATCH", rows_ok ? "ok" : "MISMATCH",
+                cols_ok ? "ok" : "MISMATCH");
+    }
+    free(ref);
+    free(got);
+    return ok ? 0 : 1;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
             "用法：%s --impl=lasx|openblas|both [--dtype=f32|f64] --m=M --k=K --n=N [--threads=N] "
-            "[--iters=N] [--seed=U64] [--tol=F]\n",
-            argv0);
+            "[--iters=N] [--seed=U64] [--tol=F] [--split=rows|cols] [--no-scatter]\n"
+            "      %s --mode=scan --k=K --n=N --ms=192,384,768,1536,3072   # 单线程扫 m（拟合打包成本）\n"
+            "      %s --mode=verify --m=M --k=K --n=N --threads=N          # 位精确自检（rows/cols）\n",
+            argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -250,6 +386,31 @@ int main(int argc, char **argv) {
             seed = strtoull(a + 7, NULL, 10);
         } else if (!strncmp(a, "--tol=", 6)) {
             tol = atof(a + 6);
+        } else if (!strncmp(a, "--mode=", 7)) {
+            const char *s = a + 7;
+            if (!strcmp(s, "scan")) {
+                G_mode_scan = 1;
+            } else if (!strcmp(s, "verify")) {
+                G_mode_verify = 1;
+                G_split_cols = 1; /* 让下面的建池逻辑把 At/Bt 计划也建出来 */
+            } else {
+                fprintf(stderr, "bench_openblas: --mode 只支持 scan|verify（收到 %s）\n", s);
+                return 2;
+            }
+        } else if (!strncmp(a, "--ms=", 5)) {
+            const char *p = a + 5;
+            G_nms = 0;
+            while (*p && G_nms < 16) {
+                G_ms[G_nms++] = atoi(p);
+                while (*p && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+        } else if (!strcmp(a, "--no-scatter")) { /* 只测时间：cols 档跳过散射（结果无效） */
+            G_no_scatter = 1;
         } else {
             fprintf(stderr, "bench_openblas: 不认识的参数 %s\n", a);
             usage(argv[0]);
@@ -259,7 +420,18 @@ int main(int argc, char **argv) {
     const int do_lasx = impl && (!strcmp(impl, "lasx") || !strcmp(impl, "both"));
     const int do_ob = impl && (!strcmp(impl, "openblas") || !strcmp(impl, "both"));
     const int do_check = impl && !strcmp(impl, "both");
-    if ((!do_lasx && !do_ob) || G_m <= 0 || G_k <= 0 || G_n <= 0) {
+    /* 测试模式（scan/verify）不需要 --impl，按各自的必填项校验 */
+    if (G_mode_scan) {
+        if (G_nms <= 0 || G_k <= 0 || G_n <= 0) {
+            usage(argv[0]);
+            return 2;
+        }
+    } else if (G_mode_verify) {
+        if (G_m <= 0 || G_k <= 0 || G_n <= 0) {
+            usage(argv[0]);
+            return 2;
+        }
+    } else if ((!do_lasx && !do_ob) || G_m <= 0 || G_k <= 0 || G_n <= 0) {
         usage(argv[0]);
         return 2;
     }
@@ -299,6 +471,11 @@ int main(int argc, char **argv) {
 
     /* 多线程档：起常驻 worker（一次，不在计时循环里反复建线程） */
     if (threads > 1) {
+        /* **两种切分的参数都要备好**：`--mode=verify` 会在同一个进程里来回切 rows/cols，
+         * 只备一种会让另一种用到未初始化的 rows/cols_per_thread（本装置曾在 verify 里
+         * 因此报出假 MISMATCH——记在这里当教训）。*/
+        G_nt = threads < G_m ? threads : G_m;
+        G_rows_per_thread = (G_m + G_nt - 1) / G_nt;
         if (G_split_cols) {
             G_nt = threads < G_n ? threads : G_n;
             G_cols_per_thread = (G_n + G_nt - 1) / G_nt;
@@ -348,9 +525,8 @@ int main(int argc, char **argv) {
                     return 2;
                 }
             }
-        } else {
-            G_nt = threads < G_m ? threads : G_m;
-            G_rows_per_thread = (G_m + G_nt - 1) / G_nt;
+        } else if (G_rows_per_thread <= 0) { /* 兜底：正常路径上面已经算过 */
+            G_rows_per_thread = 1;
         }
         pthread_barrier_init(&G_start, NULL, (unsigned)G_nt + 1);
         pthread_barrier_init(&G_end, NULL, (unsigned)G_nt + 1);
@@ -372,6 +548,28 @@ int main(int argc, char **argv) {
             pthread_barrier_destroy(&G_end);              \
         }                                                 \
     } while (0)
+
+    /* ---- 非 ABI 的测试模式：跑完即返回（--mode=scan / --mode=verify）---- */
+    if (G_mode_verify) {
+        if (G_nt <= 1) {
+            fprintf(stderr, "bench_openblas: --mode=verify 需要 --threads>1\n");
+            JOIN_WORKERS();
+            return 2;
+        }
+        const int rc = run_verify();
+        JOIN_WORKERS();
+        return rc;
+    }
+    if (G_mode_scan) {
+        if (G_nms <= 0 || threads > 1) {
+            fprintf(stderr, "bench_openblas: --mode=scan 需要 --ms=… 且 threads=1（单线程扫 m）\n");
+            JOIN_WORKERS();
+            return 2;
+        }
+        run_scan();
+        JOIN_WORKERS();
+        return 0;
+    }
 
     /* ---- 先验一致性（第 3 条）：强制、且在计时之前 ---- */
     if (do_check) {
