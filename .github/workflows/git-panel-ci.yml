@@ -55,6 +55,12 @@ jobs:
           gcc -O2 -Iinclude scripts/check_header.c target/release/liblasx_rs.a \
               -lm -lpthread -ldl -o /tmp/check_header
           /tmp/check_header
+      # **C ABI 命名规范**（2026-10-15 加）：与上面三条同思路——**规范必须由机器守**。
+      # 校验 `.so`/`.a` 的**动态符号表**与 `src/ffi/*.rs`：形态 `lasx_<domain>_<op>[_<qualifier>]`、
+      # 尾部后缀只允许 `_checked`、`_checked` 必有同名裸孪生、库级符号只能来自 5 个白名单。
+      # 规则与自查清单见 `docs/c-abi.md` §9.1。退出码 2（环境/用法问题）按失败处理。
+      - name: C ABI naming convention
+        run: bash scripts/namecheck.sh
       # **文档计数 vs 实测**（2026-10-15 加）：文档里记的库单测数曾漂成 218/220 而实测 226
       # （`docs/dev.md §4` 的增量清单自身也只加得出 ~214）⇒ 与上面两条同思路：
       # **文档承诺 vs 产物实测**。口径：4 处必须给出**同一个**数，且等于 `--list` 实测值。
