@@ -48,3 +48,16 @@ jobs:
           gcc -O2 -Iinclude scripts/check_header.c target/release/liblasx_rs.a \
               -lm -lpthread -ldl -o /tmp/check_header
           /tmp/check_header
+      # **文档计数 vs 实测**（2026-10-15 加）：文档里记的库单测数曾漂成 218/220 而实测 226
+      # （`docs/dev.md §4` 的增量清单自身也只加得出 ~214）⇒ 与上面两条同思路：
+      # **文档承诺 vs 产物实测**。口径：4 处必须给出**同一个**数，且等于 `--list` 实测值。
+      # 历史决策记录里的 "N 单测" 写法（如 `217 → 218`）不在匹配范围，故意不纳入。
+      - name: Documented test count vs measured
+        run: |
+          d=$(grep -ohE '[0-9]+ 个单元测试|[0-9]+ unit tests' docs/dev.md README.md README.en.md \
+              | grep -oE '[0-9]+' | sort -u)
+          n=$(cargo +nightly test --release --lib -- --list | grep -c ': test$')
+          echo "文档记：$(echo "$d" | tr '\n' ' ')；实测库单测：$n"
+          if [ "$(printf '%s\n' "$d" | wc -l)" != "1" ] || [ "$d" != "$n" ]; then
+            echo "::error::文档单测计数与实测不一致（或多处不一致）"; exit 1
+          fi
