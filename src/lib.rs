@@ -152,7 +152,7 @@ pub use ffi::attitude::{
     lasx_quat_rotate_batch, lasx_quat_to_dcm_batch, lasx_unitize3_batch,
 };
 pub use ffi::batch::{lasx_batch_distance2d, lasx_norm3_batch, lasx_vec3_add_scaled_batch};
-pub use ffi::matmul::{lasx_matmul, lasx_matmul_f64};
+pub use ffi::matmul::{lasx_matmul, lasx_matmul_f64, lasx_matmul_scaled};
 pub use ffi::memory::lasx_alloc;
 pub use ffi::physics::{lasx_ballistic_step, lasx_j2_accel_batch, lasx_rk4_j2_step_batch};
 pub use ffi::quant::{lasx_dot_i8, lasx_dot_q4};

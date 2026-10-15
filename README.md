@@ -16,7 +16,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ## 特点
 
 - **零第三方依赖**：仅 `core::arch::loongarch64` 的 LASX/LSX intrinsic 与 std。
-- **81 个导出符号**（41 个裸版本 + 40 个带 `int *status` 的 `_checked` 版本）。
+- **83 个导出符号**（42 个裸版本 + 41 个带 `int *status` 的 `_checked` 版本）。
   最初的 15 个 `lasx_*` 符号签名与语义**永不改动**，新增能力一律追加；
   另有 `*_checked` 变体提供结构化错误码，两者走同一条内核实现。
 - **位精确**：同一算子的 LASX / LSX / 标量尾 / 打包 / k 分块 / 并行切块等全部路径，对同一输入
@@ -136,7 +136,7 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **算子与用法**：81 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据 |
+| [docs/ops.md](docs/ops.md) | **算子与用法**：83 个符号总表、数值契约与逐位确定性、降级覆盖、C/Rust/Dart 调用、池与并行、NN 算子现状与缺口对照、int8/f32 判据 |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 | [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |
 

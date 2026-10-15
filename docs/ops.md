@@ -7,7 +7,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，81 个导出符号（41 个裸版本 + 40 个 `_checked` 变体） |
+| 适用代码版本 | `master`，83 个导出符号（42 个裸版本 + 41 个 `_checked` 变体） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 平台约束的位置 | **不在本文档**：硬件勘误（LA664 原子操作丢失更新）、内核分支生命周期、消费 ONNX 契约引出的缺口与承诺边界，都在 [`docs/platform.md`](platform.md)——**调用方通常无需读它**（勘误的命中点在库内部，库侧已自带 `_db` 与回归测试） |
@@ -29,7 +29,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（81 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（83 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -153,9 +153,8 @@ c[i][j] = fma(a[i][k-1], b[k-1][j], fma(… fma(a[i][0], b[0][j], 0) …))
   方阵 ≈0；`beta != 0` 且 `k > 384`（打包路径要 k 分块、部分和会覆盖 `C_old`）**退回与
   二遍法同构**的实现，不假装更快。其他章节不得出现"融合接近 BLAS 语义""融合带来 2×"
   这类暗示；口径与边界详见 `docs/dev.md` §19.15；
-- **入口**：Rust 侧 `api::matmul_scaled_into` 与公式 DSL 的标量前缀（§5.5）；
-  **C ABI 入口本轮未加**（`lasx_matmul_scaled` 是已记录的待办：加符号要同步本文件 §4 与
-  README 的符号计数）。
+- **入口**：Rust 侧 `api::matmul_scaled_into`、C ABI `lasx_matmul_scaled`（+ `_checked`，§4.7）、
+  以及公式 DSL 的标量前缀（§5.5）。口径与边界详见 `docs/dev.md` §19.15；
 
 **4）逐位一致的例外（仅此两处，均有测试）。** `lasx_ballistic_step` 的向量/标量分支
 结合序不同（物理一致，绝对误差有测试覆盖）；`lasx_axpy` 允许 1 ulp 以内差异。
@@ -675,14 +674,14 @@ impl SimdPath {
 `match SimdPath::detect()` 分派到 `<name>_lasx` / `<name>_lsx`（少数内核的 `Lsx` 分支
 退化为纯标量）。
 
-### 3.2 降级覆盖分类（41 个原始符号）
+### 3.2 降级覆盖分类（42 个原始符号）
 
 | 类别 | 个数 | 内核 | 无 LASX 时 |
 |---|---|---|---|
 | LASX + LSX 双路径 | 11 | `lasx_dot`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_j2_accel_batch`，以及全部 7 个姿态/几何算子 | LSX 128 位向量路径 |
 | LASX + 标量降级 | 3 | `lasx_ballistic_step`、`lasx_batch_distance2d`、`lasx_rk4_j2_step_batch` | 全标量循环（无 LSX 向量路径） |
-| LASX-only（无降级分支） | 23 | `lasx_matmul`、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`，N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 8 个**（§4.3） | 直接执行 LASX 指令 |
-| 内存工具（不涉及 SIMD） | 1 | `lasx_alloc` | 与路径无关 |
+| LASX-only（无降级分支） | 25 | `lasx_matmul`、`lasx_matmul_scaled`（融合缩放，与前者同路径）、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`、`lasx_layer_norm`（ONNX 批次），N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 8 个**（§4.3） | 直接执行 LASX 指令 |
+| 不涉及 SIMD | 3 | `lasx_alloc`（内存工具）、`lasx_gather_rows`、`lasx_gather_rows_i8`（查表/行拷贝，`memcpy` 语义，见 §2.17） | 与路径无关 |
 
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LA664，LASX 齐全），同核的 6000 机型
 （3A6000 / 3C6000 / 3B6000）都支持 LASX；不为只有 LSX 的机型（如 2K3000 / 3B6000M，
@@ -721,10 +720,10 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 （`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（81 个）
+## 4. 导出符号总表（83 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**41 个未带 `_checked`
-的 `lasx_*` + 40 个 `lasx_*_checked` = 81**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**42 个未带 `_checked`
+的 `lasx_*` + 41 个 `lasx_*_checked` = 83**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
 `lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
 各与其 checked 变体；**N3 批次加了 int8 推理的 8 个**，见 §4.3；
 **ONNX 契约补充加了 `lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` 各与其
@@ -780,7 +779,7 @@ checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
 
 契约（§2.12 量化、§2.13 GEMV）、用法（§5.14）、降级取舍（§3.2）。
 
-### 4.4 `_checked` 变体 40 个
+### 4.4 `_checked` 变体 41 个
 
 每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，仅在末尾追加
 一个 `int *status` 出参**：
@@ -793,8 +792,9 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 ```
 
-40 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
+41 个名字：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
 `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_f64_checked`、
+`lasx_matmul_scaled_checked`（融合缩放，2026-10-15 追加）、
 `lasx_dot_i8_checked`、`lasx_dot_q4_checked`、`lasx_norm3_batch_checked`、
 `lasx_vec3_add_scaled_batch_checked`、`lasx_batch_distance2d_checked`、
 `lasx_ballistic_step_checked`、`lasx_j2_accel_batch_checked`、
@@ -809,7 +809,7 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 `lasx_quantize_i8_per_row_checked`、`lasx_dequantize_i8_checked`、
 `lasx_dequantize_i8_rows_checked`、`lasx_gemv_i8_checked`、`lasx_matmul_i8_checked`，
 以及 **ONNX 契约补充的 3 个**：`lasx_layer_norm_checked`、`lasx_gather_rows_checked`、
-`lasx_gather_rows_i8_checked`（共 **40 个**）。
+`lasx_gather_rows_i8_checked`（共 **41 个**）。
 
 行为约定：先校验，失败时写入 `LasxStatus` 并返回**安全中性值**（数值型 `0.0`/`0`，`void`
 型只写状态），**不触碰输出缓冲**；成功时写回 `Ok`（0）。`status` 可传 `NULL`（不关心原因，
@@ -841,13 +841,23 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | NN 侧（N1 批次 8 个） | 8 | 8 | 16 | §4.4 的名单、§5.9–§5.13 的用法 |
 | N3（int8 推理 8 个） | 8 | 8 | 16 | §4.3、§5.14 的用法 |
 | ONNX 契约补充（3 个：`layer_norm` + `gather_rows` + `gather_rows_i8`） | 3 | 3 | 6 | 契约 §2.16/§2.17，来源 `docs/platform.md` §4 |
-| 合计 | **41** | **40** | **81** | — |
+| matmul 融合缩放（1 个，2026-10-15） | 1 | 1 | 2 | §4.7、§5.5 末段 |
+| 合计 | **42** | **41** | **83** | — |
 
-`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 40 个原始符号各有一个 checked 版本
-（41 − 1 = 40；上表"历史内核"行的 15 / 14 之差就是它）；
-原始 15 个的名字与语义始终不变。§3.2 给出 41 个原始符号的降级覆盖分类。
+`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 41 个原始符号各有一个 checked 版本
+（42 − 1 = 41；上表"历史内核"行的 15 / 14 之差就是它）；
+原始 15 个的名字与语义始终不变。§3.2 给出 42 个原始符号的降级覆盖分类。
 
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
+
+### 4.7 融合缩放（1 个，2026-10-15 追加）
+
+| 符号 | C 签名要点 | 语义 | 路径 |
+|---|---|---|---|
+| `lasx_matmul_scaled` | `void(int m, int k, int n, float alpha, const float*, const float*, float beta, float*)` | `C = alpha·(A·B) + beta·C`（原地、行主序）；`beta == 0` **不读 `C`** | LASX-only（与 `lasx_matmul` 同路径） |
+
+`lasx_matmul_scaled_checked` 与它同签名、末尾多一个 `int *status`。数值口径与性能判据见
+§2.5 第 3 点与 §5.5 末段；决策与实测记录见 `docs/dev.md` §19.15。
 
 
 ## 5. 归约、稠密与量化算子
@@ -904,10 +914,19 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 - `m == 0 || n == 0` 直接返回；`k == 0` 时 C 不会被写（`parallel::matmul_f32` 会显式
   `c.fill(0.0)`）。LASX-only。
 
-**`alpha`/`beta` 融合（`C = alpha·A·B + beta·C`，Rust API；C 入口本轮未加）**
+**`alpha`/`beta` 融合（`C = alpha·A·B + beta·C`）**
+
+```c
+// C = alpha·A·B + beta·C（原地；行主序）。beta == 0 时不读 c。
+void lasx_matmul_scaled(int m, int k, int n, float alpha,
+                        const float *a, const float *b, float beta, float *c);
+// 带错误通道：末尾多一个 int *status（校验口径同 lasx_matmul_checked）
+void lasx_matmul_scaled_checked(int m, int k, int n, float alpha, const float *a,
+                                const float *b, float beta, float *c, int *status);
+```
 
 ```rust
-// C = alpha·A·B + beta·C（原地；行主序）
+// Rust 侧同一个算子
 lasx_rs::api::matmul_scaled_into(m, k, n, alpha, beta, &a, &b, &mut c)?;
 
 // 公式 DSL 的标量前缀 = alpha 配上 beta = 0（输出被完全覆盖）
@@ -917,7 +936,8 @@ matmul!(y[M, N] = alpha * x[M, K] * p);         // plan 形态：p.apply_scaled_
 
 - 数值口径（硬契约）：`alpha = 1, beta = 0` **逐位等于** [`lasx_matmul`]（同一条内核，收尾
   不多一次乘法）；其余情况 `C = fma(beta, C_old, alpha·acc)`，与"先算 `A·B` 再整体乘/加"
-  **逐位一致**。`beta == 0` 时**不读 `C`**，可以传内容任意的缓冲。
+  **逐位一致**。`beta == 0` 时**不读 `C`**，可以传内容任意的缓冲。C 入口与 `api` 入口逐位一致
+  （`ffi::matmul` 的测试守着）。
 - 何时更快（实测，进程级交替 5 轮）：`beta == 0` 且**宽薄**（小 `k`、大 `m×n`）时省掉一整遍
   对 `C` 的读写——256×64×4096 **−10.3%**、100×64×19147 **−23.7%**；`beta != 0` 且 `k ≤ 384`
   小胜（−6.5%）；方阵/大 `k` 形状 ≈0，但**不会更慢**（`beta != 0` 且 `k > 384` 退回与朴素
@@ -2124,7 +2144,7 @@ cp target/release/liblasx.so yll/
 `lib.ylh` 补声明、`cargo build --release -p lasx_yll` 后拷 `liblasx.so`。
 
 ```bash
-# 导出符号自检：期望 81 行（41 原始 + 40 checked）= 81 个导出符号
+# 导出符号自检：期望 83 行（42 原始 + 41 checked）= 83 个导出符号
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```
@@ -2133,8 +2153,9 @@ nm -D --defined-only target/release/liblasx_rs.so \
 ## 15. Caveats 与限制
 
 1. **降级覆盖不全**：历史 7 个 LASX-only 内核（`matmul`、`matmul_f64`、`axpy`、`sum`、`dot_f64`、
-   `dot_i8`、`dot_q4`）在 LSX-only CPU 上会 SIGILL，不会自动降级；N1/N3 的新增符号同样
-   LASX-only（完整分类见 §3.2）。
+   `dot_i8`、`dot_q4`）在 LSX-only CPU 上会 SIGILL，不会自动降级；N1/N3 与 2026-10-15 追加的
+   `matmul_scaled`、`layer_norm`/`gather_rows*` 同样按 §3.2 的分类（前者 LASX-only，后两者不涉及
+   SIMD），完整分类见 §3.2。
 2. **仅标量降级**：`ballistic_step`、`batch_distance2d`、`rk4_j2_step_batch` 的非 LASX
    分支是全标量循环，没有 LSX 128 位向量路径。
 3. **两处不逐位一致的例外**：`ballistic_step` 向量/标量的 `|v|²` 结合序不同（物理一致，有绝对

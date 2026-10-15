@@ -145,6 +145,49 @@ pub extern "C" fn lasx_matmul_checked(
     crate::ops::matmul::matmul_f32(m, k, n, a, b, c);
 }
 
+/// 带错误通道的融合缩放矩阵乘 `C = alpha·(A·B) + beta·C`（原地）。
+///
+/// C 签名：`void lasx_matmul_scaled_checked(int m, int k, int n, float alpha, const float *a,
+/// const float *b, float beta, float *c, int *status)`
+///
+/// 校验口径与 [`lasx_matmul_checked`] 相同：维度非负 → 乘积不溢出 → 转切片（空指针在
+/// 长度非 0 时报错）；失败时只写状态、**不触碰输出**。成功后的数值路径与 C 裸入口、
+/// `api::matmul_scaled_into` 完全同一条（逐位一致）。
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn lasx_matmul_scaled_checked(
+    m: i32,
+    k: i32,
+    n: i32,
+    alpha: f32,
+    a: *const f32,
+    b: *const f32,
+    beta: f32,
+    c: *mut f32,
+    status: *mut i32,
+) {
+    let (m, k, n) = (
+        or_fail!(checked_len(m), status, ()),
+        or_fail!(checked_len(k), status, ()),
+        or_fail!(checked_len(n), status, ()),
+    );
+    let (la, lb, lc) = (
+        or_fail!(checked_mul(m, k), status, ()),
+        or_fail!(checked_mul(k, n), status, ()),
+        or_fail!(checked_mul(m, n), status, ()),
+    );
+    // SAFETY: 见上；各缓冲长度由调用方按 m×k / k×n / m×n 保证（`beta != 0` 时 `c` 还要可读）。
+    let (a, b, c) = unsafe {
+        (
+            or_fail!(checked_slice(a, la), status, ()),
+            or_fail!(checked_slice(b, lb), status, ()),
+            or_fail!(checked_slice_mut(c, lc), status, ()),
+        )
+    };
+    LasxStatus::Ok.write(status);
+    crate::ops::matmul::matmul_f32_scaled(m, k, n, alpha, beta, a, b, c);
+}
+
 /// 带错误通道的 f64 矩阵乘。
 /// C 签名：`void lasx_matmul_f64_checked(int m, int k, int n, const double*, const double*, double*, int*)`
 #[unsafe(no_mangle)]
