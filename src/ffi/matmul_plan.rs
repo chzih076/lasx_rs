@@ -34,6 +34,35 @@ use crate::plan::MatmulPlan;
 /// "打包好的 B + 几何"，在 `prepare` 之后**只读**，因此可以跨线程共享（各线程写自己那块 `c`）。
 pub struct LasxMatmulPlan {
     plan: MatmulPlan<f32>,
+    /// **按线程数缓存的池**（2026-10-15）：键 = 建池时的线程数，值与句柄同生命周期。
+    ///
+    /// 为什么这样设计（`docs/dev.md` §7.10 ⑫）：
+    /// - **生命周期与 plan 绑定**、显式所有权（`plan_destroy` 一并析构）⇒ 不引入任何进程级状态；
+    /// - **并发安全**：`Mutex` 只保护"查/换缓存"这一小步（纳秒级），工作负载在池里跑；
+    ///   多个线程并发 `run_threaded` 同一 plan 时**共用同一个池**——池本身的契约是
+    ///   "同一时刻一个派活者"（`DispatchToken`），所以并发调用会**串行派活**（**契约已写进
+    ///   `docs/c-abi.md` §11.2.1**）；要真正并行请用**不同的 plan** 或 `parallel::*` + 自管池。
+    /// - `threads` 与缓存不符 ⇒ **重建**（`threads` 语义是"这次用多少"，不能悄悄改）。
+    pool: std::sync::Mutex<Option<(usize, std::sync::Arc<crate::pool::WorkerPool>)>>,
+}
+
+impl LasxMatmulPlan {
+    /// 取（或建）本句柄上 `threads` 对应的池；`threads` 与缓存不符时重建。
+    fn pool_for(&self, threads: usize) -> std::sync::Arc<crate::pool::WorkerPool> {
+        let mut slot = match self.pool.lock() {
+            Ok(g) => g,
+            // 锁中毒（别处 panic）⇒ 退化为"每次现建"：正确性不受影响，只是丢掉复用。
+            Err(_) => return std::sync::Arc::new(crate::pool::WorkerPool::new(threads)),
+        };
+        if let Some((n, pool)) = slot.as_ref()
+            && *n == threads
+        {
+            return std::sync::Arc::clone(pool);
+        }
+        let pool = std::sync::Arc::new(crate::pool::WorkerPool::new(threads));
+        *slot = Some((threads, std::sync::Arc::clone(&pool)));
+        pool
+    }
 }
 
 /// `api::Error` → `LasxStatus`（本模块只会遇到这两种；`checked.rs` 的 `or_fail!` 同口径）。
@@ -86,7 +115,10 @@ pub extern "C" fn lasx_matmul_prepare(k: i32, n: i32, b: *const f32) -> *mut Las
     // SAFETY: FFI 约定——`b` 为 k×n 可读。
     let b = unsafe { std::slice::from_raw_parts(b, k * n) };
     match MatmulPlan::from_row_major(b, k, n) {
-        Ok(plan) => Box::into_raw(Box::new(LasxMatmulPlan { plan })),
+        Ok(plan) => Box::into_raw(Box::new(LasxMatmulPlan {
+            plan,
+            pool: std::sync::Mutex::new(None),
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -113,7 +145,10 @@ pub extern "C" fn lasx_matmul_prepare_checked(
     match MatmulPlan::from_row_major(b, k, n) {
         Ok(plan) => {
             LasxStatus::Ok.write(status);
-            Box::into_raw(Box::new(LasxMatmulPlan { plan }))
+            Box::into_raw(Box::new(LasxMatmulPlan {
+                plan,
+                pool: std::sync::Mutex::new(None),
+            }))
         }
         Err(e) => {
             status_of(&e).write(status);
@@ -325,8 +360,12 @@ fn run_threaded(
             ns_min: dt,
         });
     }
-    // 便利层：池**现建现拆**（不用它就零进程级状态）；分块交给池的动态取块。
-    let pool = crate::pool::WorkerPool::new(nt);
+    // 便利层：**池缓存进句柄**（2026-10-15；见 `docs/c-abi.md` §11.2.1 与 `docs/dev.md` §7.10 ⑫）。
+    // 每次调用现建现拆池要付 12 线程的创建/回收（实测 2.15× 慢）；这里按**线程数**缓存一个池，
+    // 挂在 plan 句柄里 ⇒ **生命周期与 plan 绑定**（`plan_destroy` 一并析构）、无进程级状态；
+    // `threads` 与缓存不符时**重建**（理由：缓存多份会让每个句柄的线程数/内存膨胀，
+    // 而 `threads` 参数本就是"这次用多少"）。
+    let pool = plan_ref.pool_for(nt);
     match crate::parallel::matmul_f32_plan_with_stats(&pool, &plan_ref.plan, m, a, c) {
         Ok(stats) => {
             LasxStatus::Ok.write(status);
@@ -554,4 +593,62 @@ mod tests {
         );
         lasx_matmul_plan_destroy(plan);
     }
+}
+
+/// **便利层池缓存的同进程 A/B（默认 `#[ignore]`）**：`lasx_matmul_run_threaded`（池缓存进句柄）
+/// vs **每次调用现建池**（改动前的行为）。同进程交替 ≥5 次、取中位数+极差。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_threaded_pool_cache -- --ignored --nocapture`
+#[cfg(test)]
+#[ignore = "诊断：便利层池缓存 vs 每次现建池（同进程交替）"]
+#[test]
+fn diag_threaded_pool_cache() {
+    use crate::aligned::AlignedVec;
+    use std::time::Instant;
+    let (m, k, n) = (192usize, 768usize, 3072usize);
+    let a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.125);
+    let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+    let plan = lasx_matmul_prepare(k as i32, n as i32, b.as_ptr());
+    assert!(!plan.is_null());
+    let mut c = AlignedVec::<f32>::new(m * n);
+    let flop = 2.0 * m as f64 * k as f64 * n as f64;
+    let mut t_cached = Vec::new();
+    let mut t_fresh = Vec::new();
+    for _ in 0..7 {
+        // ① 便利层（池缓存进句柄）
+        let t0 = Instant::now();
+        lasx_matmul_run_threaded(plan, m as i32, a.as_ptr(), c.as_mut_ptr(), 12);
+        t_cached.push(t0.elapsed().as_secs_f64());
+        // ② 改动前的行为：每次现建现拆池 + 计划路径
+        let t0 = Instant::now();
+        {
+            let pool = crate::pool::WorkerPool::new(12);
+            crate::parallel::matmul_f32_plan(&pool, plan_ref_of(plan), m, &a, &mut c).unwrap();
+        }
+        t_fresh.push(t0.elapsed().as_secs_f64());
+    }
+    crate::ffi::matmul_plan::lasx_matmul_plan_destroy(plan);
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (tc, tf) = (med(&mut t_cached), med(&mut t_fresh));
+    println!(
+        "便利层(池缓存)   = {:.4} ms = {:.1} GFLOP/s",
+        tc * 1e3,
+        flop / tc / 1e9
+    );
+    println!(
+        "每次现建池(旧)   = {:.4} ms = {:.1} GFLOP/s",
+        tf * 1e3,
+        flop / tf / 1e9
+    );
+    println!("加速 = {:.3}×（>1 表示缓存更快）", tf / tc);
+}
+
+/// 测试用：从裸句柄取只读 plan（仅诊断测试使用）。
+#[cfg(test)]
+fn plan_ref_of(plan: *mut LasxMatmulPlan) -> &'static MatmulPlan<f32> {
+    // SAFETY: 测试内句柄有效且不销毁；只读借用。
+    unsafe { &(*plan).plan }
 }

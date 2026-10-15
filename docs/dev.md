@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**239 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**240 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -318,6 +318,8 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 - 等待 1 个（`#[ignore]`）：`parallel::diag_spin_limit`——**H2 等待策略扫描**（剖析小节 ⑩）：
   同进程交替 `SPIN_LIMIT ∈ {128,1024,4096}`（测试用覆盖钩子 `pool::set_spin_limit_for_test`，
   生产默认值不动）；配 `LASX_SPIN_LIMIT=<n>` 可分臂上 `perf record` 取自旋占比。
+- 池缓存 1 个（`#[ignore]`）：`ffi::matmul_plan::diag_threaded_pool_cache`——**便利层池缓存的
+  同进程 A/B**（"缓存进句柄" vs "每次现建池"，7 轮交替中位数）；结果见 ⑪ 的口径更正。
 
 > **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
 > **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
@@ -352,7 +354,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 239 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 240 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -2028,6 +2030,15 @@ pthread 档每次
 
 ⇒ **同一份库内工作，模型差 70%**：这就是为什么"只差 4%"必须注明是**调用方驱动模型**下的数字；
 便利层（库自管线程）在热循环里**慢 2.15×**，原因就是每次调用的**建池/拆池**进了计时。
+
+> **⚠️ 口径更正（2026-10-15 晚，同进程对照）**：上面那 2.15× 是**跨窗口**（便利层当时窗口
+> 5.31 ms）与对手同轮 2.47 ms 相比得到的，**偏大**。改用**同进程 A/B**
+> （`src/ffi/matmul_plan.rs` 的 `diag_threaded_pool_cache`，7 轮交替取中位数）后：
+> - **每次现建池（改动前行为）3.0986 ms / 292.4 G**；
+> - **池缓存进句柄（本轮改动后）2.7038 ms / 335.1 G** ⇒ **+14.6%（1.146×）**；
+> - 同进程里的手动最优（`plan` + 调用方线程）≈ **2.55–2.66 ms / 346–355 G**（见 ⑥ 的同进程表）
+>   ⇒ **便利层 vs 手动最优其实是 ≈1.02–1.15×，不是 2.15×**。
+> ⇒ **引用请用这组同进程数字**；5.3131 ms 那条是**受窗口影响的旧账**（保留追溯，不再当结论）。
 
 **`cpu-migrations` 全档 0/0 的追问：本机该计数不可用。** 同一进程用 `/proc/<pid>/status` 看
 `voluntary_ctxt_switches` 是 **26 → 28（非零）**，而 `perf stat -e context-switches,cpu-migrations`
