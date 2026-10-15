@@ -52,6 +52,9 @@ cargo test --workspace --release         # 229 unit tests + 6 macro tests + 18 d
 cargo clippy --workspace --all-targets -- -D warnings   # zero warnings is a hard gate
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
+# C projects: compile/link flags after install (see §17.2 and §18 in docs/ops.md)
+pkg-config --cflags --libs lasx_rs
+
 # Benchmarks: no filter runs every suite, a substring selects matching suites
 cargo run -p lasx_bench --release
 cargo run -p lasx_bench --release -- softmax
@@ -59,6 +62,14 @@ cargo run -p lasx_bench --release -- softmax
 # Single-shape A/B (the entry point for process-level alternating measurement):
 #   <m> <k> <n> <stream|packed|cols|packed64|stream64|pool> [threads] [strategy]
 cargo run --release --example matmul_ab -- 512 512 512 packed
+```
+
+```c
+/* Shortest path from C; full mental model (layers / raw vs _checked / threads / errors): docs/ops.md §18 */
+if (lasx_has_lasx()) { /* ask before calling [LASX-only]: 0 = LSX only, a direct call is SIGILL */ }
+float d = lasx_dot_checked(a, b, n, &st);            /* _checked by default: on failure status only, output untouched */
+if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));   /* never hardcode 0..6 */
+lasx_free(a, n);                                     /* pair with lasx_alloc; free() is not an ABI contract */
 ```
 
 `.cargo/config.toml` sets `rustflags = ["-C", "target-feature=+lasx"]`, so the default artifacts

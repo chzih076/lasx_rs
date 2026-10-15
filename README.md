@@ -53,12 +53,23 @@ cargo test --workspace --release         # 229 个单元测试 + 6 个宏单测 
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
+# C 项目：安装后的编译/链接参数（见 docs/ops.md 的 §17.2 与 §18）
+pkg-config --cflags --libs lasx_rs
+
 # 基准：不带过滤跑全部套件，带子串只跑匹配套件
 cargo run -p lasx_bench --release
 cargo run -p lasx_bench --release -- softmax
 
 # 单形状 A/B（进程级交替测量的入口）：<m> <k> <n> <stream|packed|cols|packed64|stream64|pool> [线程数] [策略]
 cargo run --release --example matmul_ab -- 512 512 512 packed
+```
+
+```c
+/* C 侧最短路径；完整心智模型（三层 / 裸 vs _checked / 线程 / 错误模型）见 docs/ops.md §18 */
+if (lasx_has_lasx()) { /* 调 [LASX-only] 符号前先问：0 = 仅 LSX，直调会 SIGILL */ }
+float d = lasx_dot_checked(a, b, n, &st);            /* 默认 _checked：失败只写 status、不触碰输出 */
+if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));   /* 别硬编码 0..6 */
+lasx_free(a, n);                                     /* 与 lasx_alloc 配对；free() 不是 ABI 契约 */
 ```
 
 `.cargo/config.toml` 设置 `rustflags = ["-C", "target-feature=+lasx"]`，因此默认产物假定 CPU
