@@ -122,27 +122,20 @@ pub fn cmatmul_f32_into_route(
             rmath::matmul_f32(m, k, n, ai, bi, &mut ai_bi);
             rmath::matmul_f32(m, k, n, ar, bi, &mut ar_bi);
             rmath::matmul_f32(m, k, n, ai, br, &mut ai_br);
-            for l in 0..m * n {
-                cr[l] = ar_br[l] - ai_bi[l];
-                ci[l] = ar_bi[l] + ai_br[l];
-            }
+            // **B0：组合步也走 LASX intrinsic**（无标量回退；标量只用于尾部）
+            combine::sub_f32(&ar_br, &ai_bi, cr);
+            combine::add_f32(&ar_bi, &ai_br, ci);
         }
         Route::Karatsuba => {
             let (mut a_sum, mut b_sum) = (vec![0.0f32; m * k], vec![0.0f32; k * n]);
-            for l in 0..m * k {
-                a_sum[l] = ar[l] + ai[l];
-            }
-            for l in 0..k * n {
-                b_sum[l] = br[l] + bi[l];
-            }
+            combine::add_f32(ar, ai, &mut a_sum[..m * k]);
+            combine::add_f32(br, bi, &mut b_sum[..k * n]);
             let mut k1 = vec![0.0f32; m * n];
             rmath::matmul_f32(m, k, n, &a_sum, &b_sum, &mut k1);
             rmath::matmul_f32(m, k, n, ar, br, &mut ar_br); // k2
             rmath::matmul_f32(m, k, n, ai, bi, &mut ai_bi); // k3
-            for l in 0..m * n {
-                cr[l] = ar_br[l] - ai_bi[l];
-                ci[l] = k1[l] - ar_br[l] - ai_bi[l];
-            }
+            combine::sub_f32(&ar_br, &ai_bi, cr);
+            combine::sub3_f32(&k1, &ar_br, &ai_bi, ci);
         }
     }
 }
@@ -203,27 +196,20 @@ pub fn cmatmul_f64_into_route(
             rmath64::matmul_f64(m, k, n, ai, bi, &mut ai_bi);
             rmath64::matmul_f64(m, k, n, ar, bi, &mut ar_bi);
             rmath64::matmul_f64(m, k, n, ai, br, &mut ai_br);
-            for l in 0..m * n {
-                cr[l] = ar_br[l] - ai_bi[l];
-                ci[l] = ar_bi[l] + ai_br[l];
-            }
+            // **B0：组合步也走 LASX intrinsic**
+            combine::sub_f64(&ar_br, &ai_bi, cr);
+            combine::add_f64(&ar_bi, &ai_br, ci);
         }
         Route::Karatsuba => {
             let (mut a_sum, mut b_sum) = (vec![0.0f64; m * k], vec![0.0f64; k * n]);
-            for l in 0..m * k {
-                a_sum[l] = ar[l] + ai[l];
-            }
-            for l in 0..k * n {
-                b_sum[l] = br[l] + bi[l];
-            }
+            combine::add_f64(ar, ai, &mut a_sum[..m * k]);
+            combine::add_f64(br, bi, &mut b_sum[..k * n]);
             let mut k1 = vec![0.0f64; m * n];
             rmath64::matmul_f64(m, k, n, &a_sum, &b_sum, &mut k1);
             rmath64::matmul_f64(m, k, n, ar, br, &mut ar_br);
             rmath64::matmul_f64(m, k, n, ai, bi, &mut ai_bi);
-            for l in 0..m * n {
-                cr[l] = ar_br[l] - ai_bi[l];
-                ci[l] = k1[l] - ar_br[l] - ai_bi[l];
-            }
+            combine::sub_f64(&ar_br, &ai_bi, cr);
+            combine::sub3_f64(&k1, &ar_br, &ai_bi, ci);
         }
     }
 }
@@ -653,5 +639,414 @@ mod perf {
              合计速率就是单条速率 ⇒ 那种口径下 direct≈0.95、karat≈1.12（见物理效率比）"
         );
         println!("线程数：本模块是**串行核心**（未自动多线程；多线程由调用方按分平面切）");
+    }
+}
+
+/// **B0：组合步的向量化实现**（LASX intrinsic；标量只用于非 8/4 倍数的尾部）。
+///
+/// 目标：让整条链路（打包 → 实矩阵乘 → **组合**）**都没有标量回退**，使"完全 SIMD"这句话站得住。
+/// 这里只做逐元素 `a−b` / `a+b` / `a−b−c` 三种；**逐位**必须与标量版一致（IEEE 下同一次运算）——
+/// 由 `tests::combine_bit_exact_vs_scalar` 守着。
+pub mod combine {
+    use super::super::super::arch::lasx;
+    use std::arch::loongarch64::*;
+
+    /// 测试用开关：置 `true` 时组合步走**标量**实现（只用于同源 A/B；发布路径不读环境、
+    /// 不受影响——它是 `#[cfg(test)]` 的原子布尔）。
+    #[cfg(test)]
+    pub static FORCE_SCALAR: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[inline(always)]
+    fn scalar() -> bool {
+        #[cfg(test)]
+        {
+            FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// `out = a − b`（f32；8 元素/向量 + 标量尾）。
+    #[inline(never)]
+    pub fn sub_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] - b[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 8 <= n {
+            // SAFETY: 三段都有 ≥ l+8 个元素（靠上面 while 条件）；`lasx_xvfsub_s` 只做逐元素减法。
+            unsafe {
+                let va = lasx::load_f32x8(a.as_ptr().add(l));
+                let vb = lasx::load_f32x8(b.as_ptr().add(l));
+                let vr = lasx_xvfsub_s(va, vb);
+                lasx::store_f32x8(out.as_mut_ptr().add(l), vr);
+            }
+            l += 8;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] - b[l2];
+        }
+    }
+
+    /// `out = a + b`（f32）。
+    #[inline(never)]
+    pub fn add_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] + b[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 8 <= n {
+            // SAFETY: 同 `sub_f32`。
+            unsafe {
+                let va = lasx::load_f32x8(a.as_ptr().add(l));
+                let vb = lasx::load_f32x8(b.as_ptr().add(l));
+                let vr = lasx_xvfadd_s(va, vb);
+                lasx::store_f32x8(out.as_mut_ptr().add(l), vr);
+            }
+            l += 8;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] + b[l2];
+        }
+    }
+
+    /// `out = a − b − c`（f32；两个向量减法都在寄存器里）。
+    #[inline(never)]
+    pub fn sub3_f32(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n && c.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] - b[l] - c[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 8 <= n {
+            // SAFETY: 同 `sub_f32`；两次 `xvfsub` 全在向量寄存器里。
+            unsafe {
+                let va = lasx::load_f32x8(a.as_ptr().add(l));
+                let vb = lasx::load_f32x8(b.as_ptr().add(l));
+                let vc = lasx::load_f32x8(c.as_ptr().add(l));
+                let vr = lasx_xvfsub_s(lasx_xvfsub_s(va, vb), vc);
+                lasx::store_f32x8(out.as_mut_ptr().add(l), vr);
+            }
+            l += 8;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] - b[l2] - c[l2];
+        }
+    }
+
+    /// `out = a − b`（f64；4 元素/向量 + 标量尾）。
+    #[inline(never)]
+    pub fn sub_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] - b[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 4 <= n {
+            // SAFETY: 三段都有 ≥ l+4 个元素。
+            unsafe {
+                let va = lasx::load_f64x4(a.as_ptr().add(l));
+                let vb = lasx::load_f64x4(b.as_ptr().add(l));
+                let vr = lasx_xvfsub_d(va, vb);
+                lasx::store_f64x4(out.as_mut_ptr().add(l), vr);
+            }
+            l += 4;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] - b[l2];
+        }
+    }
+
+    /// `out = a + b`（f64）。
+    #[inline(never)]
+    pub fn add_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] + b[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 4 <= n {
+            // SAFETY: 同 `sub_f64`。
+            unsafe {
+                let va = lasx::load_f64x4(a.as_ptr().add(l));
+                let vb = lasx::load_f64x4(b.as_ptr().add(l));
+                let vr = lasx_xvfadd_d(va, vb);
+                lasx::store_f64x4(out.as_mut_ptr().add(l), vr);
+            }
+            l += 4;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] + b[l2];
+        }
+    }
+
+    /// `out = a − b − c`（f64）。
+    #[inline(never)]
+    pub fn sub3_f64(a: &[f64], b: &[f64], c: &[f64], out: &mut [f64]) {
+        let n = out.len();
+        assert!(a.len() >= n && b.len() >= n && c.len() >= n);
+        if scalar() {
+            for l in 0..n {
+                out[l] = a[l] - b[l] - c[l];
+            }
+            return;
+        }
+        let mut l = 0;
+        while l + 4 <= n {
+            // SAFETY: 同 `sub_f64`。
+            unsafe {
+                let va = lasx::load_f64x4(a.as_ptr().add(l));
+                let vb = lasx::load_f64x4(b.as_ptr().add(l));
+                let vc = lasx::load_f64x4(c.as_ptr().add(l));
+                let vr = lasx_xvfsub_d(lasx_xvfsub_d(va, vb), vc);
+                lasx::store_f64x4(out.as_mut_ptr().add(l), vr);
+            }
+            l += 4;
+        }
+        for l2 in l..n {
+            out[l2] = a[l2] - b[l2] - c[l2];
+        }
+    }
+}
+
+#[cfg(test)]
+mod b0_tests {
+    use super::combine;
+    use super::*;
+
+    /// **B0 位精确**：向量组合（LASX）与**标量**实现**逐位一致**（`a−b`/`a+b`/`a−b−c`，f32/f64）。
+    /// 长度覆盖 8/4 的整倍数与**尾部**（`n=1..40` 全扫）。
+    #[test]
+    fn combine_bit_exact_vs_scalar() {
+        use std::sync::atomic::Ordering;
+        for n in 1..=40usize {
+            let a: Vec<f32> = (0..n).map(|i| ((i % 17) as f32) * 0.125 - 1.0).collect();
+            let b: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.0625 - 0.5).collect();
+            let c: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.25 - 1.25).collect();
+            let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+            // 向量（默认）
+            combine::FORCE_SCALAR.store(false, Ordering::Relaxed);
+            let (mut vr1, mut vr2, mut vr3) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+            combine::sub_f32(&a, &b, &mut vr1);
+            combine::add_f32(&a, &b, &mut vr2);
+            combine::sub3_f32(&a, &b, &c, &mut vr3);
+            let (v1, v2, v3) = (bits(&vr1), bits(&vr2), bits(&vr3));
+            // 标量（强制）
+            combine::FORCE_SCALAR.store(true, Ordering::Relaxed);
+            let (mut sr1, mut sr2, mut sr3) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+            combine::sub_f32(&a, &b, &mut sr1);
+            combine::add_f32(&a, &b, &mut sr2);
+            combine::sub3_f32(&a, &b, &c, &mut sr3);
+            combine::FORCE_SCALAR.store(false, Ordering::Relaxed);
+            assert_eq!(v1, bits(&sr1), "f32 sub 不逐位（n={n}）");
+            assert_eq!(v2, bits(&sr2), "f32 add 不逐位（n={n}）");
+            assert_eq!(v3, bits(&sr3), "f32 sub3 不逐位（n={n}）");
+
+            // f64（4 元素/向量）
+            let a64: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+            let b64: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+            let c64: Vec<f64> = c.iter().map(|&x| x as f64).collect();
+            let bits64 = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+            let (mut vd1, mut vd2, mut vd3) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n]);
+            combine::sub_f64(&a64, &b64, &mut vd1);
+            combine::add_f64(&a64, &b64, &mut vd2);
+            combine::sub3_f64(&a64, &b64, &c64, &mut vd3);
+            let (w1, w2, w3) = (bits64(&vd1), bits64(&vd2), bits64(&vd3));
+            combine::FORCE_SCALAR.store(true, Ordering::Relaxed);
+            let (mut sd1, mut sd2, mut sd3) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n]);
+            combine::sub_f64(&a64, &b64, &mut sd1);
+            combine::add_f64(&a64, &b64, &mut sd2);
+            combine::sub3_f64(&a64, &b64, &c64, &mut sd3);
+            combine::FORCE_SCALAR.store(false, Ordering::Relaxed);
+            assert_eq!(w1, bits64(&sd1), "f64 sub 不逐位（n={n}）");
+            assert_eq!(w2, bits64(&sd2), "f64 add 不逐位（n={n}）");
+            assert_eq!(w3, bits64(&sd3), "f64 sub3 不逐位（n={n}）");
+        }
+    }
+
+    /// **B0 边界形状**：向量组合替换后，8 个形状（含 `k=1`/`n=1`/不整除/非 4 倍/非 32 倍）仍过。
+    #[test]
+    fn shapes_still_pass_after_vector_combine() {
+        const SH: [(usize, usize, usize); 8] = [
+            (1, 1, 1),
+            (1, 5, 1),
+            (7, 1, 3),
+            (6, 3, 5),
+            (13, 7, 9),
+            (17, 4, 33),
+            (64, 64, 64),
+            (100, 51, 97),
+        ];
+        let data = |n: usize| -> (Vec<f32>, Vec<f32>) {
+            (
+                (0..n).map(|i| ((i % 17) as f32) * 0.125 - 1.0).collect(),
+                (0..n).map(|i| ((i % 13) as f32) * 0.0625 - 0.5).collect(),
+            )
+        };
+        for &(m, k, n) in &SH {
+            let (ar, ai) = data(m * k);
+            let (br, bi) = data(k * n);
+            let (mut cr, mut ci) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            cmatmul_f32_into(m, k, n, &ar, &ai, &br, &bi, &mut cr, &mut ci);
+            let (rr, ri) = cmatmul_ref_f32(m, k, n, &ar, &ai, &br, &bi);
+            let mut worst = 0.0f32;
+            for l in 0..m * n {
+                worst = worst.max((cr[l] - rr[l]).abs() / rr[l].abs().max(1.0));
+                worst = worst.max((ci[l] - ri[l]).abs() / ri[l].abs().max(1.0));
+            }
+            assert!(
+                worst < 1e-4,
+                "形状 {m}×{k}×{n} 在向量组合下误差过大：{worst:e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod b0_perf {
+    use super::combine;
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    /// **B0 同源 A/B（默认 `#[ignore]`）**：组合步 **标量** vs **向量（LASX）**——
+    /// 整条复数链路（Karatsuba）为负载，同进程交替 ≥5 对丢首对，报 ms/复数 GFLOP·s/
+    /// 与"3 条实矩阵乘"的成本比/`iters`/`ms_max`/loadavg。
+    #[ignore = "B0 性能：组合步 标量 vs 向量"]
+    #[test]
+    fn diag_combine_scalar_vs_vector() {
+        let (m, k, n) = (192usize, 768usize, 3072usize);
+        let (ar, ai): (Vec<f32>, Vec<f32>) = (
+            (0..m * k)
+                .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+                .collect(),
+            (0..m * k)
+                .map(|i| ((i % 13) as f32) * 0.0625 - 0.5)
+                .collect(),
+        );
+        let (br, bi): (Vec<f32>, Vec<f32>) = (
+            (0..k * n)
+                .map(|i| ((i % 11) as f32) * 0.0625 - 0.75)
+                .collect(),
+            (0..k * n).map(|i| ((i % 7) as f32) * 0.125 - 0.5).collect(),
+        );
+        let (mut cr, mut ci) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+        let (mut real, mut real2) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+        let cx_flop = 8.0 * m as f64 * k as f64 * n as f64;
+        let mut rows: Vec<(f64, f64, f64, i32, f64, String)> = Vec::new();
+        for pair in 0..6 {
+            let mut t = [0.0f64; 3]; // 0 = 向量组合, 1 = 标量组合, 2 = 3 条实矩阵乘
+            let mut iters = 0i32;
+            let mut ms_max = 0.0f64;
+            for step in 0..3 {
+                let which = (pair + step) % 3;
+                combine::FORCE_SCALAR.store(which == 1, Ordering::Relaxed);
+                let mut cnt = 0i32;
+                let mut mx = 0.0f64;
+                let t0 = Instant::now();
+                while t0.elapsed().as_secs_f64() < 0.05 {
+                    let t1 = Instant::now();
+                    if which < 2 {
+                        cmatmul_f32_into_route(
+                            m,
+                            k,
+                            n,
+                            &ar,
+                            &ai,
+                            &br,
+                            &bi,
+                            &mut cr,
+                            &mut ci,
+                            Route::Karatsuba,
+                        );
+                    } else {
+                        rmath::matmul_f32(m, k, n, &ar, &br, &mut real);
+                        rmath::matmul_f32(m, k, n, &ai, &bi, &mut real2);
+                        rmath::matmul_f32(m, k, n, &ar, &bi, &mut real);
+                    }
+                    let d = t1.elapsed().as_secs_f64();
+                    if d > mx {
+                        mx = d;
+                    }
+                    cnt += 1;
+                }
+                combine::FORCE_SCALAR.store(false, Ordering::Relaxed);
+                t[which] = t0.elapsed().as_secs_f64() / cnt.max(1) as f64;
+                iters = cnt;
+                if mx > ms_max {
+                    ms_max = mx;
+                }
+            }
+            let l1 = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+                .unwrap_or_default();
+            rows.push((t[0], t[1], t[2], iters, ms_max * 1e3, l1));
+        }
+        let med = |i: usize| -> f64 {
+            let mut v: Vec<f64> = rows[1..]
+                .iter()
+                .map(|r| match i {
+                    0 => r.0,
+                    1 => r.1,
+                    _ => r.2,
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (vv, vs, vr) = (med(0), med(1), med(2));
+        for (i, r) in rows.iter().enumerate() {
+            println!(
+                "pair{} vector={:.4}ms scalar={:.4}ms real3={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                i + 1,
+                r.0 * 1e3,
+                r.1 * 1e3,
+                r.2 * 1e3,
+                r.3,
+                r.4,
+                r.5,
+                if i == 0 { " (dropped)" } else { "" }
+            );
+        }
+        println!(
+            "中位：向量组合 {:.4} ms（{:.1} 复数 GFLOP/s）｜标量组合 {:.4} ms（{:.1}）｜3 条实乘 {:.4} ms",
+            vv * 1e3,
+            cx_flop / vv / 1e9,
+            vs * 1e3,
+            cx_flop / vs / 1e9,
+            vr * 1e3
+        );
+        println!(
+            "组合步收益 = {:.2}%（标量→向量）；复数版 vs 3 条实乘成本比 = {:.2}×",
+            (vs - vv) / vs * 100.0,
+            vv / vr
+        );
+        println!("线程数：串行核心（未自动多线程）");
     }
 }
