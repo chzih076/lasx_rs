@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**285 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**289 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,6 +342,13 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
+- **超越函数 recon 4 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**原型、opt-in、不改默认**）：
+  `table_size_report`（共享表 **129 项 × 16 B = 2064 B**）、`accuracy_vs_libm`（(b) 表+多项式
+  绝对 2.37e-10 / 掩码相对 1.39e-6 / f32 ULP 16；**(c) 等距递推 1.36e-17 / 5.47e-14 / ULP 0**）、
+  诊断 `#[ignore]` `diag_kernel_construction_three_routes`（**递推 0.20×（快 5.1×）、表+多项式
+  1.45×（更慢）**）与 `diag_kernel_share_small_and_large_nb`（核占比 **61.7%（小 NB）/77.1%（大 NB）**，
+  递推路线推算改后 **−49.7% / −62.1%**）。决策与注解草案见 `docs/dev.md` §9.5，数据见
+  `docs/ops.md` §9.10。
 - **C 阶 4 个**（2026-10-16）：`ops::cmatmul::c_tests::{c_dsl_bitwise_same_as_direct, c_dsl_length_check}`
   （**DSL 表面 `CMat::mul_into` 与直接调用逐位一致** + 长度校验返回 `None`）、
   `laplace::c_route_tests::complex_route_matches_old_within_tolerance`（**正向"一次复数乘"与旧
@@ -414,7 +421,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 285 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 289 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -3093,6 +3100,38 @@ OpenBLAS 多线程非常强：f32 512³/1024³/2048³ 在 12 线程下是 305.8 
 
 结论：**2 的幂的 `n` 会惩罚跨距访问**（冲突缺失），打包路径免疫。这也是把 `PACK_MIN_K`
 下调到 64 之后 2 的幂形状收益特别大的原因。
+
+### 9.5 DSL 能知道什么 / 不能知道什么（超越函数优化决策，2026-10-16）
+
+**能知道**（已由实现验证）：**形状**——类型级、编译期可查（`CMat<R,K>` 乘 `CMat<K,N>` ⇒ `CMat<R,N>`，
+形状不匹配**编不过**，见 `docs/ops.md` §9.07 的 `compile_fail` doctest）。
+**不能知道**：**取值范围**。类型里没有"这个缓冲的数值落在 `[lo,hi]`"的信息，编译器也没有。
+⇒ **"编译期分析查表精度与范围并应用"必须先有显式范围声明**，否则是**空话**。
+
+**注解草案**（仅为草案，本轮**不实现**）：
+
+```rust
+// 方案 A：属性式（挂在 let/参数上）
+#[range(lo = 0.0, hi = 6.28, ulp = 1e-6)]
+let x = /* 输入缓冲 */;
+
+// 方案 B：类型级（范围进类型参数）
+let x: Ranged<f32, -4, 4, 1e-6> = /* … */;
+```
+
+**"编译期检查声明与生成代码一致"**（这条是草案能否成立的关键）：
+1. 由声明**推导**表长/归约区间/多项式阶数 ⇒ **在 `const` 上下文中生成**表与常量（与本轮
+   `static COS_SIN_TAB` 的做法一致：`const fn`、零运行时初始化）；
+2. 生成代码里**带上声明**（例如断言 `|x| ≤ hi` 的 `debug_assert` 或编译期常量），
+   **声明与实际不匹配时编译失败或运行期断言失败**——**没有这一步，注解就只是注释**；
+3. 超出声明范围时必须**回退到 `libm` 路径**（默认路线），**不许静默用错表**。
+
+**结论（是否值得扩语法）**：本轮数据显示**核构造是主导（62–77%）**、且**递推路线快 5.1×**，
+所以"优化核"**有收益**；但**收益来自"等距递推"这个数学结构**（`t_i` 等距），
+**不是来自"编译期知道范围"**——表驱动路线（(b)）本轮**更慢（1.45×）**。
+⇒ **建议：暂不扩 DSL 语法**；先把"递推核 + opt-in 契约"落成库内可选入口（下一轮），
+等有**真实用户场景**证明"范围声明能带来额外收益"（例如 `ω·Δt` 大时的表驱动优于递推）再议。
+详见 `docs/ops.md` §9.10。
 
 ---
 

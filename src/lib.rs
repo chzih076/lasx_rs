@@ -100,6 +100,8 @@ compile_error!(
 pub mod aligned;
 pub mod api;
 pub mod arch;
+/// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。
+pub mod fast_trig;
 pub mod ffi;
 /// **逆拉普拉斯变换**（Dubner–Abate + 跳变扣除；指数和仍用公式 DSL 表达）——见 [`ilaplace`]。
 pub mod ilaplace;
