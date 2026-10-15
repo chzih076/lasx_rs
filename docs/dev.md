@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**244 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**249 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -324,6 +324,10 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   （`Mat::prepare()` hoist + `Prepared::apply_into`）vs 手动最优，同进程交替；改前/改后见 ⑫。
 - DSL 补测 1 个（`#[ignore]`）：`parallel::diag_dsl_pick_shapes`——宽薄/小形状上"改前 `Blocked`
   vs 改后 `pick_rows`"的**同进程交替**（靠 `LASX_SHAPE_OLD_PICK` 翻转），每轮位精确断言；见 ⑫。
+- **拉普拉斯实战 5 个**（`src/laplace.rs`，2026-10-15 加，**CI 跑**）：3 组解析对照（`1↔1/s`、
+  `e^{-at}↔1/(s+a)`、`sin(ω₀t)↔ω₀/(s²+ω₀²)`，f32/f64 **实虚部都比**）+ 加密收敛（固定 `T`、
+  `Δt` 减半 ⇒ 误差 ~4× 下降，即梯形 `O(Δt²)`）+ 边界（`ω=0 ⇒ 虚部恒 0`、`s=0` 的截断和口径、
+  小 `N` 不出 NaN）+ **位精确**（DSL 路径与 `api::matmul` 行切参考逐位一致）；用法见 `docs/ops.md` §9.0。
 - 池契约 2 个：`shape::pool_init_tests::small_shapes_do_not_construct_a_pool`（**CI 跑**，线程本地
   建池计数 + "计数器活着"的正对照，见 ⑫）与 `pool::global_pool_contract_tests::init_global_first_use_then_frozen`
   （`#[ignore]`，需 `--test-threads=1` 串行跑：首次成功 / 之后 `false` / 线程数 = 物理核）。
@@ -361,7 +365,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 244 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 249 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

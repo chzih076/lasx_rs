@@ -49,7 +49,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 244 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 249 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -123,8 +123,10 @@ lasx_free(a, n);                                     /* 与 lasx_alloc 配对；
 > **公式 DSL 的复用提示**：`matmul!` 的 `mul_into` 每次调用都会重新打包 `B`；层循环里复用同一
 > 权重时应把准备阶段 hoist 出循环（256³ 实测 **143.7 µs → 96.5–99.1 µs**，与直接池化持平）。
 > **DSL 已支持在公式里直接复用 plan**——右操作数**不写方括号**即为 `Prepared`：
-> `let p = w.prepare(); … matmul!(y[M, N] = x[M, K] * p);` 生成 `p.apply_into(&x, &mut y)`，
-> 与手写 hoist 逐位一致（`to_bits()` 比对）；带方括号的旧写法 `w[K, N]` 行为完全不变。
+> `let p = w.prepare(); … matmul!(y[M, N] = x[M, K] * p);` 生成 `p.apply_into(&x, &mut y)`，> 与手写 hoist 逐位一致（`to_bits()` 比对）；带方括号的旧写法 `w[K, N]` 行为完全不变。
+> **实战例子（2026-10-15 加）**：**用 DSL 做单边数值拉普拉斯变换**——`Re F = Kc·f`、`Im F = -Ks·f`
+> 两条矩阵乘，**一次调用算一批信号**：`cargo run --release --example laplace`（解析对照误差
+> 1e-6…1e-3、加密收敛 ~4×/Δt 减半、DSL **368 GFLOP/s**）。用法与限制见 [docs/ops.md](docs/ops.md) §9.0。
 > 完整用法与 RoPE 上的同类收益见 [docs/ops.md](docs/ops.md)。
 > **标量列口径**：`+lasx` 下 LLVM 会把标量参考**自动向量化**，故 matmul 表中的 3.3–4.7× 表示
 > "手写 intrinsic vs 编译器自动向量化"，并非"vs 朴素循环"。

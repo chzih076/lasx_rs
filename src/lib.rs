@@ -101,6 +101,8 @@ pub mod aligned;
 pub mod api;
 pub mod arch;
 pub mod ffi;
+/// **单边数值拉普拉斯变换**（用公式 DSL 表达的批量矩阵乘）——见 [`laplace`] 模块文档。
+pub mod laplace;
 mod ops;
 pub mod parallel;
 pub mod plan;
