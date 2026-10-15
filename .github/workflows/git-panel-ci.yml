@@ -28,3 +28,14 @@ jobs:
       # 变红而 build/test/clippy 全绿——这类回归只能由 rustdoc 自己抓到（实测：全工作区几秒）。
       - name: Rustdoc (zero warnings guard)
         run: RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --workspace
+      # **ABI 门禁**（2026-10-15 加）：对外实际分发的是 **cdylib**，而 `doccheck` ③ 比的是
+      # "**源码里 `pub extern "C" fn lasx_*` 的个数**"——若某个符号被改名、漏 `#[no_mangle]`、
+      # 或被链接器丢掉，**源码计数仍然一致**，只有数**产物**才抓得到。故这里直接数 `.so` 的
+      # 动态符号表，并与 `docs/ops.md` §1 记录的导出符号数对比。
+      - name: ABI symbol count (cdylib vs documented)
+        run: |
+          so=target/release/liblasx_rs.so
+          n=$(nm -D "$so" | grep -c ' T lasx_')
+          d=$(grep -oE '[0-9]+ 个导出符号' docs/ops.md | head -1 | grep -oE '[0-9]+')
+          echo "cdylib 导出 lasx_* = $n；docs/ops.md §1 记 = $d"
+          [ "$n" = "$d" ] || { echo "::error::ABI 导出符号数与文档不一致"; exit 1; }
