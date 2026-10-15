@@ -132,6 +132,14 @@ live in the respective design sections.
 > **Who we compare against (must read)**: the opponent is **OpenBLAS 0.3.34, `DYNAMIC_ARCH`,
 > core `la464` (a LoongArch-optimised kernel, *not* the generic C fallback), `NO_AFFINITY`**;
 > every harness run prints its full identity (`OBIDENT`) as the first line.
+> **The official convention is now same-process call-level alternation** (2026-10-15; rationale: a
+> SIMD library's performance *is* "how long a call takes on the same data inside one process";
+> cross-process runs fold in process start-up, per-process pool creation, scheduling and other
+> tenants). **Under it, 12 threads is now sealed at ≥300 GFLOP/s**: the `plan` path (caller-resident
+> threads + dynamic claiming + short spin) measures **310.99 G median (2.9132 ms, range
+> 2.8763–3.0358, grade-A window)**, vs OpenBLAS **357.22 G** in the same alternating run (13% apart).
+> **Older cross-process figures (e.g. 274 G) are reference/legacy only** — do not draw conclusions
+> from them.
 > **The call model matters just as much**: the "tie / a few percent behind" figures above are for
 > **"caller-driven (plan + the caller's own threads)"**. The **library-managed convenience path
 > (`lasx_matmul_run_threaded`) is now ≈1.02–1.05× the manual optimum** (same-process alternating:

@@ -523,6 +523,60 @@ static void usage(const char *argv0) {
             argv0, argv0, argv0);
 }
 
+/* **`--impl=alt`：同进程调用级交替 A/B（2026-10-15 口径变更后的"正式对照"）**
+ *
+ * 口径理由（`docs/dev.md §6.4`）：SIMD 库的性能是"同一进程、同一份数据上，调它它干多久"；
+ * 跨进程（分次运行）会把进程启动、每进程建池、调度、他人干扰都掺进来 ⇒ 那不是库的性能。
+ *
+ * 本模式：三臂（`plan` = 调用方常驻线程；`threaded` = 库自管、池缓存在 plan 内；`openblas`）
+ * 在**同一进程、同一批缓冲**上**调用级交替**（每"对"按轮换次序各跑一遍三臂，≥6 对、丢首对）；
+ * 计时前做**双检查**：① 三臂输出互相在 `--tol` 内；② `plan` 臂与**串行参考**
+ * （`lasx_matmul_run` 一次调用覆盖整个 m = 纯串行内核）**逐位一致**。
+ */
+static double alt_med(double *v, int n, double *mx) {
+    *mx = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (v[i] > *mx) {
+            *mx = v[i];
+        }
+    }
+    for (int i = 1; i < n; i++) { /* 插入排序（n 很小） */
+        const double k = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > k) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = k;
+    }
+    return v[n / 2];
+}
+
+/* 单臂计时：自适应到 ~80 ms（≥3 次）取中位数；`arm`: 0=plan 1=threaded 2=openblas */
+static double alt_time_arm(int arm, void *c, int *iters_out, double *ms_max_out) {
+    const int cap = 400;
+    double *s = malloc(sizeof(double) * (size_t)cap);
+    int n = 0;
+    double acc = 0.0;
+    while (n < cap && acc < 0.080) {
+        const double t0 = now_s();
+        if (arm == 0) {
+            run_lasx(c);
+        } else if (arm == 1) {
+            lasx_matmul_run_threaded(G_plan, G_m, (const float *)G_a, (float *)c, G_nt);
+        } else {
+            run_ob(c);
+        }
+        const double dt = now_s() - t0;
+        s[n++] = dt;
+        acc += dt;
+    }
+    *iters_out = n;
+    const double med = alt_med(s, n, ms_max_out);
+    free(s);
+    return med;
+}
+
 int main(int argc, char **argv) {
     const char *impl = NULL, *dtype = "f32";
     int iters = 0, threads = 1;
@@ -625,6 +679,8 @@ int main(int argc, char **argv) {
     const int do_lasx = impl && (!strcmp(impl, "lasx") || !strcmp(impl, "both"));
     const int do_ob = impl && (!strcmp(impl, "openblas") || !strcmp(impl, "both"));
     const int do_check = impl && !strcmp(impl, "both");
+    /* **`--impl=alt`**：同进程调用级交替（正式对照，见 `docs/dev.md §6.4`） */
+    const int do_alt = impl && !strcmp(impl, "alt");
     /* 测试模式（scan/verify）不需要 --impl，按各自的必填项校验 */
     if (G_mode_scan) {
         if (G_nms <= 0 || G_k <= 0 || G_n <= 0) {
@@ -636,7 +692,7 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 2;
         }
-    } else if ((!do_lasx && !do_ob) || G_m <= 0 || G_k <= 0 || G_n <= 0) {
+    } else if ((!do_lasx && !do_ob && !do_alt) || G_m <= 0 || G_k <= 0 || G_n <= 0) {
         usage(argv[0]);
         return 2;
     }
@@ -876,6 +932,126 @@ int main(int argc, char **argv) {
             JOIN_WORKERS();
             return 1;
         }
+    }
+
+    /* ---- **`--impl=alt`：同进程调用级交替 A/B（正式对照）** ---- */
+    if (do_alt) {
+        if (!G_split_tight || G_plan == NULL || G_is_f64) {
+            fprintf(stderr,
+                    "bench_openblas: --impl=alt 需要 f32 + `--split=plan-tight-dyn`（调用方常驻线程臂）\n");
+            JOIN_WORKERS();
+            return 2;
+        }
+        const int pairs = (iters > 0 ? iters : 6); /* 复用 --iters 表达"对数"，默认 6 */
+        void *CR = malloc(esz * cn);               /* 串行参考 */
+        void *CP = malloc(esz * cn);               /* plan 臂 */
+        void *CT = malloc(esz * cn);               /* threaded 臂 */
+        void *CO = malloc(esz * cn);               /* openblas 臂 */
+        /* 串行参考：一次 `lasx_matmul_run` 覆盖整个 m（纯串行内核） */
+        memset(CR, 0, esz * cn);
+        lasx_matmul_run(G_plan, G_m, (const float *)G_a, (float *)CR);
+
+        /* ---- 计时前**双检查** ---- */
+        memset(CP, 0, esz * cn);
+        run_lasx(CP); /* 调用方常驻线程臂 */
+        memset(CT, 0, esz * cn);
+        lasx_matmul_run_threaded(G_plan, G_m, (const float *)G_a, (float *)CT, G_nt);
+        memset(CO, 0, esz * cn);
+        run_ob(CO);
+        /* ② 我们两臂 vs **串行参考**必须逐位一致（位精确硬承诺） */
+        for (size_t i = 0; i < cn; i++) {
+            if (((const uint32_t *)CP)[i] != ((const uint32_t *)CR)[i]) {
+                fprintf(stderr, "bench_openblas: [alt] plan 臂与串行参考**不逐位**（i=%zu）\n", i);
+                return 1;
+            }
+            if (((const uint32_t *)CT)[i] != ((const uint32_t *)CR)[i]) {
+                fprintf(stderr, "bench_openblas: [alt] threaded 臂与串行参考**不逐位**（i=%zu）\n", i);
+                return 1;
+            }
+        }
+        /* ① 三臂互相在 tol 内（对手与本库算的是同一个东西） */
+        double worst = 0.0;
+        for (size_t i = 0; i < cn; i++) {
+            const double r = (double)((const float *)CR)[i];
+            const double o = (double)((const float *)CO)[i];
+            const double d = fabs(r - o) / (fabs(r) > 1.0 ? fabs(r) : 1.0);
+            if (d > worst) {
+                worst = d;
+            }
+        }
+        printf("ALTCHECK serial_vs_plan=bitexact serial_vs_threaded=bitexact "
+               "serial_vs_openblas_maxrel=%.3e tol=%.1e ok=%s\n",
+               worst, tol, worst <= tol ? "yes" : "no");
+        fflush(stdout);
+        if (worst > tol) {
+            fprintf(stderr, "bench_openblas: [alt] 先验一致性不通过 ⇒ 拒绝进入计时\n");
+            return 1;
+        }
+
+        const char *names[3] = {"plan", "threaded", "openblas"};
+        double *pair_med[3] = {malloc(sizeof(double) * (size_t)pairs), NULL, NULL};
+        pair_med[1] = malloc(sizeof(double) * (size_t)pairs);
+        pair_med[2] = malloc(sizeof(double) * (size_t)pairs);
+        int *pair_iters[3] = {malloc(sizeof(int) * (size_t)pairs), NULL, NULL};
+        pair_iters[1] = malloc(sizeof(int) * (size_t)pairs);
+        pair_iters[2] = malloc(sizeof(int) * (size_t)pairs);
+        double *pair_mx[3] = {malloc(sizeof(double) * (size_t)pairs), NULL, NULL};
+        pair_mx[1] = malloc(sizeof(double) * (size_t)pairs);
+        pair_mx[2] = malloc(sizeof(double) * (size_t)pairs);
+        for (int p = 0; p < pairs; p++) {
+            /* 逐对轮换起跑次序 ⇒ 顺序效应被摊平 */
+            for (int k = 0; k < 3; k++) {
+                const int arm = (p + k) % 3;
+                const int it = 0;
+                double mx = 0.0;
+                (void)it;
+                pair_med[arm][p] = alt_time_arm(arm, arm == 0 ? CP : (arm == 1 ? CT : CO),
+                                                &pair_iters[arm][p], &mx);
+                pair_mx[arm][p] = mx * 1e3;
+            }
+            FILE *lf = fopen("/proc/loadavg", "r");
+            double l1 = 0.0;
+            if (lf) {
+                if (fscanf(lf, "%lf", &l1) != 1) {
+                    l1 = 0.0;
+                }
+                fclose(lf);
+            }
+            printf("ALTPAIR p=%d loadavg1=%.2f grade=%c%s%s\n", p + 1, l1,
+                   l1 <= 3.0 ? 'A' : (l1 <= 4.5 ? 'B' : 'C'), p == 0 ? " (dropped)" : "", "");
+            fflush(stdout);
+        }
+        const double flop = 2.0 * (double)G_m * (double)G_k * (double)G_n;
+        for (int a = 0; a < 3; a++) { /* 丢首对：用后 (pairs-1) 对 */
+            const int n = pairs - 1;
+            double *v = malloc(sizeof(double) * (size_t)n);
+            for (int i = 0; i < n; i++) {
+                v[i] = pair_med[a][i + 1];
+            }
+            double mx = 0.0;
+            const double med = alt_med(v, n, &mx);
+            double mn = v[0];
+            for (int i = 1; i < n; i++) {
+                if (v[i] < mn) {
+                    mn = v[i];
+                }
+            }
+            double itmax = 0.0;
+            for (int i = 0; i < n; i++) {
+                if (pair_mx[a][i + 1] > itmax) {
+                    itmax = pair_mx[a][i + 1];
+                }
+            }
+            printf("ALTROW arm=%s ms_med=%.4f ms_min=%.4f ms_max=%.4f gflops=%.2f pairs=%d "
+                   "iters_first=%d iters_last=%d ms_max_seen=%.3f\n",
+                   names[a], med * 1e3, mn * 1e3, mx * 1e3, flop / med / 1e9, n,
+                   pair_iters[a][1], pair_iters[a][n], itmax);
+            free(v);
+        }
+        printf("ALTNOTE 口径：同进程调用级交替、丢首对、各臂中位数；`ms_min` 只作上界参考\n");
+        fflush(stdout);
+        JOIN_WORKERS();
+        return 0;
     }
 
     /* ---- 计时：先热身 1 次，再按同一迭代数取样（第 1 条）---- */
