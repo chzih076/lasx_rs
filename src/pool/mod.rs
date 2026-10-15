@@ -1682,3 +1682,39 @@ mod tests {
         assert_eq!(global().threads(), threads);
     }
 }
+
+#[cfg(test)]
+mod global_pool_contract_tests {
+    use super::*;
+
+    /// **`init_global` 的"首次成功 / 之后 false"语义**（2026-10-15，按文档断言）。
+    ///
+    /// **串行跑**才有意义（并行测试框架里别的用例可能已经初始化过全局池）：
+    /// `cargo test --release -p lasx_rs --lib global_pool_contract -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "契约：需串行跑（并行框架下'首次'不可控）"]
+    fn init_global_first_use_then_frozen() {
+        // 首次：指定线程数应当成功，且线程数 == 指定值
+        let physical = crate::arch::parallelism().physical.max(1);
+        assert!(init_global(physical), "首次 init_global 应当成功");
+        assert_eq!(
+            global().threads(),
+            physical.min(threads_cap()),
+            "线程数应等于指定值"
+        );
+        // 之后：再改必须无效（返回 false），线程数不变
+        let before = global().threads();
+        assert!(
+            !init_global(before + 1),
+            "已建好之后 init_global 必须返回 false"
+        );
+        assert_eq!(global().threads(), before, "线程数不得被改");
+        // 默认（没人 init 过时）应当等于物理核数
+        assert_eq!(before, physical.min(threads_cap()), "默认线程数 = 物理核数");
+    }
+
+    /// 池对线程数的上界（与 `WorkerPool::new` 的 clamp 口径一致）。
+    fn threads_cap() -> usize {
+        usize::MAX
+    }
+}

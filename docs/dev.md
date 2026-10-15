@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**241 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**244 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -322,6 +322,11 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   同进程 A/B**（"缓存进句柄" vs "每次现建池"，7 轮交替中位数）；结果见 ⑪ 的口径更正。
 - DSL 基线 1 个（`#[ignore]`）：`parallel::diag_dsl_vs_manual`——**实验 A**：DSL 生成代码那条路
   （`Mat::prepare()` hoist + `Prepared::apply_into`）vs 手动最优，同进程交替；改前/改后见 ⑫。
+- DSL 补测 1 个（`#[ignore]`）：`parallel::diag_dsl_pick_shapes`——宽薄/小形状上"改前 `Blocked`
+  vs 改后 `pick_rows`"的**同进程交替**（靠 `LASX_SHAPE_OLD_PICK` 翻转），每轮位精确断言；见 ⑫。
+- 池契约 2 个：`shape::pool_init_tests::small_shapes_do_not_construct_a_pool`（**CI 跑**，线程本地
+  建池计数 + "计数器活着"的正对照，见 ⑫）与 `pool::global_pool_contract_tests::init_global_first_use_then_frozen`
+  （`#[ignore]`，需 `--test-threads=1` 串行跑：首次成功 / 之后 `false` / 线程数 = 物理核）。
 
 > **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
 > **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
@@ -356,7 +361,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 241 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 244 个单元测试（+ 6 个宏单测 + 18 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -2069,9 +2074,21 @@ vs ② **手动最优**（`matmul_f32_plan` + 常驻池），**同进程交替 7
   以后只改一处**；两边注释互相指路。
 - **位精确**：`diag_dsl_vs_manual` 每轮断言两条路与 `api::matmul` 逐位一致；全量测试
   （含 shape/DSL 的位精确矩阵）全绿。
-- **未测项（如实标注）**：宽薄/小形状在 **DSL 路径**上的改前/改后**未单独测**（C 侧宽薄那几张表
-  走的是 C plan 路径、不受本次改动影响）；`pick_rows(256,12,4) = RowBlock`（静态）与旧写死的
-  `Blocked{24}` 不同，按上面 ⑩ 的阈值表静态在中形状更优 ⇒ 方向安全，但仍应补测。
+- **宽薄/小形状补测（已做，同进程交替 + 每轮位精确断言）**：`parallel::diag_dsl_pick_shapes` 在
+  同一进程里翻转 `LASX_SHAPE_OLD_PICK` 对比"改前 `Blocked`"与"改后 `pick_rows`"：
+
+| DSL 形状 | 改前 ms（G） | 改后 ms（G） | 改后/改前 | 判定（判据 ≥0.98 不退化） |
+|---|---|---|---|---|
+| 宽薄 `256×64×4096` | 0.4568（293.8） | **0.4223（317.8）** | **1.082×** | **反而快 8.2%（旧 `Blocked` 在宽薄上更差）** |
+| 小 `64×64×64` | 0.0079（66.8） | 0.0079（66.7） | 0.999× | 不退化（走单线程档） |
+| 小 `48×384×96` | 0.0516（68.6） | 0.0516（68.6） | 1.000× | 不退化 |
+
+  ⇒ **不需要按形状收窄阈值**（宽薄反而受益）——"方向安全"由测量确认，不是推理。
+- **池契约测试（两条，见 §4 清单）**：`small_shapes_do_not_construct_a_pool`（CI 跑；用**线程本地
+  建池计数**断言"小形状不初始化池"，并**另建一个池作正对照**证明计数器活着——**注意不能用
+  "大形状走过池"作正对照**：那走的是进程级全局池，可能早被别的线程建好，本线程计数不变，
+  本轮实测就踩了这个坑）；`init_global_first_use_then_frozen`（`#[ignore]`，**须
+  `--test-threads=1` 串行跑**才有意义：首次成功 / 之后返回 `false` / 线程数 = `parallelism().physical`）。
 
 **(B1) 便利层池缓存：同进程 +14.6%；并更正"2.15×"**
 

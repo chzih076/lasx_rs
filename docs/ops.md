@@ -807,6 +807,17 @@ println!("chunks={} ms_max={:.3}", stats.chunks, stats.ns_max as f64 / 1e6);
 - 位精确同 C 侧：这些入口与 `api::matmul` **逐位一致**（`src/plan.rs` 有逐位测试）。
 - 线程数语义：C 侧 `<=0` 自动、`1` 串行、`N` 夹到物理核；Rust 侧用
   `WorkerPool::new(n)` / `WorkerPool::auto()` 表达同一件事（**不读环境变量**）。
+- **全局池与"冻结"语义（2026-10-15 写清）**：Rust 侧 `pool::global()`（`shape`/DSL 路径默认用它）
+  是**进程级 `OnceLock`，建一次、永不销毁** ⇒ **线程数在首次使用时就冻住**。**谁触发冻结**：
+  第一次"够大"的 `shape` 调用（小形状走单线程档、**根本不初始化池**——有契约测试守着）。
+  **显式出口**：Rust 侧在首次使用前调 `pool::init_global(n)`（**首次成功、之后返回 `false`**，
+  有测试）；**C 侧不需要它**——`prepare`/`run_threaded` 的 `threads` 每次调用**显式给**，
+  便利层的池按该线程数缓存在 plan 句柄里、随 `plan_destroy` 析构。
+  **切分策略按形状自动选**（判据 `src/pool/sched.rs::pick_rows`，阈值表见 `docs/dev.md` §7.10 ⑩）：
+  大形状动态认领、其余静态/多块；**DSL/`shape` 路径与 C 侧装置共用这同一份判据**。
+  **未动 `docs/dev.md` §19.7 冻结接口**：冻结的是"池的行块闭包签名 + start/切片对应"、`shape::Prepared::apply*`
+  与 `Policy::threads`；本次只改**内部选哪个 `Pick`/句柄内部字段**，签名与 `Pick` 枚举都没变
+  （理由入档在 `docs/dev.md` §7.10 ⑫）。
 
 ### 4.7 融合缩放（1 个，2026-10-15 追加）
 

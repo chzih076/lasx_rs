@@ -656,13 +656,38 @@ impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> Prepared<P, T, 
         // `shape`（DSL/plan）路径与 C 侧装置**共用同一份判据**（`src/pool/sched.rs::pick_rows`），
         // 以后只改一处。旧实现写死 `Pick::Blocked { block_rows = per_thread }`：对中等形状
         // （LLM 那种 `per_thread` 十几行）实测比"静态/动态"都慢（§7.10 ⑩ 阈值表 + 实验 A 改前后）。
-        let pick = crate::pool::pick_rows(rows, threads, 4);
+        let pick = shape_pick(rows, threads, per_thread, 4);
         // 只读的 `a` 由闭包捕获、按 `start` 切片（见 pool 模块头"行块闭包的契约"）
         pool.for_each_row_block_mut_picked(rows, 4, [(c, N)], pick, |start, block, [cb]| {
             let ab = &a[start * K..(start + block) * K];
             self.plan.run_rows_into(ab, cb);
         });
     }
+}
+
+/// `shape`（DSL/plan）路径的切分策略：**公共判据** [`pick_rows`](crate::pool::pick_rows)。
+///
+/// 2026-10-15 起与 C 侧装置**共用同一份判据**（阈值表见 `docs/dev.md` §7.10 ⑩）：大形状动态、
+/// 其余静态/多块。**测试用开关**：`LASX_SHAPE_OLD_PICK=1` 时退回改动前"写死 `Blocked`"的策略
+/// ——只为"改前 vs 改后"的**同进程 A/B** 服务；发布构建恒 `false`、**不读环境变量**。
+fn shape_pick(rows: usize, threads: usize, per_thread: usize, gran: usize) -> crate::pool::Pick {
+    if old_pick_for_test() {
+        let block_rows = per_thread.div_ceil(gran) * gran;
+        return crate::pool::Pick::Blocked { block_rows };
+    }
+    crate::pool::pick_rows(rows, threads, gran)
+}
+
+/// 测试开关（见 [`shape_pick`]）：测试构建里读一次环境变量，发布构建里恒 `false`。
+#[cfg(test)]
+fn old_pick_for_test() -> bool {
+    std::env::var("LASX_SHAPE_OLD_PICK").is_ok()
+}
+
+/// 发布构建：恒 `false`（**不读环境变量**）。
+#[cfg(not(test))]
+fn old_pick_for_test() -> bool {
+    false
 }
 
 /// `alpha` 标量前缀（公式 DSL 的 `matmul!(y[M,N] = alpha * x[M,K] * w[K,N])`）落到这里。
@@ -1315,5 +1340,38 @@ mod tests {
         let mut y1 = MatBuf::<f32, { M }, { N }>::new();
         crate::matmul!(y1[M, N] = 1.0 * x[M, K] * w[K, N]);
         assert_eq!(bits_f32(y1.as_slice()), bits_f32(&plain), "alpha = 1 退化");
+    }
+}
+
+#[cfg(test)]
+mod pool_init_tests {
+    use super::*;
+
+    /// **小形状不初始化池**（2026-10-15）：DSL/`shape` 路径在"单线程档"直接返回
+    /// （`threads <= 1` 分支），**不该碰池**——用**线程本地建池计数**断言（并行测试安全）。
+    /// 反面对照：同一个测试里跑一个**够大**的形状，计数**必须增加**（否则这条断言是假绿）。
+    #[test]
+    fn small_shapes_do_not_construct_a_pool() {
+        let before = crate::pool::pool_ctors_this_thread();
+        // 小形状：`P::threads(64,64,64)` 判为单线程 ⇒ 不派活、不建池
+        let b = vec![0.25f32; 64 * 64];
+        let a = vec![0.5f32; 64 * 64];
+        let w = Mat::<f32, 64, 64>::new(&b).unwrap();
+        let x = Mat::<f32, 64, 64>::new(&a).unwrap();
+        let mut y = MatBuf::<f32, 64, 64>::new();
+        w.prepare().apply_into(&x, &mut y);
+        assert_eq!(
+            crate::pool::pool_ctors_this_thread(),
+            before,
+            "小形状不该初始化池（单线程档必须直接返回）"
+        );
+        // 正对照：**直接建一个池**，证明这个计数器本身是活的（否则上面那条断言可能是假绿）。
+        // 不能用"大形状走过池"当正对照：大形状用的是**进程级全局池**，它可能早已被别的线程
+        // 建好 ⇒ 本线程的建池计数**不会**增加（本轮实测就踩到了这个）。
+        let _probe = crate::pool::WorkerPool::new(2);
+        assert!(
+            crate::pool::pool_ctors_this_thread() > before,
+            "正对照失败：本线程建池后计数应当增加（计数器坏了）"
+        );
     }
 }

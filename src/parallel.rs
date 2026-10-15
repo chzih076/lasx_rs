@@ -1553,3 +1553,81 @@ fn diag_dsl_vs_manual() {
     );
     println!("DSL/手动 = {:.3}×（判据 ≥0.833× 算达标）", tm / td);
 }
+
+/// **(A) 补测：DSL 路径在"宽薄 / 小形状"上的改前 vs 改后**（默认 `#[ignore]`）。
+///
+/// 动机：`pick_rows(256,12,4) = RowBlock` 与旧写死的 `Blocked{24}` **不是同一个 `Pick`**，
+/// "方向安全"是推理不是测量 ⇒ 这里在同进程里**交替翻转** `LASX_SHAPE_OLD_PICK`
+/// （`shape.rs` 的测试开关），对每个形状给出改前/改后中位数。**判据先写死：不退化（±2%）**；
+/// 每一轮都对 DSL 结果与 `api::matmul` 做**位精确断言**。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_dsl_pick_shapes -- --ignored --nocapture`
+#[cfg(test)]
+#[ignore = "补测：DSL 路径宽薄/小形状的改前 vs 改后（同进程交替翻转开关）"]
+#[test]
+fn diag_dsl_pick_shapes() {
+    use crate::aligned::AlignedVec;
+    use crate::shape::{Mat, MatBuf};
+    use std::time::Instant;
+    const ROUNDS: usize = 5;
+
+    macro_rules! run_shape {
+        ($m:expr, $k:expr, $n:expr) => {{
+            let (m, k, n) = ($m, $k, $n);
+            let a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.125);
+            let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+            let w = Mat::<f32, { $k }, { $n }>::new(&b).unwrap();
+            let x = Mat::<f32, { $m }, { $k }>::new(&a).unwrap();
+            let mut out = MatBuf::<f32, { $m }, { $n }>::new();
+            let p = w.prepare();
+            let want = crate::api::matmul(m, k, n, &a, &b).unwrap();
+            let flop = 2.0 * m as f64 * k as f64 * n as f64;
+            let mut t_old = Vec::new();
+            let mut t_new = Vec::new();
+            for _ in 0..ROUNDS {
+                for old in [true, false] {
+                    // SAFETY: 测试体单线程；池 worker 不读该环境变量。翻转只影响下一次 dispatch。
+                    unsafe {
+                        if old {
+                            std::env::set_var("LASX_SHAPE_OLD_PICK", "1");
+                        } else {
+                            std::env::remove_var("LASX_SHAPE_OLD_PICK");
+                        }
+                    }
+                    let t0 = Instant::now();
+                    p.apply_into(&x, &mut out);
+                    let dt = t0.elapsed().as_secs_f64();
+                    assert_eq!(
+                        out.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "DSL 路径不逐位（形状 {m}×{k}×{n}，old={old}）"
+                    );
+                    if old {
+                        t_old.push(dt);
+                    } else {
+                        t_new.push(dt);
+                    }
+                }
+            }
+            // SAFETY: 测试体单线程（worker 不读环境变量）；恢复开关状态。
+            unsafe { std::env::remove_var("LASX_SHAPE_OLD_PICK") };
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let (to, tn) = (med(&mut t_old), med(&mut t_new));
+            println!(
+                "DSL {m}×{k}×{n}: 改前(Blocked) {:.4} ms({:.1} G) / 改后(pick_rows) {:.4} ms({:.1} G) \
+                 ⇒ 改后/改前 = {:.3}×（≥0.98 算不退化）",
+                to * 1e3,
+                flop / to / 1e9,
+                tn * 1e3,
+                flop / tn / 1e9,
+                to / tn
+            );
+        }};
+    }
+    run_shape!(256, 64, 4096); // 宽薄（C 侧那张表的形状）
+    run_shape!(64, 64, 64); // 小形状
+    run_shape!(48, 384, 96); // 小形状 + n 非 32 倍数
+}

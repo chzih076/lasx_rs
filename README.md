@@ -49,7 +49,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 241 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 244 个单元测试 + 6 个宏单测 + 18 个文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
@@ -101,9 +101,14 @@ lasx_free(a, n);                                     /* 与 lasx_alloc 配对；
 > **跟谁比（必读）**：对手是 **OpenBLAS 0.3.34、`DYNAMIC_ARCH`、core `la464`（LA64 优化内核，
 > **非**通用 C 兜底）、`NO_AFFINITY`**；装置每次对照的**第一行**都会打印它的完整身份（`OBIDENT`）。
 > **调用模型也必须一起看**：上面"打平/只差几个百分点"的数是**"调用方自己驱动（plan + 调用方线程）"
-> 这个模型**下的；**库自管线程的便利路径（`lasx_matmul_run_threaded`）在热循环里慢 2.15×**
-> （5.3131 vs 2.4671 ms），原因是**每次调用现建现拆线程池都进了计时** ⇒ 热循环请用
-> `plan` + 你自己的常驻线程（或 Rust 侧复用 `WorkerPool`）。
+> 这个模型**下的。**库自管线程的便利路径（`lasx_matmul_run_threaded`）现在 ≈1.02–1.05× 手动最优**
+> （同进程交替：池缓存进句柄后 **2.7038 ms / 335 G**，每次现建池是 3.0986 ms ⇒ 缓存 **+14.6%**）
+> ⇒ **快路径与便利层差距已经很小**。它的**新代价**（务必知道）：**同一 plan 上并发 `run_threaded`
+> 会共用同一个池 ⇒ 派活串行**（要真并行请用不同 plan，或 `parallel::*` + 自管池）；**`threads`
+> 变化会重建池**。
+> **旧数（受窗口影响，别用）**：早先写的"便利层慢 **2.15×**"（5.3131 vs 2.4671 ms）是**坏窗口的
+> 跨窗口读数**（同进程只有 2.70 ms）——按 `docs/dev.md` §6.4 的新规矩"**'差 N 倍'必须先同进程
+> 交替复核**"，该数已降级为旧账。
 > **旧口径（Rust 池路径）≈ 打平**：本库中位数 **2.64 ms**（样本 2.42–3.79，极差 **1.57×**）vs
 > OpenBLAS **2.63 ms**（样本 2.599–2.656，极差 **2%**）——那条线的"本库慢约 10%"早已撤回，
 > 但**它是 Rust 池口径、与本轮的 C ABI 切法不可并排比较**（两条线并列保留，处置见 `docs/dev.md` §7.10 ④）。
