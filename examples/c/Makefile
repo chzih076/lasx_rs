@@ -42,6 +42,10 @@ ifeq ($(strip $(PC_CFLAGS)$(PC_LIBS)),)
   $(info [make] 想用安装树：先 scripts/install.sh --prefix=<dir> 并设 PKG_CONFIG_PATH=<dir>/lib/pkgconfig)
   CFLAGS_USE := -I$(REPO)/include
   LIBS_USE   := -L$(REPO)/target/release -llasx_rs -Wl,-rpath,$(REPO)/target/release
+  # cargo 只产出 `liblasx_rs.so`，而产物的 **SONAME 是 `liblasx_rs.so.0`**：
+  # 运行时 loader 按 SONAME 找文件，所以"直接在 target/release 上链接"必须先补这个符号链接
+  # （这是真实会踩的坑；装到 prefix 时由 `scripts/install.sh` 负责建它）。
+  SONAME_LINK := $(REPO)/target/release/liblasx_rs.so.0
 else
   CFLAGS_USE := $(PC_CFLAGS)
   LIBS_USE   := $(PC_LIBS)
@@ -52,8 +56,16 @@ endif
 
 all: quickstart
 
-quickstart: quickstart.c
+quickstart: quickstart.c $(SONAME_LINK)
 	$(CC) $(CFLAGS) $(CFLAGS_USE) -o $@ $< $(LIBS_USE) -lm
+
+# 兜底分支才用得到：补齐 SONAME 需要的文件名（内容就是同一个文件）
+$(SONAME_LINK): $(REPO)/target/release/liblasx_rs.so
+	ln -sf liblasx_rs.so $@
+
+# 没构建过时给一句人话，而不是让 make 报 "No rule to make target"
+$(REPO)/target/release/liblasx_rs.so:
+	@echo "[make] 缺少 $@：请先在仓库根目录跑 \`cargo build --release\`" >&2; exit 1
 
 run: quickstart
 	$(RUN_ENV) ./quickstart
