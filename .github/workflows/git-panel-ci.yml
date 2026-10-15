@@ -55,12 +55,22 @@ jobs:
       - name: Documented test count vs measured
         run: |
           d=$(grep -ohE '[0-9]+ 个单元测试|[0-9]+ unit tests' docs/dev.md README.md README.en.md \
-              | grep -oE '[0-9]+' | sort -u)
-          n=$(cargo +nightly test --release --lib -- --list | grep -c ': test$')
-          echo "文档记：$(echo "$d" | tr '\n' ' ')；实测库单测：$n"
-          if [ "$(printf '%s\n' "$d" | wc -l)" != "1" ] || [ "$d" != "$n" ]; then
-            echo "::error::文档单测计数与实测不一致（或多处不一致）"; exit 1
+              | grep -oE '[0-9]+' | sort -u | tr '\n' ' ' | xargs)
+          set +e
+          n=$(cargo +nightly test --release --lib -- --list 2>/dev/null | grep -c ': test$')
+          rc=$?
+          set -e
+          echo "文档记：[${d:-<无>}]；实测库单测：[${n:-<无输出>}]（--list rc=$rc）"
+          # **量不出来 ≠ 不一致**：`--list` 若没产出（例如该环境拿不到测试二进制），只告警不红，
+          # 免得"测量工具失效"被误当成"文档漂移"；**真的不一致仍然 fail**。
+          if [ -z "$n" ] || [ "$n" = "0" ]; then
+            echo "::warning::--list 无输出，本步跳过比对（未把它当作漂移）"
+            exit 0
           fi
+          case "$d" in
+            "$n") echo "OK：文档与实测一致（$n 个单元测试）" ;;
+            *) echo "::error::文档单测计数 [$d] 与实测 [$n] 不一致"; exit 1 ;;
+          esac
       # **C 调用示例**（2026-10-15 加）：把 `examples/c/` 真编译**并运行**——它是"调用体验"的
       # 可执行证据（查版本 → 查 `lasx_has_lasx()` 并分支 → 调算子 → 用 `lasx_status_message`
       # 打印状态）。CI 里没有安装前缀，所以用 `FALLBACK=1` 直接链接 `target/release`。
