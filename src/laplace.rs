@@ -647,3 +647,194 @@ mod tests {
         );
     }
 }
+
+/// **C 阶：拉普拉斯正向的"一次复数矩阵乘"路线**（`Kc + i·Ks` 乘**实信号** `f`）。
+///
+/// 数学上 `(Kc + iKs)·(f + 0i) = Kc·f + i·Ks·f` ⇒ 与"两条实矩阵乘"**同值**，但**累加次序不同**
+/// ⇒ **只承诺容差**（不承诺与旧路线逐位一致）。f32 版本。
+pub fn laplace_batch_f32_complex_route<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    route: crate::cmatmul::Route,
+) -> (Vec<f32>, Vec<f32>) {
+    use crate::cmatmul::{CMat, CMatBuf};
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc64, ks64, _) = kernels64(sig, om, dt, N, Weighting::Trapezoid);
+    let kc: Vec<f32> = kc64.iter().map(|&v| v as f32).collect();
+    let ks: Vec<f32> = ks64.iter().map(|&v| v as f32).collect();
+    // f 是**实**信号 ⇒ 虚部全 0
+    let fi = vec![0.0f32; N * NB];
+    let a = CMat::<M, N>::new(&kc, &ks).expect("K = M×N");
+    let b = CMat::<N, NB>::new(f, &fi).expect("f = N×NB");
+    let mut c = CMatBuf::<M, NB>::zeros();
+    a.mul_into(&b, &mut c, route);
+    let im = c.im.iter().map(|&v| -v).collect();
+    (c.re, im)
+}
+
+#[cfg(test)]
+mod c_route_tests {
+    use super::*;
+
+    /// **C 阶：解析三组（f32）在复数路线下仍过**，且与旧路线（两条实乘）**容差内一致**。
+    #[test]
+    fn complex_route_matches_old_within_tolerance() {
+        const N: usize = 512;
+        const NB: usize = 2;
+        let dt = 0.02;
+        let sigs = [1.0f64, 1.0, 1.0, 1.0];
+        let oms = [0.0f64, 2.0, 0.0, 3.0];
+        let mut f = vec![0.0f32; N * NB];
+        for i in 0..N {
+            let t = i as f64 * dt;
+            f[i * NB] = 1.0;
+            f[i * NB + 1] = (-2.0 * t).exp() as f32;
+        }
+        let (old_re, old_im) = laplace_batch_f32::<4, N, NB>(&sigs, &oms, dt, &f);
+        for route in [
+            crate::cmatmul::Route::Direct,
+            crate::cmatmul::Route::Karatsuba,
+        ] {
+            let (new_re, new_im) =
+                laplace_batch_f32_complex_route::<4, N, NB>(&sigs, &oms, dt, &f, route);
+            let mut worst = 0.0f32;
+            for l in 0..4 * NB {
+                worst = worst.max((new_re[l] - old_re[l]).abs() / old_re[l].abs().max(1.0));
+                worst = worst.max((new_im[l] - old_im[l]).abs() / old_im[l].abs().max(1.0));
+            }
+            assert!(worst < 1e-4, "{route:?} 复数路线 vs 旧路线 差 {worst:e}");
+            // 解析对照：`F(s)=1/s`（**s 是复数**）⇒ Re = σ/(σ²+ω²)、Im = −ω/(σ²+ω²)
+            for (j, (&s, &w)) in sigs.iter().zip(oms.iter()).enumerate() {
+                let d = s * s + w * w;
+                let (want_re, want_im) = (s / d, -w / d);
+                assert!(
+                    (new_re[j * NB] as f64 - want_re).abs() / want_re < 5e-3,
+                    "{route:?} 1/s 实部 j={j}：{} vs {want_re}",
+                    new_re[j * NB]
+                );
+                if want_im.abs() > 1e-3 {
+                    assert!(
+                        (new_im[j * NB] as f64 - want_im).abs() / want_im.abs() < 5e-3,
+                        "{route:?} 1/s 虚部 j={j}：{} vs {want_im}",
+                        new_im[j * NB]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod c_perf {
+    use super::*;
+    use std::time::Instant;
+
+    /// **C 阶性能：旧路线（两条实矩阵乘）vs 一次复数矩阵乘**（同进程交替 ≥5 对、丢首对）。
+    #[ignore = "C 阶性能：两条实乘 vs 一次复数乘"]
+    #[test]
+    fn diag_laplace_two_real_vs_one_complex() {
+        const M: usize = 64;
+        const N: usize = 1024;
+        const NB: usize = 8;
+        let dt = 1.0 / 256.0;
+        let sigs: Vec<f64> = (0..M).map(|j| 0.5 + 0.01 * j as f64).collect();
+        let oms: Vec<f64> = (0..M).map(|j| (j % 16) as f64 * 0.25).collect();
+        let f = vec![1.0f32; N * NB];
+        let cx_flop = 2.0 * M as f64 * N as f64 * NB as f64; // 复数乘加按 2 个实数乘加计（这里只做 2 条实乘的工作量）
+        let mut rows: Vec<(f64, f64, f64, i32, f64, String)> = Vec::new();
+        for pair in 0..6 {
+            let mut t = [0.0f64; 3]; // 0=旧(2 实乘), 1=复数 Direct, 2=复数 Karatsuba
+            let mut iters = 0i32;
+            let mut ms_max = 0.0f64;
+            for step in 0..3 {
+                let which = (pair + step) % 3;
+                let mut cnt = 0i32;
+                let mut mx = 0.0f64;
+                let t0 = Instant::now();
+                while t0.elapsed().as_secs_f64() < 0.04 {
+                    let t1 = Instant::now();
+                    match which {
+                        0 => {
+                            let _ = laplace_batch_f32::<M, N, NB>(&sigs, &oms, dt, &f);
+                        }
+                        1 => {
+                            let _ = laplace_batch_f32_complex_route::<M, N, NB>(
+                                &sigs,
+                                &oms,
+                                dt,
+                                &f,
+                                crate::cmatmul::Route::Direct,
+                            );
+                        }
+                        _ => {
+                            let _ = laplace_batch_f32_complex_route::<M, N, NB>(
+                                &sigs,
+                                &oms,
+                                dt,
+                                &f,
+                                crate::cmatmul::Route::Karatsuba,
+                            );
+                        }
+                    }
+                    let d = t1.elapsed().as_secs_f64();
+                    if d > mx {
+                        mx = d;
+                    }
+                    cnt += 1;
+                }
+                t[which] = t0.elapsed().as_secs_f64() / cnt.max(1) as f64;
+                iters = cnt;
+                if mx > ms_max {
+                    ms_max = mx;
+                }
+            }
+            let l1 = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+                .unwrap_or_default();
+            rows.push((t[0], t[1], t[2], iters, ms_max * 1e3, l1));
+        }
+        let med = |i: usize| -> f64 {
+            let mut v: Vec<f64> = rows[1..]
+                .iter()
+                .map(|r| match i {
+                    0 => r.0,
+                    1 => r.1,
+                    _ => r.2,
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (o, d, k) = (med(0), med(1), med(2));
+        for (i, r) in rows.iter().enumerate() {
+            println!(
+                "pair{} old2real={:.4}ms cxDirect={:.4}ms cxKarat={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                i + 1,
+                r.0 * 1e3,
+                r.1 * 1e3,
+                r.2 * 1e3,
+                r.3,
+                r.4,
+                r.5,
+                if i == 0 { " (dropped)" } else { "" }
+            );
+        }
+        println!(
+            "中位：旧(2 实乘) {:.4} ms｜复数 Direct {:.4} ms（{:.2}×旧）｜复数 Karatsuba {:.4} ms（{:.2}×旧）",
+            o * 1e3,
+            d * 1e3,
+            d / o,
+            k * 1e3,
+            k / o
+        );
+        println!("形状 M×N×NB = {M}×{N}×{NB}；线程数：串行核心（未自动多线程）");
+        println!(
+            "复杂乘加工作量 {:.4} GFLOP（按 2 实数乘加/复元素计）",
+            cx_flop / 1e9
+        );
+    }
+}

@@ -594,9 +594,11 @@ mod perf {
     #[ignore = "逆变换性能：指数和 vs 含 F 求值"]
     #[test]
     fn diag_ilaplace_perf() {
+        // **C 阶重做**：放大 NB，让矩阵乘不再被 cos/sin 核构造主导
+        //（上一轮 J×N×NB=256×512×8 时核构造 O(J·N) 与矩阵乘 O(J·N·NB) 同量级 ⇒ 判为无效测量）
         const J: usize = 256;
-        const N: usize = 512;
-        const NB: usize = 8;
+        const N: usize = 1024;
+        const NB: usize = 512;
         let ts: Vec<f64> = (0..J).map(|j| 0.01 + j as f64 * 0.015).collect();
         let p = DubnerAbate {
             t_end: 12.0,

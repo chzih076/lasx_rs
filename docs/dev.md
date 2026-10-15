@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**272 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**276 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,6 +342,14 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
+- **C 阶 4 个**（2026-10-16）：`ops::cmatmul::c_tests::{c_dsl_bitwise_same_as_direct, c_dsl_length_check}`
+  （**DSL 表面 `CMat::mul_into` 与直接调用逐位一致** + 长度校验返回 `None`）、
+  `laplace::c_route_tests::complex_route_matches_old_within_tolerance`（**正向"一次复数乘"与旧
+  "两条实乘"容差内一致、解析三组仍过**；**同源实测复数路线更慢 1.16×/1.17× ⇒ 默认仍用旧路线**）、
+  诊断 `#[ignore]` `laplace::c_perf::diag_laplace_two_real_vs_one_complex`；另 **`compile_fail`
+  doctest**（`CMat::<2,3>` 乘 `CMat::<4,5>` 编不过）进 CI 文档测试步骤；**逆变换性能表在
+  `J×N×NB=256×1024×512` 重做**（`ilaplace::perf::diag_ilaplace_perf`）：只指数和 19.40 ms /
+  55.34 复数 GFLOP·s，含 `F` 32.83 ms（`F` 占 40.9%）。见 `docs/ops.md` §9.07。
 - **复数矩阵乘 7 个 + 3 个诊断**（`src/ops/cmatmul.rs`，2026-10-16 加，A 阶 + B0）：
   `direct_matches_four_real_matmul_bitwise`（**直算 vs 4 条实矩阵乘的组合逐位一致**——位精确契约）、
   `routes_agree_within_tolerance`（两路线互比 + 与逐元素参考，f32/f64 各 8 个形状含 `k=1`/`n=1`/
@@ -390,7 +398,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 272 个单元测试（+ 6 个宏单测 + 18 个文档测试）
+cargo test --workspace --release        # 276 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

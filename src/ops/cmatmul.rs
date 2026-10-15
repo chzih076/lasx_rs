@@ -1241,3 +1241,234 @@ mod b1_tests {
         assert!(worst < 1e-4, "交错 vs 分平面 差 {worst:e}");
     }
 }
+
+/// **C 阶：形状进类型的复数矩阵视图**（分平面 `(Re, Im)`；f32）。
+///
+/// 用法（形状由**类型**强制：`R×K` 只能乘 `K×N`，结果是 `R×N`）：
+///
+/// ```
+/// use lasx_rs::cmatmul::{CMat, CMatBuf, Route};
+/// let ar = [1.0f32, 2.0, 3.0, 4.0];   // 2×2 实部
+/// let ai = [0.5f32, -0.5, 1.0, -1.0]; // 2×2 虚部
+/// let br = [1.0f32, 0.0, 0.0, 1.0];
+/// let bi = [0.0f32; 4];
+/// let a = CMat::<2, 2>::new(&ar, &ai).unwrap();
+/// let b = CMat::<2, 2>::new(&br, &bi).unwrap();
+/// let mut c = CMatBuf::<2, 2>::zeros();
+/// a.mul_into(&b, &mut c, Route::Karatsuba);
+/// assert_eq!(c.re.len(), 4);
+/// ```
+///
+/// **形状不匹配编不过**（下面这段是**编译失败**测试，用 rustdoc 的 `compile_fail`
+/// ——仓库里没有 trybuild/`compile-fail` 机制，这是标准做法且不引新依赖）：
+///
+/// ```compile_fail
+/// use lasx_rs::cmatmul::{CMat, CMatBuf};
+/// let ar = [1.0f32; 6];
+/// let ai = [0.0f32; 6];
+/// let a = CMat::<2, 3>::new(&ar, &ai).unwrap();   // 2×3
+/// let b = CMat::<4, 5>::new(&[0.0f32; 20], &[0.0f32; 20]).unwrap(); // 4×5
+/// let mut c = CMatBuf::<2, 5>::zeros();
+/// a.mul_into(&b, &mut c, lasx_rs::cmatmul::Route::Direct);  // 3 ≠ 4 ⇒ 类型错误
+/// ```
+///
+/// **位精确契约（前端不改数值）**：`mul_into` 对**同一条 `Route`** 的结果与直接调
+/// `cmatmul_f32_into_route` **逐位一致**（测试 `c_dsl_bitwise_same_as_direct`）。
+#[derive(Clone, Copy)]
+pub struct CMat<'a, const R: usize, const C: usize> {
+    /// 实部（`R×C` 行主序）
+    pub re: &'a [f32],
+    /// 虚部（`R×C` 行主序）
+    pub im: &'a [f32],
+}
+
+impl<'a, const R: usize, const C: usize> CMat<'a, R, C> {
+    /// 用两块实数组构造；长度必须恰好 `R*C`。
+    pub fn new(re: &'a [f32], im: &'a [f32]) -> Option<Self> {
+        if re.len() == R * C && im.len() == R * C {
+            Some(Self { re, im })
+        } else {
+            None
+        }
+    }
+}
+
+/// 复数输出缓冲（形状进类型）。
+#[derive(Clone)]
+pub struct CMatBuf<const R: usize, const C: usize> {
+    /// 实部（`R×C`）
+    pub re: Vec<f32>,
+    /// 虚部（`R×C`）
+    pub im: Vec<f32>,
+}
+
+impl<const R: usize, const C: usize> CMatBuf<R, C> {
+    /// 全 0。
+    pub fn zeros() -> Self {
+        Self {
+            re: vec![0.0; R * C],
+            im: vec![0.0; R * C],
+        }
+    }
+}
+
+impl<const R: usize, const K: usize> CMat<'_, R, K> {
+    /// `self: R×K`、`rhs: K×N` ⇒ `out: R×N`（**形状由类型强制**）。
+    pub fn mul_into<const N: usize>(
+        &self,
+        rhs: &CMat<'_, K, N>,
+        out: &mut CMatBuf<R, N>,
+        route: Route,
+    ) {
+        cmatmul_f32_into_route(
+            R,
+            K,
+            N,
+            self.re,
+            self.im,
+            rhs.re,
+            rhs.im,
+            &mut out.re,
+            &mut out.im,
+            route,
+        );
+    }
+}
+
+/// **C 阶：形状进类型的复数矩阵视图**（f64，同 [`CMat`] 的语义）。
+#[derive(Clone, Copy)]
+pub struct CMat64<'a, const R: usize, const C: usize> {
+    /// 实部
+    pub re: &'a [f64],
+    /// 虚部
+    pub im: &'a [f64],
+}
+
+impl<'a, const R: usize, const C: usize> CMat64<'a, R, C> {
+    /// 长度必须恰好 `R*C`。
+    pub fn new(re: &'a [f64], im: &'a [f64]) -> Option<Self> {
+        if re.len() == R * C && im.len() == R * C {
+            Some(Self { re, im })
+        } else {
+            None
+        }
+    }
+}
+
+/// f64 输出缓冲。
+#[derive(Clone)]
+pub struct CMatBuf64<const R: usize, const C: usize> {
+    /// 实部
+    pub re: Vec<f64>,
+    /// 虚部
+    pub im: Vec<f64>,
+}
+
+impl<const R: usize, const C: usize> CMatBuf64<R, C> {
+    /// 全 0。
+    pub fn zeros() -> Self {
+        Self {
+            re: vec![0.0; R * C],
+            im: vec![0.0; R * C],
+        }
+    }
+}
+
+impl<const R: usize, const K: usize> CMat64<'_, R, K> {
+    /// `self: R×K`、`rhs: K×N` ⇒ `out: R×N`。
+    pub fn mul_into<const N: usize>(
+        &self,
+        rhs: &CMat64<'_, K, N>,
+        out: &mut CMatBuf64<R, N>,
+        route: Route,
+    ) {
+        cmatmul_f64_into_route(
+            R,
+            K,
+            N,
+            self.re,
+            self.im,
+            rhs.re,
+            rhs.im,
+            &mut out.re,
+            &mut out.im,
+            route,
+        );
+    }
+}
+
+#[cfg(test)]
+mod c_tests {
+    use super::*;
+
+    /// **C 阶位精确契约**：DSL 表面（`CMat::mul_into`）与**直接调** `cmatmul_*_into_route`
+    /// 在**同一条 `Route`** 下**逐位一致**（前端不改数值）。
+    #[test]
+    fn c_dsl_bitwise_same_as_direct() {
+        let (m, k, n) = (5usize, 7usize, 3usize);
+        let (ar, ai): (Vec<f32>, Vec<f32>) = (
+            (0..m * k)
+                .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+                .collect(),
+            (0..m * k)
+                .map(|i| ((i % 13) as f32) * 0.0625 - 0.5)
+                .collect(),
+        );
+        let (br, bi): (Vec<f32>, Vec<f32>) = (
+            (0..k * n)
+                .map(|i| ((i % 11) as f32) * 0.0625 - 0.75)
+                .collect(),
+            (0..k * n).map(|i| ((i % 7) as f32) * 0.125 - 0.5).collect(),
+        );
+        for route in [Route::Direct, Route::Karatsuba] {
+            // 直接调用
+            let (mut dr, mut di) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            cmatmul_f32_into_route(m, k, n, &ar, &ai, &br, &bi, &mut dr, &mut di, route);
+            // DSL 表面
+            let a = CMat::<5, 7>::new(&ar, &ai).unwrap();
+            let b = CMat::<7, 3>::new(&br, &bi).unwrap();
+            let mut c = CMatBuf::<5, 3>::zeros();
+            a.mul_into(&b, &mut c, route);
+            let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+            assert_eq!(
+                bits(&c.re),
+                bits(&dr),
+                "{route:?} 实部不逐位（DSL 改了数值？）"
+            );
+            assert_eq!(bits(&c.im), bits(&di), "{route:?} 虚部不逐位");
+        }
+        // f64 侧同样
+        let ar64: Vec<f64> = ar.iter().map(|&x| x as f64).collect();
+        let ai64: Vec<f64> = ai.iter().map(|&x| x as f64).collect();
+        let br64: Vec<f64> = br.iter().map(|&x| x as f64).collect();
+        let bi64: Vec<f64> = bi.iter().map(|&x| x as f64).collect();
+        let (mut dr, mut di) = (vec![0.0f64; m * n], vec![0.0f64; m * n]);
+        cmatmul_f64_into_route(
+            m,
+            k,
+            n,
+            &ar64,
+            &ai64,
+            &br64,
+            &bi64,
+            &mut dr,
+            &mut di,
+            Route::Direct,
+        );
+        let a = CMat64::<5, 7>::new(&ar64, &ai64).unwrap();
+        let b = CMat64::<7, 3>::new(&br64, &bi64).unwrap();
+        let mut c = CMatBuf64::<5, 3>::zeros();
+        a.mul_into(&b, &mut c, Route::Direct);
+        let bits64 = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits64(&c.re), bits64(&dr));
+        assert_eq!(bits64(&c.im), bits64(&di));
+    }
+
+    /// **长度校验**：给错长度 ⇒ `None`（不是 panic）。
+    #[test]
+    fn c_dsl_length_check() {
+        assert!(CMat::<2, 3>::new(&[0.0; 6], &[0.0; 5]).is_none());
+        assert!(CMat::<2, 3>::new(&[0.0; 6], &[0.0; 6]).is_some());
+        assert!(CMat64::<2, 3>::new(&[0.0; 5], &[0.0; 6]).is_none());
+    }
+}
