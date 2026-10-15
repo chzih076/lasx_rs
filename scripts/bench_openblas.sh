@@ -135,9 +135,21 @@ for i in $(seq 1 "$rounds"); do
     # 每条实现各起一个进程；两个进程的先后顺序逐轮翻转 ⇒ 同窗口成对交替
     if [ $((i % 2)) -eq 1 ]; then order="lasx openblas"; else order="openblas lasx"; fi
     for impl in $order; do
-      line=$(OPENBLAS_NUM_THREADS=$threads $pre "$bin" --impl="$impl" "${args[@]}" 2>&1 | grep '^OB ')
+      # 保留 `OBIDENT`（对手身份，每次对照的第一行）与 `OB`（结果）——口径要求见 §6.4
+      out=$(OPENBLAS_NUM_THREADS=$threads $pre "$bin" --impl="$impl" "${args[@]}" 2>&1)
+      line=$(printf '%s' "$out" | grep '^OB ')
       echo "r$i case=$name $line" >> "$log"
+      printf '%s\n' "$out" | grep '^OBIDENT' | sed "s/^/r$i case=$name /" >> "$log"
+      if [ "$impl" = lasx ]; then
+        it_lasx=$(printf '%s' "$line" | grep -oE 'iters=[0-9]+' | cut -d= -f2)
+        mx_lasx=$(printf '%s' "$line" | grep -oE 'ms_max=[0-9.]+' | cut -d= -f2)
+      else
+        it_ob=$(printf '%s' "$line" | grep -oE 'iters=[0-9]+' | cut -d= -f2)
+        mx_ob=$(printf '%s' "$line" | grep -oE 'ms_max=[0-9.]+' | cut -d= -f2)
+      fi
     done
+    # **对称性留证**：两臂 `iters`/`ms_max` 并排同一行（防"一臂跑得更久/更少"）
+    echo "OBCMP r$i case=$name threads=$threads lasx_iters=${it_lasx:-?} lasx_ms_max=${mx_lasx:-?} openblas_iters=${it_ob:-?} openblas_ms_max=${mx_ob:-?}" >> "$log"
   done
   echo "## round $i after:  $(uptime)" >> "$log"
 done

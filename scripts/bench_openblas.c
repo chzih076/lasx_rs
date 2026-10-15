@@ -73,6 +73,11 @@
 
 /* 本机 `cblas.h` 没声明它（只有 Fortran 侧 `f77blas.h` 有），但符号在 libopenblas 里。 */
 extern void openblas_set_num_threads(int);
+/* **对手身份**（2026-10-15 审计加）：`docs/dev.md §6.4` 要求"每次对照第一行就声明对手的
+ * 构建与内核"。这三个查询函数本机头文件同样没声明 ⇒ 显式 extern（与上面同法）。 */
+extern char *openblas_get_config(void);
+extern char *openblas_get_corename(void);
+extern int openblas_get_num_threads(void);
 
 /* ---- 形状与缓冲：做成文件级状态，让"一次计算"只有一处实现（少犯重复分支的错）---- */
 static int G_m, G_k, G_n, G_is_f64, G_nt, G_rows_per_thread;
@@ -668,6 +673,15 @@ int main(int argc, char **argv) {
     }
     G_a = A;
     G_b = B;
+
+    /* **对照口径第一行（2026-10-15 审计加）**：打印对手身份 + 两边共享缓冲的地址对齐。
+     * `docs/dev.md §6.4`：以后任何对外数字都要带这一行（build / core / 线程后端 / 实际线程数），
+     * 以及"同一批缓冲"的地址（两边读写的是**同一块内存**，布局与对齐天然一致）。 */
+    printf("OBIDENT openblas_config=\"%s\" core=%s nthreads_set=%d nthreads_get=%d "
+           "a_mod64=%zu b_mod64=%zu ptrs_a=%p b=%p\n",
+           openblas_get_config(), openblas_get_corename(), threads, openblas_get_num_threads(),
+           (size_t)A % 64, (size_t)B % 64, A, B);
+    fflush(stdout);
 
     /* `--split=plan` / `--split=threaded`：**打包 B 一次**（`lasx_matmul_prepare`），
      * 成本单独打印成 OBPLAN（不进计时——它就是"计划"该摊掉的那部分）。 */
