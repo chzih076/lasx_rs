@@ -10,6 +10,7 @@
 //!   差异即内核差异。
 use crate::report::Row;
 use lasx_rs::arch::SimdPath;
+use lasx_rs::{lasx_cross3_batch, lasx_norm3_batch};
 use std::arch::loongarch64::*;
 use std::hint::black_box;
 use std::mem::transmute;
@@ -203,7 +204,216 @@ fn call_ns(name: &str, n: usize, f: impl Fn(&[f32], &[f32]) -> f32) -> f64 {
     ns
 }
 
+/// 空循环的"测量地板"：`iters` 次只做一件 `black_box` 累加，用来判断 ns/调用 里有多少
+/// 是循环与外层记账本身。
+fn loop_floor_ns(iters: usize) -> f64 {
+    let mut acc = 0u32;
+    let t = Instant::now();
+    for _ in 0..iters {
+        acc = acc.wrapping_add(black_box(1));
+    }
+    let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+    println!("LAT arm=loop_floor ns={ns:.3} iters={iters} acc={acc}");
+    ns
+}
+
+/// **8 路展开的吞吐探针**：`WITH_DETECT = false` 是地板（每次异或一个常量），
+/// `true` 时每次异或 `detect()` 的结果。8 条独立的 `xor` 链 + 8 次调用，循环本身的开销
+/// 摊到 1/8，于是量的是 `detect()` 的**吞吐成本（µop 数）**，而不是外层循环的依赖链
+/// ——朴素写法（`acc += black_box(detect())`）的依赖链约 1.37 ns/迭代，会把 1 ns 级的
+/// 函数完全罩住（实测地板 1.367、detect 1.371–1.425，分辨不出来）。
+#[inline(never)]
+fn unrolled_probe<const WITH_DETECT: bool>(iters: usize) -> u64 {
+    let mut acc = [0u64; 8];
+    let rounds = iters / 8;
+    for _ in 0..rounds {
+        for (k, slot) in acc.iter_mut().enumerate() {
+            let v = if WITH_DETECT {
+                SimdPath::detect() as u64
+            } else {
+                k as u64
+            };
+            *slot ^= black_box(v);
+        }
+    }
+    acc.iter().fold(0u64, |x, y| x ^ *y)
+}
+
+/// 极小形状算子的每调用时间。`n` 越小，固定开销（FFI + 切片构造 + `detect()`）占比越大。
+fn tiny_batch_ns(
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+    out: &mut [f64],
+    oz: &mut [f64],
+    iters: usize,
+) -> f64 {
+    let n = out.len();
+    let mut ox = vec![0f64; n];
+    let mut oy = vec![0f64; n];
+    let mut sink = 0f64;
+    // norm3_batch：out = √(x²+y²+z²)
+    for _ in 0..10_000 {
+        lasx_norm3_batch(
+            x.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            out.as_mut_ptr(),
+            n as i32,
+        );
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        lasx_norm3_batch(
+            x.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            out.as_mut_ptr(),
+            n as i32,
+        );
+        sink += black_box(out[0]);
+    }
+    let norm3 = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+
+    // cross3_batch：o = a × b（六个输入 + 三个输出）
+    let t = Instant::now();
+    for _ in 0..iters {
+        lasx_cross3_batch(
+            x.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            y.as_ptr(),
+            z.as_ptr(),
+            x.as_ptr(),
+            ox.as_mut_ptr(),
+            oy.as_mut_ptr(),
+            oz.as_mut_ptr(),
+            n as i32,
+        );
+        sink += black_box(ox[0]);
+    }
+    let cross3 = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+    println!("LAT arm=tiny_n{n} ns_norm3={norm3:.2} ns_cross3={cross3:.2} sink={sink:.1}");
+    norm3
+}
+
+/// 定向测量 `detect()` 的**每调用固定开销**与"极小形状算子"的每调用时间。
+///
+/// 机器可读行（`LAT arm=… ns=… …` + `loadavg=`），供**进程级交替**的 before/after A/B 用。
+///
+/// 顺序很重要：`lasx_force_lsx_thread` 一旦被调用过（新实现会把 `FORCE_USED` 置位），
+/// `detect()` 就多走一条线程局部读——真实用户的进程里没人调它，所以
+///
+/// 1. 先测**极小形状算子**、`hardware()`、以及两种 `detect()` 循环（force 从未用过的常态，
+///    也就是被优化的那条路）；
+/// 2. 最后才调一次 `lasx_force_lsx_thread(false)`，再测一次 `detect()`（force 分支的代价）。
+///
+/// 两个状态都在同一个进程、同一个测量窗口里，比值不受窗口漂移影响。
+///
+/// 另外：本函数用的迭代次数是固定的，所以 `perf stat -e instructions` 的**整进程指令数**
+/// 在 before/after 之间可直接相减——两个 `detect` 大循环共 2e7 次调用，差值除以次数就是
+/// "每次 `detect()` 省下几条指令"（`detect_fresh` 那 1e7 次走的是被优化的路径）。
+pub fn detect_overhead() {
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let load = load.split_whitespace().next().unwrap_or("?").to_string();
+
+    const ITERS_DETECT: usize = 10_000_000;
+    const ITERS_TINY: usize = 1_000_000;
+    const ITERS_PROBE: usize = 8_000_000;
+
+    loop_floor_ns(ITERS_DETECT);
+
+    // ---- 极小形状算子（每个入口各调用一次 `detect()`）----
+    for tiny_n in [8usize, 64] {
+        let x: Vec<f64> = (0..tiny_n).map(|i| 1.0 + i as f64 * 0.25).collect();
+        let y: Vec<f64> = (0..tiny_n).map(|i| 2.0 + i as f64 * 0.5).collect();
+        let z: Vec<f64> = (0..tiny_n).map(|i| 3.0 + i as f64 * 0.75).collect();
+        let mut out = vec![0f64; tiny_n];
+        let mut oz = vec![0f64; tiny_n];
+        tiny_batch_ns(&x, &y, &z, &mut out, &mut oz, ITERS_TINY);
+    }
+
+    // ---- `hardware()`（只读一个原子字节）----
+    {
+        let mut acc = 0u32;
+        let t = Instant::now();
+        for _ in 0..ITERS_DETECT {
+            acc = acc.wrapping_add(black_box(lasx_rs::arch::hardware().lasx) as u32);
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_DETECT as f64;
+        println!("LAT arm=hardware ns={ns:.3} iters={ITERS_DETECT} loadavg={load} acc={acc}");
+    }
+
+    // ---- 8 路展开探针：地板与"含 detect"的差 = detect 的吞吐边际成本 ----
+    let floor_ns = {
+        let t = Instant::now();
+        let v = unrolled_probe::<false>(ITERS_PROBE);
+        let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_PROBE as f64;
+        println!("LAT arm=unrolled_floor ns={ns:.3} iters={ITERS_PROBE} loadavg={load} acc={v}");
+        ns
+    };
+    let det_thr = {
+        let t = Instant::now();
+        let v = unrolled_probe::<true>(ITERS_PROBE);
+        let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_PROBE as f64;
+        println!("LAT arm=unrolled_detect ns={ns:.3} iters={ITERS_PROBE} loadavg={load} acc={v}");
+        ns
+    };
+    println!(
+        "LAT arm=unrolled_marginal ns={:.3} loadavg={load}",
+        det_thr - floor_ns
+    );
+
+    // ---- 朴素循环（与历史 1.52 ns 口径一致，便于对照）----
+    {
+        let mut acc = 0u32;
+        let t = Instant::now();
+        for _ in 0..ITERS_DETECT {
+            acc = acc.wrapping_add(black_box(SimdPath::detect()) as u32);
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_DETECT as f64;
+        println!("LAT arm=detect_fresh ns={ns:.3} iters={ITERS_DETECT} loadavg={load} acc={acc}");
+    }
+
+    // ---- 用过一次 force API 之后的 `detect()`（只有测试/基准会走到这个状态）----
+    lasx_rs::lasx_force_lsx_thread(false);
+    {
+        let mut acc = 0u32;
+        let t = Instant::now();
+        for _ in 0..ITERS_DETECT {
+            acc = acc.wrapping_add(black_box(SimdPath::detect()) as u32);
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_DETECT as f64;
+        println!(
+            "LAT arm=detect_after_force ns={ns:.3} iters={ITERS_DETECT} loadavg={load} acc={acc}"
+        );
+    }
+}
+
 pub fn lat(_rows: &mut Vec<Row>) {
+    // 定向臂（进程级交替 A/B 用）：`lasx_bench lat detect` 只跑"每调用固定开销"这一组，
+    // 不夹带指令级长跑，便于把 before/after 两个二进制交替起来测。
+    if let Some(arm) = std::env::args().nth(2) {
+        match arm.as_str() {
+            "detect" => {
+                detect_overhead();
+                return;
+            }
+            // 只跑**一个**循环：给 `perf stat -e instructions` 用——整进程指令数 ÷ 1e7
+            // 就是"每次 detect() 几条指令"，before/after 相减即"省下几条"（纯计数、无噪声）。
+            "detect_only" => {
+                let mut acc = 0u32;
+                let t = Instant::now();
+                for _ in 0..ITERS_CALL {
+                    acc = acc.wrapping_add(black_box(SimdPath::detect()) as u32);
+                }
+                let ns = t.elapsed().as_secs_f64() * 1e9 / ITERS_CALL as f64;
+                println!("LAT arm=detect_only ns={ns:.3} iters={ITERS_CALL} acc={acc}");
+                return;
+            }
+            _ => {}
+        }
+    }
     println!("| 指令级（本机 {MHZ} MHz；周期 = ns × 主频） | 延迟 | 吞吐 | 备注 |");
     println!("|---|---|---|---|");
     let t = Instant::now();
