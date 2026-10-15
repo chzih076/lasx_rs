@@ -120,8 +120,8 @@ lasx_rs/
 
 ```bash
 cargo build --release
-nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
-# 当前：75 个（38 个裸版本 + 37 个 _checked），与上一版比较应只有"新增"
+nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*' | sort -u
+# 当前：83 个（42 个裸版本 + 41 个 _checked），与上一版比较应只有"新增"
 ```
 
 **当前值（2026-10-15）**：83 个 = 42 裸 + 41 `_checked`（上一行的 75 是旧值）；权威清单与原型在 `docs/ops.md` §4 与 `include/lasx_rs.h`，并由 `scripts/check_header.c` 逐符号校验（取地址 ⇒ 缺符号/改名/原型漂移即编译或链接失败）。
@@ -3622,7 +3622,7 @@ exp(x) = p · 2ⁿ
 `src/ops/gelu_quick.rs` + `src/ffi/nn.rs`（2 个裸符号）+ `src/ffi/checked.rs`（2 个
 `_checked`）+ `src/api.rs`（`silu`/`gelu_quick`，直接返回对齐缓冲——**没有失败模式就不套
 `Result`**，与 `api::sum` 同例）+ `cli/src/suites/activation.rs`（组 `act`）。
-符号总数见 `docs/ops.md` §4.6 的清点表（当前 **75 = 38 裸 + 37 checked**）。
+符号总数见 `docs/ops.md` §4.6 的清点表（当前 **83 = 42 裸 + 41 checked**）。
 
 **重新导出**：`src/lib.rs` 里 `pub use ffi::nn::{…}`，符号在 crate 根可见
 （`lasx_rs::lasx_silu`），与 `docs/ops.md` §4 按 C ABI 名列的符号表一致；`ffi` 模块路径

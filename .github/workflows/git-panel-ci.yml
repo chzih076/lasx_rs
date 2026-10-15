@@ -39,3 +39,12 @@ jobs:
           d=$(grep -oE '[0-9]+ 个导出符号' docs/ops.md | head -1 | grep -oE '[0-9]+')
           echo "cdylib 导出 lasx_* = $n；docs/ops.md §1 记 = $d"
           [ "$n" = "$d" ] || { echo "::error::ABI 导出符号数与文档不一致"; exit 1; }
+      # **逐符号原型校验**（2026-10-15 加）：上面的门禁只数**个数**，抓不到"原型漂移/参数次序错/
+      # 少一个 `_checked` 变体"。`scripts/check_header.c` 把 83 个符号地址放进数组（编译期钉住个数）
+      # 并逐个实调 41 个 `_checked`（断言 status 位置与取值域），另含融合缩放的行为断言。
+      # 用**静态**链接（不依赖本地 SONAME 符号链接，runner 上更稳）。
+      - name: C header vs ABI (per-symbol link + behaviour)
+        run: |
+          gcc -O2 -Iinclude scripts/check_header.c target/release/liblasx_rs.a \
+              -lm -lpthread -ldl -o /tmp/check_header
+          /tmp/check_header
