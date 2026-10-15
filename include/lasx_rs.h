@@ -246,7 +246,8 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
 /* 分配 n 个 f32 的 **32 字节对齐、未初始化** 缓冲；n == 0 返回"对齐但不可解引用"的
  * 非空悬垂指针。**必须用 `lasx_free(p, n)` 按同一个 n 归还**（§10、上面第 0 节）：
  * 两者共用同一 layout；`free()` 在本机 glibc 下偶然可用，但**不是 ABI 契约**。
- * 这是**唯一没有 _checked 变体**的裸符号（§4.6）；`lasx_free` 同样没有。 */
+ * 库级元信息符号没有 `_checked` 变体——白名单与清单的唯一权威是 `docs/c-abi.md` §9.1；
+ * 算子级哪个裸符号带 `_checked`，以 `docs/c-abi.md` 第 3 节的逐符号表为准。 */
 float *lasx_alloc(int n);
 
 /* 语义：out[i] = sqrt(xs[i]^2 + ys[i]^2 + zs[i]^2)（f64 SOA）。路径：LASX+LSX。
