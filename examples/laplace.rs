@@ -6,7 +6,7 @@
 //! 3. **性能演示（同进程口径）**：挑一个**能触发自动动态认领**（`每线程行数 ≥ 32` 且
 //!    `线程数 ≥ 12`）的规模，同进程交替测 `plan`（调用方常驻线程）与 `matmul!`（DSL 路径），
 //!    报 ms / GFLOP/s / **实际线程数** / `iters` / `ms_max`。
-use lasx_rs::laplace::{laplace_batch_f32, trapezoid_weights};
+use lasx_rs::laplace::{Weighting, laplace_batch_f32, trapezoid_weights};
 use lasx_rs::pool::WorkerPool;
 use lasx_rs::shape::{Mat, MatBuf};
 use std::time::Instant;
@@ -224,10 +224,64 @@ fn perf_part() {
     println!("    位精确：DSL 结果与 api::matmul 逐位一致 ✓");
 }
 
+/// **权重方案对比（梯形 `O(Δt²)` vs Simpson `O(Δt⁴)`）**：固定 `T=20`（截断可忽略）看阶数。
+fn weighting_part() {
+    const T: f64 = 20.0;
+    let sigs = [1.0f64, 2.0, 3.0, 4.0];
+    println!("\n== ④ 权重方案（T={T}，f=e^{{-2t}}，解析 1/(s+2)）==");
+    println!("     N     梯形误差    相邻比     Simpson 误差   相邻比");
+    let mut prev = (0.0f64, 0.0f64);
+    for &n in &[65usize, 129, 257, 513] {
+        let dt = T / (n - 1) as f64;
+        let mut f = vec![0.0f64; n];
+        for (i, fi) in f.iter_mut().enumerate() {
+            *fi = (-2.0 * (i as f64 * dt)).exp();
+        }
+        let mut e = [0.0f64; 2];
+        for (k, kind) in [Weighting::Trapezoid, Weighting::Simpson]
+            .iter()
+            .enumerate()
+        {
+            // 用参考路径（任意 n；核矩阵构造与 DSL 路径完全一致）
+            let w = kind.weights(n).0;
+            for (j, &s) in sigs.iter().enumerate() {
+                let mut acc = 0.0f64;
+                for (i, &wi) in w.iter().enumerate() {
+                    acc += wi * dt * (-s * (i as f64 * dt)).exp() * f[i];
+                }
+                let want = 1.0 / (s + 2.0);
+                e[k] = e[k].max((acc - want).abs() / want);
+                let _ = j;
+            }
+        }
+        let r = if prev.0 > 0.0 {
+            (
+                format!("{:.2}×", prev.0 / e[0]),
+                format!("{:.2}×", prev.1 / e[1]),
+            )
+        } else {
+            ("-".into(), "-".into())
+        };
+        println!(
+            "    {n:>4}   {:.3e}   {:>7}    {:.3e}    {:>7}",
+            e[0], r.0, e[1], r.1
+        );
+        prev = (e[0], e[1]);
+    }
+    println!("    ⇒ 梯形 ≈4×/Δt 减半（二阶）；**Simpson ≈16×（四阶）**。");
+    println!(
+        "    回退口径：N<3 或 N 为偶数（区间数奇数）⇒ Simpson **整段回退梯形**并返回标记（不丢尾巴）。"
+    );
+}
+
 fn main() {
     println!("拉普拉斯变换实战（公式 DSL）：F(s)=∫₀^∞ f(t)e^{{-st}}dt，Re F=Kc·f、Im F=-Ks·f");
     analytic_part();
     refinement_part();
     perf_part();
-    println!("\n限制：非任意精度（截断 + 梯形 O(Δt²)）；s 靠近极点时不能用；**不做逆变换**。");
+    weighting_part();
+    println!(
+        "\n限制：非任意精度（截断 + 求积阶数：梯形 O(Δt²)、Simpson O(Δt⁴)）；\
+         s 靠近极点时不能用；**不做逆变换**。"
+    );
 }

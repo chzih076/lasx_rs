@@ -36,8 +36,58 @@ pub fn trapezoid_weights(n: usize) -> Vec<f64> {
     w
 }
 
-/// 造核矩阵（`f64` 中间量、按 `to_f32`/原样给两条路径用）。
-fn kernels64(sig: &[f64], om: &[f64], dt: f64, n: usize, w: &[f64]) -> (Vec<f64>, Vec<f64>) {
+/// **求积权重方案**（2026-10-15 加；核矩阵构造方式不变，只换 `w_i`）。
+///
+/// - [`Weighting::Trapezoid`]（**默认**）：`[½,1,…,1,½]·Δt`，**`O(Δt²)`**。默认保持梯形是
+///   **向后兼容**：改默认会改变已有调用的结果与精度特征（且 Simpson 要求偶数个区间）。
+/// - [`Weighting::Simpson`]：**复合 1/3 规则**，`[1,4,2,4,…,4,1]·Δt/3`，**`O(Δt⁴)`**；
+///   仅当 **`n ≥ 3` 且 `n` 为奇数**（= 偶数个区间）时成立。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Weighting {
+    /// 梯形法（默认，`O(Δt²)`）。
+    #[default]
+    Trapezoid,
+    /// Simpson 复合 1/3 规则（`O(Δt⁴)`；`n≥3` 且 `n` 奇数时才可用）。
+    Simpson,
+}
+
+impl Weighting {
+    /// 取本方案的权重；**Simpson 不满足条件时回退梯形**，第二个返回值标记是否发生回退。
+    ///
+    /// 回退条件：`n < 3` 或 `n` 为偶数（区间数为奇数，凑不出配对的 1/3 面板）。
+    /// **不"丢尾巴"**：把最后一个区间用低阶规则拼上去会引入 `O(Δt²)` 项、把整体阶数拖回二阶；
+    /// 宁可**整段回退梯形**——阶数诚实、误差可预期（两种回退情形都有测试）。
+    pub fn weights(self, n: usize) -> (Vec<f64>, bool) {
+        match self {
+            Weighting::Trapezoid => (trapezoid_weights(n), false),
+            Weighting::Simpson => {
+                if n < 3 || n.is_multiple_of(2) {
+                    return (trapezoid_weights(n), true);
+                }
+                let mut w = vec![2.0f64; n];
+                w[0] = 1.0;
+                w[n - 1] = 1.0;
+                for i in (1..n - 1).step_by(2) {
+                    w[i] = 4.0;
+                }
+                for v in w.iter_mut() {
+                    *v /= 3.0;
+                }
+                (w, false)
+            }
+        }
+    }
+}
+
+/// 造核矩阵（`f64` 中间量；权重按 `kind` 取；第三个返回值 = 是否回退到梯形）。
+fn kernels64(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    kind: Weighting,
+) -> (Vec<f64>, Vec<f64>, bool) {
+    let (w, fell_back) = kind.weights(n);
     let m = sig.len();
     let mut kc = vec![0.0f64; m * n];
     let mut ks = vec![0.0f64; m * n];
@@ -49,7 +99,7 @@ fn kernels64(sig: &[f64], om: &[f64], dt: f64, n: usize, w: &[f64]) -> (Vec<f64>
             ks[j * n + i] = e * (om[j] * t).sin();
         }
     }
-    (kc, ks)
+    (kc, ks, fell_back)
 }
 
 /// `f32` 批量正变换：`f` 是 `N×NB`（**列主序的 N 条信号按列排**……实际用行主序 `[N][NB]`），
@@ -62,7 +112,20 @@ pub fn laplace_batch_f32<const M: usize, const N: usize, const NB: usize>(
 ) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(sig.len(), M);
     assert_eq!(f.len(), N * NB);
-    let (kc64, ks64) = kernels64(sig, om, dt, N, &trapezoid_weights(N));
+    laplace_batch_f32_with::<M, N, NB>(sig, om, dt, f, Weighting::Trapezoid).0
+}
+
+/// 同上，但**指定权重方案**；返回 `(Re, Im, 是否回退到梯形)`。
+pub fn laplace_batch_f32_with<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    kind: Weighting,
+) -> ((Vec<f32>, Vec<f32>), bool) {
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let (kc64, ks64, fell_back) = kernels64(sig, om, dt, N, kind);
     let kc: Vec<f32> = kc64.iter().map(|&v| v as f32).collect();
     let ks: Vec<f32> = ks64.iter().map(|&v| v as f32).collect();
     let mkc = Mat::<f32, M, N>::new(&kc).expect("Kc 长度 = M×N");
@@ -75,19 +138,30 @@ pub fn laplace_batch_f32<const M: usize, const N: usize, const NB: usize>(
     matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
     let re = re.as_slice().to_vec();
     let im = im.as_slice().iter().map(|&v| -v).collect();
-    (re, im)
+    ((re, im), fell_back)
 }
 
-/// `f64` 批量正变换（同 `f32` 版，走 `f64` 的 `Mat`/`matmul!`）。
+/// `f64` 批量正变换（同 `f32` 版，走 `f64` 的 `Mat`/`matmul!`；默认梯形）。
 pub fn laplace_batch_f64<const M: usize, const N: usize, const NB: usize>(
     sig: &[f64],
     om: &[f64],
     dt: f64,
     f: &[f64],
 ) -> (Vec<f64>, Vec<f64>) {
+    laplace_batch_f64_with::<M, N, NB>(sig, om, dt, f, Weighting::Trapezoid).0
+}
+
+/// 同上，但**指定权重方案**；返回 `(Re, Im, 是否回退到梯形)`。
+pub fn laplace_batch_f64_with<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f64],
+    kind: Weighting,
+) -> ((Vec<f64>, Vec<f64>), bool) {
     assert_eq!(sig.len(), M);
     assert_eq!(f.len(), N * NB);
-    let (kc, ks) = kernels64(sig, om, dt, N, &trapezoid_weights(N));
+    let (kc, ks, fell_back) = kernels64(sig, om, dt, N, kind);
     let mkc = Mat::<f64, M, N>::new(&kc).expect("Kc 长度 = M×N");
     let mks = Mat::<f64, M, N>::new(&ks).expect("Ks 长度 = M×N");
     let mf = Mat::<f64, N, NB>::new(f).expect("f 长度 = N×NB");
@@ -97,7 +171,7 @@ pub fn laplace_batch_f64<const M: usize, const N: usize, const NB: usize>(
     matmul!(im[M, NB] = mks[M, N] * mf[N, NB]);
     let re = re.as_slice().to_vec();
     let im = im.as_slice().iter().map(|&v| -v).collect();
-    (re, im)
+    ((re, im), fell_back)
 }
 
 /// **串行参考**：按 `api::matmul` 逐列做（与 DSL 路径**位精确对照**用）。
@@ -107,7 +181,18 @@ pub fn reference_f32<const M: usize, const N: usize, const NB: usize>(
     dt: f64,
     f: &[f32],
 ) -> (Vec<f32>, Vec<f32>) {
-    let (kc64, ks64) = kernels64(sig, om, dt, N, &trapezoid_weights(N));
+    reference_f32_with::<M, N, NB>(sig, om, dt, f, Weighting::Trapezoid)
+}
+
+/// 同 [`reference_f32`]，但指定权重方案（**行切参考**：逐列走 `api::matmul`）。
+pub fn reference_f32_with<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    kind: Weighting,
+) -> (Vec<f32>, Vec<f32>) {
+    let (kc64, ks64, _) = kernels64(sig, om, dt, N, kind);
     let kc: Vec<f32> = kc64.iter().map(|&v| v as f32).collect();
     let ks: Vec<f32> = ks64.iter().map(|&v| v as f32).collect();
     let mut re = vec![0.0f32; M * NB];
@@ -136,9 +221,10 @@ fn laplace_ref_f64<const M: usize, const NB: usize>(
     om: &[f64],
     dt: f64,
     f: &[f64],
+    kind: Weighting,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = f.len() / NB;
-    let (kc, ks) = kernels64(sig, om, dt, n, &trapezoid_weights(n));
+    let (kc, ks, _) = kernels64(sig, om, dt, n, kind);
     let mut re = vec![0.0f64; M * NB];
     let mut im = vec![0.0f64; M * NB];
     for b in 0..NB {
@@ -293,7 +379,7 @@ mod tests {
             for (i, fi) in f.iter_mut().enumerate() {
                 *fi = (-0.5 * (i as f64 * dt)).exp();
             }
-            let (re, _) = laplace_ref_f64::<M, 1>(&sigs, &oms, dt, &f);
+            let (re, _) = laplace_ref_f64::<M, 1>(&sigs, &oms, dt, &f, Weighting::Trapezoid);
             let mut e = 0.0f64;
             for (j, &s) in sigs.iter().enumerate() {
                 let want = 1.0 / (s + 0.5);
@@ -375,5 +461,189 @@ mod tests {
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
         assert_eq!(bits(&re_dsl), bits(&re_ref), "Re：DSL 与行切参考不逐位");
         assert_eq!(bits(&im_dsl), bits(&im_ref), "Im：DSL 与行切参考不逐位");
+    }
+
+    /// **⑤ 位精确（两种权重各断言一次）**：DSL 路径 vs 行切参考（`api::matmul`）逐位一致。
+    #[test]
+    fn bit_exact_both_weightings() {
+        const N: usize = 129; // 奇数 ⇒ Simpson 可用
+        let dt = 0.03;
+        let sigs = [0.5f64, 1.0, 1.5, 2.0];
+        let oms = [0.0f64, 1.0, 0.0, 2.0];
+        let mut f = vec![0.0f32; N * NB];
+        for i in 0..N {
+            let t = i as f64 * dt;
+            f[i * NB] = t.sin() as f32;
+            f[i * NB + 1] = (-t).exp() as f32;
+        }
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        for kind in [Weighting::Trapezoid, Weighting::Simpson] {
+            let ((re_dsl, im_dsl), fell_back) =
+                laplace_batch_f32_with::<M, N, NB>(&sigs, &oms, dt, &f, kind);
+            assert!(!fell_back, "{kind:?} 在 N={N}（奇数）下不该回退");
+            let (re_ref, im_ref) = reference_f32_with::<M, N, NB>(&sigs, &oms, dt, &f, kind);
+            assert_eq!(bits(&re_dsl), bits(&re_ref), "{kind:?}：Re 不逐位");
+            assert_eq!(bits(&im_dsl), bits(&im_ref), "{kind:?}：Im 不逐位");
+        }
+    }
+
+    /// **⑥ 阶数：梯形 `O(Δt²)` vs Simpson `O(Δt⁴)`**（固定 `T`、`Δt` 减半；`n` 取奇数让 Simpson 可用）。
+    ///
+    /// 断言口径：梯形相邻比落在 `[2.5, 8]`（≈4，二阶）；Simpson **> 8**（理想 ≈16，四阶）。
+    /// **阶数只在不被 `T` 截断地板支配时才可见**——所以这里挑 `sig ∈ [1,4]`（衰减快）与 `T=6.4`。
+    #[test]
+    fn convergence_order_trapezoid_vs_simpson() {
+        // 采样误差：固定 T、n 递增（n 取奇数让 Simpson 可用）
+        let sample = |t_end: f64, a: f64, ns: &[usize]| -> Vec<(usize, f64, f64)> {
+            let sigs = [1.0f64, 2.0, 3.0, 4.0];
+            let oms = [0.0f64; 4];
+            let mut rows = Vec::new();
+            for &n in ns {
+                let dt = t_end / (n - 1) as f64;
+                let mut f = vec![0.0f64; n];
+                for (i, fi) in f.iter_mut().enumerate() {
+                    *fi = (-a * (i as f64 * dt)).exp();
+                }
+                let mut errs = [0.0f64; 2];
+                for (k, kind) in [Weighting::Trapezoid, Weighting::Simpson]
+                    .iter()
+                    .enumerate()
+                {
+                    let (re, _) = laplace_ref_f64::<M, 1>(&sigs, &oms, dt, &f, *kind);
+                    let mut e = 0.0f64;
+                    for (j, &s) in sigs.iter().enumerate() {
+                        let want = 1.0 / (s + a);
+                        e = e.max((re[j] - want).abs() / want);
+                    }
+                    errs[k] = e;
+                }
+                rows.push((n, errs[0], errs[1]));
+            }
+            rows
+        };
+        // ① T=20（截断可忽略）⇒ 阶数可见：梯形 ≈4×、Simpson >8×
+        let rows = sample(20.0, 2.0, &[65, 129, 257, 513]);
+        let trap_ratios: Vec<f64> = rows.windows(2).map(|w| w[0].1 / w[1].1).collect();
+        let simp_ratios: Vec<f64> = rows.windows(2).map(|w| w[0].2 / w[1].2).collect();
+        for r in &trap_ratios {
+            assert!(
+                (2.5..=8.0).contains(r),
+                "梯形相邻比应 ≈4（二阶），实测 {r:.2}×"
+            );
+        }
+        for r in &simp_ratios {
+            assert!(
+                *r > 8.0,
+                "Simpson 相邻比应 ≫4（四阶、理想 ≈16），实测 {r:.2}×；表 {rows:?}"
+            );
+        }
+        for (n, et, es) in &rows {
+            assert!(es < et, "N={n} 时 Simpson({es:.3e}) 应优于梯形({et:.3e})");
+        }
+        // ② T=6.4：Simpson 被**截断地板**卡住（末对相邻比 ≈1），梯形仍 ≈4 ⇒ 阶数不可见
+        let rows2 = sample(6.4, 0.5, &[65, 129, 257, 513]);
+        let simp2: Vec<f64> = rows2.windows(2).map(|w| w[0].2 / w[1].2).collect();
+        let trap2: Vec<f64> = rows2.windows(2).map(|w| w[0].1 / w[1].1).collect();
+        assert!(
+            *simp2.last().unwrap() < 2.0,
+            "T=6.4 时 Simpson 应被截断地板卡住（末对相邻比 <2），实测 {:.2}×；表 {rows2:?}",
+            simp2.last().unwrap()
+        );
+        for r in &trap2 {
+            assert!((2.5..=8.0).contains(r), "梯形相邻比应 ≈4，实测 {r:.2}×");
+        }
+    }
+
+    /// **⑦ Simpson 下的解析对照（3 组、实虚部）**：两种权重都对（阈值按 **f32 累加** 放宽到
+    /// `3e-3`——513 项 f32 点积自身就有 ~1e-4 量级的舍入），并断言 **Simpson 误差 < 梯形**。
+    #[test]
+    fn simpson_analytic_three_cases() {
+        const N: usize = 513; // 奇数
+        let dt = 0.0125;
+        let sigs = [1.0f64, 1.0, 1.0, 1.0];
+        let oms = [0.0f64, 2.0, 0.0, 3.0];
+        let mut f = vec![0.0f32; N * NB];
+        for i in 0..N {
+            let t = i as f64 * dt;
+            f[i * NB] = 1.0;
+            f[i * NB + 1] = (-2.0 * t).exp() as f32;
+        }
+        let mut worst = [0.0f64; 2];
+        for (k, kind) in [Weighting::Trapezoid, Weighting::Simpson]
+            .iter()
+            .enumerate()
+        {
+            let ((re, im), fell_back) =
+                laplace_batch_f32_with::<M, N, NB>(&sigs, &oms, dt, &f, *kind);
+            assert!(!fell_back);
+            for (j, (&s, &w)) in sigs.iter().zip(oms.iter()).enumerate() {
+                let (wr, wi) = f_inv_s(s, w);
+                let (gr, gi) = (re[j * NB] as f64, im[j * NB] as f64);
+                let e1 = (gr - wr).abs() / wr.abs();
+                let e2 = (gi - wi).abs() / wi.abs().max(1e-3);
+                let (wr2, wi2) = f_inv_s_plus_a(s, w, 2.0);
+                let (gr2, gi2) = (re[j * NB + 1] as f64, im[j * NB + 1] as f64);
+                let e3 = (gr2 - wr2).abs() / wr2.abs();
+                let e4 = (gi2 - wi2).abs() / wi2.abs().max(1e-3);
+                let e = e1.max(e2).max(e3).max(e4);
+                worst[k] = worst[k].max(e);
+                assert!(e < 3e-3, "{kind:?} 解析对照误差过大 j={j}: {e:.3e}");
+            }
+        }
+        assert!(
+            worst[1] < worst[0],
+            "Simpson 的最大误差应小于梯形：{:.3e} vs {:.3e}",
+            worst[1],
+            worst[0]
+        );
+    }
+
+    /// **⑧ 边界**：`N<3` 与**奇数区间（偶数 N）**⇒ Simpson **回退梯形**并**如实返回标记**；
+    /// `s=0` 的截断和、`ω=0` 的零虚部在两种权重下都成立。
+    #[test]
+    fn simpson_fallback_and_boundaries() {
+        // 权重层面
+        let (w2, fb2) = Weighting::Simpson.weights(2);
+        assert!(fb2, "N=2 必须回退");
+        assert_eq!(w2, trapezoid_weights(2));
+        let (w4, fb4) = Weighting::Simpson.weights(4);
+        assert!(fb4, "N=4（区间数 3，奇数）必须回退");
+        assert_eq!(w4, trapezoid_weights(4));
+        let (w5, fb5) = Weighting::Simpson.weights(5);
+        assert!(!fb5);
+        assert_eq!(w5.len(), 5);
+        assert_eq!(
+            (w5[0], w5[1], w5[2], w5[3], w5[4]),
+            (1.0 / 3.0, 4.0 / 3.0, 2.0 / 3.0, 4.0 / 3.0, 1.0 / 3.0)
+        );
+        // 路径层面：N=2 走 Simpson ⇒ 回退标记为真
+        let sigs = [1.0f64, 2.0, 3.0, 4.0];
+        let oms = [0.0f64; 4];
+        let ((_, _), fell_back) =
+            laplace_batch_f64_with::<M, 2, 1>(&sigs, &oms, 0.5, &[1.0, 1.0], Weighting::Simpson);
+        assert!(fell_back, "N=2 的路径也必须标出回退");
+        // ω=0 ⇒ 虚部恒 0；σ=0（即 s=0）时 Re = 权重和 × dt（两种方案对常数都精确 ⇒ 都等于 (n-1)Δt）
+        let n = 33usize;
+        let dt = 0.05;
+        let zero_sig = [0.0f64; 4];
+        let ((re_s, im_s), fb) = laplace_batch_f64_with::<M, 33, 2>(
+            &zero_sig,
+            &oms,
+            dt,
+            &vec![1.0f64; n * 2],
+            Weighting::Simpson,
+        );
+        assert!(!fb);
+        for v in im_s.iter() {
+            assert_eq!(*v, 0.0, "ω=0 时虚部必须为 0");
+        }
+        // s=0 的 Re 就是"权重和 × dt"（梯形 = (n-1)Δt；Simpson = 也等于 (n-1)Δt，因为 1/3 规则
+        // 对常数精确）——两种方案对 f≡1、s=0 都应给出同一个 (n-1)Δt。
+        let want = (n - 1) as f64 * dt;
+        assert!(
+            (re_s[0] - want).abs() / want < 1e-12,
+            "Simpson 对常数应精确：{} vs {want}",
+            re_s[0]
+        );
     }
 }
