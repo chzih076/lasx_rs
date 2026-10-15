@@ -297,6 +297,343 @@ fn tiny_batch_ns(
     norm3
 }
 
+/// 8 路展开探针的四种"被异或的值从哪来"。**循环形状完全一致**（8 条独立 `xor` 链 +
+/// 每次异或一次 `black_box`），只有这个值的来源不同 ⇒ 差值才是那一项的真实每调用成本。
+const MODE_CONST: u8 = 0;
+const MODE_HOISTED: u8 = 1;
+const MODE_INLINE_DETECT: u8 = 2;
+const MODE_INLINE_HARDWARE: u8 = 3;
+
+/// 8 路展开 + 可插拔"每调用一次的动作"（`MODE_*`）。
+///
+/// 为什么不用"两个不同形状的循环"来比：§7.14 的教训——`vec+detect` 与 `vec` 各自
+/// 循环的地板不同，差值会把地板差也算进去。这里四个 `MODE` 的循环体逐条对应，
+/// 展开度、依赖链、`black_box` 位置都一样。
+#[inline(never)]
+fn probe8<const MODE: u8>(calls: usize) -> f64 {
+    let hoisted = if MODE == MODE_HOISTED {
+        SimdPath::detect() as u64
+    } else {
+        0
+    };
+    let mut acc = [0u64; 8];
+    let rounds = calls / 8;
+    let t = Instant::now();
+    for _ in 0..rounds {
+        for (k, slot) in acc.iter_mut().enumerate() {
+            let v = match MODE {
+                MODE_CONST => k as u64,
+                MODE_HOISTED => hoisted,
+                MODE_INLINE_DETECT => SimdPath::detect() as u64,
+                MODE_INLINE_HARDWARE => lasx_rs::arch::hardware().lasx as u64,
+                _ => 0,
+            };
+            *slot ^= black_box(v);
+        }
+    }
+    let ns = t.elapsed().as_secs_f64() * 1e9 / calls as f64;
+    black_box(acc.iter().fold(0u64, |x, y| x ^ y));
+    ns
+}
+
+/// 候选 + 每次调用一次能力检查，但**检查值的来源由参数决定**。
+///
+/// 受控对照的关键：同一个函数体、同一个循环形状，只让"`flag` 从哪来"变化 ⇒
+/// `dot_flagged(检测值)` 与 `dot_flagged(循环外算好的值)` 之差就是 §7.13 里
+/// `vec+detect` − `vec` 那 2.8–4.2 ns 中**真正属于能力检查**的部分。
+#[inline(never)]
+fn dot_flagged(flag: bool, a: &[f32], b: &[f32]) -> f32 {
+    if flag { dot_vec(a, b) } else { dot_ref(a, b) }
+}
+
+/// 通用计时：先预热再计时 `iters` 次，返回 ns/次。
+fn timed_ns<F: FnMut()>(iters: usize, mut f: F) -> f64 {
+    for _ in 0..(iters / 10).max(1000) {
+        f();
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        f();
+    }
+    t.elapsed().as_secs_f64() * 1e9 / iters as f64
+}
+
+/// 每调用固定开销的**受控拆解**（`lasx_bench lat callcost`）。
+///
+/// 方法论（§7.14 的教训）：要断言"差值 = 某项的真实每调用成本"，必须
+/// ① **同一个二进制、同一个循环形状**（同一展开度、同一依赖链），只让被测量的那一项变化；
+/// ② 差值要显著大于地板噪声。
+///
+/// 三个条目各给**地板 / 含该项 / 边际**三行，`ROUNDS` 轮进程内交替、每轮记 `loadavg`，
+/// 最后按"丢首轮 + 中位数 + 极差"汇总（原始逐轮值也都打印，便于独立复核）。
+///
+/// - **A 能力检查**（`SimdPath::detect()`，14 个算子入口各一次）：8 路展开探针，
+///   `const`（地板）/ `hoisted`（循环外算一次）/ `inline`（循环内每次算）/
+///   `hardware`（只读原子字节，用来把 detect 拆成"原子读 + TLS 读"）。
+/// - **B `_checked` vs 裸入口**（同一个算子、n=64）：校验 + 状态写回的净成本。
+/// - **C 分配 vs 复用**：`AlignedVec::new` 本身、`api` 分配型入口 vs 复用入口、
+///   `shape` 层 `Mat::mul` vs `Mat::mul_into`。
+pub fn callcost() {
+    use lasx_rs::aligned::AlignedVec;
+    use lasx_rs::shape::{Mat, MatBuf};
+
+    const ROUNDS: usize = 5;
+    const P_CALLS: usize = 8_000_000; // 8 路展开探针的"调用次数"
+    const C_ITERS: usize = 1_000_000;
+    const N64: usize = 64;
+
+    let x: Vec<f64> = (0..N64).map(|i| 1.0 + i as f64 * 0.25).collect();
+    let y: Vec<f64> = (0..N64).map(|i| 2.0 + i as f64 * 0.5).collect();
+    let z: Vec<f64> = (0..N64).map(|i| 3.0 + i as f64 * 0.75).collect();
+    let mut out = vec![0f64; N64];
+    let mut sink = 0f64;
+
+    // C 的 shape 层对照（32³ matmul，同一份重量/输入）
+    let w_data: Vec<f32> = (0..32 * 32).map(|i| (i % 17) as f32 * 0.125).collect();
+    let x_data: Vec<f32> = (0..32 * 32).map(|i| (i % 11) as f32 * 0.0625).collect();
+    let w = Mat::<f32, 32, 32>::new(&w_data).unwrap();
+    let xm = Mat::<f32, 32, 32>::new(&x_data).unwrap();
+    let mut outm = MatBuf::<f32, 32, 32>::new();
+
+    let mut raw: Vec<(String, Vec<f64>)> = Vec::new();
+    let push = |name: &str, v: f64, store: &mut Vec<(String, Vec<f64>)>| match store
+        .iter_mut()
+        .find(|(k, _)| k == name)
+    {
+        Some((_, vs)) => vs.push(v),
+        None => store.push((name.to_string(), vec![v])),
+    };
+
+    for r in 1..=ROUNDS {
+        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        let load = load.split_whitespace().next().unwrap_or("?").to_string();
+
+        // ---- A：能力检查 ----
+        let a_floor = probe8::<MODE_CONST>(P_CALLS);
+        let a_hoisted = probe8::<MODE_HOISTED>(P_CALLS);
+        let a_inline = probe8::<MODE_INLINE_DETECT>(P_CALLS);
+        let a_hw = probe8::<MODE_INLINE_HARDWARE>(P_CALLS);
+        for (k, v) in [
+            ("A_floor", a_floor),
+            ("A_hoisted", a_hoisted),
+            ("A_inline", a_inline),
+            ("A_hardware", a_hw),
+        ] {
+            println!("CALL r={r} load={load} item=A variant={k} ns={v:.3} calls={P_CALLS}");
+            push(k, v, &mut raw);
+        }
+        let a_marg = a_inline - a_hoisted;
+        println!("CALL r={r} load={load} item=A variant=A_marginal ns={a_marg:.3} calls={P_CALLS}");
+        push("A_marginal", a_marg, &mut raw);
+
+        // ---- A2：§7.13 的 `vec+detect` − `vec` = 2.8–4.2 ns 到底有多少是"能力检查" ----
+        // 同一个 `dot_flagged` 函数体，只换 flag 的来源：循环外算好的值 vs 循环内每次 detect()。
+        for dn in [8usize, 24] {
+            let da: Vec<f32> = (0..dn).map(|i| 1.0 + i as f32 * 0.0625).collect();
+            let db: Vec<f32> = (0..dn).map(|i| 0.5 + i as f32 * 0.03125).collect();
+            let d_base = timed_ns(C_ITERS, || {
+                sink += black_box(dot_vec(&da, &db)) as f64;
+            });
+            let d_hoist = timed_ns(C_ITERS, || {
+                sink += black_box(dot_flagged(black_box(true), &da, &db)) as f64;
+            });
+            let d_inline = timed_ns(C_ITERS, || {
+                sink += black_box(dot_flagged(
+                    black_box(matches!(SimdPath::detect(), SimdPath::Lasx)),
+                    &da,
+                    &db,
+                )) as f64;
+            });
+            let d_dispatch = timed_ns(C_ITERS, || {
+                sink += black_box(dot_vec_dispatch(&da, &db)) as f64;
+            });
+            for (k, v) in [
+                (format!("A2_n{dn}_vec"), d_base),
+                (format!("A2_n{dn}_flagged_hoisted"), d_hoist),
+                (format!("A2_n{dn}_flagged_detect"), d_inline),
+                (format!("A2_n{dn}_dispatch_asis"), d_dispatch),
+                (format!("A2_n{dn}_marg_detect"), d_inline - d_hoist),
+                (format!("A2_n{dn}_marg_structure"), d_dispatch - d_inline),
+            ] {
+                println!("CALL r={r} load={load} item=A2 variant={k} ns={v:.2} iters={C_ITERS}");
+                push(&k, v, &mut raw);
+            }
+        }
+
+        // ---- B：`_checked` vs 裸入口（同一算子 n=64）----
+        let b_raw = timed_ns(C_ITERS, || {
+            lasx_norm3_batch(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                out.as_mut_ptr(),
+                N64 as i32,
+            );
+            sink += black_box(out[0]);
+        });
+        let b_checked = timed_ns(C_ITERS, || {
+            let mut st = 0i32;
+            lasx_rs::ffi::checked::lasx_norm3_batch_checked(
+                x.as_ptr(),
+                y.as_ptr(),
+                z.as_ptr(),
+                out.as_mut_ptr(),
+                N64 as i32,
+                &mut st,
+            );
+            sink += black_box(out[0]) + black_box(st) as f64;
+        });
+        println!("CALL r={r} load={load} item=B variant=B_floor_raw ns={b_raw:.2} iters={C_ITERS}");
+        println!(
+            "CALL r={r} load={load} item=B variant=B_checked ns={b_checked:.2} iters={C_ITERS}"
+        );
+        println!(
+            "CALL r={r} load={load} item=B variant=B_marginal ns={:.2} iters={C_ITERS}",
+            b_checked - b_raw
+        );
+        push("B_floor_raw", b_raw, &mut raw);
+        push("B_checked", b_checked, &mut raw);
+        push("B_marginal", b_checked - b_raw, &mut raw);
+
+        // ---- C：分配 vs 复用 ----
+        let c_new = timed_ns(C_ITERS, || {
+            let v = AlignedVec::<f64>::new(N64);
+            sink += black_box(v[0]);
+        });
+        let c_api = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::norm3_batch(&x, &y, &z).unwrap();
+            sink += black_box(v[0]);
+        });
+        let c_mul = timed_ns(C_ITERS, || {
+            let m = xm.mul(&w);
+            sink += black_box(m.as_slice()[0]) as f64;
+        });
+        let c_mul_into = timed_ns(C_ITERS, || {
+            xm.mul_into(&w, &mut outm);
+            sink += black_box(outm.as_slice()[0]) as f64;
+        });
+        for (k, v) in [
+            ("C_new64", c_new),
+            ("C_api_norm3", c_api),
+            ("C_shape_mul", c_mul),
+            ("C_shape_mul_into", c_mul_into),
+        ] {
+            println!("CALL r={r} load={load} item=C variant={k} ns={v:.2} iters={C_ITERS}");
+            push(k, v, &mut raw);
+        }
+        // 边际：分配只出现在 `new` / `api`（分配型）/ `mul`（分配型）那一侧
+        for (k, v) in [
+            ("C_marg_api_vs_raw", c_api - b_raw),
+            ("C_marg_mul_vs_into", c_mul - c_mul_into),
+        ] {
+            println!("CALL r={r} load={load} item=C variant={k} ns={v:.2} iters={C_ITERS}");
+            push(k, v, &mut raw);
+        }
+
+        // ---- C2：热循环里反复调用，**分配型 vs `_into` 孪生**（本次落地的那一刀）----
+        // 同一内核、同一循环形状，只有"输出缓冲从哪来"不同 ⇒ 差值就是省下的那笔分配。
+        let mut ox = vec![0f64; N64];
+        let mut oy = vec![0f64; N64];
+        let mut oz = vec![0f64; N64];
+        let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let yf: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut of = vec![0f32; N64];
+        let mut c2: Vec<(&str, f64, f64)> = Vec::new();
+        // ① norm3_batch（1 个输出）
+        let a1 = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::norm3_batch(&x, &y, &z).unwrap();
+            sink += black_box(v[0]);
+        });
+        let i1 = timed_ns(C_ITERS, || {
+            lasx_rs::api::norm3_batch_into(&x, &y, &z, &mut ox).unwrap();
+            sink += black_box(ox[0]);
+        });
+        c2.push(("norm3_batch", a1, i1));
+        // ② cross3_batch（3 个输出）
+        let a2 = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::cross3_batch(&x, &y, &z, &y, &z, &x).unwrap();
+            sink += black_box(v[0][0]);
+        });
+        let i2 = timed_ns(C_ITERS, || {
+            lasx_rs::api::cross3_batch_into(&x, &y, &z, &y, &z, &x, &mut ox, &mut oy, &mut oz)
+                .unwrap();
+            sink += black_box(ox[0]);
+        });
+        c2.push(("cross3_batch", a2, i2));
+        // ③ unitize3_batch（3 个输出）
+        let a3 = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::unitize3_batch(&x, &y, &z).unwrap();
+            sink += black_box(v[0][0]);
+        });
+        let i3 = timed_ns(C_ITERS, || {
+            lasx_rs::api::unitize3_batch_into(&x, &y, &z, &mut ox, &mut oy, &mut oz).unwrap();
+            sink += black_box(ox[0]);
+        });
+        c2.push(("unitize3_batch", a3, i3));
+        // ④ vec3_add_scaled_batch（3 个输出）
+        let a4 = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::vec3_add_scaled_batch(&x, &y, &z, &y, &z, &x, 0.75).unwrap();
+            sink += black_box(v[0][0]);
+        });
+        let i4 = timed_ns(C_ITERS, || {
+            lasx_rs::api::vec3_add_scaled_batch_into(
+                &x, &y, &z, &y, &z, &x, 0.75, &mut ox, &mut oy, &mut oz,
+            )
+            .unwrap();
+            sink += black_box(ox[0]);
+        });
+        c2.push(("vec3_add_scaled_batch", a4, i4));
+        // ⑤ batch_distance2d（1 个输出，f32）
+        let a5 = timed_ns(C_ITERS, || {
+            let v = lasx_rs::api::batch_distance2d(0.25, -1.5, &xf, &yf).unwrap();
+            sink += black_box(v[0]) as f64;
+        });
+        let i5 = timed_ns(C_ITERS, || {
+            lasx_rs::api::batch_distance2d_into(0.25, -1.5, &xf, &yf, &mut of).unwrap();
+            sink += black_box(of[0]) as f64;
+        });
+        c2.push(("batch_distance2d", a5, i5));
+
+        for (name, a, i) in c2 {
+            let save = a - i;
+            println!(
+                "CALL r={r} load={load} item=C2 variant={name}_alloc ns={a:.2} iters={C_ITERS}"
+            );
+            println!(
+                "CALL r={r} load={load} item=C2 variant={name}_into ns={i:.2} iters={C_ITERS}"
+            );
+            println!(
+                "CALL r={r} load={load} item=C2 variant={name}_save ns={save:.2} iters={C_ITERS}"
+            );
+            push(&format!("C2_{name}_alloc"), a, &mut raw);
+            push(&format!("C2_{name}_into"), i, &mut raw);
+            push(&format!("C2_{name}_save"), save, &mut raw);
+        }
+    }
+
+    // ---- 汇总：丢首轮（r=1）后取中位数 + 极差 ----
+    for (name, vs) in &raw {
+        let mut v = vs.clone();
+        if v.len() > 1 {
+            v.remove(0); // 丢首轮
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = if v.len() % 2 == 1 {
+            v[v.len() / 2]
+        } else {
+            (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0
+        };
+        println!(
+            "CALLSUM item={} median={med:.3} min={:.3} max={:.3} rounds={}",
+            name,
+            v.first().copied().unwrap_or(f64::NAN),
+            v.last().copied().unwrap_or(f64::NAN),
+            v.len()
+        );
+    }
+    println!("CALLSUM sink={sink:.1}");
+}
+
 /// 定向测量 `detect()` 的**每调用固定开销**与"极小形状算子"的每调用时间。
 ///
 /// 机器可读行（`LAT arm=… ns=… …` + `loadavg=`），供**进程级交替**的 before/after A/B 用。
@@ -397,6 +734,11 @@ pub fn lat(_rows: &mut Vec<Row>) {
         match arm.as_str() {
             "detect" => {
                 detect_overhead();
+                return;
+            }
+            // 每调用固定开销的受控拆解（同一二进制、同一循环形状，逐项"地板/含该项/边际"）。
+            "callcost" => {
+                callcost();
                 return;
             }
             // 只跑**一个**循环：给 `perf stat -e instructions` 用——整进程指令数 ÷ 1e7

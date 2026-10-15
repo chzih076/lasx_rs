@@ -1110,8 +1110,32 @@ pub fn norm3_batch(xs: &[f64], ys: &[f64], zs: &[f64]) -> Result<AlignedVec<f64>
         &[("xs", xs.len()), ("ys", ys.len()), ("zs", zs.len())],
     )?;
     let mut out = AlignedVec::<f64>::new(n);
-    crate::ops::norm3_batch::norm3_batch(xs, ys, zs, out.as_mut_slice());
+    norm3_batch_into(xs, ys, zs, out.as_mut_slice())?;
     Ok(out)
+}
+
+/// [`norm3_batch`] 的**免分配**版本（输出写进调用方给的 `out`）。
+///
+/// # 为什么有它（收益说准）
+///
+/// **它不改变 `norm3_batch` 的计算速度**——同一个内核、同样的数值。它去掉的是**调用方
+/// 被迫付的那笔分配**：分配型入口每次调用要 `AlignedVec::new(n)`，实测 `n=64` 时
+/// **19.0 ns/次**，整个分配型入口比裸 FFI 入口贵 **+27.1 ns（+22%）**（见 `docs/dev.md`
+/// §7.14 的"调用侧"小节）。热循环里反复调用时改用本函数即可省下这笔钱；一次性调用不必改。
+///
+/// # Errors
+/// 三个数组长度不一致、或 `out.len()` 不等于它，返回 [`Error::Shape`]。
+pub fn norm3_batch_into(xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f64]) -> Result<()> {
+    let n = expect_same_len(
+        "norm3_batch",
+        &[("xs", xs.len()), ("ys", ys.len()), ("zs", zs.len())],
+    )?;
+    expect_len("norm3_batch", "out", out.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::norm3_batch::norm3_batch(xs, ys, zs, out);
+    Ok(())
 }
 
 /// 每个点到 `(px, py)` 的距离（f32）。
@@ -1121,8 +1145,28 @@ pub fn norm3_batch(xs: &[f64], ys: &[f64], zs: &[f64]) -> Result<AlignedVec<f64>
 pub fn batch_distance2d(px: f32, py: f32, xs: &[f32], ys: &[f32]) -> Result<AlignedVec<f32>> {
     let n = expect_same_len("batch_distance2d", &[("xs", xs.len()), ("ys", ys.len())])?;
     let mut out = AlignedVec::<f32>::new(n);
-    crate::ops::batch_distance2d::batch_distance2d(px, py, xs, ys, out.as_mut_slice());
+    batch_distance2d_into(px, py, xs, ys, out.as_mut_slice())?;
     Ok(out)
+}
+
+/// [`batch_distance2d`] 的**免分配**版本（收益口径同 [`norm3_batch_into`]）。
+///
+/// # Errors
+/// `xs`/`ys` 长度不一致、或 `out.len()` 不等于它，返回 [`Error::Shape`]。
+pub fn batch_distance2d_into(
+    px: f32,
+    py: f32,
+    xs: &[f32],
+    ys: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let n = expect_same_len("batch_distance2d", &[("xs", xs.len()), ("ys", ys.len())])?;
+    expect_len("batch_distance2d", "out", out.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::batch_distance2d::batch_distance2d(px, py, xs, ys, out);
+    Ok(())
 }
 
 /* ==================== 批量物理 ==================== */
@@ -1157,7 +1201,7 @@ pub fn vec3_add_scaled_batch(
         AlignedVec::<f64>::new(n),
         AlignedVec::<f64>::new(n),
     );
-    crate::ops::vec3_add_scaled_batch::vec3_add_scaled_batch(
+    vec3_add_scaled_batch_into(
         ax,
         ay,
         az,
@@ -1168,8 +1212,52 @@ pub fn vec3_add_scaled_batch(
         ox.as_mut_slice(),
         oy.as_mut_slice(),
         oz.as_mut_slice(),
-    );
+    )?;
     Ok([ox, oy, oz])
+}
+
+/// [`vec3_add_scaled_batch`] 的**免分配**版本（三个输出都由调用方给）。
+///
+/// # 为什么有它
+///
+/// **不改变计算速度**——同一个内核、同样的数值。去掉的是调用方被迫付的**三笔**分配
+/// （分配型入口每次要 3× `AlignedVec::new(n)`；实测 `n=64` 时 `norm3_batch` 的分配型
+/// 入口比裸 FFI 贵 +27.1 ns，本算子是 3 个输出，见 `docs/dev.md` §7.14）。
+///
+/// # Errors
+/// 六个输入数组长度不一致、或任一输出长度不等于它，返回 [`Error::Shape`]。
+#[allow(clippy::too_many_arguments)]
+pub fn vec3_add_scaled_batch_into(
+    ax: &[f64],
+    ay: &[f64],
+    az: &[f64],
+    bx: &[f64],
+    by: &[f64],
+    bz: &[f64],
+    s: f64,
+    ox: &mut [f64],
+    oy: &mut [f64],
+    oz: &mut [f64],
+) -> Result<()> {
+    let n = expect_same_len(
+        "vec3_add_scaled_batch",
+        &[
+            ("ax", ax.len()),
+            ("ay", ay.len()),
+            ("az", az.len()),
+            ("bx", bx.len()),
+            ("by", by.len()),
+            ("bz", bz.len()),
+        ],
+    )?;
+    expect_len("vec3_add_scaled_batch", "ox", ox.len(), n)?;
+    expect_len("vec3_add_scaled_batch", "oy", oy.len(), n)?;
+    expect_len("vec3_add_scaled_batch", "oz", oz.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::vec3_add_scaled_batch::vec3_add_scaled_batch(ax, ay, az, bx, by, bz, s, ox, oy, oz);
+    Ok(())
 }
 
 /// 中心引力 + J2 摄动加速度，返回 `[ax, ay, az]`。
@@ -1313,8 +1401,60 @@ pub fn cross3_batch(
         ],
     )?;
     let (mut ox, mut oy, mut oz) = alloc3(n);
-    crate::ops::cross3_batch::cross3_batch(ax, ay, az, bx, by, bz, &mut ox, &mut oy, &mut oz);
+    cross3_batch_into(
+        ax,
+        ay,
+        az,
+        bx,
+        by,
+        bz,
+        ox.as_mut_slice(),
+        oy.as_mut_slice(),
+        oz.as_mut_slice(),
+    )?;
     Ok([ox, oy, oz])
+}
+
+/// [`cross3_batch`] 的**免分配**版本（三个输出都由调用方给）。
+///
+/// # 为什么有它
+///
+/// **不改变计算速度**——同一个内核、同样的数值。去掉的是调用方被迫付的**三笔**分配
+/// （口径与数字见 [`vec3_add_scaled_batch_into`]、`docs/dev.md` §7.14）。
+///
+/// # Errors
+/// 六个输入数组长度不一致、或任一输出长度不等于它，返回 [`Error::Shape`]。
+#[allow(clippy::too_many_arguments)]
+pub fn cross3_batch_into(
+    ax: &[f64],
+    ay: &[f64],
+    az: &[f64],
+    bx: &[f64],
+    by: &[f64],
+    bz: &[f64],
+    ox: &mut [f64],
+    oy: &mut [f64],
+    oz: &mut [f64],
+) -> Result<()> {
+    let n = expect_same_len(
+        "cross3_batch",
+        &[
+            ("ax", ax.len()),
+            ("ay", ay.len()),
+            ("az", az.len()),
+            ("bx", bx.len()),
+            ("by", by.len()),
+            ("bz", bz.len()),
+        ],
+    )?;
+    expect_len("cross3_batch", "ox", ox.len(), n)?;
+    expect_len("cross3_batch", "oy", oy.len(), n)?;
+    expect_len("cross3_batch", "oz", oz.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::cross3_batch::cross3_batch(ax, ay, az, bx, by, bz, ox, oy, oz);
+    Ok(())
 }
 
 /// 批量三维单位化 `o = v/|v|`（零向量 → `(0,0,0)`），返回 `[ox, oy, oz]`。
@@ -1327,8 +1467,46 @@ pub fn unitize3_batch(x: &[f64], y: &[f64], z: &[f64]) -> Result<[AlignedVec<f64
         &[("x", x.len()), ("y", y.len()), ("z", z.len())],
     )?;
     let (mut ox, mut oy, mut oz) = alloc3(n);
-    crate::ops::unitize3_batch::unitize3_batch(x, y, z, &mut ox, &mut oy, &mut oz);
+    unitize3_batch_into(
+        x,
+        y,
+        z,
+        ox.as_mut_slice(),
+        oy.as_mut_slice(),
+        oz.as_mut_slice(),
+    )?;
     Ok([ox, oy, oz])
+}
+
+/// [`unitize3_batch`] 的**免分配**版本（三个输出都由调用方给）。
+///
+/// # 为什么有它
+///
+/// **不改变计算速度**——同一个内核、同样的数值。去掉的是调用方被迫付的**三笔**分配
+/// （口径与数字见 [`vec3_add_scaled_batch_into`]、`docs/dev.md` §7.14）。
+///
+/// # Errors
+/// 三个输入数组长度不一致、或任一输出长度不等于它，返回 [`Error::Shape`]。
+pub fn unitize3_batch_into(
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+    ox: &mut [f64],
+    oy: &mut [f64],
+    oz: &mut [f64],
+) -> Result<()> {
+    let n = expect_same_len(
+        "unitize3_batch",
+        &[("x", x.len()), ("y", y.len()), ("z", z.len())],
+    )?;
+    expect_len("unitize3_batch", "ox", ox.len(), n)?;
+    expect_len("unitize3_batch", "oy", oy.len(), n)?;
+    expect_len("unitize3_batch", "oz", oz.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::unitize3_batch::unitize3_batch(x, y, z, ox, oy, oz);
+    Ok(())
 }
 
 /// 批量 `o = M·v`（`m` 为行主序 3×3），返回 `[ox, oy, oz]`。
@@ -3109,5 +3287,131 @@ mod tests {
         ));
         // 空形状不 panic、也不写
         assert!(matmul_scaled_into(0, 3, 4, 1.5, 0.5, &[], &b, &mut []).is_ok());
+    }
+
+    /// 五个小批量几何算子的 `_into` 孪生：**位精确**（对分配型入口，`to_bits()`）+ 契约。
+    ///
+    /// 位精确现在**由构造成立**（分配型入口直接委托给 `_into`），这个测试是**守卫**：
+    /// 将来谁把某一侧改成另一条实现（或改了长度校验的边界），这里立刻红。
+    /// 形状覆盖空、1、LASX/标量尾部边界（7/8/9、31/32/33）与 64/65。
+    #[test]
+    fn test_batch_geometry_into_bit_exact_and_contract() {
+        use crate::ops::testutil::Lcg;
+        let mut rng = Lcg(0x9e37_79b9);
+        for &n in &[0usize, 1, 7, 8, 9, 31, 32, 33, 64, 65] {
+            let x: Vec<f64> = (0..n).map(|_| rng.f64() * 2.0 - 1.0).collect();
+            let y: Vec<f64> = (0..n).map(|_| rng.f64() * 2.0 - 1.0).collect();
+            let z: Vec<f64> = (0..n).map(|_| rng.f64() * 2.0 - 1.0).collect();
+            let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+            let yf: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+
+            let same = |got: &[f64], want: &[f64], what: &str| {
+                assert_eq!(got.len(), want.len(), "{what} n={n} 长度");
+                for i in 0..want.len() {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "{what} n={n} 第 {i} 个元素与分配型入口不逐位相同"
+                    );
+                }
+            };
+
+            // ① norm3_batch
+            let mut g1 = vec![f64::NAN; n];
+            norm3_batch_into(&x, &y, &z, &mut g1).unwrap();
+            same(&g1, &norm3_batch(&x, &y, &z).unwrap(), "norm3_batch");
+
+            // ② cross3_batch
+            let (mut ox, mut oy, mut oz) =
+                (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
+            cross3_batch_into(&x, &y, &z, &y, &z, &x, &mut ox, &mut oy, &mut oz).unwrap();
+            let want = cross3_batch(&x, &y, &z, &y, &z, &x).unwrap();
+            same(&ox, &want[0], "cross3_batch.ox");
+            same(&oy, &want[1], "cross3_batch.oy");
+            same(&oz, &want[2], "cross3_batch.oz");
+
+            // ③ unitize3_batch
+            let (mut ox, mut oy, mut oz) =
+                (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
+            unitize3_batch_into(&x, &y, &z, &mut ox, &mut oy, &mut oz).unwrap();
+            let want = unitize3_batch(&x, &y, &z).unwrap();
+            same(&ox, &want[0], "unitize3_batch.ox");
+            same(&oy, &want[1], "unitize3_batch.oy");
+            same(&oz, &want[2], "unitize3_batch.oz");
+
+            // ④ vec3_add_scaled_batch
+            let s = 0.75f64;
+            let (mut ox, mut oy, mut oz) =
+                (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
+            vec3_add_scaled_batch_into(&x, &y, &z, &y, &z, &x, s, &mut ox, &mut oy, &mut oz)
+                .unwrap();
+            let want = vec3_add_scaled_batch(&x, &y, &z, &y, &z, &x, s).unwrap();
+            same(&ox, &want[0], "vec3_add_scaled_batch.ox");
+            same(&oy, &want[1], "vec3_add_scaled_batch.oy");
+            same(&oz, &want[2], "vec3_add_scaled_batch.oz");
+
+            // ⑤ batch_distance2d（f32）
+            let mut gf = vec![f32::NAN; n];
+            batch_distance2d_into(0.25, -1.5, &xf, &yf, &mut gf).unwrap();
+            let wantf = batch_distance2d(0.25, -1.5, &xf, &yf).unwrap();
+            for i in 0..n {
+                assert_eq!(
+                    gf[i].to_bits(),
+                    wantf[i].to_bits(),
+                    "batch_distance2d n={n} 第 {i} 个元素不逐位相同"
+                );
+            }
+        }
+
+        // ⑥ 契约：输出长度不对 → `Error::Shape { what: "out" / "ox" / "oy" / "oz" }`
+        let a = vec![1f64; 4];
+        let mut o4a = vec![0f64; 4];
+        let mut o4b = vec![0f64; 4];
+        let mut o3 = vec![0f64; 3];
+        assert!(matches!(
+            norm3_batch_into(&a, &a, &a, &mut o3),
+            Err(Error::Shape { what: "out", .. })
+        ));
+        assert!(matches!(
+            cross3_batch_into(&a, &a, &a, &a, &a, &a, &mut o4a, &mut o4b, &mut o3),
+            Err(Error::Shape { what: "oz", .. })
+        ));
+        assert!(matches!(
+            unitize3_batch_into(&a, &a, &a, &mut o3, &mut o4a, &mut o4b),
+            Err(Error::Shape { what: "ox", .. })
+        ));
+        assert!(matches!(
+            vec3_add_scaled_batch_into(&a, &a, &a, &a, &a, &a, 1.0, &mut o3, &mut o4a, &mut o4b),
+            Err(Error::Shape { what: "ox", .. })
+        ));
+        assert!(matches!(
+            batch_distance2d_into(0.0, 0.0, &[0f32; 4], &[0f32; 4], &mut [0f32; 3]),
+            Err(Error::Shape { what: "out", .. })
+        ));
+        // 输入长度不一致 → what 指向那个输入
+        assert!(matches!(
+            norm3_batch_into(&a, &a[..3], &a, &mut o4a),
+            Err(Error::Shape { what: "ys", .. })
+        ));
+        // 空输入 + 空输出：Ok 且不 panic
+        assert!(norm3_batch_into(&[], &[], &[], &mut []).is_ok());
+        assert!(cross3_batch_into(&[], &[], &[], &[], &[], &[], &mut [], &mut [], &mut []).is_ok());
+        assert!(unitize3_batch_into(&[], &[], &[], &mut [], &mut [], &mut []).is_ok());
+        assert!(
+            vec3_add_scaled_batch_into(
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                2.0,
+                &mut [],
+                &mut [],
+                &mut []
+            )
+            .is_ok()
+        );
+        assert!(batch_distance2d_into(0.0, 0.0, &[], &[], &mut []).is_ok());
     }
 }

@@ -1268,6 +1268,11 @@ lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
 - 结合序固定 `x² + (y² + z²)`（右结合）；LASX 4 样本/向量、LSX 2 样本/向量、标量尾同式，
   分块内逐位一致。对独立标量参考（左结合写法）相对误差 <1e-9。
 
+> **Rust 侧有免分配版 `api::norm3_batch_into(xs, ys, zs, out)`**：同一内核、与分配版**逐位一致**
+> （分配版直接委托给它），只是输出缓冲由调用方给。热循环里反复调用时它省掉每次
+> `AlignedVec::new` 的 **30.6 ns**（n=64 实测：155.6 → 124.9 ns/调用；`docs/dev.md` §7.14）。
+> 一次性调用不必改。
+
 ### 6.2 `lasx_vec3_add_scaled_batch` — 批量缩放加（LASX+LSX）
 
 `void lasx_vec3_add_scaled_batch(6×const double*, double s, 3×double*, int n)`
@@ -1277,6 +1282,9 @@ lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
 - 向量路径单条 FMA `lasx_xvfmadd_d(vs, vb, va)`；标量尾 `f64::mul_add(s, b, a)` 同式，
   分块内逐位一致。相对独立标量参考 <1e-9。
 
+> **Rust 侧有免分配版 `api::vec3_add_scaled_batch_into(…, ox, oy, oz)`**：三个输出都由调用方给；
+> n=64 实测省 **74.7 ns/调用**（159.9 → 85.2 ns）。
+
 ### 6.3 `lasx_batch_distance2d` — 批量 2D 距离（LASX+标量）
 
 `void lasx_batch_distance2d(float px, float py, const float *xs, const float *ys, float *out, int n)`
@@ -1284,6 +1292,9 @@ lasx_gemv_i8(w, scale_w, x_q, scale_x, y, m, k);
 - 语义：`out[i] = √(dx² + dy²)`，`dx = xs[i]-px`、`dy = ys[i]-py`。
 - LASX 8 点/向量：`xvfsub_s` 求差、`xvfmul_s`+`xvfadd_s` 求平方和（`fadd(fmul,fmul)`）、
   `xvfsqrt_s` 开方；标量尾同式同结合序，分块内逐位一致。非 LASX 时**全标量**。
+
+> **Rust 侧有免分配版 `api::batch_distance2d_into(px, py, xs, ys, out)`**：n=64 实测省
+> **26.4 ns/调用**（94.8 → 68.3 ns）。
 
 ### 6.4 `lasx_ballistic_step` — 批量弹道欧拉步（LASX+标量）
 
@@ -1389,6 +1400,15 @@ let mut rv32 = RvMut::<f32, N>::new(&mut rx32, &mut ry32, &mut rz32,
                                     &mut vx32, &mut vy32, &mut vz32)?;
 rv32.ballistic_step(&k, dt, g);                  // = lasx_ballistic_step（原地）
 ```
+
+> **`api` 层的免分配孪生（本次补齐）**：上面演示的 `shape` 层方法**本来就是免分配的**
+> （输出写进调用方给的 `VecBuf`/`V3Buf`），缺的一直是 `api` 层——它对五个小批量几何算子
+> 只有分配型入口：`api::cross3_batch_into`（n=64 实测省 **88.6 ns/调用**：174.7 → 86.0）、
+> `api::unitize3_batch_into`（省 **107.9 ns**：425.6 → 317.9），以及 §6.1/§6.2/§6.3 里那三个
+> （`norm3_batch_into` 30.6 ns、`vec3_add_scaled_batch_into` 74.7 ns、`batch_distance2d_into`
+> 26.4 ns）。三个输出的算子需要三份输出缓冲；与分配型入口**逐位一致**，由
+> `src/api.rs` 的 `test_batch_geometry_into_bit_exact_and_contract` 守（覆盖 n = 0/1/7/8/9/
+> 31/32/33/64/65）。口径与全部数字见 `docs/dev.md` §7.14 ③。
 
 - **两组视图（按"长度在哪"分）**：`V3Ref`/`V3Buf`/`RvMut`/`V2Ref` 的长度在**类型里**（const `N`，
   适合形状编译期已知）；`V3Dyn`/`V3DynMut`/`RvDynMut`/`V2Dyn` 的长度是**运行期字段**
