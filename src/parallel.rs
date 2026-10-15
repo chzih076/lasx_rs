@@ -1481,3 +1481,75 @@ fn diag_spin_limit() {
         );
     }
 }
+
+/// **实验 A（DSL 基线；默认 `#[ignore]`）**：DSL 生成代码那条路
+/// （`Mat::prepare().apply_into`，即 `matmul!(y = x*p)` 的语义）vs **手动最优**
+/// （`matmul_f32_plan` + 常驻池），同进程交替 ≥5 次取中位数。
+///
+/// 判据（先写死）：**DSL ≥ 0.833× 手动最优** 就算"DSL 已达标"；只有"接上阈值确实可测更快"
+/// 才改 `src/shape.rs` 里写死的 `Pick`。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_dsl_vs_manual -- --ignored --nocapture`
+#[cfg(test)]
+#[ignore = "实验 A：DSL(shape::Prepared) vs 手动最优的同进程交替"]
+#[test]
+fn diag_dsl_vs_manual() {
+    use crate::aligned::AlignedVec;
+    use crate::shape::{Mat, MatBuf};
+    use std::time::Instant;
+    const M: usize = 192;
+    const K: usize = 768;
+    const N: usize = 3072;
+    let a = AlignedVec::<f32>::fill_with(M * K, |i| ((i % 23) as f32 - 11.0) * 0.125);
+    let b = AlignedVec::<f32>::fill_with(K * N, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+    let w = Mat::<f32, K, N>::new(&b).unwrap();
+    let x = Mat::<f32, M, K>::new(&a).unwrap();
+    let mut out = MatBuf::<f32, M, N>::new();
+    let mut c = AlignedVec::<f32>::new(M * N);
+    let pool = WorkerPool::new(12);
+    let plan = MatmulPlan::from_row_major(&b, K, N).unwrap();
+    let flop = 2.0 * M as f64 * K as f64 * N as f64;
+
+    let mut t_dsl = Vec::new();
+    let mut t_manual = Vec::new();
+    // **按文档推荐的用法 hoist 打包**（`matmul!(y = x*p)` 的语义就是"循环外 prepare 一次"）：
+    // 把 `prepare()` 留在循环里测到的是"每次重打包"，那不是 DSL 的推荐用法、也不是本实验要问的问题。
+    let p = w.prepare();
+    for _ in 0..7 {
+        // ① DSL 生成代码那条路（shape::Prepared ⇒ 进程级共享池 + 内部 Pick）
+        let t0 = Instant::now();
+        p.apply_into(&x, &mut out);
+        t_dsl.push(t0.elapsed().as_secs_f64());
+
+        // ② 手动最优（plan + 常驻池 + 调用方切分）
+        let t0 = Instant::now();
+        matmul_f32_plan(&pool, &plan, M, &a, &mut c).unwrap();
+        t_manual.push(t0.elapsed().as_secs_f64());
+    }
+    // 位精确：两条路都必须与 api::matmul 逐位一致
+    let want = crate::api::matmul(M, K, N, &a, &b).unwrap();
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    assert_eq!(
+        bits(out.as_slice()),
+        bits(&want),
+        "DSL 路径与 api::matmul 不逐位"
+    );
+    assert_eq!(bits(&c), bits(&want), "手动最优与 api::matmul 不逐位");
+
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (td, tm) = (med(&mut t_dsl), med(&mut t_manual));
+    println!(
+        "DSL(shape::Prepared)  = {:.4} ms = {:.1} GFLOP/s",
+        td * 1e3,
+        flop / td / 1e9
+    );
+    println!(
+        "手动最优(plan+池)     = {:.4} ms = {:.1} GFLOP/s",
+        tm * 1e3,
+        flop / tm / 1e9
+    );
+    println!("DSL/手动 = {:.3}×（判据 ≥0.833× 算达标）", tm / td);
+}

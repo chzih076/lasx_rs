@@ -650,18 +650,18 @@ impl<P: Policy, T: PackedKernel, const K: usize, const N: usize> Prepared<P, T, 
         // 用"切几个块"表达"用几个线程"：块大小向上取整到 4（微内核 4 行一块），
         // 且每线程至少 4 行。池把自己那批 worker 铺到这些块上，多出来的没活干。
         let per_thread = rows.div_ceil(threads).max(4);
-        let block_rows = per_thread.div_ceil(4) * 4;
+        let _ = per_thread;
+        // **切分策略走公共判据**（2026-10-15，实验 A 之后接上）：`pick_rows` 的阈值是
+        // **同进程交替实测**出来的（大形状动态、其余静态/多块，见 `docs/dev.md` §7.10 ⑩）⇒
+        // `shape`（DSL/plan）路径与 C 侧装置**共用同一份判据**（`src/pool/sched.rs::pick_rows`），
+        // 以后只改一处。旧实现写死 `Pick::Blocked { block_rows = per_thread }`：对中等形状
+        // （LLM 那种 `per_thread` 十几行）实测比"静态/动态"都慢（§7.10 ⑩ 阈值表 + 实验 A 改前后）。
+        let pick = crate::pool::pick_rows(rows, threads, 4);
         // 只读的 `a` 由闭包捕获、按 `start` 切片（见 pool 模块头"行块闭包的契约"）
-        pool.for_each_row_block_mut_picked(
-            rows,
-            4,
-            [(c, N)],
-            crate::pool::Pick::Blocked { block_rows },
-            |start, block, [cb]| {
-                let ab = &a[start * K..(start + block) * K];
-                self.plan.run_rows_into(ab, cb);
-            },
-        );
+        pool.for_each_row_block_mut_picked(rows, 4, [(c, N)], pick, |start, block, [cb]| {
+            let ab = &a[start * K..(start + block) * K];
+            self.plan.run_rows_into(ab, cb);
+        });
     }
 }
 
