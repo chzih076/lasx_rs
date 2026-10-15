@@ -126,6 +126,10 @@ arm_cmd() { # $1 = 档名 → 打印命令（不含 perf）
 # ③ 逐档 × 逐分批 × reps 次：跑 perf stat，收计数 + 装置自报的窗口指标
 # ------------------------------------------------------------------
 echo "== ③ 逐档计数（每格 ${reps} 次，报中位数+极差） =="
+d() { # $1 表达式（bc -l）。注意：**bc 不认 `1e9` 这类科学计数**（会让整行变空、静默丢数），
+      # 所有常量都写全数字（本脚本踩过一次：派生量整列变成 "-"）。
+  printf '%s\n' "$1" | bc -l 2>/dev/null
+}
 median_of() { # 从 stdin 的整数列表取中位数（偶数取上中位）
   local n
   n="$(printf '%s\n' "$@" | grep -c .)"
@@ -148,11 +152,25 @@ extract() { # $1 = perf 原文, $2 = 事件名（带或不带 :u）→ 打印计
 }
 
 : > "$sum"
+# 每个分批的"同源比率"规格：分子/分母**必须来自同一次运行**（同一个 `perf stat` 的同一批事件）。
+# 格式：`分子下标 分母下标 比率名 上界`。**为什么必须同源**：上一版把"A 分批的中位数"与
+# "B 分批的中位数"相除 ⇒ 出现 95%/435% 这种不可能的缺失率、DRAM 估计也对不上（Lead 复核抓到）。
+# 比率型结果一律**逐轮算、再看中位数**，并且带机器自洽闸门（不合格只打 `!!`，不出数）。
+ratio_spec() {
+  case "$1" in
+    ipc) printf '1 0 IPC_每条指令周期 20' ;; # IPC = instructions/cycles（上限 20 是防呆，不是百分比）
+    llc) printf '2 1 LLC缺失率pct 110' ;;
+    tlb) printf '1 0 TLB缺失率pct 110' ;;
+    br) printf '1 0 分支缺失率pct 110' ;;
+    *) printf '' ;;
+  esac
+}
 for a in "${arms[@]}"; do
   aname="${a%%|*}"; rest="${a#*|}"; atype="${rest%%|*}"; aargs="${rest#*|}"
   for b in "${batches[@]}"; do
     bname="${b%%|*}"; evs="${b#*|}"
-    vals_ms=(); vals_iters=(); vals_max=()
+    vals_ms=(); vals_iters=(); vals_max=(); vals_calls=()
+    vals_ratio=(); vals_bw=()
     # 注意：`declare -A` 对**已存在**的关联数组是"重新声明"而**不清空** ⇒ 必须显式 unset，
     # 否则上一档/上一分批的计数会留在里面，把中位数与极差污染掉（本脚本踩过一次）。
     unset per_event
@@ -179,35 +197,95 @@ for a in "${arms[@]}"; do
         mx="$ms"
       fi
       vals_ms+=("${ms:-}"); vals_iters+=("${it:-}"); vals_max+=("${mx:-}")
-      # 计数（按事件名逐个取；忽略 n/a）
+      # 本次运行"每次调用折算"用的调用数：bench = iters + 2（1 热身 + 1 自适应探测 + iters 计时）
+      if [ "$atype" = bench ] && [ -n "${it:-}" ]; then
+        calls_i=$((it + 2))
+      else
+        calls_i=7
+      fi
+      vals_calls+=("$calls_i")
+      # 计数：**逐事件、同一次运行**地取（ev_vals 与 ev_list 下标对齐）
       IFS=',' read -r -a ev_list <<<"$evs"
+      ev_vals=()
       for e in "${ev_list[@]}"; do
         v="$(extract "$out" "$e")"
-        if [ "$v" != "n/a" ]; then
-          per_event["$e"]="${per_event[$e]:-} $v"
-        else
-          per_event["$e"]="${per_event[$e]:-} n/a"
-        fi
+        ev_vals+=("$v")
+        per_event["$e"]="${per_event[$e]:-} $v"
       done
+      # ---- 同源比率（**逐轮**算；分子分母来自这一次运行）----
+      case "$bname" in
+        ipc)
+          if [ "${ev_vals[0]:-n/a}" != n/a ] && [ "${ev_vals[1]:-n/a}" != n/a ] &&
+            [ "${ev_vals[0]:-0}" != 0 ]; then
+            vals_ratio+=("$(d "${ev_vals[1]}/${ev_vals[0]}")")
+          fi
+          ;;
+        llc)
+          if [ "${ev_vals[1]:-n/a}" != n/a ] && [ "${ev_vals[2]:-n/a}" != n/a ] &&
+            [ "${ev_vals[1]:-0}" != 0 ]; then
+            vals_ratio+=("$(d "100*${ev_vals[2]}/${ev_vals[1]}")")
+            # 每调用的 **全线程合计** DRAM 估计 =（miss × 64 B ÷ 本次运行调用数）÷ 每次调用墙钟
+            if [ -n "${ms:-}" ] && [ "$ms" != 0 ]; then
+              vals_bw+=("$(d "${ev_vals[2]}*64*1000/($calls_i*$ms*1000000000)")")
+            fi
+          fi
+          ;;
+        tlb)
+          if [ "${ev_vals[0]:-n/a}" != n/a ] && [ "${ev_vals[1]:-n/a}" != n/a ] &&
+            [ "${ev_vals[0]:-0}" != 0 ]; then
+            vals_ratio+=("$(d "100*${ev_vals[1]}/${ev_vals[0]}")")
+          fi
+          ;;
+        br)
+          if [ "${ev_vals[0]:-n/a}" != n/a ] && [ "${ev_vals[1]:-n/a}" != n/a ] &&
+            [ "${ev_vals[0]:-0}" != 0 ]; then
+            vals_ratio+=("$(d "100*${ev_vals[1]}/${ev_vals[0]}")")
+          fi
+          ;;
+      esac
     done
     # 折算：bench 档的调用数 = iters + 2（1 热身 + 1 自适应探测 + iters 计时）；rusttest = 7
     calls=""
-    if [ "$atype" = bench ]; then
-      it_med="$(median_of "${vals_iters[@]}")"
-      [ -n "$it_med" ] && calls=$((it_med + 2))
-    else
-      calls=7
-    fi
+    calls="$(median_of "${vals_calls[@]}")"
     {
       printf 'arm=%s batch=%s shape=192x768x3072-f32-threads12 calls_per_run=%s\n' \
         "$aname" "$bname" "${calls:-n/a}"
       printf '  ms_med 中位数=%s 极差=%s | iters 中位数=%s | ms_max 中位数=%s\n' \
         "$(median_of "${vals_ms[@]}")" "$(range_of "${vals_ms[@]}")" \
         "$(median_of "${vals_iters[@]}")" "$(median_of "${vals_max[@]}")"
+      # **原始分子/分母**都打出来（读者可手算复核）
       for e in "${ev_list[@]}"; do
         read -r -a vv <<<"${per_event[$e]}"
         printf '  %-22s 中位数=%-14s 极差=%s\n' "$e" "$(median_of "${vv[@]}")" "$(range_of "${vv[@]}")"
       done
+      # 同源比率 + **自洽闸门**（不合格只打 `!!`，不出数）
+      spec="$(ratio_spec "$bname")"
+      if [ -n "$spec" ] && [ "${#vals_ratio[@]}" -gt 0 ]; then
+        set -- $spec
+        rname="$3"; rbound="$4"
+        rmed="$(median_of "${vals_ratio[@]}")"
+        ok=1
+        for rv in "${vals_ratio[@]}"; do
+          if [ "$bname" = ipc ]; then
+            [ "$(d "$rv < 0.05")" = 1 ] && ok=0
+            [ "$(d "$rv > 20")" = 1 ] && ok=0
+          else
+            [ "$(d "$rv > $rbound")" = 1 ] && ok=0
+            [ "$(d "$rv < 0")" = 1 ] && ok=0
+          fi
+        done
+        if [ "$ok" = 1 ]; then
+          printf '  %s 逐轮中位数=%s 极差=%s（**同源**：分子/分母同一次运行；闸门 OK）\n' \
+            "$rname" "$rmed" "$(range_of "${vals_ratio[@]}")"
+        else
+          printf '  !! 自洽失败：%s 逐轮=%s（闸门 %s）——**不出数**\n' \
+            "$rname" "$(printf '%s ' "${vals_ratio[@]}")" "$rbound"
+        fi
+      fi
+      if [ "${#vals_bw[@]}" -gt 0 ]; then
+        printf '  DRAM估计GB/s 逐轮中位数=%s 极差=%s（**每调用、全线程合计**流量 ÷ 每调用墙钟）\n' \
+          "$(median_of "${vals_bw[@]}")" "$(range_of "${vals_bw[@]}")"
+      fi
       printf '\n'
     } >> "$sum"
     printf '  %-14s %-6s ms_med=%s iters=%s ms_max=%s\n' "$aname" "$bname" \
@@ -216,59 +294,63 @@ for a in "${arms[@]}"; do
 done
 
 # ------------------------------------------------------------------
-# ④ 派生量（每个都写清"支持什么结论"）——从汇总里读中位数，用 bc 算
+# ④ 派生量（**全部读 ③ 里"逐轮同源"算好的比率**，不再跨分批相除）
 # ------------------------------------------------------------------
-val_of() { # $1 arm, $2 batch, $3 事件 → 该 arm 该事件的中位数（取不到打空）
-  grep -A 8 "^arm=$1 batch=$2 " "$sum" |
-    grep -E "^  $3 +中位数=" | head -1 | grep -oE '中位数=[0-9.]+' | cut -d= -f2
+ratio_of() { # $1 arm, $2 batch, $3 比率名 → 打该比率的"逐轮中位数"（取不到打空）
+  grep -A 12 "^arm=$1 batch=$2 " "$sum" |
+    grep -E "^  $3 逐轮中位数=" | head -1 | grep -oE '逐轮中位数=[0-9.]+' | cut -d= -f2
 }
-calls_of() { # $1 arm → calls_per_run
-  grep "^arm=$1 batch=ipc " "$sum" | head -1 | grep -oE 'calls_per_run=[0-9]+' | cut -d= -f2
+bw_of() { # $1 arm → DRAM 逐轮中位数
+  grep -A 12 "^arm=$1 batch=llc " "$sum" |
+    grep -E '^  DRAM估计GB/s 逐轮中位数=' | head -1 | grep -oE '=[0-9.]+' | head -1 | cut -d= -f2
 }
-ms_of() { # $1 arm → ms_med 中位数（值在下一行，必须 -A 1）
-  grep -A 1 "^arm=$1 batch=ipc " "$sum" | grep -oE 'ms_med 中位数=[0-9.]+' | head -1 | cut -d= -f2
-}
-d() { # $1 表达式（bc -l）
-  printf '%s\n' "$1" | bc -l 2>/dev/null
+cpc_of() { # $1 arm, $2 batch, $3 事件 → 该事件的**每次调用**中位数 = 中位数 ÷ calls_per_run
+  local med calls
+  med="$(grep -A 12 "^arm=$1 batch=$2 " "$sum" | grep -E "^  $3 +中位数=" | head -1 |
+    grep -oE '中位数=[0-9]+' | cut -d= -f2)"
+  calls="$(grep "^arm=$1 batch=$2 " "$sum" | head -1 | grep -oE 'calls_per_run=[0-9]+' | cut -d= -f2)"
+  [ -n "$med" ] && [ -n "$calls" ] && [ "$calls" != 0 ] && d "$med/$calls"
 }
 
 {
   echo
-  echo "== ④ 派生量（按每次调用折算；**只用于判断"哪类资源更像绑定项"，不是吞吐天花板**） =="
-  printf '%-14s %8s %8s %8s %9s %10s %8s %8s %8s\n' arm ms/调用 IPC LLC缺失率 DRAM估GB/s ctx切换/调用 迁移/调用 dTLB缺失 TLB缺失率
+  echo "== ④ 派生量总表 =="
+  # 注意：这一段提示**全部用单引号**——双引号里的反引号会被 bash 当命令替换执行
+  # （本脚本踩过两次：`--call-graph fp` 与 `perf stat` 都被当命令跑，后者没带参数直接挂住）。
+  echo '# **口径（每列逐个写明）**：所有计数都是**整个进程之和**（12 个 worker + 主线程；'
+  echo '#   perf stat 默认继承所有线程）；'
+  echo '#   * X/调用 = 该次运行的计数 ÷ 该次运行的调用数（bench = iters+2：1 热身 + 1 自适应'
+  echo '#     探测 + iters 计时；rust 测试档 = 7）——即**全线程合计**的每调用量；'
+  echo '#   * IPC / 缺失率 / DRAM 都是**逐轮同源**算完再取中位数（不是两个中位数相除）；'
+  echo '#   * DRAM 估计 =（llc-load-misses × 64 B ÷ 调用数）÷ 每次调用墙钟 = **每调用、全线程合计**；'
+  echo '#   * ctx/迁移/页缺失 = 整轮计数 ÷ 调用数。'
+  printf '%-14s %8s %6s %8s %10s %11s %12s %10s %10s %9s\n' \
+    档 ms/调用 iters/ms_max IPC LLC缺失率 DRAM估GB/s cycles/调用 instr/调用 llc-loads/调用 dTLB缺失/调用
   for a in plan-tight "pool(rust)" single-thread openblas "rows(病理)"; do
-    ms="$(ms_of "$a")"
-    calls="$(calls_of "$a")"
-    cyc="$(val_of "$a" ipc cycles:u)"
-    ins="$(val_of "$a" ipc instructions:u)"
-    ll="$(val_of "$a" llc llc-loads:u)"
-    lm="$(val_of "$a" llc llc-load-misses:u)"
-    dm="$(val_of "$a" tlb dTLB-load-misses:u)"
-    dt="$(val_of "$a" tlb dTLB-loads:u)"
-    cs="$(val_of "$a" sched context-switches)"
-    mg="$(val_of "$a" sched cpu-migrations)"
-    ipc="-"; mr="-"; bw="-"; csc="-"; mgc="-"; tmr="-"
-    [ -n "$cyc" ] && [ -n "$ins" ] && [ "$cyc" != 0 ] && ipc="$(d "$ins/$cyc")"
-    [ -n "$ll" ] && [ -n "$lm" ] && [ "$ll" != 0 ] && mr="$(d "100*$lm/$ll")"
-    if [ -n "$lm" ] && [ -n "$ms" ] && [ -n "$calls" ] && [ "$ms" != 0 ]; then
-      # 注意：**bc 不认 `1e9` 这类科学计数**（会让整行变成空 ⇒ 早期版本这一列全是 "-"），
-      # 所以这里写全 `1000000000`。
-      bw="$(d "$lm*64/1000000000/($ms*$calls/1000)")"
-    fi
-    [ -n "$cs" ] && [ -n "$calls" ] && csc="$(d "$cs/$calls")"
-    [ -n "$mg" ] && [ -n "$calls" ] && mgc="$(d "$mg/$calls")"
-    [ -n "$dm" ] && [ -n "$dt" ] && [ "$dt" != 0 ] && tmr="$(d "100*$dm/$dt")"
-    printf '%-14s %8s %8s %8s %9s %10s %8s %8s %8s\n' \
-      "$a" "${ms:--}" "${ipc:--}" "${mr:--}" "${bw:--}" "${csc:--}" "${mgc:--}" "${dm:--}" "${tmr:--}"
+    ms="$(grep -A 1 "^arm=$a batch=ipc " "$sum" | grep -oE 'ms_med 中位数=[0-9.]+' | head -1 | cut -d= -f2)"
+    it="$(grep -A 1 "^arm=$a batch=ipc " "$sum" | grep -oE 'iters 中位数=[0-9]+' | head -1 | cut -d= -f2)"
+    mx="$(grep -A 1 "^arm=$a batch=ipc " "$sum" | grep -oE 'ms_max 中位数=[0-9.]+' | head -1 | cut -d= -f2)"
+    ipc="$(ratio_of "$a" ipc IPC_每条指令周期)"
+    mr="$(ratio_of "$a" llc LLC缺失率pct)"
+    bw="$(bw_of "$a")"
+    cy="$(cpc_of "$a" ipc cycles:u)"
+    ins="$(cpc_of "$a" ipc instructions:u)"
+    ll="$(cpc_of "$a" llc llc-loads:u)"
+    dm="$(cpc_of "$a" tlb dTLB-load-misses:u)"
+    printf '%-14s %8s %6s %8s %10s %11s %12s %10s %10s %9s\n' "$a" "${ms:--}" "${it:-?}/${mx:-?}" \
+      "${ipc:--}" "${mr:--}" "${bw:--}" "${cy:--}" "${ins:--}" "${ll:--}" "${dm:--}"
   done
+  echo '# 表中"-"= 该量**本机没测到/闸门不过**（不编数）；比率列若出现"!! 自洽失败"，'
+  echo '#   请直接看 ③ 里那一段的逐轮原值。'
   echo
-  echo "# 读法（每个量支持什么结论）："
-  echo "#  IPC = instructions/cycles：接近/超过 1 说明**计算单元在干活**（不是纯等内存）；"
-  echo "#  LLC 缺失率 = llc-load-misses/llc-loads：高（>20%）说明**L3 层面在反复取数**；"
-  echo "#  DRAM 估计 = llc-load-misses×64B÷时间：**只是估计**（缺 uncore/内存控制器事件，"
-  echo "#      也无法区分预取/写回），别当实测天花板；文档里 ~100 GB/s 同样是估计值；"
-  echo "#  ctx 切换/迁移 per call：判断**同步与调度抖动**的量级（自旋握手应当接近 0）；"
-  echo "#  dTLB 缺失/缺失率：判断**页表抖动**（大页是否可能有用）。"
+  echo "# 读法（每个量支持 / 不支持什么）："
+  echo "#  IPC = instructions/cycles（逐轮同源）：明显低于 1.5 说明**每条指令停顿多**；"
+  echo "#  LLC 缺失率 = llc-load-misses/llc-loads（逐轮同源，闸门 ≤110%）：高说明 L3 装不住；"
+  echo "#  DRAM 估GB/s = llc-load-misses×64B÷时间：**只是估计**（缺 uncore/内存控制器事件，"
+  echo "#      也分不清预取/写回），**别当实测天花板**；文档里 ~100 GB/s 同样是估计值；"
+  echo "#  cycles/调用 与 instr/调用 是**全线程合计**（12 线程之和，不是单线程口径）；"
+  echo "#  ctx 切换/迁移/页缺失：**调度与同步抖动**的量级（自旋握手应当接近 0）；"
+  echo "#  dTLB 缺失：**页表抖动**（大页是否可能有用）。"
 } >> "$sum"
 
 # ------------------------------------------------------------------
