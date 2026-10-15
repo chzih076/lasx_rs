@@ -1,7 +1,7 @@
 # lasx_rs 开发文档：架构与性能
 
 > 面向**维护者与二次开发者**：内部分层、不可破坏的约定、测试与 CI、性能方法学与实测数据。
-> **算子语义与调用方法**（FFI/Rust API/池用法、83 个导出符号）见 [`docs/ops.md`](ops.md)；
+> **算子语义与调用方法**（FFI/Rust API/池用法、87 个导出符号）见 [`docs/ops.md`](ops.md)；
 > **平台给的外部约束**（LA664 勘误、内核生命周期）与由外部契约派生的待补项见
 > [`docs/platform.md`](platform.md)。
 
@@ -75,7 +75,7 @@ lasx_rs/
 | 层 | 职责 | 不变量 |
 |---|---|---|
 | `ops/` | 纯计算，吃 `&[T]` / `&mut [T]`，不碰裸指针 | 每条向量路径必须与标量参考**逐位一致** |
-| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **83 个导出符号**中原始 15 个的签名与语义永不改动 |
+| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | **87 个导出符号**中原始 15 个的签名与语义永不改动 |
 | `api.rs` | 安全 Rust 接口，做长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
 | `view.rs` + `plan.rs` | 形状/跨距对象化与打包复用（纯 Rust，不导出符号） | 视图/计划只做布局与打包，不引入新的累加次序（§18.4） |
 | `pool.rs` + `parallel.rs` | 并行派活，切块必须与串行结果逐位一致 | 切块边界不得改变每个元素的累加次序 |
@@ -121,10 +121,10 @@ lasx_rs/
 ```bash
 cargo build --release
 nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*' | sort -u
-# 当前：83 个（42 个裸版本 + 41 个 _checked），与上一版比较应只有"新增"
+# 当前：87 个（46 个裸版本 + 41 个 _checked），与上一版比较应只有"新增"
 ```
 
-**当前值（2026-10-15）**：83 个 = 42 裸 + 41 `_checked`（上一行的 75 是旧值）；权威清单与原型在 `docs/ops.md` §4 与 `include/lasx_rs.h`，并由 `scripts/check_header.c` 逐符号校验（取地址 ⇒ 缺符号/改名/原型漂移即编译或链接失败）。
+**当前值（2026-10-15）**：87 个 = 46 裸 + 41 `_checked`（上一行的 75 是更早的旧值；2026-10-15 追加了 §4.8 的 4 个元信息/内存符号后是 87）；权威清单与原型在 `docs/ops.md` §4 与 `include/lasx_rs.h`，并由 `scripts/check_header.c` 逐符号校验（取地址 ⇒ 缺符号/改名/原型漂移即编译或链接失败）。
 
 ### 2.3 数值约定（跨算子汇总）
 
@@ -3548,6 +3548,46 @@ error: `dot!` 只认受支持的 dtype 组合
 **给下游的判据**：`beta == 0` 且"宽薄（小 k、大 m×n）"⇒ 用融合；方阵/大 k 形状融合 ≈0，
 但**不会更慢**（回退同构）；`beta != 0` 且 `k > 384` 别指望融合。
 
+### 19.16 C ABI 的调用体验：能力 / 版本 / 状态串 / 内存归还（2026-10-15）
+
+**起因**（用户："优化调用动态链接库的体验和优化心智模型"）：审计 C 侧后确认三处真缺口，
+它们都不是"少一个便利函数"，而是**把安全责任推给了调用方**：
+
+| 缺口 | 原状 | 后果 |
+|---|---|---|
+| 无能力查询 | 头文件只能写"调用方须自行读 `cpucfg` CFG2.bit7" | LSX-only 机型上误调 `[LASX-only]` 符号 ⇒ **SIGILL**；而"读 CPU 寄存器"本来就该由库做 |
+| 无版本/状态串 | 只有 `lasx_alloc` 一个元信息符号 | 调用方要把 `0..6` 的语义硬编码进自己的 `switch`；出问题无法在日志里指明版本 |
+| 内存归属是"文档化的坑" | `lasx_alloc` 用 Rust `Layout`（align = `LASX_ALIGN`）分配，**不导出释放**；头文件写"本机 glibc 下 `free()` 可用" | **"在本机可用"不是契约**——换分配器/换平台就静默坏 |
+
+**落地**（`83 → 87`；**既有 83 个符号的原型与语义一字不改**，纯追加）：
+
+| 新符号 | 语义 | 为什么这么定 |
+|---|---|---|
+| `lasx_has_lasx` | `SimdPath::detect().is_lasx() as i32` | 必须与**算子入口同源**：调用方问的是"现在能不能安全调 `[LASX-only]`"，所以它**尊重 `lasx_force_lsx_thread`**（降级时返回 0）。若改成"读硬件有没有"，被强制降级的进程里它会撒谎 |
+| `lasx_version` | `concat!(env!("CARGO_PKG_VERSION"), "\0")` 的静态指针 | 永不为 NULL、生命周期 = 进程；不需要长度参数 |
+| `lasx_status_message` | `0..=6` 的中文说明；未知码给"未知状态码" | 永不为 NULL；消息与 Rust `LasxStatus` **同表**（`c_message()` 是唯一来源，`message()` 由它去掉 NUL 得来）⇒ C 侧与 Rust 侧永远不会漂 |
+| `lasx_free` | 与 `lasx_alloc` **共用 `f32_layout()`** 归还；`p == NULL` 与 `n <= 0` 都是 no-op | 抽共用 layout 函数是"同一 layout"的**结构性保证**（各写一份 `Layout::from_size_align` 是这类 API 最典型的堆破坏来源）；`n <= 0` 的 no-op 覆盖 `lasx_alloc(0)` 的对齐悬垂指针——它从来不是堆块，交给 `dealloc` 就是 UB |
+
+**心智模型（写进头文件与 `docs/ops.md` §4.8/§11）**：
+`lasx_version()` 知道版本 → `lasx_has_lasx()` 决定能不能调 `[LASX-only]` → 调算子 →
+`lasx_status_message(st)` 打日志；`lasx_alloc` 的缓冲**只能**用 `lasx_free` 归还。
+可编译样板在 `examples/c/`（`quickstart.c` + `Makefile`，`make run`）。
+
+**谁守（每条都点名）**：
+
+| 契约 | 由什么守 |
+|---|---|
+| `lasx_has_lasx()` ≡ 算子路径 | `src/ffi/meta.rs` 直接返回 `detect()`；单测断言 `force(true) ⇒ 0` 且逐点等于 `detect().is_lasx()` |
+| `lasx_version()` 非 NULL / NUL 结尾 / 与 `CARGO_PKG_VERSION` 一致 | 单测（`CStr::from_ptr` 读回比对）；`scripts/check_header.c` 再实测一次 |
+| `lasx_status_message()` 覆盖 0..6 + 未知码且非 NULL | 单测（0..6、±边界、`i32::MIN/MAX`）；`check_header.c` 实测 -1..8 |
+| `lasx_free` 与 `lasx_alloc` 同 layout | **构造保证**（同一个 `f32_layout()`）+ 单测（配对、两种 no-op） |
+| `lasx_free(p, n)` 的 `n` 必须等于分配时的值 | **只有约定**；违反（非 0 且不同）破坏堆 = UB，已在 `docs/ops.md` §15 第 4 条点名 |
+| 87 个符号一个不少 / 原型不漂 | `scripts/check_header.c` 对 87 个逐个取地址（编译期钉住 `LASX_SYMBOL_COUNT`）+ CI 的 ABI 门禁（`nm -D` 计数） |
+
+**诚实标注**：`examples/c` 的"无 LASX"分支在**本机（含 LASX）无法实测**（`lasx_force_lsx_thread`
+不导出给 C），与 §3.3 那条"无 LASX 真机"是同一类限制；该分支的正确性由 Rust 单测守。
+显式示例的实测输出见本轮的 CI/汇报（`make run` 打印版本、能力、算子结果与归还）。
+
 ## 20. NN 侧 N1 批次：算子契约与依据
 
 `docs/ops.md §12.3` 的 N1 批次共 8 个算子（`softmax_rows`、`rms_norm`、`silu`、`gelu_quick`、
@@ -3770,7 +3810,7 @@ exp(x) = p · 2ⁿ
 `src/ops/gelu_quick.rs` + `src/ffi/nn.rs`（2 个裸符号）+ `src/ffi/checked.rs`（2 个
 `_checked`）+ `src/api.rs`（`silu`/`gelu_quick`，直接返回对齐缓冲——**没有失败模式就不套
 `Result`**，与 `api::sum` 同例）+ `cli/src/suites/activation.rs`（组 `act`）。
-符号总数见 `docs/ops.md` §4.6 的清点表（当前 **83 = 42 裸 + 41 checked**）。
+符号总数见 `docs/ops.md` §4.6 的清点表（当前 **87 = 46 裸 + 41 checked**）。
 
 **重新导出**：`src/lib.rs` 里 `pub use ffi::nn::{…}`，符号在 crate 根可见
 （`lasx_rs::lasx_silu`），与 `docs/ops.md` §4 按 C ABI 名列的符号表一致；`ffi` 模块路径
@@ -4396,7 +4436,7 @@ f32 的 16 FLOP/指令——按 §21.7 的天花板（~40–50 MAC/指令·秒/�
 
 | 内容 | 位置 |
 |---|---|
-| 8 个 int8 算子 + 8 个 `_checked`（总 83 个导出符号） | `src/ops/quant_i8.rs`、`src/ops/gemv_i8.rs`、`src/ops/matmul_i8.rs`；契约 §2.12–§2.14；用法 §5.14 |
+| 8 个 int8 算子 + 8 个 `_checked`（当时使导出符号总数到 83；2026-10-15 后为 87） | `src/ops/quant_i8.rs`、`src/ops/gemv_i8.rs`、`src/ops/matmul_i8.rs`；契约 §2.12–§2.14；用法 §5.14 |
 | 12 个新单测（位精确 / 误差界 / 满量程 / NaN / C ABI 逐位一致 / `_checked` 状态通道） | `cargo test`，总数 128 → **203** |
 | `parallel::gemv_i8_k`（k 方向切分，`m = 1` 可用）+ 2 个测试（逐位一致、错误/退化） | `src/parallel.rs`；数据见 §21.6 |
 | bench 套件 `int8_gemv` / `int8_quant`（含批量 GEMM、多核 GEMM、k 归约、保活胶水四组行） | `cli/src/suites/int8.rs` |
@@ -4657,7 +4697,7 @@ Rust 侧依赖它；`staticlib` 给不想带 `.so` 的 C 消费者）；**SONAME
 保持可预测。安装脚本还会核对产物的 SONAME（`readelf` 可用时）并在不对时**拒绝安装**：
 把错误 SONAME 写进系统 libdir 是真实事故，不能静默放过。
 
-**ABI 规则**（与 `docs/ops.md` §17.5 同一份）：符号**只追加**（现有 83 个；历史 15 个签名与
+**ABI 规则**（与 `docs/ops.md` §17.5 同一份）：符号**只追加**（现有 87 个；历史 15 个签名与
 语义永不改），追加不改 SONAME；只有"改已有符号签名/语义、删符号、改 `LasxStatus` 码值或调用
 约定"才把 major +1，届时同改 `build.rs`、`scripts/install.sh` 的 `SONAME` 变量与
 `docs/ops.md` §17.5/§4。0.x 阶段 major = 0 表示"尚未承诺二进制兼容"，但"只追加"实践已在遵守。

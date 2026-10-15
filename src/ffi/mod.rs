@@ -41,6 +41,8 @@ pub mod batch;
 pub mod checked;
 pub mod matmul;
 pub mod memory;
+/// 运行时元信息：`lasx_has_lasx` / `lasx_version`（§4.8）。
+pub mod meta;
 pub mod nn;
 pub mod physics;
 pub mod quant;

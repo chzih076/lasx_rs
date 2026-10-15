@@ -7,7 +7,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，83 个导出符号（42 个裸版本 + 41 个 `_checked` 变体） |
+| 适用代码版本 | `master`，87 个导出符号（46 个裸版本 + 41 个 `_checked` 变体） |
 | 库形态 | LoongArch64 LASX 256 位 / LSX 128 位批量数值内核；零依赖（仅 std + `#![feature(stdarch_loongarch)]`，需 nightly）；产物为 `cdylib + rlib` |
 | 性能数据的位置 | **不在本文档**：全部性能数据的唯一权威位置是 `docs/dev.md` §7；编译期常量与阈值的 A/B 对照在 `docs/dev.md` 的对应设计小节 |
 | 平台约束的位置 | **不在本文档**：硬件勘误（LA664 原子操作丢失更新）、内核分支生命周期、消费 ONNX 契约引出的缺口与承诺边界，都在 [`docs/platform.md`](platform.md)——**调用方通常无需读它**（勘误的命中点在库内部，库侧已自带 `_db` 与回归测试） |
@@ -29,7 +29,7 @@ Rust API、常驻工作池、对齐缓冲，以及以 ggml 为参照的 NN 算�
 
 | 层 | 给谁用 | 形态 | 校验 |
 |---|---|---|---|
-| `lasx_rs::ffi`（83 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status` |
+| `lasx_rs::ffi`（87 个 `extern "C"` 符号） | C / Dart 等 FFI 调用方 | 裸指针 + `int` 长度 | 原始符号零校验（误用即 UB）；`_checked` 带 `int *status`；另有 4 个运行时元信息符号 |
 | `lasx_rs::api`（纯 Rust，不导出符号） | Rust 调用方 | `&[T]`/`&mut [T]` 进出，返回 `Result<_, api::Error>`，输出是 `AlignedVec` | 形状、溢出、物理常数 |
 | `lasx_rs::view` + `lasx_rs::plan`（纯 Rust，不导出符号） | Rust，矩阵类调用 | `MatRef`/`MatMut` 视图；`MatmulPlan` 把 `B` 打包一次反复用 | 视图/计划在**构造时**校验一次 |
 | `lasx_rs::pool` + `lasx_rs::parallel`（纯 Rust，不导出符号） | Rust，要多核 | 池 + 闭包 / 固定切分策略 | 派活取 `&self`（内部排队）、形状不符 panic |
@@ -679,14 +679,14 @@ impl SimdPath {
 它是"每次算子调用一次"的设计口径，**不要在循环里重复调用**；真要省，省的是调用侧那次
 数据相关分支（§7.13 的 `vec+detect` vs `vec`：每调用 2.8–4.2 ns），不是它内部的算术。
 
-### 3.2 降级覆盖分类（42 个原始符号）
+### 3.2 降级覆盖分类（46 个原始符号）
 
 | 类别 | 个数 | 内核 | 无 LASX 时 |
 |---|---|---|---|
 | LASX + LSX 双路径 | 11 | `lasx_dot`、`lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_j2_accel_batch`，以及全部 7 个姿态/几何算子 | LSX 128 位向量路径 |
 | LASX + 标量降级 | 3 | `lasx_ballistic_step`、`lasx_batch_distance2d`、`lasx_rk4_j2_step_batch` | 全标量循环（无 LSX 向量路径） |
 | LASX-only（无降级分支） | 25 | `lasx_matmul`、`lasx_matmul_scaled`（融合缩放，与前者同路径）、`lasx_matmul_f64`、`lasx_axpy`、`lasx_sum`、`lasx_dot_f64`、`lasx_dot_i8`、`lasx_dot_q4`、`lasx_layer_norm`（ONNX 批次），N1 全部 8 个（§2.6–§2.11），以及 **N3 全部 8 个**（§4.3） | 直接执行 LASX 指令 |
-| 不涉及 SIMD | 3 | `lasx_alloc`（内存工具）、`lasx_gather_rows`、`lasx_gather_rows_i8`（查表/行拷贝，`memcpy` 语义，见 §2.17） | 与路径无关 |
+| 不涉及 SIMD（内存 + 运行时元信息） | 7 | `lasx_alloc`、`lasx_free`（内存工具）、`lasx_gather_rows`、`lasx_gather_rows_i8`（查表/行拷贝，`memcpy` 语义，见 §2.17）、`lasx_has_lasx`、`lasx_version`、`lasx_status_message` | 与路径无关（`lasx_has_lasx` 正是用来**问**这件事的） |
 
 N1 批次**有意不写 LSX 降级**：目标平台是 3B6000（LA664，LASX 齐全），同核的 6000 机型
 （3A6000 / 3C6000 / 3B6000）都支持 LASX；不为只有 LSX 的机型（如 2K3000 / 3B6000M，
@@ -706,8 +706,9 @@ LA364E 核）付这份复杂度（决策记录见 `docs/dev.md` §20.1）。
 有一批 LASX-only 内核**没有 `has_lasx()` 检查，也没有降级分支**（完整清单与分类见 §3.2 的分类表）：
 
 - 在**只有 LSX（128 位）、没有 LASX 的机型**（如 2K3000 / 3B6000M，LA364E 核）上调用会执行
-  LASX 指令，产生**非法指令（SIGILL）**，不会自动降级。使用方必须自行按 CPU 能力调度；
-  LA464（3A5000）/ LA664（3A6000 等）支持 128/256 位两档向量指令，不属于此列。
+  LASX 指令，产生**非法指令（SIGILL）**，不会自动降级。**C 侧调度前请先调 `lasx_has_lasx()`
+  （§4.8）**——它返回 0 就说明当前生效路径只剩 LSX，此时只能调 LASX+LSX 的符号；不必自己去读
+  `cpucfg`。LA464（3A5000）/ LA664（3A6000 等）支持 128/256 位两档向量指令，不属于此列。
 - 源码模块文档对每个 LASX-only 内核都显式标注了这一点。
 - `SimdPath::detect()` 与 `lasx_force_lsx_thread` 的降级只对有降级分支的内核有效；
   对 LASX-only 内核，`lasx_force_lsx_thread(true)` 不改变行为。
@@ -720,23 +721,30 @@ let caps = lasx_rs::arch::hardware();                 // HwCaps { lasx, lsx }
 let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 ```
 
+C 侧**不必**读 `cpucfg`：`int lasx_has_lasx(void)`（§4.8）返回的正是
+`SimdPath::detect().is_lasx()`——**同一个源**，所以它尊重强制降级（被降级时返回 0），
+调用方问到的就是"算子此刻会走哪条路"。它是"调 `[LASX-only]` 之前"的安全前提，
+不是可选优化；代价一次约 0.2–0.6 ns（§7.14 的实测口径），按批次问一次即可。
+
 用于在含 LASX 的真机上真实执行 LSX 分支（验证数值与性能），并非"无 LASX 真机"。测试后必须
 显式置回 `false`。池化路径的 worker 是复用线程，与调用线程的 `FORCE_LSX` 无关
 （`parallel::rk4_j2_step_batch` 在每块开头显式置 `false`）。
 
 
-## 4. 导出符号总表（83 个）
+## 4. 导出符号总表（87 个）
 
-权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**42 个未带 `_checked`
-的 `lasx_*` + 41 个 `lasx_*_checked` = 83**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
+权威清单来自 `nm -D --defined-only target/release/liblasx_rs.so`：**46 个未带 `_checked`
+的 `lasx_*` + 41 个 `lasx_*_checked` = 87**（N1 批次加了 `lasx_softmax_rows`、`lasx_rms_norm`、
 `lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`
 各与其 checked 变体；**N3 批次加了 int8 推理的 8 个**，见 §4.3；
 **ONNX 契约补充加了 `lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` 各与其
-checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
+checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约；
+**2026-10-15 又加了 4 个运行时元信息/内存符号**（`lasx_has_lasx`、`lasx_version`、
+`lasx_status_message`、`lasx_free`，见 §4.8、§3.2/§3.4/§10））。
 
 **这些原型的权威副本是 `include/lasx_rs.h`**（随库一起安装的生产用 C 头文件）：`scripts/check_header.c`
-对 83 个符号逐个取地址（缺符号/改名/原型不匹配 ⇒ 编译或链接失败），并实调全部 41 个 `_checked`
-变体与融合缩放的行为断言。C 侧用法：
+对 87 个符号逐个取地址（缺符号/改名/原型不匹配 ⇒ 编译或链接失败），并实调全部 41 个 `_checked`
+变体、融合缩放的行为断言，以及 §4.8 那 4 个符号的行为（版本/能力/状态串/alloc→free 配对）。C 侧用法：
 
 ```c
 #include "lasx_rs.h"   /* cc -O2 -I<prefix>/include app.c -L<prefix>/lib -llasx_rs -lm */
@@ -857,11 +865,14 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 | N3（int8 推理 8 个） | 8 | 8 | 16 | §4.3、§5.14 的用法 |
 | ONNX 契约补充（3 个：`layer_norm` + `gather_rows` + `gather_rows_i8`） | 3 | 3 | 6 | 契约 §2.16/§2.17，来源 `docs/platform.md` §4 |
 | matmul 融合缩放（1 个，2026-10-15） | 1 | 1 | 2 | §4.7、§5.5 末段 |
-| 合计 | **42** | **41** | **83** | — |
+| 运行时元信息 + 内存归还（4 个，2026-10-15） | 4 | 0 | 4 | §4.8、§3.2/§3.4/§10 |
+| 合计 | **46** | **41** | **87** | — |
 
-`lasx_alloc` 是唯一没有 `_checked` 变体的原始符号，其余 41 个原始符号各有一个 checked 版本
-（42 − 1 = 41；上表"历史内核"行的 15 / 14 之差就是它）；
-原始 15 个的名字与语义始终不变。§3.2 给出 42 个原始符号的降级覆盖分类。
+**5 个原始符号没有 `_checked` 变体**，其余 41 个原始符号各有一个 checked 版本
+（46 − 5 = 41）：`lasx_alloc`（上表"历史内核"行的 15 / 14 之差就是它）与 §4.8 那 4 个
+（`lasx_free` 的入参只有"指针 + 长度"，本来就是 no-op 语义、没有可失败的结构校验；
+三个元信息符号没有长度/指针参数可校验，且**约定永不返回 NULL**）。
+原始 15 个的名字与语义始终不变。§3.2 给出 46 个原始符号的降级覆盖分类。
 
 清点方式：`nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | wc -l`。
 
@@ -873,6 +884,47 @@ Rust 侧另有 `LasxStatus::message()`（中文原因）、`is_ok()`、`from_i32
 
 `lasx_matmul_scaled_checked` 与它同签名、末尾多一个 `int *status`。数值口径与性能判据见
 §2.5 第 3 点与 §5.5 末段；决策与实测记录见 `docs/dev.md` §19.15。
+
+### 4.8 运行时元信息与内存归还（4 个，2026-10-15 追加）
+
+这 4 个符号是为**调用体验**加的：没有它们时，C 调用方只能"读 CPU 寄存器判断能不能调 +
+猜版本 + 把错误码 0..6 硬编码 + 赌一个释放函数能用"。
+
+| 符号 | C 签名要点 | 语义 | 谁守 |
+|---|---|---|---|
+| `lasx_has_lasx` | `int(void)` | 当前**生效路径**是否 LASX（1/0）= `SimdPath::detect().is_lasx()`；调 `[LASX-only]` 前必须问 | 与算子**同源**：`src/ffi/meta.rs` 直接返回 `detect()`；单测断言"force(true) ⇒ 0" |
+| `lasx_version` | `const char *(void)` | `CARGO_PKG_VERSION`，静态 NUL 结尾串，**永不为 NULL** | 单测断言非 NULL/NUL 结尾/与 `env!("CARGO_PKG_VERSION")` 一致 |
+| `lasx_status_message` | `const char *(int status)` | `0..6` 的中文说明；**任何未知码**返回"未知状态码"；**永不为 NULL** | 与 Rust `LasxStatus` 同表（`c_message()` 是唯一来源）；单测覆盖 0..6 与未知码 |
+| `lasx_free` | `void(float *p, int n)` | 归还 `lasx_alloc`；与它**共用同一 layout**；`p == NULL` 与 `n <= 0` 都是 no-op | 同一 `f32_layout()` 被两个函数共用（结构性），单测覆盖配对与两种 no-op |
+
+**用法（C）**：
+
+```c
+printf("lasx_rs %s\n", lasx_version());          /* ① 先知道版本 */
+if (!lasx_has_lasx()) {                           /* ② 再问能力（[LASX-only] 的安全前提） */
+    fprintf(stderr, "无 LASX 路径：不能调 lasx_dot/lasx_matmul/int8 内核\n");
+    return 2;
+}
+float *a = lasx_alloc(n);                         /* 32 字节对齐、未初始化 */
+int st;
+float d = lasx_dot_checked(a, b, n, &st);         /* ③ status 通道 */
+if (st != LASX_OK) fprintf(stderr, "%s\n", lasx_status_message(st));
+lasx_free(a, n);                                  /* ④ 必须用它归还（不是 free()） */
+```
+
+**边界与诚实标注**：
+
+- `lasx_has_lasx()` 问的是**当前进程/线程的生效路径**，不是"这块 CPU 有没有 LASX"：
+  被 `lasx_force_lsx_thread` 降级时同样返回 0——这正是调用方需要的语义（能不能安全调）。
+  想拿"硬件有没有"用 Rust 侧 `arch::hardware()`（C ABI 不导出它）。
+- "无 LASX 分支"在**本机（含 LASX）无法实测**：`lasx_force_lsx_thread` 不导出给 C。
+  该分支的正确性由 Rust 单测守（`lasx_force_lsx_thread(true) ⇒ lasx_has_lasx() == 0`），
+  与 §3.3 记的"无 LASX 真机"是同一条诚实标注。
+- `lasx_version` / `lasx_status_message` 返回的是**静态数据**：不要 `free`、不要写它；
+  同一个参数多次调用返回同一指针。
+- `lasx_free` 的契约是"**同一个 `n`**"：`lasx_alloc` 与 `lasx_free` 共用 `f32_layout()`，
+  所以"同一 layout"由构造保证；传错的 `n`（非 0 且与分配时不同）仍会破坏堆——这条**只有约定**，
+  违反是 UB（与其它 `lasx_*` 裸符号同一档）。
 
 
 ## 5. 归约、稠密与量化算子
@@ -1872,26 +1924,33 @@ for _ in 0..steps {
 | `Clone` | 克隆后**重新计算对齐偏移**并复制数据 |
 
 ```c
-float *lasx_alloc(int n);   // 保证 32 字节对齐、未初始化；库内不导出 lasx_free
+float *lasx_alloc(int n);   // 保证 32 字节对齐、未初始化
+void   lasx_free(float *p, int n);   // 必须用它归还；n 传当初分配时的值
 ```
 
 - `lasx_alloc` 用 `Layout::from_size_align(n*4, 32)` 分配，**保证 32 字节对齐**（普通 `Vec`
-  只保证 4 字节）。`n == 0` 返回"对齐但不可解引用"的非空悬垂指针；`n < 0` 因 layout 非法
-  而 panic。归还时 layout 必须与分配时一致：
+  只保证 4 字节）。`n == 0` 返回"对齐但不可解引用"的非空悬垂指针；`n < 0` 因布局非法
+  而 abort/panic（这不是契约内用法）。
+- **归还必须用 `lasx_free(p, n)`**（`n` = 分配时那个值）：两个符号共用同一个
+  `f32_layout()`，"同一 layout"由构造成立，不必调用方自己拼 `Layout`。
+  **`free()` 不是契约**——本机恰好是 glibc malloc 只是实现细节。
+- **两种 no-op**（安全，不必在调用方特判）：`p == NULL`；`n <= 0`——后者包含
+  `lasx_alloc(0)` 返回的那个悬垂指针（它从来不是堆块，绝不能交给 `dealloc`）。
+- 契约边界：`n` 与分配时不同（非 0）会破坏堆，**只有约定、违反是 UB**（与其它裸符号同档）。
 
-```rust
-unsafe {
-    let layout = std::alloc::Layout::from_size_align(n as usize * 4, 32).unwrap();
-    std::alloc::dealloc(ptr as *mut u8, layout);
-}
+C 侧配对写法（也是 `examples/c/quickstart.c` 的做法）：
+
+```c
+float *a = lasx_alloc(n);        /* 32 字节对齐、未初始化 */
+/* ... 用 a ... */
+lasx_free(a, n);                 /* 同一个 n */
 ```
 
 对齐只影响性能、不影响正确性：LASX 的 `xvld/xvst` 是 32 字节访问，起始地址不落在 32 字节
 边界时会跨缓存行。实测 glibc `malloc` 与 Dart FFI 的缓冲区只有约一半落在 32 字节边界上，
 **不要假设缓冲区天然对齐**；未对齐时结果照样正确，且仍明显快于 LSX 路径。想稳定拿到对齐
-内存：C 用 `posix_memalign(&p, 32, n)` / `aligned_alloc(32, n)`，Rust 用 `AlignedVec`，或
-本库的 `lasx_alloc`。量化对比见 `cargo run -p lasx_bench --release -- align`，完整数据
-详见 `docs/dev.md`。
+内存：C 用 `lasx_alloc`（配 `lasx_free`）或 `posix_memalign(&p, 32, n)`，Rust 用 `AlignedVec`。
+量化对比见 `cargo run -p lasx_bench --release -- align`，完整数据详见 `docs/dev.md`。
 
 
 ## 11. FFI 用法（C / Dart）
@@ -1899,21 +1958,33 @@ unsafe {
 ```c
 #include <stdint.h>
 
-float lasx_dot(const float *a, const float *b, int n);
-void  lasx_axpy(float alpha, const float *x, float *y, int n);
-void  lasx_matmul(int m, int k, int n, const float *a, const float *b, float *c);
+/* 元信息与内存（§4.8）：先问它们，再调算子 */
+int         lasx_has_lasx(void);              /* 1 = 当前生效路径是 LASX；0 = 只剩 LSX */
+const char *lasx_version(void);               /* 永不为 NULL，静态串，不要 free */
+const char *lasx_status_message(int status);  /* 永不为 NULL；未知码给通用串 */
+float      *lasx_alloc(int n);                /* 32 字节对齐、未初始化 */
+void        lasx_free(float *p, int n);       /* n = 分配时那个值；NULL / n<=0 是 no-op */
+
+float lasx_dot(const float *a, const float *b, int n);            /* [LASX-only] */
+void  lasx_axpy(float alpha, const float *x, float *y, int n);    /* [LASX-only] */
+void  lasx_matmul(int m, int k, int n, const float *a, const float *b, float *c); /* [LASX-only] */
 void  lasx_norm3_batch(const double *xs, const double *ys, const double *zs,
-                       double *out, int n);
+                       double *out, int n);                       /* LASX+LSX：两种机型都安全 */
 void  lasx_rk4_j2_step_batch(double *rx, double *ry, double *rz,
                              double *vx, double *vy, double *vz,
                              double mu, double j2, double re, double dt, int n);
 
 float a[1024], b[1024];
 float d = lasx_dot(a, b, 1024);   /* n 是 int（i32） */
-
 int st;
 float d2 = lasx_dot_checked(a, b, 1024, &st);
-if (st != LASX_OK) { /* LASX_OK == 0，其余状态码见 4.4 */ }
+if (st != LASX_OK) {              /* 不用硬编码 0..6： */
+    fprintf(stderr, "lasx_dot: %s (status=%d)\n", lasx_status_message(st), st);
+}
+
+float *buf = lasx_alloc(1024);    /* 32 字节对齐、未初始化 */
+/* ... 用 buf ... */
+lasx_free(buf, 1024);             /* 必须配对归还；free(buf) 不是契约 */
 ```
 
 ```dart
@@ -1926,12 +1997,25 @@ final lasxDot = lib.lookupFunction<
 final lasxAlloc = lib.lookupFunction<          // 32 字节对齐的输出缓冲
     Pointer<Float> Function(Int32 n),
     Pointer<Float> Function(int n)>('lasx_alloc');
+
+final lasxFree = lib.lookupFunction<           // 必须配对归还
+    Void Function(Pointer<Float> p, Int32 n),
+    void Function(Pointer<Float> p, int n)>('lasx_free');
+
+// 调 [LASX-only] 之前先问：0 = 当前只剩 LSX 路径（硬调会 SIGILL）
+final lasxHasLasx = lib.lookupFunction<Int32 Function(), int Function()>('lasx_has_lasx');
+if (lasxHasLasx() == 0) { /* 改用 LASX+LSX 的符号 */ }
 ```
 
 `lookupFunction` 的泛型参数（Native 侧 / Dart 侧签名）必须与 C 签名完全一致，否则 UB；
 Dart 侧 `n` 为 `int`，Rust 侧为 `Int32`。生命周期：所有内核只在调用期间读/写传入缓冲区，
-不持有任何指针（无回调、无异步），函数返回后即可安全释放输入/输出缓冲。长度必须与实际
-容量一致，指针不得悬垂或越界，`n` 不得为负——原始符号不做这些校验，误用即 UB。
+不持有任何指针（无回调、无异步），函数返回后即可安全释放输入/输出缓冲——但 `lasx_alloc`
+拿到的缓冲**只能**用 `lasx_free` 归还（见 §10）。长度必须与实际容量一致，指针不得悬垂或
+越界，`n` 不得为负——原始符号不做这些校验，误用即 UB。
+
+**调 `[LASX-only]` 之前的推荐顺序**（三行心智模型，完整说明见 §4.8）：
+`lasx_version()` 知道版本 → `lasx_has_lasx()` 决定能不能调 → 调算子后按
+`lasx_status_message(st)` 打日志。
 
 
 ## 12. NN 算子：当前状态与候选
@@ -2179,7 +2263,7 @@ cp target/release/liblasx.so yll/
 `lib.ylh` 补声明、`cargo build --release -p lasx_yll` 后拷 `liblasx.so`。
 
 ```bash
-# 导出符号自检：期望 83 行（42 原始 + 41 checked）= 83 个导出符号
+# 导出符号自检：期望 87 行（46 原始 + 41 checked）= 87 个导出符号
 nm -D --defined-only target/release/liblasx_rs.so \
   | awk '$2=="T" && $3 ~ /^lasx_/ {print $3}' | sort
 ```
@@ -2190,12 +2274,15 @@ nm -D --defined-only target/release/liblasx_rs.so \
 1. **降级覆盖不全**：历史 7 个 LASX-only 内核（`matmul`、`matmul_f64`、`axpy`、`sum`、`dot_f64`、
    `dot_i8`、`dot_q4`）在 LSX-only CPU 上会 SIGILL，不会自动降级；N1/N3 与 2026-10-15 追加的
    `matmul_scaled`、`layer_norm`/`gather_rows*` 同样按 §3.2 的分类（前者 LASX-only，后两者不涉及
-   SIMD），完整分类见 §3.2。
+   SIMD），完整分类见 §3.2。**C 侧可以在调用前用 `lasx_has_lasx()`（§4.8）判断**，返回 0 时
+   只能调 LASX+LSX 的符号。
 2. **仅标量降级**：`ballistic_step`、`batch_distance2d`、`rk4_j2_step_batch` 的非 LASX
    分支是全标量循环，没有 LSX 128 位向量路径。
 3. **两处不逐位一致的例外**：`ballistic_step` 向量/标量的 `|v|²` 结合序不同（物理一致，有绝对
    误差测试守护）；`axpy` 向量/标量尾至多差 1 ulp（FMA vs 分离乘加，无逐位守护）。
-4. **`lasx_alloc` 无对等释放导出**：无 `lasx_free`，调用方必须按同一 layout 归还，否则泄漏或 UB。
+4. **`lasx_free` 的 `n` 必须与分配时一致**：`lasx_alloc`/`lasx_free` 共用同一 layout
+   （见 §10），所以"layout 对得上"由构造成立；但 `n` 传错（非 0 且不同）会破坏堆——
+   这条**只有约定**，违反是 UB。`p == NULL` 与 `n <= 0` 是安全的 no-op，不必特判。
 5. **原始符号长度参数无负数/零防护**：`n` 为 `i32` 后立即 `as usize`，负数变成巨大 usize，
    `from_raw_parts` 长度超界即 UB；`lasx_alloc` 对负 `n` 会 panic。必须保证 `n ≥ 0` 且与缓冲区
    实际容量一致。
@@ -2314,7 +2401,7 @@ CARGO_TARGET_DIR=/tmp/build scripts/install.sh --prefix=/tmp/stage
 | `lib/liblasx_rs.so` | 符号链接 → 本体；**链接期** `-llasx_rs` 找这个名字 |
 | `lib/liblasx_rs.a` | 静态库 |
 | `lib/pkgconfig/lasx_rs.pc` | pkg-config 元数据（由 `lasx_rs.pc.in` 生成，`prefix`/`Version` 已替换） |
-| `include/lasx_rs.h` | C 头（**由仓库提供**，83 个原型；脚本不生成头文件） |
+| `include/lasx_rs.h` | C 头（**由仓库提供**，87 个原型；脚本不生成头文件） |
 
 失败即退出、且**校验都在写入之前**（不留半套安装）：缺 `liblasx_rs.so`/`.a` 会提示先
 `cargo build --release`；缺 `include/lasx_rs.h` 会直接报错（可用 `LASX_RS_HEADER=<path>` 指向
@@ -2338,12 +2425,19 @@ PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --cflags --libs lasx_rs
 ```
 
 ```c
-#include <lasx_rs.h>   /* 83 个原型；契约见 §2.5–§2.17，符号清单见 §4 */
+#include <lasx_rs.h>   /* 87 个原型；契约见 §2.5–§2.17，符号清单见 §4 */
 
+if (!lasx_has_lasx()) {                            /* §4.8：调 [LASX-only] 前先问 */
+    fprintf(stderr, "lasx_rs %s：无 LASX 路径\n", lasx_version());
+    return 2;
+}
 float a[16], b[16], c[16];
 lasx_matmul(4, 4, 4, a, b, c);                     /* C = A·B（历史符号，签名永不改） */
 lasx_matmul_scaled(4, 4, 4, 1.5f, a, b, 0.5f, c);  /* C = 1.5·A·B + 0.5·C（§4.7/§5.5） */
 ```
+
+完整的可编译示例在 `examples/c/`（`quickstart.c` + `Makefile`，`make run`；用 pkg-config
+找库，找不到时自动兜底到 `target/release`）。
 
 ### 17.4 SONAME 与文件名布局
 
@@ -2357,17 +2451,17 @@ lasx_matmul_scaled(4, 4, 4, 1.5f, a, b, 0.5f, c);  /* C = 1.5·A·B + 0.5·C（�
 
 ```bash
 readelf -d target/release/liblasx_rs.so | grep -i soname   # → Library soname: [liblasx_rs.so.0]
-nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # → 83
+nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # → 87
 ```
 
 ### 17.5 ABI 兼容规则（什么时候可以动 major）
 
-本库对 C ABI 的承诺写在 §4.1/§4.7：**符号只追加、不改签名与语义**；现有 83 个符号里，
+本库对 C ABI 的承诺写在 §4.1/§4.7：**符号只追加、不改签名与语义**；现有 87 个符号里，
 最初的 15 个（§4.1）永不改动。由此得到可执行的规则：
 
 | 变更 | 允许？ | major |
 |---|---|---|
-| 追加新符号（含 `_checked` 变体，如 2026-10-15 的 `lasx_matmul_scaled`） | 允许 | **不变**（仍 `liblasx_rs.so.0`） |
+| 追加新符号（含 `_checked` 变体与元信息符号，如 2026-10-15 的 `lasx_matmul_scaled` 与同日的 4 个元信息符号） | 允许 | **不变**（仍 `liblasx_rs.so.0`） |
 | 修 bug 导致数值结果变化（仍在逐位承诺内） | 允许 | 不变 |
 | 改已有符号的**签名**、语义，或删除符号 | 破坏 ABI | **+1** |
 | 改 `LasxStatus` 的码值 / 结构布局、改调用约定 | 破坏 ABI | **+1** |

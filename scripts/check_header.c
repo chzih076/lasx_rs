@@ -1,15 +1,17 @@
 /*
  * check_header.c — `include/lasx_rs.h` 与 `liblasx_rs.so` 的**逐符号 ABI 校验**。
  *
- * 三件事：
- *   ① 把**全部 83 个符号**（42 裸 + 41 `_checked`，docs/ops.md §4）的地址放进一个数组
+ * 四件事：
+ *   ① 把**全部 87 个符号**（46 裸 + 41 `_checked`，docs/ops.md §4）的地址放进一个数组
  *      ⇒ 任何一个缺失/改名/未声明都会在**编译期或链接期**失败（不是"运行时才发现"）；
  *   ② 逐符号**调用**所有 41 个 `_checked`（零长度/NULL 入参 ⇒ 校验路径必然执行），
  *      断言状态码被写进末尾的 `int *status` 且落在 `[0, 6]` ⇒ 同时校验了
  *      "`status` 是最后一个参数"这条 ABI 约定；
  *   ③ 实测融合缩放的三条行为（§5.5 末段、§2.5 第 3 点）：
  *      alpha=1,beta=0 与 `lasx_matmul` **逐位一致**；beta=0 时**不读 c**（NaN 探针）；
- *      `_checked` 空指针 ⇒ 状态非 0 且**不触碰输出**。
+ *      `_checked` 空指针 ⇒ 状态非 0 且**不触碰输出**；
+ *   ④ 实测运行时元信息与内存归还（§4.8）：`lasx_version` / `lasx_status_message` 非 NULL、
+ *      `lasx_has_lasx()` 与状态码范围、`lasx_alloc`→写→`lasx_free` 配对 + 两种 no-op。
  *
  * 编译（在仓库根目录；`target/release/liblasx_rs.so` 必须已构建）：
  *     gcc -O2 -Iinclude scripts/check_header.c -Ltarget/release -llasx_rs -lm \
@@ -37,10 +39,10 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* ① 全部 83 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
+/* ① 全部 87 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
 /* ------------------------------------------------------------------ */
 
-#define LASX_SYMBOL_COUNT 83
+#define LASX_SYMBOL_COUNT 87
 
 static void *const g_syms[] = {
     /* --- §4.1 归约 / 稠密 / 量化 / 物理 --- */
@@ -63,6 +65,11 @@ static void *const g_syms[] = {
     (void *)lasx_dot_q4,
     (void *)lasx_dot_q4_checked,
     (void *)lasx_alloc,
+    /* --- §4.8 运行时元信息与内存归还（2026-10-15 新增的 4 个） --- */
+    (void *)lasx_free,
+    (void *)lasx_has_lasx,
+    (void *)lasx_version,
+    (void *)lasx_status_message,
     (void *)lasx_norm3_batch,
     (void *)lasx_norm3_batch_checked,
     (void *)lasx_vec3_add_scaled_batch,
@@ -300,6 +307,65 @@ static void behavior_checks(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* ④ 运行时元信息与内存归还（§4.8）                                     */
+/* ------------------------------------------------------------------ */
+
+static void meta_and_memory_checks(void) {
+    /* (a) 版本：永不为 NULL、非空 */
+    {
+        const char *v = lasx_version();
+        check(v != NULL, "lasx_version() != NULL");
+        check(v != NULL && strlen(v) > 0, "lasx_version() non-empty");
+        check(lasx_version() == v, "lasx_version() returns static data (stable pointer)");
+    }
+
+    /* (b) 能力查询：0/1 二值；本机（含 LASX 的 CI 机）应为 1 */
+    {
+        int h = lasx_has_lasx();
+        check(h == 0 || h == 1, "lasx_has_lasx() in {0,1}");
+        check(h == 1, "lasx_has_lasx() == 1 on this LASX machine");
+    }
+
+    /* (c) 状态串：0..6 + 未知码全部非 NULL、非空 */
+    {
+        int ok = 1;
+        for (int st = -1; st <= 8; st++) {
+            const char *m = lasx_status_message(st);
+            if (m == NULL || strlen(m) == 0) ok = 0;
+        }
+        check(ok, "lasx_status_message(-1..8) never NULL / never empty");
+        check(strcmp(lasx_status_message(LASX_OK), lasx_status_message(0)) == 0,
+              "lasx_status_message is stable per code");
+        check(strcmp(lasx_status_message(999), lasx_status_message(-7)) == 0,
+              "unknown codes share one generic message");
+    }
+
+    /* (d) lasx_alloc → 写 → lasx_free 配对；两种 no-op 不得崩 */
+    {
+        const int n = 257;
+        float *p = lasx_alloc(n);
+        check(p != NULL && ((uintptr_t)p % 32) == 0, "lasx_alloc(257) 32-byte aligned");
+        if (p != NULL) {
+            for (int i = 0; i < n; i++) p[i] = (float)i * 0.5f;
+            check(p[0] == 0.0f && p[n - 1] == (float)(n - 1) * 0.5f,
+                  "lasx_alloc buffer is writable/readable");
+            lasx_free(p, n); /* 配对归还（同一 layout） */
+            check(1, "lasx_free(p, n) returns without crashing");
+        }
+        /* no-op：NULL（任意 n）与 n <= 0（含 alloc(0) 的对齐悬垂指针） */
+        lasx_free(NULL, 0);
+        lasx_free(NULL, 64);
+        lasx_free(NULL, -3);
+        float *dangling = lasx_alloc(0);
+        check(dangling != NULL && ((uintptr_t)dangling % 32) == 0,
+              "lasx_alloc(0) -> aligned dangling pointer (historical contract)");
+        lasx_free(dangling, 0);
+        lasx_free(dangling, -1);
+        check(1, "lasx_free no-op paths (NULL / n<=0 / dangling) do not crash");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     const size_t n_syms = sizeof(g_syms) / sizeof(g_syms[0]);
@@ -314,7 +380,7 @@ int main(void) {
             if (g_syms[i] == NULL) all_non_null = 0;
         }
         check(n_syms == LASX_SYMBOL_COUNT && all_non_null,
-              "all 83 symbol addresses resolved at link time");
+              "all 87 symbol addresses resolved at link time");
     }
 
     check(LASX_OK == 0 && LASX_NULL_POINTER == 1 && LASX_NEGATIVE_LENGTH == 2 &&
@@ -324,6 +390,7 @@ int main(void) {
 
     smoke_checked_symbols();
     behavior_checks();
+    meta_and_memory_checks();
 
     printf("\n%s：%d 项失败\n", g_failures == 0 ? "结论 OK" : "结论 FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -2,8 +2,8 @@
  * lasx_rs.h — LoongArch64 LASX(256 位)/LSX(128 位) 批量数值内核库的 C ABI。
  *
  * 生产用头文件：与库产物 `liblasx_rs.so`（SONAME `liblasx_rs.so.0`）/ `liblasx_rs.a`
- * 配套安装。**本文件是手写并逐符号校验的**——权威符号清单是 `docs/ops.md` §4（83 个：
- * 42 个裸符号 + 41 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
+ * 配套安装。**本文件是手写并逐符号校验的**——权威符号清单是 `docs/ops.md` §4（87 个：
+ * 46 个裸符号 + 41 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
  * 每一个符号取地址（缺符号/改名/原型不匹配会在编译或链接期失败），并实测若干行为。
  *
  * 编译提示（C / C++ 均可 include）：
@@ -42,14 +42,18 @@
  * 指令集要求（docs/ops.md §3.2、§3.3）：
  *   - 标了 `[LASX-only]` 的符号**没有降级分支**：在只实现 LSX(128 位) 的机型
  *     （如 2K3000 / 3B6000M，LA364E 核）上调用会执行 LASX 指令 → **非法指令(SIGILL)**；
- *   - C ABI **不导出**能力查询，调用方须自行确认 CPU 具备 LASX（读 `cpucfg` CFG2.bit7
- *     或 `/proc/cpuinfo` 的 Features），再调度；
+ *   - **调任何 `[LASX-only]` 符号之前，先用 `lasx_has_lasx()` 判断**（见下面第 0 节）：
+ *     返回 0 就说明当前生效路径只剩 LSX，此时只能调 `LASX+LSX` 的符号。它问的是
+ *     **当前生效路径**（与算子走的路同源），所以不必也不该自己去读 `cpucfg`；
  *   - `la464`(3A5000) / `la664`(3A6000 等) 支持 128/256 位两档，不属于上面那类机型。
  *
  * 内存（docs/ops.md §10）：
- *   - 库**不导出**释放函数；`lasx_alloc` 返回 32 字节对齐的**未初始化** f32 缓冲，
- *     调用方必须按**同一 layout** 归还（本机 glibc 下 `free()` 可用；更稳妥的是自己
- *     用 `posix_memalign`/`aligned_alloc` 分配并自行释放）；
+ *   - `lasx_alloc` 返回 32 字节对齐的**未初始化** f32 缓冲；**必须用 `lasx_free(p, n)` 归还**
+ *     （`n` 传当初分配时那个值）——两者共用同一 layout，"对齐"与"归还"是同一个契约的两半；
+ *   - **不要**用 `free()` / `posix_memalign` 配对的释放函数代替 `lasx_free`：库走的是 Rust
+ *     全局分配器的 alloc/dealloc 路径，本机恰好是 glibc malloc 只是实现细节，**不是 ABI 契约**；
+ *   - `lasx_free(NULL, n)` 与 `lasx_free(p, n <= 0)`（含 `lasx_alloc(0)` 返回的对齐悬垂指针）
+ *     都是**安全的 no-op**，不必在调用方特判；
  *   - 对齐只影响性能、不影响正确性：非 32 字节对齐的缓冲结果照样正确（§10）。
  *
  * 其它 ABI 约定（docs/ops.md §4.1 末段、§11）：
@@ -93,6 +97,50 @@ typedef enum lasx_status {
 #define LASX_STATUS_SIZE_OVERFLOW LASX_SIZE_OVERFLOW
 #define LASX_STATUS_NON_POSITIVE_CONSTANT LASX_NON_POSITIVE_CONSTANT
 #define LASX_STATUS_NON_FINITE_CONSTANT LASX_NON_FINITE_CONSTANT
+
+/* ========================================================================
+ * 0. 运行时元信息与内存归还（docs/ops.md §4.8、§3.1、§10）
+ *
+ * **先读这一节再写调用代码**——这 4 个符号就是为了让调用方不必靠"读 CPU 寄存器 +
+ * 猜版本 + 硬编码错误码 + 赌释放函数"来用这个库：
+ *   - lasx_has_lasx()      ：能不能调 [LASX-only]（LSX-only 机型上硬调 = SIGILL）
+ *   - lasx_version()       ：链接到的是哪一版
+ *   - lasx_status_message(): 把 `_checked` 的 status 翻成人能读的串（不必硬编码 0..6）
+ *   - lasx_free()          ：与 lasx_alloc 配对的归还（free() 不是契约）
+ * ======================================================================== */
+
+/* 当前**生效路径**是否为 LASX：1 = 是，0 = 仅 LSX。
+ *
+ * **调用任何标了 [LASX-only] 的符号之前必须先问它**（lasx_dot / lasx_sum / lasx_matmul /
+ * lasx_dot_i8 / 全部 int8 内核 …；标了 LASX+LSX 的符号两种机型都安全，不必问）。
+ * 返回 0 时只能调 LASX+LSX 的符号，否则在 LSX-only 机型上执行 LASX 指令 → SIGILL。
+ *
+ * 它与算子入口**同源**（都走 SimdPath::detect()），所以回答的是"现在能不能安全调"，
+ * 而不是"这块 CPU 有没有 LASX"：被 lasx_force_lsx_thread 强制降级时同样返回 0，
+ * 与算子实际会走的路一致。
+ *
+ * 代价：一次进程级原子读 + 一次线程局部读（~0.2–0.6 ns），按批次问一次即可。 */
+int lasx_has_lasx(void);
+
+/* 库版本（`CARGO_PKG_VERSION`，如 "0.1.0"）。
+ * **永不为 NULL**，指向静态 NUL 结尾字符串，生命周期 = 整个进程；**不要 free**、
+ * 不要写它。可直接 printf("%s") / strcmp，不需要长度参数。 */
+const char *lasx_version(void);
+
+/* 状态码（0..6，见上面的 lasx_status 枚举）的人类可读说明。
+ * **永不为 NULL**：任何未知整数（负数、>6）返回通用串"未知状态码"。
+ * 返回静态 NUL 结尾字符串，**不要 free**。用法：
+ *     int st;
+ *     float v = lasx_dot_checked(a, b, n, &st);
+ *     if (st != LASX_OK) fprintf(stderr, "lasx_dot: %s\n", lasx_status_message(st)); */
+const char *lasx_status_message(int status);
+
+/* 归还 lasx_alloc 分配的缓冲：`n` 必须是当初传给 lasx_alloc 的**同一个值**。
+ * 两者共用同一 layout（"对齐"与"归还"是同一契约的两半，见 §10）。
+ * **必须用它归还，不要用 free()**（本机 glibc 下偶然可用，但不是 ABI 契约）。
+ * 两种 no-op（安全、不崩、不必调用方特判）：`p == NULL`；`n <= 0`——后者包括
+ * `lasx_alloc(0)` 返回的那个"对齐但不可解引用"的悬垂指针（它从来不是堆块）。 */
+void lasx_free(float *p, int n);
 
 /* ========================================================================
  * 1. 归约、稠密线性代数、量化点积、物理（docs/ops.md §4.1、§4.7）
@@ -173,9 +221,9 @@ double lasx_dot_q4_checked(const uint8_t *qa, const float *sa, const uint8_t *qb
                            const float *sb, int n_bytes, int *status);
 
 /* 分配 n 个 f32 的 **32 字节对齐、未初始化** 缓冲；n == 0 返回"对齐但不可解引用"的
- * 非空悬垂指针。库内**不导出释放函数**（§10）：调用方按同一 layout 归还；本机 glibc
- * 下 free() 可用，更稳妥的是自己用 posix_memalign/aligned_alloc。
- * 这是唯一没有 _checked 变体的符号（§4.6）。 */
+ * 非空悬垂指针。**必须用 `lasx_free(p, n)` 按同一个 n 归还**（§10、上面第 0 节）：
+ * 两者共用同一 layout；`free()` 在本机 glibc 下偶然可用，但**不是 ABI 契约**。
+ * 这是**唯一没有 _checked 变体**的裸符号（§4.6）；`lasx_free` 同样没有。 */
 float *lasx_alloc(int n);
 
 /* 语义：out[i] = sqrt(xs[i]^2 + ys[i]^2 + zs[i]^2)（f64 SOA）。路径：LASX+LSX。

@@ -17,7 +17,7 @@ Four workload classes are covered:
 ## Features
 
 - **Zero third-party dependencies** — only `core::arch::loongarch64` LASX/LSX intrinsics and std.
-- **83 exported symbols** (42 plain + 41 `_checked` variants taking a trailing `int *status`).
+- **87 exported symbols** (46 plain + 41 `_checked` variants taking a trailing `int *status`).
   The signatures and semantics of the original 15 `lasx_*` symbols are **frozen**; new capability
   is only ever appended. Both symbol families are backed by the same kernel implementations.
 - **Bitwise determinism** — for a given input, every path of an operator (LASX / LSX / scalar tail
@@ -129,7 +129,7 @@ operator are in `docs/ops.md`. The safe Rust API is `lasx_rs::api` (32 `pub fn`)
 
 | Document | Contents |
 |---|---|
-| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 83-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule |
+| [docs/ops.md](docs/ops.md) | **Operators and usage**: the 87-symbol table, numerical contracts and bitwise determinism, degradation coverage, C/Rust/Dart invocation, pool and parallelism, NN operator status and gap comparison, int8-vs-f32 decision rule |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 | [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
 
