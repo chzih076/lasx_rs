@@ -102,9 +102,24 @@ live in the respective design sections.
 | `lasx_dot_f16` / `lasx_gemv_f16` | 38.1–68.3 / 4.2–64.7 GB/s |
 | Resident pool vs threads-per-step (reused across 200 steps) | 37.47 ms vs 83.81 ms (**2.24×**; single-threaded 302.69 ms) |
 
-Comparisons against OpenBLAS 0.3.34 (single-threaded) on the same machine, together with the
-per-shape root-cause analysis, are in `docs/dev.md`. **(See `docs/dev.md` §7.10: historical
-baseline, not covered by the 2026-10-15 variance-method re-measurement.)**
+> **Two cross-library conclusions** (authoritative table, per-cell 5-round medians and ms ranges,
+> per-round `loadavg`, A/B/C grading, the **prior-consistency check** and the old-vs-new disposition
+> are all in `docs/dev.md` §7.10; both harnesses are in the repo
+> (`scripts/bench_openblas.c` + `scripts/bench_openblas.sh`) ⇒ reproducible):
+> **① Single-threaded f32: ahead at small shapes, slightly behind at large ones** — 64³
+> **67.8 vs 53.8 GFLOP/s (+27%)**, 128³ **65.8 vs 57.6 (+14%)**, 256³ a tie (62.4 vs 61.7),
+> **384³ 60.6 vs 64.0 (−5.2%)**, **512³ 60.9 vs 64.9 (−6.2%)**; wide/thin `256×64×4096`
+> **61.7 vs 41.0 (+50%)**. **f64 is 4–15% behind overall** (64³ a tie; 256³/384³/512³ at
+> −7.5% / −4.4% / −6.3%; **the weakest structural point is f64 128³: 23.7 vs 28.1 G, −15%**).
+> **② Multi-threaded: how you split decides everything** — `192×768×3072` f32 @12 threads, and the
+> **C ABI does not export the thread pool**, so the caller splits: `rows` (the default, by output
+> row) **14.46 ms, scaling only 1.08× (≈ no parallelism)**; `cols` (pre-transposed plan)
+> **3.84 ms, scaling 4.09×**; OpenBLAS **2.46 ms (6.3×)** ⇒ **use the `cols`/pre-transposed split
+> from C** — with `rows` every thread re-packs the whole `B` and bandwidth saturates at once.
+> **The older figure (Rust pool path) was ≈ a tie**: median **2.64 ms** (samples 2.42–3.79, range
+> **1.57×**) vs OpenBLAS **2.63 ms** (2.599–2.656, range **2%**) — the earlier "we are ~10% slower"
+> was withdrawn on that line, but **it is the Rust-pool convention and cannot be compared
+> side-by-side with this round's C-ABI splits** (both lines are kept; disposition in `docs/dev.md` §7.10 ④).
 
 > **Formula-DSL reuse note**: `matmul!`'s `mul_into` re-packs `B` on every call, so a layer loop
 > that reuses the same weight should hoist the preparation out of the loop (256³ measured
