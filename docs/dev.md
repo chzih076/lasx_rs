@@ -4494,6 +4494,40 @@ cargo publish --dry-run --registry crates-io     # 必须通过
 yank 只是从新解析中隐藏）。因此本节所记的两处 `Cargo.toml` 改动、两段 crate 文档、
 以及发布顺序，**都应在真正按下发布之前完成并复核**。
 
+### 22.7 打包与安装（2026-10-15）
+
+**决定**：一次构建产出三种产物（`crate-type = ["cdylib", "rlib", "staticlib"]`——`rlib` 保留，
+Rust 侧依赖它；`staticlib` 给不想带 `.so` 的 C 消费者）；**SONAME 用 `build.rs` 的
+`cargo:rustc-cdylib-link-arg=-Wl,-soname,liblasx_rs.so.0` 固定为 `liblasx_rs.so.0`**，而不是写进
+`.cargo/config.toml`——`rustc-cdylib-link-arg` 只作用于 cdylib（rlib/staticlib/测试都不受影响），
+而 `rustflags` 会洒到所有目标；且 `build.rs` **只打 `cargo:` 指令、不引入任何构建依赖**
+（零第三方依赖是卖点，打包环节不能破）。
+
+**为什么版本化文件名放在安装脚本、不放进 Cargo**：cargo 的 cdylib 产物名固定是
+`liblasx_rs.so`，"发行布局"（`liblasx_rs.so.0.1.0` + `.so.0` + `.so` 两个符号链接）由
+`scripts/install.sh` 负责——构建管一段、安装管一段，职责不重叠，也让 `cargo build` 的产物树
+保持可预测。安装脚本还会核对产物的 SONAME（`readelf` 可用时）并在不对时**拒绝安装**：
+把错误 SONAME 写进系统 libdir 是真实事故，不能静默放过。
+
+**ABI 规则**（与 `docs/ops.md` §17.5 同一份）：符号**只追加**（现有 83 个；历史 15 个签名与
+语义永不改），追加不改 SONAME；只有"改已有符号签名/语义、删符号、改 `LasxStatus` 码值或调用
+约定"才把 major +1，届时同改 `build.rs`、`scripts/install.sh` 的 `SONAME` 变量与
+`docs/ops.md` §17.5/§4。0.x 阶段 major = 0 表示"尚未承诺二进制兼容"，但"只追加"实践已在遵守。
+
+**实测自检（本决策的验收，2026-10-15）**：
+
+```bash
+readelf -d target/release/liblasx_rs.so | grep -i soname   # Library soname: [liblasx_rs.so.0]
+nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # 83
+ls target/release/liblasx_rs.a                             # 静态库在
+scripts/install.sh --prefix=/tmp/lasx_install              # 装完并用 gcc 从安装树链接最小 C 程序
+```
+
+**边界（明确记下，别当遗漏）**：`install.sh` 与 `lasx_rs.pc.in` 是**源码仓库**里的打包输入——
+`Cargo.toml` 的 `exclude` 把 `/scripts` 排除在 crate 之外，所以从 crates.io 装的用户拿到的是
+库本体（含 `build.rs` 已固定的 SONAME），发行布局由各发行版自己写或从源码仓库取；C 头
+`include/lasx_rs.h` 由仓库提供，安装脚本只负责拷贝、缺了就报错退出（不生成、不猜）。
+
 
 
 

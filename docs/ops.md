@@ -2253,3 +2253,129 @@ nm -D --defined-only target/release/liblasx_rs.so \
 - 跨文档引用一律写成 `docs/xxx.md §N`（带文件名）；本文内部引用写成 `§N`，两者都可机械校验。
 - 引用写到最小可解析粒度（如 `§2.10`、`docs/dev.md` §20.7）。`§` 编号是稳定标识，重构时保持
   编号不变，标题文字可以改。
+
+## 17. 作为共享库 / C 项目使用（构建、安装、SONAME 与 ABI 规则）
+
+### 17.1 构建产物
+
+```bash
+cargo build --release
+```
+
+`[lib] crate-type = ["cdylib", "rlib", "staticlib"]` 一次产出三种，**同一份数值实现**
+（不存在"动态库版和静态库版结果不同"）：
+
+| 产物 | 路径 | 给谁 |
+|---|---|---|
+| 动态库 | `target/release/liblasx_rs.so` | C / Dart 等 FFI 调用方（SONAME 已固定，见 §17.4） |
+| 静态库 | `target/release/liblasx_rs.a` | 不想带 `.so` 的 C 消费者 |
+| Rust 库 | `target/release/liblasx_rs.rlib` | Rust 依赖（`lasx_rs = "0.1"` 用的就是这个） |
+
+### 17.2 安装
+
+```bash
+# 装进系统目录（或先装进暂存目录看一眼布局）
+scripts/install.sh --prefix=/usr/local
+scripts/install.sh --prefix=/tmp/stage          # 空格形式等价
+CARGO_TARGET_DIR=/tmp/build scripts/install.sh --prefix=/tmp/stage
+```
+
+脚本（`set -eu`）装这几样，**幂等**——重复执行只覆盖它们、用 `ln -sf` 重建链接：
+
+| 相对 `<prefix>` | 内容 |
+|---|---|
+| `lib/liblasx_rs.so.<version>` | 动态库本体（`<version>` = `Cargo.toml` 的 version，如 `0.1.0`） |
+| `lib/liblasx_rs.so.0` | 符号链接 → 本体；**运行时**按 SONAME 找这个名字 |
+| `lib/liblasx_rs.so` | 符号链接 → 本体；**链接期** `-llasx_rs` 找这个名字 |
+| `lib/liblasx_rs.a` | 静态库 |
+| `lib/pkgconfig/lasx_rs.pc` | pkg-config 元数据（由 `lasx_rs.pc.in` 生成，`prefix`/`Version` 已替换） |
+| `include/lasx_rs.h` | C 头（**由仓库提供**，83 个原型；脚本不生成头文件） |
+
+失败即退出、且**校验都在写入之前**（不留半套安装）：缺 `liblasx_rs.so`/`.a` 会提示先
+`cargo build --release`；缺 `include/lasx_rs.h` 会直接报错（可用 `LASX_RS_HEADER=<path>` 指向
+别处）；`readelf` 可用时会核对产物的 SONAME，不对就拒绝安装。
+
+### 17.3 链接与运行
+
+```bash
+# ① 动态链接（推荐）：rpath 写进可执行文件，运行期不必设 LD_LIBRARY_PATH
+cc example.c -o example -I/usr/local/include -L/usr/local/lib -llasx_rs -Wl,-rpath,/usr/local/lib
+
+# ② 动态链接但不设 rpath：运行前给 loader 指路（或装到系统目录后 ldconfig）
+cc example.c -o example -I/usr/local/include -L/usr/local/lib -llasx_rs
+LD_LIBRARY_PATH=/usr/local/lib ./example
+
+# ③ 静态链接（不带 .so；静态库的数学函数要自己带 -lm）
+cc example.c -o example -I/usr/local/include /usr/local/lib/liblasx_rs.a -lm
+
+# ④ pkg-config
+PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --cflags --libs lasx_rs
+```
+
+```c
+#include <lasx_rs.h>   /* 83 个原型；契约见 §2.5–§2.17，符号清单见 §4 */
+
+float a[16], b[16], c[16];
+lasx_matmul(4, 4, 4, a, b, c);                     /* C = A·B（历史符号，签名永不改） */
+lasx_matmul_scaled(4, 4, 4, 1.5f, a, b, 0.5f, c);  /* C = 1.5·A·B + 0.5·C（§4.7/§5.5） */
+```
+
+### 17.4 SONAME 与文件名布局
+
+- **SONAME 固定为 `liblasx_rs.so.0`**，由 `build.rs` 的
+  `cargo:rustc-cdylib-link-arg=-Wl,-soname,liblasx_rs.so.0` 写入（只作用于 cdylib；rlib /
+  staticlib / 测试不受影响，也没有引入任何构建依赖）。
+- 因此**构建产物名**是 `liblasx_rs.so`，而**安装后**是 `liblasx_rs.so.<version>` +
+  `liblasx_rs.so.0` + `liblasx_rs.so` 三个名字：第一个给"想固定到具体版本"的打包脚本，
+  第二个是 loader 运行期真正要找的名字，第三个只给链接器。
+- 自检两条（`docs/dev.md` §22.7 有同样的命令）：
+
+```bash
+readelf -d target/release/liblasx_rs.so | grep -i soname   # → Library soname: [liblasx_rs.so.0]
+nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # → 83
+```
+
+### 17.5 ABI 兼容规则（什么时候可以动 major）
+
+本库对 C ABI 的承诺写在 §4.1/§4.7：**符号只追加、不改签名与语义**；现有 83 个符号里，
+最初的 15 个（§4.1）永不改动。由此得到可执行的规则：
+
+| 变更 | 允许？ | major |
+|---|---|---|
+| 追加新符号（含 `_checked` 变体，如 2026-10-15 的 `lasx_matmul_scaled`） | 允许 | **不变**（仍 `liblasx_rs.so.0`） |
+| 修 bug 导致数值结果变化（仍在逐位承诺内） | 允许 | 不变 |
+| 改已有符号的**签名**、语义，或删除符号 | 破坏 ABI | **+1** |
+| 改 `LasxStatus` 的码值 / 结构布局、改调用约定 | 破坏 ABI | **+1** |
+
+**major 变更时要一起改三处**：`build.rs` 的 SONAME、`scripts/install.sh` 的 `SONAME` 变量、
+本节与 §4 的规则表；并按 `AGENTS.md` 规则 3 先在 `docs/dev.md` 记一笔。
+0.x 阶段 major 恒为 0（`Cargo.toml` 是 0.1.0），语义是"**尚未承诺二进制兼容**"，但"只追加"
+这条实践已经在遵守；升到 1.0 之后 major 才承担真正的兼容承诺。不同 major 的库可以**并存**
+（`liblasx_rs.so.0` 与 `liblasx_rs.so.1` 互不覆盖）。
+
+### 17.6 `_checked` 变体的 `status` 语义
+
+每个原始符号（`lasx_alloc` 除外）都有一个 `_checked` 变体：**签名完全一致，只在末尾追加
+`int *status` 出参**（清单见 §4.4）。C 侧调用约定：
+
+```c
+int st;
+lasx_matmul_scaled_checked(m, k, n, alpha, a, b, beta, c, &st);
+if (st != LASX_OK) { /* st 给出原因；此时输出缓冲未被触碰 */ }
+```
+
+| 码 | 名称 | 含义 |
+|---|---|---|
+| 0 | `Ok` | 成功 |
+| 1 | `NullPointer` | 指针为空且长度非 0 |
+| 2 | `NegativeLength` | 长度参数为负 |
+| 3 | `BadShape` | 形状/长度自洽性不成立（**留给知道真实长度的上层**，如语言绑定） |
+| 4 | `SizeOverflow` | 尺寸相乘溢出 |
+| 5 | `NonPositiveConstant` | `mu <= 0` 或 `re <= 0` |
+| 6 | `NonFiniteConstant` | `j2`/`dt` 为 NaN 或无穷 |
+
+- **失败时**：只写状态，返回安全中性值（数值型 `0.0`/`0`，`void` 型不写输出）——**不触碰输出
+  缓冲**，所以调用方可以把出参留在原地重试。
+- `status` 可传 `NULL`：表示"不关心原因"，但**校验仍然执行**（避免 UB）。
+- C 层只能判**结构**（空指针、负长度、溢出、物理常数）；"数组真实长度是否与声明形状一致"
+  只有知道长度的上层判得了。

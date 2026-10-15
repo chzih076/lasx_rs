@@ -18,7 +18,12 @@ categories = ["hardware-support", "mathematics", "science"]
 exclude = ["/docs", "/scripts", "/cli", "/yll", "/examples", "/AGENTS.md"]
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# 三种产物，各自有明确消费者：
+# - `rlib`：Rust 侧依赖（`lasx_rs = "0.1"` 走这个，cargo 默认会选它）；
+# - `cdylib`：C/其它语言用的动态库（SONAME 由 `build.rs` 固定为 `liblasx_rs.so.0`）；
+# - `staticlib`：不想带 `.so` 的 C 消费者静态链接（`liblasx_rs.a`）。
+# 三者的数值实现是同一份代码，不存在"动态库版与静态库版结果不同"。
+crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 # 公式 DSL 的宏实现：零第三方依赖（手写 TokenStream）。

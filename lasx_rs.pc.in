@@ -1,0 +1,17 @@
+# pkg-config 模板：由 scripts/install.sh 生成 lib/pkgconfig/lasx_rs.pc
+# 脚本会把 `<--prefix>` 与 `Cargo.toml` 的 version 分别替换进下面的 prefix / Version 两行。
+#
+# 用法（装完后）：
+#   PKG_CONFIG_PATH=<prefix>/lib/pkgconfig pkg-config --cflags --libs lasx_rs
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: lasx_rs
+Description: 龙芯 LoongArch64 LASX/LSX 向量库（矩阵乘/归约/NN/物理算子；C ABI 83 个符号）
+Version: @VERSION@
+Libs: -L${libdir} -llasx_rs
+# 静态链接（liblasx_rs.a）时需要显式带上 libm；动态库已把依赖记在自己的 DT_NEEDED 里。
+Libs.private: -lm
+Cflags: -I${includedir}
