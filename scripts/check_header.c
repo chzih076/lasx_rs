@@ -1,0 +1,330 @@
+/*
+ * check_header.c — `include/lasx_rs.h` 与 `liblasx_rs.so` 的**逐符号 ABI 校验**。
+ *
+ * 三件事：
+ *   ① 把**全部 83 个符号**（42 裸 + 41 `_checked`，docs/ops.md §4）的地址放进一个数组
+ *      ⇒ 任何一个缺失/改名/未声明都会在**编译期或链接期**失败（不是"运行时才发现"）；
+ *   ② 逐符号**调用**所有 41 个 `_checked`（零长度/NULL 入参 ⇒ 校验路径必然执行），
+ *      断言状态码被写进末尾的 `int *status` 且落在 `[0, 6]` ⇒ 同时校验了
+ *      "`status` 是最后一个参数"这条 ABI 约定；
+ *   ③ 实测融合缩放的三条行为（§5.5 末段、§2.5 第 3 点）：
+ *      alpha=1,beta=0 与 `lasx_matmul` **逐位一致**；beta=0 时**不读 c**（NaN 探针）；
+ *      `_checked` 空指针 ⇒ 状态非 0 且**不触碰输出**。
+ *
+ * 编译（在仓库根目录；`target/release/liblasx_rs.so` 必须已构建）：
+ *     gcc -O2 -Iinclude scripts/check_header.c -Ltarget/release -llasx_rs -lm \
+ *         -Wl,-rpath,$PWD/target/release -o /tmp/check_header
+ * 运行前注意 **SONAME**：产物的 SONAME 是 `liblasx_rs.so.0`，而 `cargo build` 只产出
+ * `liblasx_rs.so`（不建版本化文件/符号链接），所以本地跑之前先补一个：
+ *     ln -sf liblasx_rs.so target/release/liblasx_rs.so.0
+ * 运行：
+ *     /tmp/check_header
+ * 退出码：0 = 全部通过；1 = 有断言失败。
+ *
+ * 建议加 `-Wall -Wextra`。本文件刻意用了"函数指针 → `void *`"的转换（POSIX 定向支持，
+ * `dlsym` 的返回值就是这种往返）来做到"取地址即引用"；`-Wpedantic` 下会对此告警。
+ *
+ * 注：`(void *)&func` 这种函数指针↔对象指针转换不是 ISO C 的严格子集，但在 POSIX 上
+ * 是**定向支持**的（`dlsym` 的返回值正是这种往返）。这里只是为了"取地址即引用"，
+ * 不会真的通过 void* 调用。
+ */
+
+#include "lasx_rs.h"
+
+#include <math.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------ */
+/* ① 全部 83 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
+/* ------------------------------------------------------------------ */
+
+#define LASX_SYMBOL_COUNT 83
+
+static void *const g_syms[] = {
+    /* --- §4.1 归约 / 稠密 / 量化 / 物理 --- */
+    (void *)lasx_dot,
+    (void *)lasx_dot_checked,
+    (void *)lasx_sum,
+    (void *)lasx_sum_checked,
+    (void *)lasx_dot_f64,
+    (void *)lasx_dot_f64_checked,
+    (void *)lasx_axpy,
+    (void *)lasx_axpy_checked,
+    (void *)lasx_matmul,
+    (void *)lasx_matmul_checked,
+    (void *)lasx_matmul_scaled,
+    (void *)lasx_matmul_scaled_checked,
+    (void *)lasx_matmul_f64,
+    (void *)lasx_matmul_f64_checked,
+    (void *)lasx_dot_i8,
+    (void *)lasx_dot_i8_checked,
+    (void *)lasx_dot_q4,
+    (void *)lasx_dot_q4_checked,
+    (void *)lasx_alloc,
+    (void *)lasx_norm3_batch,
+    (void *)lasx_norm3_batch_checked,
+    (void *)lasx_vec3_add_scaled_batch,
+    (void *)lasx_vec3_add_scaled_batch_checked,
+    (void *)lasx_batch_distance2d,
+    (void *)lasx_batch_distance2d_checked,
+    (void *)lasx_ballistic_step,
+    (void *)lasx_ballistic_step_checked,
+    (void *)lasx_j2_accel_batch,
+    (void *)lasx_j2_accel_batch_checked,
+    (void *)lasx_rk4_j2_step_batch,
+    (void *)lasx_rk4_j2_step_batch_checked,
+    /* --- §4.2 批量姿态 / 几何 --- */
+    (void *)lasx_cross3_batch,
+    (void *)lasx_cross3_batch_checked,
+    (void *)lasx_unitize3_batch,
+    (void *)lasx_unitize3_batch_checked,
+    (void *)lasx_mat3_mul_vec3_batch,
+    (void *)lasx_mat3_mul_vec3_batch_checked,
+    (void *)lasx_quat_normalize_batch,
+    (void *)lasx_quat_normalize_batch_checked,
+    (void *)lasx_quat_mul_batch,
+    (void *)lasx_quat_mul_batch_checked,
+    (void *)lasx_quat_rotate_batch,
+    (void *)lasx_quat_rotate_batch_checked,
+    (void *)lasx_quat_to_dcm_batch,
+    (void *)lasx_quat_to_dcm_batch_checked,
+    /* --- N1：NN 侧（§4.6） --- */
+    (void *)lasx_softmax_rows,
+    (void *)lasx_softmax_rows_checked,
+    (void *)lasx_rms_norm,
+    (void *)lasx_rms_norm_checked,
+    (void *)lasx_silu,
+    (void *)lasx_silu_checked,
+    (void *)lasx_gelu_quick,
+    (void *)lasx_gelu_quick_checked,
+    (void *)lasx_gelu_erf,
+    (void *)lasx_gelu_erf_checked,
+    (void *)lasx_rope,
+    (void *)lasx_rope_checked,
+    (void *)lasx_dot_f16,
+    (void *)lasx_dot_f16_checked,
+    (void *)lasx_gemv_f16,
+    (void *)lasx_gemv_f16_checked,
+    /* --- N3：int8 推理（§4.3） --- */
+    (void *)lasx_amax,
+    (void *)lasx_amax_checked,
+    (void *)lasx_absmax_rows,
+    (void *)lasx_absmax_rows_checked,
+    (void *)lasx_quantize_i8_per_tensor,
+    (void *)lasx_quantize_i8_per_tensor_checked,
+    (void *)lasx_quantize_i8_per_row,
+    (void *)lasx_quantize_i8_per_row_checked,
+    (void *)lasx_dequantize_i8,
+    (void *)lasx_dequantize_i8_checked,
+    (void *)lasx_dequantize_i8_rows,
+    (void *)lasx_dequantize_i8_rows_checked,
+    (void *)lasx_gemv_i8,
+    (void *)lasx_gemv_i8_checked,
+    (void *)lasx_matmul_i8,
+    (void *)lasx_matmul_i8_checked,
+    /* --- ONNX 契约补充（§4.6） --- */
+    (void *)lasx_layer_norm,
+    (void *)lasx_layer_norm_checked,
+    (void *)lasx_gather_rows,
+    (void *)lasx_gather_rows_checked,
+    (void *)lasx_gather_rows_i8,
+    (void *)lasx_gather_rows_i8_checked,
+};
+
+/* 数量在**编译期**钉住：漏写/多写一个都会在这里失败。 */
+typedef char lasx_symbol_count_check
+    [(sizeof(g_syms) / sizeof(g_syms[0]) == LASX_SYMBOL_COUNT) ? 1 : -1];
+
+/* ------------------------------------------------------------------ */
+/* 断言工具                                                            */
+/* ------------------------------------------------------------------ */
+
+static int g_failures = 0;
+
+static void check(int ok, const char *what) {
+    printf("%-58s %s\n", what, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        g_failures++;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* ② 41 个 _checked 符号：零长/NULL 调用 ⇒ 状态必须写进末尾的 status   */
+/* ------------------------------------------------------------------ */
+
+static int status_valid(int st) { return st >= LASX_OK && st <= LASX_NON_FINITE_CONSTANT; }
+
+static void smoke_checked_symbols(void) {
+    int st;
+
+    st = 999; lasx_dot_checked(NULL, NULL, 0, &st);                          check(status_valid(st), "call lasx_dot_checked");
+    st = 999; lasx_sum_checked(NULL, 0, &st);                                check(status_valid(st), "call lasx_sum_checked");
+    st = 999; lasx_dot_f64_checked(NULL, NULL, 0, &st);                      check(status_valid(st), "call lasx_dot_f64_checked");
+    st = 999; lasx_axpy_checked(0.0f, NULL, NULL, 0, &st);                   check(status_valid(st), "call lasx_axpy_checked");
+    st = 999; lasx_matmul_checked(0, 0, 0, NULL, NULL, NULL, &st);           check(status_valid(st), "call lasx_matmul_checked");
+    st = 999; lasx_matmul_scaled_checked(0, 0, 0, 0.0f, NULL, NULL, 0.0f, NULL, &st);
+                                                                             check(status_valid(st), "call lasx_matmul_scaled_checked");
+    st = 999; lasx_matmul_f64_checked(0, 0, 0, NULL, NULL, NULL, &st);       check(status_valid(st), "call lasx_matmul_f64_checked");
+    st = 999; lasx_dot_i8_checked(NULL, NULL, 0, &st);                       check(status_valid(st), "call lasx_dot_i8_checked");
+    st = 999; lasx_dot_q4_checked(NULL, NULL, NULL, NULL, 0, &st);           check(status_valid(st), "call lasx_dot_q4_checked");
+    st = 999; lasx_norm3_batch_checked(NULL, NULL, NULL, NULL, 0, &st);      check(status_valid(st), "call lasx_norm3_batch_checked");
+    st = 999; lasx_vec3_add_scaled_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, 0.0,
+                                                 NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_vec3_add_scaled_batch_checked");
+    st = 999; lasx_batch_distance2d_checked(0.0f, 0.0f, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_batch_distance2d_checked");
+    st = 999; lasx_ballistic_step_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0.0f,
+                                          0.0f, &st);
+                                                                             check(status_valid(st), "call lasx_ballistic_step_checked");
+    st = 999; lasx_j2_accel_batch_checked(NULL, NULL, NULL, 0.0, 0.0, 0.0, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_j2_accel_batch_checked");
+    st = 999; lasx_rk4_j2_step_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, 0.0, 0.0, 0.0,
+                                             0.0, 0, &st);
+                                                                             check(status_valid(st), "call lasx_rk4_j2_step_batch_checked");
+    st = 999; lasx_cross3_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_cross3_batch_checked");
+    st = 999; lasx_unitize3_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_unitize3_batch_checked");
+    st = 999; lasx_mat3_mul_vec3_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                               NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_mat3_mul_vec3_batch_checked");
+    st = 999; lasx_quat_normalize_batch_checked(NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_quat_normalize_batch_checked");
+    st = 999; lasx_quat_mul_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                          NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_quat_mul_batch_checked");
+    st = 999; lasx_quat_rotate_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                             NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_quat_rotate_batch_checked");
+    st = 999; lasx_quat_to_dcm_batch_checked(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                             NULL, NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_quat_to_dcm_batch_checked");
+    st = 999; lasx_softmax_rows_checked(NULL, NULL, NULL, 0, 0, 0.0f, &st);
+                                                                             check(status_valid(st), "call lasx_softmax_rows_checked");
+    st = 999; lasx_rms_norm_checked(NULL, NULL, NULL, 0, 0, 0.0f, &st);      check(status_valid(st), "call lasx_rms_norm_checked");
+    st = 999; lasx_silu_checked(NULL, NULL, 0, &st);                         check(status_valid(st), "call lasx_silu_checked");
+    st = 999; lasx_gelu_quick_checked(NULL, NULL, 0, &st);                   check(status_valid(st), "call lasx_gelu_quick_checked");
+    st = 999; lasx_gelu_erf_checked(NULL, NULL, 0, &st);                     check(status_valid(st), "call lasx_gelu_erf_checked");
+    st = 999; lasx_rope_checked(NULL, NULL, NULL, NULL, 0, 0, 0, 0, &st);    check(status_valid(st), "call lasx_rope_checked");
+    st = 999; lasx_dot_f16_checked(NULL, NULL, 0, &st);                      check(status_valid(st), "call lasx_dot_f16_checked");
+    st = 999; lasx_gemv_f16_checked(NULL, NULL, NULL, 0, 0, &st);            check(status_valid(st), "call lasx_gemv_f16_checked");
+    st = 999; lasx_amax_checked(NULL, 0, &st);                               check(status_valid(st), "call lasx_amax_checked");
+    st = 999; lasx_absmax_rows_checked(NULL, 0, 0, NULL, &st);               check(status_valid(st), "call lasx_absmax_rows_checked");
+    st = 999; lasx_quantize_i8_per_tensor_checked(NULL, NULL, 0, &st);       check(status_valid(st), "call lasx_quantize_i8_per_tensor_checked");
+    st = 999; lasx_quantize_i8_per_row_checked(NULL, NULL, NULL, 0, 0, &st); check(status_valid(st), "call lasx_quantize_i8_per_row_checked");
+    st = 999; lasx_dequantize_i8_checked(NULL, 0.0f, NULL, 0, &st);          check(status_valid(st), "call lasx_dequantize_i8_checked");
+    st = 999; lasx_dequantize_i8_rows_checked(NULL, NULL, NULL, 0, 0, &st);  check(status_valid(st), "call lasx_dequantize_i8_rows_checked");
+    st = 999; lasx_gemv_i8_checked(NULL, NULL, NULL, 0.0f, NULL, 0, 0, &st); check(status_valid(st), "call lasx_gemv_i8_checked");
+    st = 999; lasx_matmul_i8_checked(NULL, NULL, NULL, NULL, NULL, 0, 0, 0, &st);
+                                                                             check(status_valid(st), "call lasx_matmul_i8_checked");
+    st = 999; lasx_layer_norm_checked(NULL, NULL, NULL, NULL, 0, 0, 0.0f, &st);
+                                                                             check(status_valid(st), "call lasx_layer_norm_checked");
+    st = 999; lasx_gather_rows_checked(NULL, NULL, NULL, 0, 1, 1, &st);      check(status_valid(st), "call lasx_gather_rows_checked");
+    st = 999; lasx_gather_rows_i8_checked(NULL, NULL, NULL, NULL, 0, 1, 1, &st);
+                                                                             check(status_valid(st), "call lasx_gather_rows_i8_checked");
+}
+
+/* ------------------------------------------------------------------ */
+/* ③ 行为核对：matmul / matmul_scaled / _checked                        */
+/* ------------------------------------------------------------------ */
+
+#define MM_M 5
+#define MM_K 7
+#define MM_N 6
+
+static void behavior_checks(void) {
+    float a[MM_M * MM_K];
+    float b[MM_K * MM_N];
+    float c_ref[MM_M * MM_N];
+    float c_scaled[MM_M * MM_N];
+
+    for (int i = 0; i < MM_M * MM_K; i++) a[i] = (float)i * 0.25f - 1.0f;
+    for (int i = 0; i < MM_K * MM_N; i++) b[i] = 0.5f - (float)i * 0.125f;
+
+    /* (a) alpha=1,beta=0 与 lasx_matmul 逐位一致（memcmp） */
+    lasx_matmul(MM_M, MM_K, MM_N, a, b, c_ref);
+    memset(c_scaled, 0xA5, sizeof(c_scaled)); /* 先弄脏，确认 beta=0 会整体覆盖 */
+    lasx_matmul_scaled(MM_M, MM_K, MM_N, 1.0f, a, b, 0.0f, c_scaled);
+    check(memcmp(c_ref, c_scaled, sizeof(c_ref)) == 0,
+          "matmul_scaled(alpha=1,beta=0) bitwise == matmul");
+
+    /* (b) beta=0 时**不读 c**：c 填 NaN，输出必须全有限 */
+    for (int i = 0; i < MM_M * MM_N; i++) c_scaled[i] = NAN;
+    lasx_matmul_scaled(MM_M, MM_K, MM_N, 1.5f, a, b, 0.0f, c_scaled);
+    {
+        int all_finite = 1;
+        for (int i = 0; i < MM_M * MM_N; i++) {
+            if (!isfinite(c_scaled[i])) all_finite = 0;
+        }
+        check(all_finite, "matmul_scaled(beta=0) does not read c (NaN probe)");
+    }
+
+    /* (c) _checked 空指针（长度非 0）⇒ 状态非 0，且**不触碰输出** */
+    {
+        int st = 999;
+        int untouched = 1;
+        for (int i = 0; i < MM_M * MM_N; i++) c_scaled[i] = 7.5f;
+        lasx_matmul_scaled_checked(MM_M, MM_K, MM_N, 1.5f, NULL, b, 0.5f, c_scaled, &st);
+        for (int i = 0; i < MM_M * MM_N; i++) {
+            if (c_scaled[i] != 7.5f) untouched = 0;
+        }
+        check(st == LASX_NULL_POINTER, "matmul_scaled_checked(NULL a) -> LASX_NULL_POINTER");
+        check(untouched, "matmul_scaled_checked(NULL a) leaves output untouched");
+    }
+
+    /* (d) _checked 成功路径与裸符号逐位一致，且写 Ok */
+    {
+        int st = 999;
+        memset(c_ref, 0, sizeof(c_ref));
+        for (int i = 0; i < MM_M * MM_N; i++) c_scaled[i] = 3.25f;
+        for (int i = 0; i < MM_M * MM_N; i++) c_ref[i] = 3.25f;
+        lasx_matmul_scaled(MM_M, MM_K, MM_N, 1.25f, a, b, 0.5f, c_ref);
+        lasx_matmul_scaled_checked(MM_M, MM_K, MM_N, 1.25f, a, b, 0.5f, c_scaled, &st);
+        check(st == LASX_OK, "matmul_scaled_checked(ok) -> LASX_OK");
+        check(memcmp(c_ref, c_scaled, sizeof(c_ref)) == 0,
+              "matmul_scaled_checked bitwise == matmul_scaled");
+    }
+
+    /* (e) status = NULL 合法（校验仍执行，不 deref 空指针） */
+    {
+        int untouched = 1;
+        for (int i = 0; i < MM_M * MM_N; i++) c_scaled[i] = -1.0f;
+        lasx_matmul_scaled_checked(MM_M, MM_K, MM_N, 1.0f, NULL, b, 0.0f, c_scaled, NULL);
+        for (int i = 0; i < MM_M * MM_N; i++) {
+            if (c_scaled[i] != -1.0f) untouched = 0;
+        }
+        check(untouched, "matmul_scaled_checked(status=NULL) still validates");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
+int main(void) {
+    const size_t n_syms = sizeof(g_syms) / sizeof(g_syms[0]);
+
+    printf("lasx_rs C ABI check\n");
+    printf("  头文件符号数（编译期钉住）：%d\n", LASX_SYMBOL_COUNT);
+    printf("  数组实际条目数              ：%zu\n", n_syms);
+
+    {
+        int all_non_null = 1;
+        for (size_t i = 0; i < n_syms; i++) {
+            if (g_syms[i] == NULL) all_non_null = 0;
+        }
+        check(n_syms == LASX_SYMBOL_COUNT && all_non_null,
+              "all 83 symbol addresses resolved at link time");
+    }
+
+    check(LASX_OK == 0 && LASX_NULL_POINTER == 1 && LASX_NEGATIVE_LENGTH == 2 &&
+              LASX_BAD_SHAPE == 3 && LASX_SIZE_OVERFLOW == 4 &&
+              LASX_NON_POSITIVE_CONSTANT == 5 && LASX_NON_FINITE_CONSTANT == 6,
+          "lasx_status codes match docs/ops.md 4.5");
+
+    smoke_checked_symbols();
+    behavior_checks();
+
+    printf("\n%s：%d 项失败\n", g_failures == 0 ? "结论 OK" : "结论 FAIL", g_failures);
+    return g_failures == 0 ? 0 : 1;
+}

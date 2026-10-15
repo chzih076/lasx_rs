@@ -124,6 +124,8 @@ nm -D --defined-only target/release/liblasx_rs.so | awk '$2=="T" && $3 ~ /^lasx_
 # 当前：75 个（38 个裸版本 + 37 个 _checked），与上一版比较应只有"新增"
 ```
 
+**当前值（2026-10-15）**：83 个 = 42 裸 + 41 `_checked`（上一行的 75 是旧值）；权威清单与原型在 `docs/ops.md` §4 与 `include/lasx_rs.h`，并由 `scripts/check_header.c` 逐符号校验（取地址 ⇒ 缺符号/改名/原型漂移即编译或链接失败）。
+
 ### 2.3 数值约定（跨算子汇总）
 
 | 约定 | 内容 |

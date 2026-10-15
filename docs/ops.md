@@ -729,6 +729,16 @@ let path = lasx_rs::arch::SimdPath::detect();         // Lasx | Lsx
 **ONNX 契约补充加了 `lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` 各与其
 checked 变体**，见 §4.6 的表与 §2.16/§2.17 的契约）。
 
+**这些原型的权威副本是 `include/lasx_rs.h`**（随库一起安装的生产用 C 头文件）：`scripts/check_header.c`
+对 83 个符号逐个取地址（缺符号/改名/原型不匹配 ⇒ 编译或链接失败），并实调全部 41 个 `_checked`
+变体与融合缩放的行为断言。C 侧用法：
+
+```c
+#include "lasx_rs.h"   /* cc -O2 -I<prefix>/include app.c -L<prefix>/lib -llasx_rs -lm */
+int st;
+lasx_matmul_scaled_checked(m, k, n, 1.0f, a, b, 0.0f, c, &st);   /* st == LASX_OK */
+```
+
 ### 4.1 原始 15 个（历史契约，签名与语义不变）
 
 | 符号 | C 签名要点 | 语义 | 路径 |
