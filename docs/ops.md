@@ -1950,7 +1950,14 @@ f̃(t) ≈ (e^{a t}/T)·[ ½F̃(a) + Σ_{k=1..N} Re{ F̃(a + i kπ/T)·e^{i kπ 
 |---|---|---|
 | `Route::Direct` | **4**：`Re=Ar·Br−Ai·Bi`、`Im=Ar·Bi+Ai·Br` | **每条乘积与对应实矩阵乘逐位一致** —— 测试 `direct_matches_four_real_matmul_bitwise`（与 4 条实内核的组合**逐位**比对）；和/差按 IEEE 逐元素 |
 | `Route::Karatsuba`（**默认**） | **3**：`k1=(Ar+Ai)(Br+Bi)`、`k2=ArBr`、`k3=AiBi` | **只承诺容差**（`k1` 多一次加法、组合次序不同）⇒ **不承诺**与直算逐位；测试 `routes_agree_within_tolerance` + 本文档声明 |
-| `Route::Fused`（**B1，规划中，尚未实现**） | **1 个交错微内核**（Gauss 3 乘全在 LASX 寄存器内） | **只承诺容差**：累加次序与 `Direct`/`Karatsuba` **都不同**（交错布局 + 寄存器内组合）⇒ **不承诺**与任何一条逐位；验收测试 `fused_*`（一旦落地） |
+| `Route::Fused`（**B1：正确性原型已过，寄存器化未完成**） | 1 个交错微内核（Gauss 3 乘；**组合当前仍标量**） | **只承诺容差**（累加次序与上两条都不同）；已过 `b1_tests::interleaved_all_shapes_vs_reference`（9 形状含零维/`k=1`/`n=1`/非 4 倍 rows/非 32 倍 n）与 `interleaved_matches_split_plane_within_tolerance` |
+
+**B1 现状（2026-10-16；**未进 `Route` 枚举、不是默认、不改任何既有行为**）**：`cmatmul_interleaved_f32/f64`
+（交错 `[re,im]` 布局 + Gauss3）**已跑通全形状正确性**（上面两个测试）—— 这是**正确性原型**；
+**寄存器化（把 `t1/t2/t3` 与 `re/im` 的组合搬进 LASX 向量寄存器）尚未完成** ⇒ **没有性能结论**，
+**默认仍是 `Karatsuba`**。寄存器化的下一步（已定）：用"**lane 对交换 + 交错累加器**"避免去交织
+shuffle —— `t = b ∗ [a1,a2,a1,a2,…]`、`u = swap_pairs(b) ∗ [a2,a1,a2,a1,…]` ⇒ `re`/`im` 落在
+`t−u` 的偶/奇 lane 上，最后用掩码累加（掩码乘加同样在寄存器内）。
 
 **边界矩阵（三条路线共用，缺一个都不许出货）**：`k=1`、`n=1`、`m/k/n` 不整除、
 **非 4 倍 rows**、**非 32 倍 n**、大方阵、零维（`m/n/k=0`）。

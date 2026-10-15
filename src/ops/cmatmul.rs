@@ -1063,3 +1063,181 @@ mod b0_perf {
         println!("线程数：串行核心（未自动多线程）");
     }
 }
+
+/// **B1 第一步：交错布局 `[re,im]` 的复数矩阵乘**（Gauss 3 乘；**组合先用标量**，正确性优先）。
+///
+/// 布局：`a` 是 `2·m·k`（`a[2*(i*k+l)] = Re A[i,l]`、`a[2*(i*k+l)+1] = Im A[i,l]`），
+/// `b` 是 `2·k·n`，`c` 是 `2·m·n`（写出）。
+///
+/// **契约：只承诺容差**（累加次序与 `Direct`/`Karatsuba` 都不同）。
+/// **现状**：`k` 循环里的 Gauss3 仍是**标量**（`t1=a1*b1`、`t2=a2*b2`、`t3=(a1+a2)(b1+b2)`、
+/// `re=t1−t2`、`im=t3−t1−t2`）—— 下一步才逐段换成寄存器内运算。
+pub fn cmatmul_interleaved_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    assert_eq!(a.len(), 2 * m * k);
+    assert_eq!(b.len(), 2 * k * n);
+    assert_eq!(c.len(), 2 * m * n);
+    c.fill(0.0);
+    for i in 0..m {
+        for l in 0..k {
+            let (a1, a2) = (a[2 * (i * k + l)], a[2 * (i * k + l) + 1]);
+            for j in 0..n {
+                let (b1, b2) = (b[2 * (l * n + j)], b[2 * (l * n + j) + 1]);
+                let t1 = a1 * b1;
+                let t2 = a2 * b2;
+                let t3 = (a1 + a2) * (b1 + b2);
+                c[2 * (i * n + j)] += t1 - t2;
+                c[2 * (i * n + j) + 1] += t3 - t1 - t2;
+            }
+        }
+    }
+}
+
+/// 同 [`cmatmul_interleaved_f32`]，`f64`。
+pub fn cmatmul_interleaved_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    assert_eq!(a.len(), 2 * m * k);
+    assert_eq!(b.len(), 2 * k * n);
+    assert_eq!(c.len(), 2 * m * n);
+    c.fill(0.0);
+    for i in 0..m {
+        for l in 0..k {
+            let (a1, a2) = (a[2 * (i * k + l)], a[2 * (i * k + l) + 1]);
+            for j in 0..n {
+                let (b1, b2) = (b[2 * (l * n + j)], b[2 * (l * n + j) + 1]);
+                let t1 = a1 * b1;
+                let t2 = a2 * b2;
+                let t3 = (a1 + a2) * (b1 + b2);
+                c[2 * (i * n + j)] += t1 - t2;
+                c[2 * (i * n + j) + 1] += t3 - t1 - t2;
+            }
+        }
+    }
+}
+
+/// 交错布局的**逐元素复数参考**（f32）。
+pub fn cmatmul_interleaved_ref_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut c = vec![0.0f32; 2 * m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let (mut sr, mut si) = (0.0f32, 0.0f32);
+            for l in 0..k {
+                let (a1, a2) = (a[2 * (i * k + l)], a[2 * (i * k + l) + 1]);
+                let (b1, b2) = (b[2 * (l * n + j)], b[2 * (l * n + j) + 1]);
+                sr += a1 * b1 - a2 * b2;
+                si += a1 * b2 + a2 * b1;
+            }
+            c[2 * (i * n + j)] = sr;
+            c[2 * (i * n + j) + 1] = si;
+        }
+    }
+    c
+}
+
+/// 交错布局的**逐元素复数参考**（f64）。
+pub fn cmatmul_interleaved_ref_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
+    let mut c = vec![0.0f64; 2 * m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let (mut sr, mut si) = (0.0f64, 0.0f64);
+            for l in 0..k {
+                let (a1, a2) = (a[2 * (i * k + l)], a[2 * (i * k + l) + 1]);
+                let (b1, b2) = (b[2 * (l * n + j)], b[2 * (l * n + j) + 1]);
+                sr += a1 * b1 - a2 * b2;
+                si += a1 * b2 + a2 * b1;
+            }
+            c[2 * (i * n + j)] = sr;
+            c[2 * (i * n + j) + 1] = si;
+        }
+    }
+    c
+}
+
+#[cfg(test)]
+mod b1_tests {
+    use super::*;
+
+    /// **B1 步骤 1：全形状正确性**（交错布局 + Gauss3，逐元素参考对照）。
+    /// 覆盖 `k=1`、`n=1`、不整除、**非 4 倍 rows**、**非 32 倍 n**、零维、大方阵。
+    #[test]
+    fn interleaved_all_shapes_vs_reference() {
+        const SH: [(usize, usize, usize); 9] = [
+            (0, 3, 4),
+            (3, 0, 4),
+            (3, 4, 0),
+            (1, 1, 1),
+            (1, 5, 1),
+            (7, 1, 3),
+            (6, 3, 5),
+            (13, 7, 9),
+            (17, 4, 33),
+        ];
+        for &(m, k, n) in &SH {
+            let mut a32 = vec![0.0f32; 2 * m * k];
+            let mut b32 = vec![0.0f32; 2 * k * n];
+            for (i, v) in a32.iter_mut().enumerate() {
+                *v = ((i % 17) as f32) * 0.125 - 1.0;
+            }
+            for (i, v) in b32.iter_mut().enumerate() {
+                *v = ((i % 13) as f32) * 0.0625 - 0.5;
+            }
+            let mut c32 = vec![0.0f32; 2 * m * n];
+            cmatmul_interleaved_f32(m, k, n, &a32, &b32, &mut c32);
+            let r32 = cmatmul_interleaved_ref_f32(m, k, n, &a32, &b32);
+            for l in 0..2 * m * n {
+                let e = (c32[l] - r32[l]).abs() / r32[l].abs().max(1.0);
+                assert!(e < 1e-4, "f32 交错 {m}×{k}×{n} 元素 {l} 误差 {e:e}");
+            }
+            let a64: Vec<f64> = a32.iter().map(|&x| x as f64).collect();
+            let b64: Vec<f64> = b32.iter().map(|&x| x as f64).collect();
+            let mut c64 = vec![0.0f64; 2 * m * n];
+            cmatmul_interleaved_f64(m, k, n, &a64, &b64, &mut c64);
+            let r64 = cmatmul_interleaved_ref_f64(m, k, n, &a64, &b64);
+            for l in 0..2 * m * n {
+                assert!(
+                    (c64[l] - r64[l]).abs() < 1e-11,
+                    "f64 交错 {m}×{k}×{n} 元素 {l}"
+                );
+            }
+        }
+    }
+
+    /// **B1 步骤 1 交叉**：交错路线的结果与**分平面**路线（`Route::Direct`）在容差内一致。
+    #[test]
+    fn interleaved_matches_split_plane_within_tolerance() {
+        let (m, k, n) = (13usize, 7usize, 9usize);
+        let (ar, ai): (Vec<f32>, Vec<f32>) = (
+            (0..m * k)
+                .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+                .collect(),
+            (0..m * k)
+                .map(|i| ((i % 13) as f32) * 0.0625 - 0.5)
+                .collect(),
+        );
+        let (br, bi): (Vec<f32>, Vec<f32>) = (
+            (0..k * n)
+                .map(|i| ((i % 11) as f32) * 0.0625 - 0.75)
+                .collect(),
+            (0..k * n).map(|i| ((i % 7) as f32) * 0.125 - 0.5).collect(),
+        );
+        let (mut cr, mut ci) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+        cmatmul_f32_into_route(m, k, n, &ar, &ai, &br, &bi, &mut cr, &mut ci, Route::Direct);
+        // 组交错布局
+        let mut a = vec![0.0f32; 2 * m * k];
+        for i in 0..m * k {
+            a[2 * i] = ar[i];
+            a[2 * i + 1] = ai[i];
+        }
+        let mut b = vec![0.0f32; 2 * k * n];
+        for i in 0..k * n {
+            b[2 * i] = br[i];
+            b[2 * i + 1] = bi[i];
+        }
+        let mut c = vec![0.0f32; 2 * m * n];
+        cmatmul_interleaved_f32(m, k, n, &a, &b, &mut c);
+        let mut worst = 0.0f32;
+        for i in 0..m * n {
+            worst = worst.max((c[2 * i] - cr[i]).abs() / cr[i].abs().max(1.0));
+            worst = worst.max((c[2 * i + 1] - ci[i]).abs() / ci[i].abs().max(1.0));
+        }
+        assert!(worst < 1e-4, "交错 vs 分平面 差 {worst:e}");
+    }
+}
