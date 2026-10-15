@@ -129,6 +129,15 @@ live in the respective design sections.
 > was withdrawn on that line, but **it is the Rust-pool convention and cannot be compared
 > side-by-side with this round's C-ABI splits** (both lines are kept; disposition in `docs/dev.md` §7.10 ④).
 
+> **Who we compare against (must read)**: the opponent is **OpenBLAS 0.3.34, `DYNAMIC_ARCH`,
+> core `la464` (a LoongArch-optimised kernel, *not* the generic C fallback), `NO_AFFINITY`**;
+> every harness run prints its full identity (`OBIDENT`) as the first line.
+> **The call model matters just as much**: the "tie / a few percent behind" figures above are for
+> **"caller-driven (plan + the caller's own threads)"**; the **library-managed convenience path
+> (`lasx_matmul_run_threaded`) is 2.15× slower in a hot loop** (5.3131 vs 2.4671 ms) because
+> **it creates and tears down the thread pool inside every call** ⇒ use `plan` + your own
+> resident threads (or reuse a `WorkerPool` on the Rust side).
+
 > **Formula-DSL reuse note**: `matmul!`'s `mul_into` re-packs `B` on every call, so a layer loop
 > that reuses the same weight should hoist the preparation out of the loop (256³ measured
 > **143.7 µs → 96.5–99.1 µs**, on par with the direct pooled call). **The DSL can now reuse a plan
