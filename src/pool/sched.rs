@@ -206,17 +206,20 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
         //   threads=6  per=64：静态 3.6658 → 动态 3.9342（**−7%**：线程太少，抢不到均衡）
         //   per ≤ 16（threads 12/24）与 per=8 全部：静态明显更好（动态慢 5–40%）
         //
-        // **2026-10-15 晚补扫（`docs/dev.md` §7.10 ⑬，粗网格 9×9×3 次 + 加密 4×5×5 次，B 级窗口）**：
-        // - **一致、可用于判据**：`threads ∈ {16,20}` 时**18 个格子全部静态**（含 per=64，比值
-        //   0.77–0.97）⇒ 这两档**即使 per ≥ 32 也不该走动态**；`threads=32` 在 per ≥ 20 全部动态
-        //   （+10–30%）；`threads=4` 全部静态。
-        // - **噪声主导、不足以移动边界**：`threads ∈ {8,10,12,14}` 在 per=24–32 一带**两阶段互相
-        //   翻转**（例：`8×32` 粗扫 0.687 静态 / 加密 1.134 动态；`12×24` 1.114 / 0.904）
-        //   ⇒ **边界只按一致的那一处收窄**，不按噪声格子重划。
-        //   仍属**外推**：`threads ∈ {5..7,9,11,13,15,17..19,21..23,25..31}` 与更细的 per 网格未扫。
-        // ⇒ **判据：`per_thread ≥ 32` 且 `threads ≥ 12` 且 `threads ∉ [16,20]`**；
+        // **2026-10-15 晚：补扫 + 聚焦复验（`docs/dev.md` §7.10 ⑬）**：
+        // - **复现、保留**：`threads=16` **两窗口 15/15 格全部静态**（含 per=64：粗扫 0.91、复验
+        //   0.949；其余格 0.72–0.97）⇒ 这一档**即使 per ≥ 32 也不走动态**。
+        // - **不复现、已回退**：`threads=20` 粗扫说静态（per=48/64 → 0.935/0.958），聚焦复验却说
+        //   动态（**1.092/1.102**）⇒ **两窗口相反** ⇒ 按"不复现就回退"的口径**恢复 20 档走判据**
+        //   （不排除 20），粗扫那两格**降级为窗口噪声**。
+        // - **边界区未定**：`threads ∈ {8,10,12,14} × per ∈ [20,32]` 两阶段符号翻转
+        //   （`8×32` 0.687 静 / 1.134 动；`12×24` 1.114 动 / 0.904 静）⇒ **该区域判据未定、维持
+        //   保守（阈值 32）**，不要拿一次粗扫去改它。
+        // - **仍是外推**：`threads ∈ {5..7,9,11,13,15,17..19,21..23,25..31}`、更细的 per 网格、
+        //   以及**所有 `n≠2048`/`k≠768` 的形状**（判据不含形状维度）。
+        // ⇒ **判据：`per_thread ≥ 32` 且 `threads ≥ 12` 且 `threads != 16`**；
         //   否则静态等分（块留在缓存里、没有原子竞争）。
-        if per_thread >= 32 && threads >= 12 && !(16..=20).contains(&threads) {
+        if per_thread >= 32 && threads >= 12 && threads != 16 {
             return Pick::Dynamic {
                 block_rows: quarter(per_thread, gran),
             };
@@ -286,8 +289,8 @@ mod tests {
         assert_eq!(pick_rows(1024, 1, 4), Pick::RowBlock);
         // 2026-10-15 实测交叉点（§7.10 ⑩ 阈值表）：per_thread ≥ 32 且 threads ≥ 12 才动态
         assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 }); // per=43
-        assert_eq!(pick_rows(1024, 16, 4), Pick::RowBlock); // per=64 但 16 线程：实测 18 格全静态
-        assert_eq!(pick_rows(1024, 20, 4), Pick::RowBlock); // 20 线程：同上（§7.10 ⑬）
+        assert_eq!(pick_rows(1024, 16, 4), Pick::RowBlock); // 16 线程：两窗口 15/15 格全静态（保留）
+        assert_eq!(pick_rows(1024, 20, 4), Pick::Dynamic { block_rows: 16 }); // 20：复验不复现 ⇒ 回退
         assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 });
         assert_eq!(pick_rows(1024, 32, 4), Pick::Dynamic { block_rows: 8 });
         assert_eq!(pick_rows(384, 12, 4), Pick::Dynamic { block_rows: 8 }); // per=32 边界上侧

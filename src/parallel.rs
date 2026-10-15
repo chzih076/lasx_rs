@@ -1359,11 +1359,14 @@ fn diag_static_vs_dynamic_grid() {
     use std::time::Instant;
     const K: usize = 768;
     const N: usize = 2048;
-    // **两阶段网格**（2026-10-15 补外推）：
-    //   `LASX_GRID_STAGE=1`（默认）粗扫 9×9 × 3 次；`=2` 加密交叉点邻域 × 5 次。
+    // **三阶段网格**（2026-10-15 补外推 + 聚焦复验）：
+    //   `LASX_GRID_STAGE=1`（默认）粗扫 9×9 × 3 次；`=2` 加密交叉点邻域 × 5 次；
+    //   `=3` **聚焦复验 `threads ∈ {16,20}` 两列**（8–12 格 × ≥5 次，独立窗口，打印池实际线程数）。
     // 级别按轮前 1min loadavg 标（A ≤3 / B ≤4.5 / C 其余）；**C 级不当正式数**。
     let stage = std::env::var("LASX_GRID_STAGE").unwrap_or_else(|_| "1".into());
-    let (threads_list, per_list): (&[usize], &[usize]) = if stage == "2" {
+    let (threads_list, per_list): (&[usize], &[usize]) = if stage == "3" {
+        (&[16, 20], &[16, 24, 32, 40, 48, 64])
+    } else if stage == "2" {
         (&[8, 10, 12, 14], &[24, 28, 32, 40, 48])
     } else {
         (
@@ -1399,6 +1402,8 @@ fn diag_static_vs_dynamic_grid() {
             let plan = MatmulPlan::from_row_major(&b, K, N).unwrap();
             let pool = WorkerPool::new(threads);
             let blk = (per / 4).max(4);
+            // 复验要求：**上报池的实际线程数**，排除"线程数没真设成 16/20"这类假象。
+            println!("#   pool.threads()={} (请求 {threads})", pool.threads());
             let run = |c: &mut [f32], pick: Pick| {
                 pool.for_each_row_block_mut_picked(m, 4, [(c, N)], pick, |start, rows, [cb]| {
                     plan.run_rows_into(&a[start * K..(start + rows) * K], cb);

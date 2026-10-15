@@ -814,8 +814,10 @@ println!("chunks={} ms_max={:.3}", stats.chunks, stats.ns_max as f64 / 1e6);
   有测试）；**C 侧不需要它**——`prepare`/`run_threaded` 的 `threads` 每次调用**显式给**，
   便利层的池按该线程数缓存在 plan 句柄里、随 `plan_destroy` 析构。
   **切分策略按形状自动选**（判据 `src/pool/sched.rs::pick_rows`，阈值表见 `docs/dev.md` §7.10 ⑩，
-  **网格补扫与收窄见 `docs/dev.md` 的 §7.10 ⑬**）：大形状动态认领、其余静态/多块；**但 `threads ∈ {16,20}` 实测
-  18 个格子全静态 ⇒ 这两档即使"每线程行数够多"也走静态**；**DSL/`shape` 路径与 C 侧装置共用
+  **网格补扫、聚焦复验与最终口径见 `docs/dev.md` 的 §7.10 ⑬**）：大形状动态认领、其余静态/多块；
+  **唯一按实测收窄的一档是 `threads = 16`（两窗口 15/15 格全静态）⇒ 它即使"每线程行数够多"也走静态**；
+  `threads = 20` 曾一度被排除，**复核后不复现、已回退**（照常走判据）；`threads ∈ {8,10,12,14} ×
+  每线程 20–32 行的"边界区"判据未定、维持保守（阈值 32）。**DSL/`shape` 路径与 C 侧装置共用
   这同一份判据**。
   **未动 `docs/dev.md` §19.7 冻结接口**：冻结的是"池的行块闭包签名 + start/切片对应"、`shape::Prepared::apply*`
   与 `Policy::threads`；本次只改**内部选哪个 `Pick`/句柄内部字段**，签名与 `Pick` 枚举都没变
