@@ -48,6 +48,8 @@ cases=(
   "m192x768x3072-f32-rows|f32|192|768|3072|12|rows|nopin"
   "m192x768x3072-f32-cols|f32|192|768|3072|12|cols|nopin"
   "m192x768x3072-f32-plan|f32|192|768|3072|12|plan|nopin"
+  "m192x768x3072-f32-tight|f32|192|768|3072|12|plan-tight|nopin"
+  "m192x768x3072-f32-omp|f32|192|768|3072|12|omp|nopin"
   "m192x768x3072-f32-threaded|f32|192|768|3072|12|threaded|nopin"
   "w256x64x4096-f32-1t|f32|256|64|4096|1|rows|pin"
   "w256x64x4096-f32-12t-cols|f32|256|64|4096|12|cols|nopin"
@@ -79,7 +81,8 @@ median_of() { # 读 stdin 的数字（每行一个），打印上中位数
 # ---- 构建（缺失时）----
 if [ ! -x "$bin" ]; then
   echo "[bench_openblas] 构建 $bin"
-  gcc -O2 -march=native -Iinclude scripts/bench_openblas.c target/release/liblasx_rs.a \
+  # `-fopenmp`：`--split=omp` 档要用它（没编 OpenMP 时该档会明确报错，不静默降级）。
+  gcc -O2 -march=native -fopenmp -Iinclude scripts/bench_openblas.c target/release/liblasx_rs.a \
       $(pkg-config --cflags --libs openblas) -lm -lpthread -ldl -o "$bin" || exit 1
 fi
 

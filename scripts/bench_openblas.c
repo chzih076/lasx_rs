@@ -63,6 +63,8 @@
 #include <cblas.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,6 +95,23 @@ static int G_ms[16], G_nms;
 static int G_split_plan, G_split_threaded;
 static lasx_matmul_plan *G_plan;
 static int G_plan_threads;
+/* `--split=omp`：**用 OpenMP 驱动**（C 消费者的正规用法：并行区常驻 + `omp for` 派活）。
+ * 与 pthread 档的差别主要在**每次调用的握手成本**（futex 屏障 vs 自旋+分块），见 §7.10 ⑦。
+ * 没编 `-fopenmp` 时这一档直接报错退出（不静默降级）。 */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+static int G_split_omp;
+/* `--split=plan-tight`：常驻 worker + **原子自旋握手**（不用 futex 屏障）。
+ * 用途见 `docs/dev.md` §7.10 ⑦：把"C 调用方驱动的 plan 路径"从"每次调用一次屏障"的
+ * 台架成本里解放出来，量出真实可得的每调用时间。 */
+static int G_split_tight;
+/* 本装置是否真的起了 worker（只有起了才允许去等屏障——`omp` 档不起 worker，
+ * 早期版本让 JOIN_WORKERS 去等**未初始化**的 `pthread_barrier_t`，整进程挂死过一次）。 */
+static int G_workers_created;
+static atomic_int G_tight_go, G_tight_done;
+static double G_tight_ns[64];
+static double G_tight_last_ns; /* 最近一次调用里最慢工人的耗时（纯工人侧关键路径，诊断用） */
 
 static double now_s(void) {
     struct timespec t;
@@ -123,7 +142,43 @@ static void fill_rand_f64(double *p, size_t n, uint64_t seed) {
 
 /* ---- 一次计算：两条实现各一处（无重复分支）---- */
 static void run_lasx(void *c) {
-    if (G_split_threaded && G_plan != NULL) {
+    if (G_split_tight && G_plan != NULL) {
+        /* 一次调用 = 一次原子自旋握手：放行工人 → 等齐 → 本代耗时取**最慢工人**。
+         * （`time_once` 外面量的墙钟含握手本身，所以这个数仍是"含最小握手的每调用时间"。） */
+        G_c = c;
+        atomic_store_explicit(&G_tight_done, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&G_tight_go, 1, memory_order_release);
+        int spins = 0;
+        while (atomic_load_explicit(&G_tight_done, memory_order_acquire) < G_nt) {
+            if (++spins > 4000) {
+                sched_yield();
+                spins = 0;
+            }
+        }
+        double mx = 0.0;
+        for (int i = 0; i < G_nt; i++) {
+            if (G_tight_ns[i] > mx) {
+                mx = G_tight_ns[i];
+            }
+        }
+        G_tight_last_ns = mx; /* 供诊断打印：纯工人侧的关键路径 */
+    } else if (G_split_omp && G_plan != NULL) {
+#ifdef _OPENMP
+        /* OpenMP 驱动：调用一次就开一个并行区，`omp for` 把行块派给线程——这就是给 C 消费者
+         * 的推荐用法（`docs/c-abi.md` §11.2 的 `#pragma omp parallel for` 样板）。 */
+        const int kk = G_k, nn = G_n, blk = G_rows_per_thread > 0 ? G_rows_per_thread : 1;
+        const float *a = (const float *)G_a;
+        float *cc = (float *)c;
+#pragma omp parallel for schedule(static)
+        for (int r0 = 0; r0 < G_m; r0 += blk) {
+            const int rows = (G_m - r0 < blk) ? (G_m - r0) : blk;
+            lasx_matmul_run(G_plan, rows, a + (size_t)r0 * kk, cc + (size_t)r0 * nn);
+        }
+#else
+        fprintf(stderr, "bench_openblas: 这个二进制没编 -fopenmp，--split=omp 不可用\n");
+        exit(2);
+#endif
+    } else if (G_split_threaded && G_plan != NULL) {
         /* 便利层：库内派发（调用方不另起 worker；`G_plan_threads` 就是 --threads） */
         lasx_matmul_run_threaded(G_plan, G_m, (const float *)G_a, (float *)c, G_plan_threads);
     } else if (G_nt > 1) { /* 多线程档：常驻 worker 行切分（见文件头第 4 条） */
@@ -162,6 +217,41 @@ static double time_once(int do_lasx, void *c) {
 
 static void *worker_fn(void *arg) {
     const int idx = (int)(intptr_t)arg;
+    if (G_split_tight) {
+        /* **握手最小化的常驻 worker**（`--split=plan-tight`）：等**原子自旋**握手（不是
+         * `pthread_barrier_t` 的 futex），醒一次只跑自己那批行的 `lasx_matmul_run`。
+         * 这就是"真实 C 调用方"的写法：线程常驻、plan 复用、每次调用只做一次轻握手。 */
+        const int r0 = idx * G_rows_per_thread;
+        int r1 = r0 + G_rows_per_thread;
+        if (r1 > G_m) {
+            r1 = G_m;
+        }
+        /* 代数从 0 起、主线程每次调用前 +1。初始快照**必须钉死为 0**：worker 可能创建得晚
+         * （主线程已经 +1），若那时快照成 1 就会去等"下一代"，而主线程在等本轮完成 ⇒ 死锁。
+         * 这个坑实测踩过一次（整进程挂死），记在这里。 */
+        int seen = 0;
+        for (;;) {
+            int spins = 0;
+            while (atomic_load_explicit(&G_tight_go, memory_order_acquire) == seen) {
+                if (++spins > 4000) { /* 长等时让出 CPU，别把机器烧了 */
+                    sched_yield();
+                    spins = 0;
+                }
+            }
+            seen = atomic_load_explicit(&G_tight_go, memory_order_acquire);
+            if (G_stop) {
+                break;
+            }
+            const double t0 = now_s();
+            if (r0 < r1) {
+                lasx_matmul_run(G_plan, r1 - r0, (const float *)G_a + (size_t)r0 * G_k,
+                                (float *)G_c + (size_t)r0 * G_n);
+            }
+            G_tight_ns[idx] = now_s() - t0; /* 只给主线程读（done 计数做发布） */
+            atomic_fetch_add_explicit(&G_tight_done, 1, memory_order_release);
+        }
+        return NULL;
+    }
     for (;;) {
         pthread_barrier_wait(&G_start);
         if (G_stop) {
@@ -379,7 +469,7 @@ static int run_verify(void) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "用法：%s --impl=lasx|openblas|both [--dtype=f32|f64] --m=M --k=K --n=N [--threads=N] "
-            "[--iters=N] [--seed=U64] [--tol=F] [--split=rows|cols|plan|threaded] [--no-scatter]\n"
+            "[--iters=N] [--seed=U64] [--tol=F] [--split=rows|cols|plan|threaded|omp] [--no-scatter]\n"
             "      %s --mode=scan --k=K --n=N --ms=192,384,768,1536,3072   # 单线程扫 m（拟合打包成本）\n"
             "      %s --mode=verify --m=M --k=K --n=N --threads=N          # 位精确自检（rows/plan/cols）\n",
             argv0, argv0, argv0);
@@ -416,8 +506,15 @@ int main(int argc, char **argv) {
             } else if (!strcmp(s, "threaded")) {
                 G_split_plan = 1;
                 G_split_threaded = 1; /* 便利层：库内派发 */
-            } else {                fprintf(stderr, "bench_openblas: --split 只支持 rows|cols|plan|threaded（收到 %s）\n",
-                        s);
+            } else if (!strcmp(s, "omp")) {
+                G_split_plan = 1;
+                G_split_omp = 1; /* OpenMP 驱动（C 消费者的正规用法） */
+            } else if (!strcmp(s, "plan-tight")) {
+                G_split_plan = 1;
+                G_split_tight = 1; /* 常驻线程 + 原子自旋握手（握手最小化） */
+            } else {
+                fprintf(stderr,
+                        "bench_openblas: --split 只支持 rows|cols|plan|threaded|omp（收到 %s）\n", s);
                 return 2;
             }
         } else if (!strncmp(a, "--iters=", 8)) {
@@ -526,13 +623,20 @@ int main(int argc, char **argv) {
         }
         G_plan_threads = threads;
         printf("OBPLAN dtype=%s k=%d n=%d threads=%d split=%s prepare_ms=%.4f\n", dtype, G_k, G_n,
-               threads, G_split_threaded ? "threaded" : "plan", dt);
+               threads,
+               G_split_tight ? "plan-tight" : (G_split_threaded ? "threaded" : "plan"), dt);
         fflush(stdout);
     }
 
     /* 多线程档：起常驻 worker（一次，不在计时循环里反复建线程）。
      * `--split=threaded` 不走 worker（库内派发），所以这里不起池。 */
-    if (threads > 1 && !G_split_threaded) {
+    /* `--split=omp` 用 OpenMP 自己的线程，不需要本装置的 worker/屏障；但要先把行块大小算出来。 */
+    if (G_split_omp) {
+        const int nt = threads < 1 ? 1 : threads;
+        G_nt = nt < G_m ? nt : G_m;
+        G_rows_per_thread = (G_m + G_nt - 1) / G_nt;
+    }
+    if (threads > 1 && !G_split_threaded && !G_split_omp) {
         /* **两种切分的参数都要备好**：`--mode=verify` 会在同一个进程里来回切 rows/cols，
          * 只备一种会让另一种用到未初始化的 rows/cols_per_thread（本装置曾在 verify 里
          * 因此报出假 MISMATCH——记在这里当教训）。*/
@@ -595,16 +699,24 @@ int main(int argc, char **argv) {
         for (int i = 0; i < G_nt; i++) {
             pthread_create(&G_th[i], NULL, worker_fn, (void *)(intptr_t)i);
         }
+        G_workers_created = 1;
     }
 
 /* 收工：放行并回收 worker（正常返回与一致性失败两条路都要走）。 */
 #define JOIN_WORKERS()                                    \
     do {                                                  \
-        if (G_nt > 1) {                                   \
+        if (G_workers_created) {                          \
             G_stop = 1;                                   \
-            pthread_barrier_wait(&G_start);               \
-            for (int i = 0; i < G_nt; i++) {              \
-                pthread_join(G_th[i], NULL);              \
+            if (G_split_tight) {                          \
+                atomic_fetch_add_explicit(&G_tight_go, 1, memory_order_release); \
+                for (int i = 0; i < G_nt; i++) {          \
+                    pthread_join(G_th[i], NULL);          \
+                }                                         \
+            } else {                                      \
+                pthread_barrier_wait(&G_start);           \
+                for (int i = 0; i < G_nt; i++) {          \
+                    pthread_join(G_th[i], NULL);          \
+                }                                         \
             }                                             \
             pthread_barrier_destroy(&G_start);            \
             pthread_barrier_destroy(&G_end);              \
@@ -631,6 +743,28 @@ int main(int argc, char **argv) {
         run_scan();
         JOIN_WORKERS();
         return 0;
+    }
+
+    /* ---- 计时前的**位精确断言**（`--split=plan-tight`）：与单线程 `lasx_matmul` 逐位比。
+     * 与 `--mode=verify` 同一个命题，只是这里针对"常驻线程 + 自旋握手"这个驱动器。 ---- */
+    if (G_split_tight) {
+        run_lasx(C1); /* 握手跑一遍（同一套 worker） */
+        if (G_is_f64) {
+            lasx_matmul_f64(G_m, G_k, G_n, (const double *)A, (const double *)B, (double *)C2);
+        } else {
+            lasx_matmul(G_m, G_k, G_n, (const float *)A, (const float *)B, (float *)C2);
+        }
+        const int same = memcmp(C1, C2, cn * esz) == 0;
+        printf("OBTIGHT dtype=%s m=%d k=%d n=%d threads=%d bitexact=%s\n", dtype, G_m, G_k, G_n,
+               threads, same ? "yes" : "NO");
+        fflush(stdout);
+        if (!same) {
+            fprintf(stderr,
+                    "bench_openblas: --split=plan-tight 与单线程 lasx_matmul **不逐位一致**，"
+                    "拒绝进入计时。\n");
+            JOIN_WORKERS();
+            return 1;
+        }
     }
 
     /* ---- 先验一致性（第 3 条）：强制、且在计时之前 ---- */

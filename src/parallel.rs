@@ -1158,3 +1158,55 @@ mod plan_threaded_tests {
         }
     }
 }
+
+/// **诊断用（默认 `#[ignore]`）**：同进程交替对照"池"与"计划"两条并行驱动，用来把
+/// **台架/窗口**与**驱动层**的差异分开。
+///
+/// 跑法：`cargo test --release -p lasx_rs --lib diag_pool_vs_plan -- --ignored --nocapture`
+///
+/// 起因（`docs/dev.md` §7.10 ⑦）：跨台架比较曾给出"池比计划快 1.35×"，于是先怀疑"面板/行的
+/// 循环次序"。结果同进程交替测下来**计划反而略快**（≈2.55 ms / 355 G vs 池 ≈3.02 ms / 300 G）
+/// ⇒ 差异来自台架的**每次调用握手**（futex 屏障 vs 自旋）与窗口噪声，不是库内结构。
+/// 留下这个测试是为了下次不要再从"跨台架差 1.4×"直接推结论。
+#[cfg(test)]
+#[ignore = "诊断用：打印池/计划的同进程交替中位数，不进 CI 计时"]
+#[test]
+fn diag_pool_vs_plan() {
+    use crate::aligned::AlignedVec;
+    use std::time::Instant;
+    let (m, k, n) = (192usize, 768usize, 3072usize);
+    let mut a = AlignedVec::<f32>::fill_with(m * k, |i| ((i % 23) as f32 - 11.0) * 0.125);
+    let b = AlignedVec::<f32>::fill_with(k * n, |i| ((i % 19) as f32 - 9.0) * 0.0625);
+    let plan = MatmulPlan::from_row_major(&b, k, n).unwrap();
+    let pool = WorkerPool::new(12);
+    let mut c = AlignedVec::<f32>::new(m * n);
+    let flop = 2.0 * m as f64 * k as f64 * n as f64;
+
+    let mut t_pool = Vec::new();
+    let mut t_plan = Vec::new();
+    for _ in 0..7 {
+        let t0 = Instant::now();
+        matmul_f32(&pool, m, k, n, &mut a, &b, &mut c).unwrap();
+        t_pool.push(t0.elapsed().as_secs_f64());
+
+        let t0 = Instant::now();
+        matmul_f32_plan(&pool, &plan, m, &a, &mut c).unwrap();
+        t_plan.push(t0.elapsed().as_secs_f64());
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (tp, tq) = (med(&mut t_pool), med(&mut t_plan));
+    println!(
+        "池   parallel::matmul_f32   = {:.3} ms = {:.1} GFLOP/s",
+        tp * 1e3,
+        flop / tp / 1e9
+    );
+    println!(
+        "计划 parallel::matmul_f32_plan = {:.3} ms = {:.1} GFLOP/s",
+        tq * 1e3,
+        flop / tq / 1e9
+    );
+    println!("线程数 = {}，形状 = {m}×{k}×{n}", pool.threads());
+}
