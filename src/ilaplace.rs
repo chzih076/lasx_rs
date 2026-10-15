@@ -29,15 +29,15 @@
 //!
 //! - **首选：调用方给**（`DubnerAbate::with_f0`）——`f₀` 是**解析已知量**（初值定理），调用方按
 //!   自己的 `F` 给出最可靠；**默认 `f₀ = 0`**（等于不做扣除，适用于 `f(0⁺) = 0` 的 `F`）。
-//! - **数值估计**：[`estimate_f0`] 用 `s·F(s)` 在**有限 `s`** 上近似 `lim_{s→∞}` ⇒
+//! - **数值估计**：`estimate_f0` 用 `s·F(s)` 在**有限 `s`** 上近似 `lim_{s→∞}` ⇒
 //!   **不可靠**（`F` 衰减慢、或 `s` 取得不够大都会错）。要用**必须显式**调用并放进
-//!   [`DubnerAbate::with_f0`]，**没有任何静默回退**。
+//!   `DubnerAbate::with_f0`，**没有任何静默回退**。
 //! - **取错的后果**：残留跳变 ⇒ **退回 O(1/N)**（误差随 `N` 只按 `1/N` 降，不再指数收敛）。
 //!   这是"看 N 扫描曲线就能自诊"的性质，见 `docs/ops.md §9.0`。
 //!
 //! # 硬约束
 //! - **周期 `2T`**：级数只在 `0 < t < 2T` 内代表原函数（超出是周期延拓）；建议 `T ≥ 3·t_max`。
-//!   [`DubnerAbate::check`] 会拦 `T ≤ t_max`。
+//!   `DubnerAbate::check` 会拦 `T ≤ t_max`。
 //! - **`a·t_max ≲ 4…8`**：`e^{a t}` 放大绝对截断误差（实测 `a=6 → 1e7`、`a=12 → 1e17`）。
 //! - **`t=0` 给跳变平均值**（`F=1/s` 时 ≈ `f₀/2`）：Fourier 反演的已知行为，**不是 bug**。
 //!
@@ -96,7 +96,7 @@ impl ComplexFn for OmegaOverS2Plus {
 }
 
 /// **不可靠**的 `f₀` 数值估计：`s_probe · F(s_probe)`。要用请显式放进
-/// [`DubnerAbate::with_f0`]，并知道 `F` 衰减慢或 `s_probe` 不够大时它会错。
+/// `DubnerAbate::with_f0`，并知道 `F` 衰减慢或 `s_probe` 不够大时它会错。
 pub fn estimate_f0<F: ComplexFn>(f: &F, s_probe: f64) -> f64 {
     s_probe * f.eval(s_probe, 0.0).0
 }
