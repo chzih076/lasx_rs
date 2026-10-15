@@ -205,9 +205,18 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
         //   threads=24 per=16/32/64：+4.9% / +7.8% / +7.4%
         //   threads=6  per=64：静态 3.6658 → 动态 3.9342（**−7%**：线程太少，抢不到均衡）
         //   per ≤ 16（threads 12/24）与 per=8 全部：静态明显更好（动态慢 5–40%）
-        // ⇒ **判据（实测交叉点）：`per_thread ≥ 32` 且 `threads ≥ 12` 才用动态领取**；
+        //
+        // **2026-10-15 晚补扫（`docs/dev.md` §7.10 ⑬，粗网格 9×9×3 次 + 加密 4×5×5 次，B 级窗口）**：
+        // - **一致、可用于判据**：`threads ∈ {16,20}` 时**18 个格子全部静态**（含 per=64，比值
+        //   0.77–0.97）⇒ 这两档**即使 per ≥ 32 也不该走动态**；`threads=32` 在 per ≥ 20 全部动态
+        //   （+10–30%）；`threads=4` 全部静态。
+        // - **噪声主导、不足以移动边界**：`threads ∈ {8,10,12,14}` 在 per=24–32 一带**两阶段互相
+        //   翻转**（例：`8×32` 粗扫 0.687 静态 / 加密 1.134 动态；`12×24` 1.114 / 0.904）
+        //   ⇒ **边界只按一致的那一处收窄**，不按噪声格子重划。
+        //   仍属**外推**：`threads ∈ {5..7,9,11,13,15,17..19,21..23,25..31}` 与更细的 per 网格未扫。
+        // ⇒ **判据：`per_thread ≥ 32` 且 `threads ≥ 12` 且 `threads ∉ [16,20]`**；
         //   否则静态等分（块留在缓存里、没有原子竞争）。
-        if per_thread >= 32 && threads >= 12 {
+        if per_thread >= 32 && threads >= 12 && !(16..=20).contains(&threads) {
             return Pick::Dynamic {
                 block_rows: quarter(per_thread, gran),
             };
@@ -277,7 +286,10 @@ mod tests {
         assert_eq!(pick_rows(1024, 1, 4), Pick::RowBlock);
         // 2026-10-15 实测交叉点（§7.10 ⑩ 阈值表）：per_thread ≥ 32 且 threads ≥ 12 才动态
         assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 }); // per=43
-        assert_eq!(pick_rows(1024, 16, 4), Pick::Dynamic { block_rows: 16 }); // per=64
+        assert_eq!(pick_rows(1024, 16, 4), Pick::RowBlock); // per=64 但 16 线程：实测 18 格全静态
+        assert_eq!(pick_rows(1024, 20, 4), Pick::RowBlock); // 20 线程：同上（§7.10 ⑬）
+        assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 });
+        assert_eq!(pick_rows(1024, 32, 4), Pick::Dynamic { block_rows: 8 });
         assert_eq!(pick_rows(384, 12, 4), Pick::Dynamic { block_rows: 8 }); // per=32 边界上侧
         assert_eq!(pick_rows(192, 12, 4), Pick::RowBlock); // per=16（LLM 形状）⇒ 静态
         assert_eq!(pick_rows(256, 12, 4), Pick::RowBlock); // per=22（宽薄 256×64×4096）⇒ 静态（与旧判据同）

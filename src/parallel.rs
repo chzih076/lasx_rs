@@ -1357,15 +1357,42 @@ fn diag_static_vs_dynamic_grid() {
     use crate::aligned::AlignedVec;
     use crate::pool::Pick;
     use std::time::Instant;
-    const ROUNDS: usize = 5;
     const K: usize = 768;
     const N: usize = 2048;
+    // **两阶段网格**（2026-10-15 补外推）：
+    //   `LASX_GRID_STAGE=1`（默认）粗扫 9×9 × 3 次；`=2` 加密交叉点邻域 × 5 次。
+    // 级别按轮前 1min loadavg 标（A ≤3 / B ≤4.5 / C 其余）；**C 级不当正式数**。
+    let stage = std::env::var("LASX_GRID_STAGE").unwrap_or_else(|_| "1".into());
+    let (threads_list, per_list): (&[usize], &[usize]) = if stage == "2" {
+        (&[8, 10, 12, 14], &[24, 28, 32, 40, 48])
+    } else {
+        (
+            &[4, 8, 10, 12, 14, 16, 20, 24, 32],
+            &[12, 16, 20, 24, 28, 32, 40, 48, 64],
+        )
+    };
+    let rounds: usize = std::env::var("LASX_GRID_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if stage == "2" { 5 } else { 3 });
     let only = std::env::var("LASX_DIAG_ARM").unwrap_or_default();
     let want_static = only.is_empty() || only == "static";
     let want_dyn = only.is_empty() || only == "dynamic";
-    println!("threads per_thread    m  static_ms  dyn_ms   比值  判定");
-    for &threads in &[6usize, 12, 24] {
-        for &per in &[8usize, 16, 32, 64] {
+    let l1 = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+        .unwrap_or_default();
+    let grade = match l1.parse::<f64>() {
+        Ok(v) if v <= 3.0 => "A",
+        Ok(v) if v <= 4.5 => "B",
+        _ => "C",
+    };
+    println!(
+        "# stage={stage} rounds={rounds} loadavg1={l1} grade={grade} k={K} n={N}\n\
+         threads per_thread    m  static_ms  dyn_ms   比值  判定"
+    );
+    for &threads in threads_list {
+        for &per in per_list {
             let m = threads * per;
             let a = AlignedVec::<f32>::fill_with(m * K, |i| ((i % 23) as f32 - 11.0) * 0.125);
             let b = AlignedVec::<f32>::fill_with(K * N, |i| ((i % 19) as f32 - 9.0) * 0.0625);
@@ -1379,19 +1406,39 @@ fn diag_static_vs_dynamic_grid() {
             };
             let mut ts = Vec::new();
             let mut td = Vec::new();
-            for _ in 0..ROUNDS {
+            // **每个组合都要位精确**（Lead 要求）：静态版与动态版逐位比，且都与 `api::matmul` 比
+            // （`api::matmul` 在 m ≤ 512 的格子上跑，避免大格子把诊断拖成分钟级）。
+            let mut cs = AlignedVec::<f32>::new(m * N);
+            let mut cd = AlignedVec::<f32>::new(m * N);
+            for _ in 0..rounds {
                 if want_static {
                     let mut c = AlignedVec::<f32>::new(m * N);
                     let t0 = Instant::now();
                     run(&mut c, Pick::RowBlock);
                     ts.push(t0.elapsed().as_secs_f64());
+                    cs.copy_from_slice(c.as_slice());
                 }
                 if want_dyn {
                     let mut c = AlignedVec::<f32>::new(m * N);
                     let t0 = Instant::now();
                     run(&mut c, Pick::Dynamic { block_rows: blk });
                     td.push(t0.elapsed().as_secs_f64());
+                    cd.copy_from_slice(c.as_slice());
                 }
+            }
+            let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+            assert_eq!(
+                bits(cs.as_slice()),
+                bits(cd.as_slice()),
+                "静态 vs 动态不逐位（threads={threads} per={per} m={m}）"
+            );
+            if m <= 512 {
+                let want = crate::api::matmul(m, K, N, &a, &b).unwrap();
+                assert_eq!(
+                    bits(cs.as_slice()),
+                    bits(&want),
+                    "与 api::matmul 不逐位（threads={threads} per={per} m={m}）"
+                );
             }
             let med = |v: &mut Vec<f64>| {
                 v.sort_by(f64::total_cmp);
