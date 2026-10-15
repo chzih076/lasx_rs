@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**276 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**280 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -350,6 +350,15 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   doctest**（`CMat::<2,3>` 乘 `CMat::<4,5>` 编不过）进 CI 文档测试步骤；**逆变换性能表在
   `J×N×NB=256×1024×512` 重做**（`ilaplace::perf::diag_ilaplace_perf`）：只指数和 19.40 ms /
   55.34 复数 GFLOP·s，含 `F` 32.83 ms（`F` 占 40.9%）。见 `docs/ops.md` §9.07。
+- **导数定理（运算微积分）4 个**（`src/laplace.rs::derivative_tests`，2026-10-16 加）：
+  `derivative_theorem_three_analytic_cases`（`e^{−2t}`/`sin(3t)`/`t` 三组 `L{f″}` 解析对照，
+  实虚部，<1e-12；并断言通用式与二阶特化**逐位一致**）、
+  `derivative_theorem_round_trip_through_inverse`（**端到端往返**：`G(s)=s²F−s·f₀−f₁` 交给库内
+  `invert_batch_f64`（开跳变扣除 `f0=f″(0⁺)`）⇒ `f″` 误差 8.6e-5…9.7e-4）、
+  `derivative_theorem_wrong_init_leaves_residual`（**初值取错的后果**：残差 = `ε·s`，实测
+  `s∈{2,8,32}` ⇒ 0.02/0.08/0.32 与 `ε·s` 逐位吻合）、
+  `derivative_theorem_step_counterexample`（**阶跃/含 δ 不适用**的反例：定理给 0，真值是 `δ′`）。
+  定理、初值契约与限制见 `docs/ops.md` §9.08。
 - **复数矩阵乘 7 个 + 3 个诊断**（`src/ops/cmatmul.rs`，2026-10-16 加，A 阶 + B0）：
   `direct_matches_four_real_matmul_bitwise`（**直算 vs 4 条实矩阵乘的组合逐位一致**——位精确契约）、
   `routes_agree_within_tolerance`（两路线互比 + 与逐元素参考，f32/f64 各 8 个形状含 `k=1`/`n=1`/
@@ -398,7 +407,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 276 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 280 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

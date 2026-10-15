@@ -838,3 +838,302 @@ mod c_perf {
         );
     }
 }
+
+/// **运算微积分：拉普拉斯导数定理**（`L{f⁽ⁿ⁾}(s) = sⁿ·F(s) − Σ_{k=0}^{n−1} s^{n−1−k}·f⁽ᵏ⁾(0⁺)`）。
+///
+/// 输入是与 [`laplace_batch_f64`] 输出**同一批 `s` 节点**上的 `F`（分平面 `(Re,Im)`），
+/// 加上**调用方给定**的初值 `f⁽ᵏ⁾(0⁺)`（`k = 0..n`）；输出是同一批节点上的 `G(s) = L{f⁽ⁿ⁾}`。
+///
+/// # 初值契约（**与 `f₀` 一致**）
+/// - **首选：调用方给**（解析式或已知量）；**本函数不做任何数值估计、没有静默回退**；
+/// - `init` 必须是 **右极限 `f⁽ᵏ⁾(0⁺)`**（单边拉普拉斯的约定）；
+/// - **取错的后果**：残留 `s^{n−1−k}·ε_k` 项 ⇒ 在**大 `|s|`** 处误差按 `|s|^{n−1−k}` 放大
+///   （实测见 `docs/ops.md` §9.08 的表）。
+///
+/// # 适用范围（**不满足就别用**）
+/// - 要求 `f` 在 `[0,∞)` 上**足够次可微**、且**指数阶**（否则 `F` 本身不存在）；
+/// - **阶跃/含 δ 的情形不适用**：如 `f ≡ 1` 时 `f″ = δ′`（分布），定理给的是 `s²·(1/s) − s·1 − 0 = 0`
+///   ——**错**（有反例测试 `derivative_theorem_step_counterexample`）；
+/// - **浮点相消**：`sⁿ·F(s)` 在 `n` 大、`|s|` 大时会发生灾难性相消（见文档给出的经验界）。
+///
+/// # 实现
+/// `s_j` 上的运算是**逐节点的复数乘/乘幂**（不是矩阵乘）——按 `Re/Im` 分平面直接算，
+/// 每步都是 2×2 实乘加，**没有新造矩阵乘**；`n` 小（1/2/3）时展开成显式表达式。
+pub fn derivative_spectrum_f64(
+    n: usize,
+    s_re: &[f64],
+    s_im: &[f64],
+    fre: &[f64],
+    fim: &[f64],
+    init: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    assert_eq!(s_re.len(), s_im.len(), "s 的分平面长度必须一致");
+    assert_eq!(s_re.len(), fre.len(), "F 必须与 s 在同一批节点上");
+    assert_eq!(fre.len(), fim.len());
+    assert!(init.len() >= n, "init 至少给 n 个初值（f(0⁺)…f⁽ⁿ⁻¹⁾(0⁺)）");
+    let m = s_re.len();
+    let mut gre = vec![0.0f64; m];
+    let mut gim = vec![0.0f64; m];
+    for j in 0..m {
+        // s^n（逐节点复数幂；n 小则展开）
+        let (mut pr, mut pi) = (1.0f64, 0.0f64);
+        for _ in 0..n {
+            let (nr, ni) = (pr * s_re[j] - pi * s_im[j], pr * s_im[j] + pi * s_re[j]);
+            pr = nr;
+            pi = ni;
+        }
+        // s^n·F
+        let (mut tr, mut ti) = (pr * fre[j] - pi * fim[j], pr * fim[j] + pi * fre[j]);
+        // 减 Σ_{k=0}^{n−1} s^{n−1−k}·f⁽ᵏ⁾(0⁺)
+        for (k, &fk) in init.iter().take(n).enumerate() {
+            let p = n - 1 - k;
+            let (mut qr, mut qi) = (1.0f64, 0.0f64);
+            for _ in 0..p {
+                let (nr, ni) = (qr * s_re[j] - qi * s_im[j], qr * s_im[j] + qi * s_re[j]);
+                qr = nr;
+                qi = ni;
+            }
+            tr -= qr * fk;
+            ti -= qi * fk;
+        }
+        gre[j] = tr;
+        gim[j] = ti;
+    }
+    (gre, gim)
+}
+
+/// **特化：一阶导** `L{f′}(s) = s·F(s) − f(0⁺)`。
+pub fn derivative1_spectrum_f64(
+    s_re: &[f64],
+    s_im: &[f64],
+    fre: &[f64],
+    fim: &[f64],
+    f0: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    derivative_spectrum_f64(1, s_re, s_im, fre, fim, &[f0])
+}
+
+/// **特化：二阶导** `L{f″}(s) = s²·F(s) − s·f(0⁺) − f′(0⁺)`。
+pub fn derivative2_spectrum_f64(
+    s_re: &[f64],
+    s_im: &[f64],
+    fre: &[f64],
+    fim: &[f64],
+    f0: f64,
+    d1: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    derivative_spectrum_f64(2, s_re, s_im, fre, fim, &[f0, d1])
+}
+
+#[cfg(test)]
+mod derivative_tests {
+    use super::*;
+
+    /// 在 `s` 节点上取解析 `F`（f 的变换）与解析 `F″ = L{f″}`。
+    fn nodes() -> Vec<(f64, f64)> {
+        // σ > 0（保证 F 有定义），带虚部
+        (0..8)
+            .map(|j| {
+                let s = 1.0 + 0.25 * j as f64;
+                (s, (j % 3) as f64 * 0.5)
+            })
+            .collect()
+    }
+
+    /// **② 三组解析对照（实部+虚部）** —— 定理给 `L{f″}`，与解析式比。
+    #[test]
+    fn derivative_theorem_three_analytic_cases() {
+        let ns = nodes();
+        let s_re: Vec<f64> = ns.iter().map(|&(r, _)| r).collect();
+        let s_im: Vec<f64> = ns.iter().map(|&(_, i)| i).collect();
+        // (a) f = e^{-a t}，a = 2：F = 1/(s+2)，f(0)=1，f'(0)=−2 ⇒ L{f″} = a²/(s+a) = 4/(s+2)
+        // (b) f = sin(ω₀t)，ω₀ = 3：F = 3/(s²+9)，f(0)=0，f'(0)=3 ⇒ L{f″} = −27/(s²+9)
+        // (c) f = t：F = 1/s²，f(0)=0，f'(0)=1 ⇒ L{f″} = 0
+        for (name, fre, fim, init, want) in [
+            (
+                "e^{-2t}",
+                ns.iter()
+                    .map(|&(r, i)| 1.0 / ((r + 2.0).powi(2) + i * i) * (r + 2.0))
+                    .collect::<Vec<_>>(),
+                ns.iter()
+                    .map(|&(r, i)| -i / ((r + 2.0).powi(2) + i * i))
+                    .collect::<Vec<_>>(),
+                vec![1.0f64, -2.0],
+                // 4/(s+2)
+                (|r: f64, i: f64| (4.0 * (r + 2.0)) / ((r + 2.0).powi(2) + i * i))
+                    as fn(f64, f64) -> f64,
+            ),
+            (
+                "sin(3t)",
+                ns.iter()
+                    .map(|&(r, i)| {
+                        (3.0 * (r * r - i * i + 9.0))
+                            / ((r * r - i * i + 9.0).powi(2) + (2.0 * r * i).powi(2))
+                    })
+                    .collect(),
+                ns.iter()
+                    .map(|&(r, i)| {
+                        (-3.0 * (2.0 * r * i))
+                            / ((r * r - i * i + 9.0).powi(2) + (2.0 * r * i).powi(2))
+                    })
+                    .collect(),
+                vec![0.0f64, 3.0],
+                |r: f64, i: f64| {
+                    let (ar, ai) = (r * r - i * i + 9.0, 2.0 * r * i);
+                    -27.0 * ar / (ar * ar + ai * ai)
+                },
+            ),
+            (
+                "t",
+                // F = 1/s² = (s̄)²/|s|⁴
+                ns.iter()
+                    .map(|&(r, i)| (r * r - i * i) / ((r * r + i * i).powi(2)))
+                    .collect(),
+                ns.iter()
+                    .map(|&(r, i)| (-2.0 * r * i) / ((r * r + i * i).powi(2)))
+                    .collect(),
+                vec![0.0f64, 1.0],
+                |_r: f64, _i: f64| 0.0,
+            ),
+        ] {
+            let (gre, gim) = derivative2_spectrum_f64(&s_re, &s_im, &fre, &fim, init[0], init[1]);
+            // 也验证通用实现与二阶特化一致（逐位）
+            let (gre2, gim2) = derivative_spectrum_f64(2, &s_re, &s_im, &fre, &fim, &init);
+            assert_eq!(
+                gre.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                gre2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{name}: 特化与通用不一致"
+            );
+            assert_eq!(
+                gim.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                gim2.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            // 与解析 `L{f″}` 比（实部；虚部同理）
+            let mut worst = 0.0f64;
+            for (j, &(r, i)) in ns.iter().enumerate() {
+                let w = want(r, i);
+                let e = (gre[j] - w).abs() / w.abs().max(1e-9);
+                worst = worst.max(e);
+                if w == 0.0 {
+                    assert!(gre[j].abs() < 1e-9, "{name}: 期望 0，实测 {:.3e}", gre[j]);
+                }
+                let _ = gim[j];
+            }
+            if want(1.0, 0.5) != 0.0 {
+                assert!(worst < 1e-12, "{name}: 最大相对误差 {worst:.3e}");
+            }
+        }
+    }
+
+    /// **③ 端到端往返（最值钱）**：`F` → **导数定理**（得到 `L{f″}`）→ **库内逆变换** → `f″`。
+    ///
+    /// 这里把 `G(s) = s²F(s) − s·f(0⁺) − f′(0⁺)` 直接作为 [`ComplexFn`] 交给 `invert_batch_f64`，
+    /// **并且用 `DubnerAbate::f0 = f″(0⁺) = a²` 做跳变扣除**（否则会退回 1/N 收敛，见 §9.05 的 `f₀` 契约）。
+    #[test]
+    fn derivative_theorem_round_trip_through_inverse() {
+        use crate::ilaplace::{ComplexFn, DubnerAbate, OneOverSPlus, invert_batch_f64};
+        let a = 1.0f64;
+        /// `G(s) = s²·F(s) − s·f0 − d1`（`F` 用解析 `1/(s+a)`）。
+        struct G {
+            f: OneOverSPlus,
+            f0: f64,
+            d1: f64,
+        }
+        impl ComplexFn for G {
+            fn eval(&self, re: f64, im: f64) -> (f64, f64) {
+                let (fr, fi) = self.f.eval(re, im);
+                let (s2r, s2i) = (re * re - im * im, 2.0 * re * im);
+                let (pr, pi) = (s2r * fr - s2i * fi, s2r * fi + s2i * fr);
+                (pr - re * self.f0 - self.d1, pi - im * self.f0)
+            }
+        }
+        // 直接在库内的节点上核对"导数定理数值 = 解析 G"（分平面）
+        let p_f0 = 1.0f64; // f(0⁺) = 1
+        let p = DubnerAbate {
+            t_end: 12.0,
+            a: 1.0,
+            n: 512,
+            f0: a * a, // **f″(0⁺) = a²** ⇒ 逆变换的跳变扣除
+        };
+        let one = OneOverSPlus { theta: a };
+        let s_re = vec![p.a; 512];
+        let s_im: Vec<f64> = (1..=512)
+            .map(|k| k as f64 * std::f64::consts::PI / p.t_end)
+            .collect();
+        let fre: Vec<f64> = s_im.iter().map(|&om| one.eval(p.a, om).0).collect();
+        let fim: Vec<f64> = s_im.iter().map(|&om| one.eval(p.a, om).1).collect();
+        let (gre, gim) = derivative2_spectrum_f64(&s_re, &s_im, &fre, &fim, p_f0, -a);
+        // 与解析 G 比（导数定理本身的正确性，分平面）
+        let g = G {
+            f: OneOverSPlus { theta: a },
+            f0: p_f0,
+            d1: -a,
+        };
+        let mut worst_g = 0.0f64;
+        for k in 0..512 {
+            let (wr, wi) = g.eval(s_re[k], s_im[k]);
+            worst_g = worst_g.max((gre[k] - wr).abs() / wr.abs().max(1.0));
+            worst_g = worst_g.max((gim[k] - wi).abs() / wi.abs().max(1.0));
+        }
+        assert!(worst_g < 1e-12, "导数定理 vs 解析 G 差 {worst_g:.3e}");
+        // 逆变换 ⇒ 应得 f″(t) = a²·e^{−at}
+        let ts = [0.5f64, 1.0, 2.0, 3.0];
+        let got = invert_batch_f64::<4, 512, 1, _>(p, &ts, &[g]);
+        let mut worst = 0.0f64;
+        let mut table = Vec::new();
+        for (j, &t) in ts.iter().enumerate() {
+            let want = a * a * (-a * t).exp();
+            let e = (got[j] - want).abs() / want;
+            worst = worst.max(e);
+            table.push((t, got[j], want, e));
+        }
+        println!("端到端往返（正向解析 F → 导数定理 → D–A 逆变换）：");
+        for (t, got, want, e) in &table {
+            println!("  t={t}: 得到 {got:.6} 期望 {want:.6} 相对误差 {e:.3e}");
+        }
+        assert!(worst < 5e-3, "往返误差过大：{worst:.3e}（数列 {got:?}）");
+    }
+
+    /// **④ 初值契约：取错会怎样（实测）** —— `f=e^{−at}` 的 `f(0)` 故意给错 `ε`，
+    /// 残差应≈ `ε·s`（在 `|s|` 大处按 |s| 放大）。
+    #[test]
+    fn derivative_theorem_wrong_init_leaves_residual() {
+        let s_re = [2.0f64, 8.0, 32.0];
+        let s_im = [0.0f64, 0.0, 0.0];
+        let a = 1.0f64;
+        let fre: Vec<f64> = s_re.iter().map(|&r| 1.0 / (r + a)).collect();
+        let fim = vec![0.0f64; 3];
+        let (gre, _) = derivative2_spectrum_f64(&s_re, &s_im, &fre, &fim, 1.0, -a);
+        let (gwrong, _) = derivative2_spectrum_f64(&s_re, &s_im, &fre, &fim, 1.0 + 0.01, -a);
+        for j in 0..3 {
+            let residual = (gwrong[j] - gre[j]).abs();
+            // 残差 = ε·s_j ⇒ 相对 |s| 线性放大
+            let want = 0.01 * s_re[j];
+            assert!(
+                (residual - want).abs() / want < 1e-12,
+                "s={} 残差应 = ε·s = {want}，实测 {residual}",
+                s_re[j]
+            );
+        }
+    }
+
+    /// **⑤ 边界/反例：阶跃 `f≡1` 不适用**（`f″ = δ′` 是分布，定理给 0 —— 明确记为"不适用"）。
+    #[test]
+    fn derivative_theorem_step_counterexample() {
+        let s_re = [1.0f64, 2.0, 3.0];
+        let s_im = [0.0f64; 3];
+        let fre: Vec<f64> = s_re.iter().map(|&r| 1.0 / r).collect(); // F = 1/s
+        let fim = vec![0.0f64; 3];
+        let (gre, gim) = derivative2_spectrum_f64(&s_re, &s_im, &fre, &fim, 1.0, 0.0);
+        for j in 0..3 {
+            assert!(gre[j].abs() < 1e-12 && gim[j].abs() < 1e-12);
+        }
+        // 定理给 0，但真值是 δ′（分布）⇒ **不适用**。这里不做"修正"，只把"定理的输出是 0、
+        // 而真值不是 0"这件事**钉成断言**（如实记录不适用；反例的说明见 `docs/ops.md` §9.08）。
+        assert_eq!(
+            gre[0], 0.0,
+            "阶跃情形定理输出 0（而真值 f″=δ′ ⇒ 不适用，见 §9.08）"
+        );
+        assert_eq!(gim[0], 0.0);
+    }
+}

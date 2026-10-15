@@ -274,12 +274,85 @@ fn weighting_part() {
     );
 }
 
+/// **运算微积分：导数定理**（`L{f⁽ⁿ⁾}(s) = sⁿF(s) − Σ s^{n−1−k}f⁽ᵏ⁾(0⁺)`）：
+/// `f=e^{−2t}` ⇒ `L{f″} = 4/(s+2)`；再**走库内逆变换**反演出 `f″`，与解析 `4e^{−2t}` 对照。
+fn derivative_part() {
+    use lasx_rs::ilaplace::{ComplexFn, DubnerAbate, OneOverSPlus, invert_batch_f64};
+    use lasx_rs::laplace::derivative2_spectrum_f64;
+    /// `G(s) = s²F(s) − s·f(0⁺) − f′(0⁺)`（`F = 1/(s+2)`）。
+    struct G {
+        f: OneOverSPlus,
+        f0: f64,
+        d1: f64,
+    }
+    impl ComplexFn for G {
+        fn eval(&self, re: f64, im: f64) -> (f64, f64) {
+            let (fr, fi) = self.f.eval(re, im);
+            let (s2r, s2i) = (re * re - im * im, 2.0 * re * im);
+            let (pr, pi) = (s2r * fr - s2i * fi, s2r * fi + s2i * fr);
+            (pr - re * self.f0 - self.d1, pi - im * self.f0)
+        }
+    }
+    let (a, f0, d1) = (2.0f64, 1.0f64, -2.0f64); // f=e^{−2t}：f(0)=1、f′(0)=−2
+    let one = OneOverSPlus { theta: a };
+    println!("\n[导数定理] f=e^{{−2t}} ⇒ L{{f″}} 应 = 4/(s+2)（f″ = 4e^{{−2t}}）");
+    println!("   s（实部, 虚部）   |  计算 L{{f″}}      |  解析 4/(s+2)     |  相对误差");
+    let mut worst_calc = 0.0f64;
+    for &(sr, si) in &[(1.0f64, 0.0f64), (2.0, 1.0), (4.0, -0.5)] {
+        let (fr, fi) = one.eval(sr, si);
+        let (gr, gi) = derivative2_spectrum_f64(&[sr], &[si], &[fr], &[fi], f0, d1);
+        // 解析 4/(s+2)
+        let d = (sr + a) * (sr + a) + si * si;
+        let (wr, wi) = (4.0 * (sr + a) / d, -4.0 * si / d);
+        let e = ((gr[0] - wr).abs() + (gi[0] - wi).abs()) / (wr.abs() + wi.abs()).max(1e-12);
+        worst_calc = worst_calc.max(e);
+        println!(
+            "   ({sr:5.2}, {si:5.2})    |  {:.6} {:+.6}i |  {wr:.6} {wi:+.6}i |  {e:.2e}",
+            gr[0], gi[0]
+        );
+    }
+    println!("   最大相对误差 {worst_calc:.2e}");
+    // 逆变换反演 f″：G 交给 D–A。**两个参数都要选对**：`f0 = f″(0⁺) = 4` 做跳变扣除（否则退回
+    // 1/N 收敛）；位移 `a` 实测敏感（同形状下 a=1 比 a=2 好：t=3 误差 4.0e-2 vs 8.3e-1 ⇒
+    // `e^{a t}` 会放大截断），这里取 a=1（`a·t_max = 3`）。
+    let p = DubnerAbate {
+        t_end: 12.0,
+        a: 1.0,
+        n: 512,
+        f0: a * a,
+    };
+    let g = G {
+        f: OneOverSPlus { theta: a },
+        f0,
+        d1,
+    };
+    let ts = [0.5f64, 1.0, 2.0, 3.0];
+    let got = invert_batch_f64::<4, 512, 1, _>(p, &ts, &[g]);
+    println!("   逆变换回 f″：");
+    let mut worst_inv = 0.0f64;
+    for (j, &t) in ts.iter().enumerate() {
+        let want = a * a * (-a * t).exp();
+        let e = (got[j] - want).abs() / want;
+        worst_inv = worst_inv.max(e);
+        println!(
+            "     t={t}: 得到 {:+.6}，解析 {want:.6}，相对误差 {e:.2e}",
+            got[j]
+        );
+    }
+    println!("   逆变换最大相对误差 {worst_inv:.2e}（跳变扣除已开）");
+    println!(
+        "   限制：**阶跃/含 δ 不适用**（f≡1 时 f″=δ′，定理给 0 —— 反例见 docs/ops.md §9.05）；\
+         初值须给**右极限**，给错会残留 s^{{n−1−k}}·ε 项。"
+    );
+}
+
 fn main() {
     println!("拉普拉斯变换实战（公式 DSL）：F(s)=∫₀^∞ f(t)e^{{-st}}dt，Re F=Kc·f、Im F=-Ks·f");
     analytic_part();
     refinement_part();
     perf_part();
     weighting_part();
+    derivative_part();
     println!(
         "\n限制：非任意精度（截断 + 求积阶数：梯形 O(Δt²)、Simpson O(Δt⁴)）；\
          s 靠近极点时不能用；**不做逆变换**。"

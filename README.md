@@ -49,7 +49,7 @@ Rust 实现、导出稳定的 C ABI，并提供安全 Rust API、常驻工作池
 ```bash
 # 需要 nightly（#![feature(stdarch_loongarch)]）与 LoongArch 真机
 cargo build --release                    # 产出 liblasx_rs.so + rlib
-cargo test --workspace --release         # 276 个单元测试 + 6 个宏单测 + 19 个文档测试（另 2 个标 ignore）
+cargo test --workspace --release         # 280 个单元测试 + 6 个宏单测 + 19 个文档测试（另 2 个标 ignore）
 cargo clippy --workspace --all-targets -- -D warnings   # 零警告是硬门槛
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p lasx_rs
 
