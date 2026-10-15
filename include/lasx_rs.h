@@ -4,8 +4,8 @@
  * 生产用头文件：与库产物 `liblasx_rs.so`（SONAME `liblasx_rs.so.0`）/ `liblasx_rs.a`
  * 配套安装。**权威说明见 `docs/c-abi.md`**——C 侧的符号清单、逐符号原型、内存与安全模型、
  * 能力探测与降级、线程模型、ABI 稳定性策略都在那一份里，读它即可，不必再翻别处。
- * **本文件是手写并逐符号校验的**——权威符号清单是 `docs/c-abi.md` 第 3 节（94 个：
- * 50 个裸符号 + 44 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
+ * **本文件是手写并逐符号校验的**——权威符号清单是 `docs/c-abi.md` 第 3 节（98 个：
+ * 52 个裸符号 + 46 个 `_checked` 变体），`scripts/check_header.c` 对本头文件里的
  * 每一个符号取地址（缺符号/改名/原型不匹配会在编译或链接期失败），并实测若干行为。
  *
  * 编译提示（C / C++ 均可 include）：
@@ -288,6 +288,35 @@ void lasx_matmul_f64(int m, int k, int n, const double *a, const double *b, doub
 
 void lasx_matmul_f64_checked(
     int m, int k, int n, const double *a, const double *b, double *c, int *status);
+
+/* 语义：**复数**矩阵乘 C[m×n] = A[m×k]·B[k×n]，**分平面**（实部/虚部各一块）**紧凑行主序**。
+ *       布局：ar/ai 各 m*k、br/bi 各 k*n、cr/ci 各 m*n。
+ * route：0 = Direct（4 条实矩阵乘；**各乘积与对应实矩阵乘逐位一致**）；
+ *        1 = Karatsuba（3 条实矩阵乘；**仅承诺容差**——Rust 侧默认）；其它值 ⇒ `_checked` 报错
+ *        （复用"非法整型参数"码，**不新增状态码**）且不改输出。
+ * 别名规则：**cr/ci 不得与 ar/ai/br/bi 任一重叠**；ar≠ai、br≠bi（分平面两块独立缓冲）。
+ * 无内部分配：全部复用调用方缓冲。线段：总为 LASX 实矩阵乘内核（**无标量回退**）。
+ * 成本（真话）：复数 ≈ **1.22×** 调 3 条实矩阵乘的成本；复数 API 的价值是**一次调用 /
+ *        正确的复数语义 / 可选逐位**，**不是速度**。
+ * 长度契约：ar/ai 至少 m*k、br/bi 至少 k*n、cr/ci 至少 m*n 个 float。 */
+void lasx_cmatmul_f32(int m, int k, int n, const float *ar, const float *ai, const float *br,
+                      const float *bi, float *cr, float *ci, int route);
+
+/* 带错误通道的 lasx_cmatmul_f32：返回 0 = Ok，非 0 = 错误码；失败时**不改输出**。
+ * `m/k/n < 0` ⇒ NegativeLength；尺寸相乘溢出 ⇒ SizeOverflow；指针空且长度非 0 ⇒ NullPointer；
+ * `route ∉ {0,1}` ⇒ NegativeLength。`m/k/n = 0` 是合法输入（返回 Ok、输出清零）。 */
+int lasx_cmatmul_f32_checked(int m, int k, int n, const float *ar, const float *ai,
+                             const float *br, const float *bi, float *cr, float *ci, int route,
+                             int *status);
+
+/* 同 lasx_cmatmul_f32，`float` → `double`。 */
+void lasx_cmatmul_f64(int m, int k, int n, const double *ar, const double *ai, const double *br,
+                      const double *bi, double *cr, double *ci, int route);
+
+/* 带错误通道的 lasx_cmatmul_f64（约定同上）。 */
+int lasx_cmatmul_f64_checked(int m, int k, int n, const double *ar, const double *ai,
+                             const double *br, const double *bi, double *cr, double *ci, int route,
+                             int *status);
 
 /* 语义：sum a[i]*b[i]，int8 输入、**i32 返回**（整数精确：i16 乘积 → i32 累加 →
  * 每 1024 字节落 i64）。路径：[LASX-only]。

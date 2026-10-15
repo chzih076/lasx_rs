@@ -17,7 +17,7 @@ Four workload classes are covered:
 ## Features
 
 - **Zero third-party dependencies** — only `core::arch::loongarch64` LASX/LSX intrinsics and std.
-- **94 exported symbols** (50 plain + 44 `_checked` variants taking a trailing `int *status`).
+- **98 exported symbols** (52 plain + 46 `_checked` variants taking a trailing `int *status`).
   The signatures and semantics of the original 15 `lasx_*` symbols are **frozen**; new capability
   is only ever appended. Both symbol families are backed by the same kernel implementations.
 - **Bitwise determinism** — for a given input, every path of an operator (LASX / LSX / scalar tail

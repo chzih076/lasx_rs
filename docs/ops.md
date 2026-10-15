@@ -1944,7 +1944,8 @@ f̃(t) ≈ (e^{a t}/T)·[ ½F̃(a) + Σ_{k=1..N} Re{ F̃(a + i kπ/T)·e^{i kπ 
 **表示**：**分平面 `(Re, Im)` 两块实数组**（`ar/ai/br/bi` 行主序；`cr/ci` 复用调用方缓冲，
 风格与库内 `_into` 一致）。**f32/f64 两条路径**：`ops::cmatmul::{cmatmul_f32_into, cmatmul_f64_into}`
 （默认路线）与 `*_into_route(..., Route::{Direct, Karatsuba})`（显式选路线）。
-**A–C 阶不加 C 符号**（`nm -D` 仍 94）。
+**A–C 阶不加 C 符号**（`nm -D` 在 A–C 阶保持 94）；**D 阶已按 `docs/c-abi.md` §9.1 正式追加 4 个符号
+（`lasx_cmatmul_{f32,f64}` + `_checked` 孪生）⇒ `nm -D` = 98**，同步见 `docs/c-abi.md` §3.1b。
 
 | 路线 | 实矩阵乘条数 | 位精确契约（**谁守**） |
 |---|---|---|

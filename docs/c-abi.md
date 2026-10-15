@@ -12,7 +12,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 适用代码版本 | `master`，**94 个导出符号**（50 个裸符号 + 44 个 `_checked` 变体） |
+| 适用代码版本 | `master`，**98 个导出符号**（52 个裸符号 + 46 个 `_checked` 变体） |
 | 权威原型 | [`include/lasx_rs.h`](../include/lasx_rs.h)（手写、随库安装；机器校验见第 10 节） |
 | 读者 | C / C++ 调用方，以及用 `dlopen`/`lookupFunction` 的其它语言绑定（Dart 例见 2.5） |
 | 与源码同源 | 第 3 节的清单与参数次序逐条对照 `src/ffi/*.rs` 的 `pub extern "C" fn`；个数由 CI 门禁核对 |
@@ -192,7 +192,7 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 
 ---
 
-## 3. 完整符号参考（94 = 50 裸 + 44 `_checked`）
+## 3. 完整符号参考（98 = 52 裸 + 46 `_checked`）
 
 ### 3.0 怎么读这一节
 
@@ -231,6 +231,30 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 | `lasx_ballistic_step` | `void lasx_ballistic_step(float *x, float *y, float *z, float *vx, float *vy, float *vz, const float *k, int n, float dt, float g)` | LASX+标量 | 批量弹道欧拉步（**原地**）；向量/标量路径**非逐位一致**（第 7 节例外之一） |
 | `lasx_j2_accel_batch` | `void lasx_j2_accel_batch(const double *rx, const double *ry, const double *rz, double mu, double j2, double re, double *ax, double *ay, double *az, int n)` | LASX+LSX | J2 引力加速度；每样本独立、无跨 lane 归约 |
 | `lasx_rk4_j2_step_batch` | `void lasx_rk4_j2_step_batch(double *rx, double *ry, double *rz, double *vx, double *vy, double *vz, double mu, double j2, double re, double dt, int n)` | LASX+标量 | RK4 J2 单步（**原地**）；分块内与标量同式 |
+
+### 3.1b 复数矩阵乘（4 个新符号：2 裸 + 2 `_checked`，2026-10-16 追加）
+
+**布局**：**分平面 `(Re, Im)` + 紧凑行主序**（不引 leading dimension；与 `lasx_matmul` 的 ABI 一致）。
+`ar/ai` 各 `m*k`、`br/bi` 各 `k*n`、`cr/ci` 各 `m*n`。
+**`route`**：**0 = Direct**（4 条实矩阵乘；**各乘积与对应实矩阵乘逐位一致**）；
+**1 = Karatsuba**（3 条实矩阵乘；**只承诺容差**，Rust 侧默认）；其它值 ⇒ `_checked` 报
+`LASX_NEGATIVE_LENGTH`（复用现有"非法整型参数"码，**不新增状态码**）且**不改输出**。
+**别名规则**：`cr/ci` 不得与 `ar/ai/br/bi` 任一重叠（违反是 UB）；`ar ≠ ai`、`br ≠ bi`。
+**无内部分配**：全部复用调用方缓冲。
+**成本（真话）**：复数 ≈ **1.22×** 调 3 条实矩阵乘的成本；复数 API 的价值是**一次调用 /
+正确的复数语义 / 可选逐位**，**不是速度**。
+
+| 符号 | C 原型 | 语义 |
+|---|---|---|
+| `lasx_cmatmul_f32` | `void lasx_cmatmul_f32(int m, int k, int n, const float *ar, const float *ai, const float *br, const float *bi, float *cr, float *ci, int route)` | `C = A·B`（复数、分平面、紧凑行主序）；`k==0` ⇒ 输出清零；`m==0\|\|n==0` 直接返回 |
+| `lasx_cmatmul_f32_checked` | `int lasx_cmatmul_f32_checked(…同上…, int route, int *status)` | 同上；返回 0 = `LASX_OK`；坏参返回非 0 且**不改输出** |
+| `lasx_cmatmul_f64` | `void lasx_cmatmul_f64(int m, int k, int n, const double *ar, const double *ai, const double *br, const double *bi, double *cr, double *ci, int route)` | f64 版（契约同 f32） |
+| `lasx_cmatmul_f64_checked` | `int lasx_cmatmul_f64_checked(…同上…, int route, int *status)` | f64 版带错误通道 |
+
+**与 `_checked` 的关系**（§3.0 通用规则）：同一原型 + 末尾 `int *status`；错误码取值域与既有
+`_checked` 完全一致（`m/k/n < 0` ⇒ `NegativeLength`、溢出 ⇒ `SizeOverflow`、空指针 + 非 0 长度 ⇒
+`NullPointer`）。**行为断言**（`scripts/check_header.c`）：`route=0` 与"手工 4 条 `lasx_matmul`
+组合"**按位 `memcmp` 一致**（f32/f64）、`route=1` 与逐元素参考 1e-4 内、零维不崩、坏参哨兵。
 
 ### 3.2 批量姿态与几何（7 个裸符号，全部 LASX+LSX）
 
@@ -298,9 +322,9 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
 | `lasx_status_message` | `const char *lasx_status_message(int status)` | 状态码的静态说明串；未知码给通用串；**永不为 NULL**、不要 free |
 | `lasx_free` | `void lasx_free(float *p, int n)` | 归还 `lasx_alloc` 的缓冲（`n` 必须是分配时那个值）；`p==NULL` 与 `n<=0` 是安全 no-op |
 
-### 3.7 `_checked` 变体（44 个名字）
+### 3.7 `_checked` 变体（46 个名字）
 
-规则见 3.0：**同一个原型 + 末尾 `int *status`**。44 个名字（分组与 3.1–3.5、3.9 对应）：
+规则见 3.0：**同一个原型 + 末尾 `int *status`**。46 个名字（分组与 3.1–3.5、3.9 对应）：
 
 - 归约/稠密/量化/物理/内存：`lasx_dot_checked`、`lasx_sum_checked`、`lasx_dot_f64_checked`、
   `lasx_axpy_checked`、`lasx_matmul_checked`、`lasx_matmul_scaled_checked`、
@@ -322,8 +346,9 @@ rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时
   `lasx_gather_rows_i8_checked`（3）
 - 计划句柄（3.9）：`lasx_matmul_prepare_checked`、`lasx_matmul_run_checked`、
   `lasx_matmul_run_threaded_checked`（3）
+- **复数矩阵乘（3.1b）**：`lasx_cmatmul_f32_checked`、`lasx_cmatmul_f64_checked`（2）
 
-**6 个裸符号没有 `_checked` 变体**（50 − 44 = 6）：`lasx_alloc`、`lasx_free` 与三个元信息
+**6 个裸符号没有 `_checked` 变体**（52 − 46 = 6）：`lasx_alloc`、`lasx_free` 与三个元信息
 符号——它们的入参里没有"可失败的结构"（`lasx_free` 的 `p==NULL`/`n<=0` 本来就是安全 no-op，
 元信息符号约定永不返回 NULL）；外加 `lasx_matmul_plan_destroy`（`void` + 只接受句柄/`NULL`，
 没有可取的状态码，见 3.9）。
@@ -506,7 +531,7 @@ float d = lasx_dot(a, b, n);
 
 ### 9.1 命名规范（只管**未来新增**）
 
-**为什么只管未来**：已发布的 94 个符号**只追加不改名**——改名即破坏 ABI（见上一节）。所以本节
+**为什么只管未来**：已发布的 98 个符号**只追加不改名**——改名即破坏 ABI（见上一节）。所以本节
 只约束新增符号，既有情况见文末"历史例外"表。规则由
 [`scripts/namecheck.sh`](../scripts/namecheck.sh) 机械校验（CI 单列一步，用法见脚本头部注释）。
 
@@ -534,8 +559,9 @@ void lasx_Dot_fast_checked(const float *a, const float *b, int n, int *status);
 ③ 是不是库级符号？是就进白名单并改上面说的三处；④ 参数次序照规则 6（`status` 最后）；
 ⑤ 是否沿用了既有词根（`n`/`out`/`c`/`_i8`…），别新造同义词。
 
-**历史例外（审计于 2026-10-15）**：**零违规**——94 个符号在"形态 / 后缀 / 孪生 / 库级"四类审计上
-全部通过（`bash scripts/namecheck.sh` ⇒ `OK（94 个符号，0 例外）`；当日追加"计划句柄"7 个后复跑，
+**历史例外（审计于 2026-10-15；2026-10-16 追加复数矩阵乘 4 个后复跑）**：**零违规**——98 个符号在
+"形态 / 后缀 / 孪生 / 库级"四类审计上全部通过（`bash scripts/namecheck.sh` ⇒
+`OK（98 个符号，0 例外）`；当日追加"计划句柄"7 个后同样复跑过，
 仍是零违规——新符号照样要在同一套规则下过）。下表只记"不是违规、但需要
 知道的读法与白名单"，**没有为了凑表而编的例外**：
 
@@ -551,7 +577,7 @@ void lasx_Dot_fast_checked(const float *a, const float *b, int n, int *status);
 
 | 守什么 | 谁在守 | 怎么守 |
 |---|---|---|
-| **逐符号原型一致**（94 个都在、参数次序对） | [`scripts/check_header.c`](../scripts/check_header.c) | 把**全部 94 个符号的地址**放进数组（缺符号/改名/原型漂移 ⇒ 编译或链接失败），再逐个实调 44 个 `_checked`（断言 `status` 位置与取值域），并含融合缩放/能力探测/`alloc`↔`free`/**计划句柄位精确**的行为断言 |
+| **逐符号原型一致**（98 个都在、参数次序对） | [`scripts/check_header.c`](../scripts/check_header.c) | 把**全部 98 个符号的地址**放进数组（缺符号/改名/原型漂移 ⇒ 编译或链接失败），再逐个实调 46 个 `_checked`（断言 `status` 位置与取值域），并含融合缩放/能力探测/`alloc`↔`free`/**计划句柄位精确**/**复数矩阵乘两条 `route` 契约与坏参哨兵**的行为断言 |
 | **导出符号个数 = 本文写的数** | panel CI「ABI symbol count」 | 数**产物**的动态符号表 `nm -D target/release/liblasx_rs.so`（而不是数源码），与文档里的计数比对 |
 | **本文与 ops.md 的计数/表格不再各写一份** | `scripts/doccheck.sh` | 符号计数写法必须与源码实际数量一致；表格列数一致；`§` 引用可解析；同一 `§X` 引用 ≤12 次 |
 | **调用体验真的能跑** | panel CI「C example (compile + run)」 | `make -C examples/c FALLBACK=1 && ./examples/c/quickstart`（编译**并运行** 2.4 那个程序） |

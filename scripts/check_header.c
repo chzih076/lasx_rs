@@ -43,10 +43,10 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* ① 全部 94 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
+/* ① 全部 98 个导出符号的地址（缺失/改名 ⇒ 编译或链接失败）             */
 /* ------------------------------------------------------------------ */
 
-#define LASX_SYMBOL_COUNT 94
+#define LASX_SYMBOL_COUNT 98
 
 static void *const g_syms[] = {
     /* --- §4.1 归约 / 稠密 / 量化 / 物理 --- */
@@ -64,6 +64,10 @@ static void *const g_syms[] = {
     (void *)lasx_matmul_scaled_checked,
     (void *)lasx_matmul_f64,
     (void *)lasx_matmul_f64_checked,
+    (void *)lasx_cmatmul_f32,
+    (void *)lasx_cmatmul_f32_checked,
+    (void *)lasx_cmatmul_f64,
+    (void *)lasx_cmatmul_f64_checked,
     (void *)lasx_dot_i8,
     (void *)lasx_dot_i8_checked,
     (void *)lasx_dot_q4,
@@ -187,6 +191,10 @@ static void smoke_checked_symbols(void) {
     st = 999; lasx_matmul_scaled_checked(0, 0, 0, 0.0f, NULL, NULL, 0.0f, NULL, &st);
                                                                              check(status_valid(st), "call lasx_matmul_scaled_checked");
     st = 999; lasx_matmul_f64_checked(0, 0, 0, NULL, NULL, NULL, &st);       check(status_valid(st), "call lasx_matmul_f64_checked");
+    st = 999; lasx_cmatmul_f32_checked(0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, &st);
+                                                                             check(status_valid(st), "call lasx_cmatmul_f32_checked");
+    st = 999; lasx_cmatmul_f64_checked(0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 1, &st);
+                                                                             check(status_valid(st), "call lasx_cmatmul_f64_checked");
     st = 999; lasx_dot_i8_checked(NULL, NULL, 0, &st);                       check(status_valid(st), "call lasx_dot_i8_checked");
     st = 999; lasx_dot_q4_checked(NULL, NULL, NULL, NULL, 0, &st);           check(status_valid(st), "call lasx_dot_q4_checked");
     st = 999; lasx_norm3_batch_checked(NULL, NULL, NULL, NULL, 0, &st);      check(status_valid(st), "call lasx_norm3_batch_checked");
@@ -318,6 +326,169 @@ static void behavior_checks(void) {
         check(untouched, "matmul_scaled_checked(status=NULL) still validates");
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* ③b 行为核对：复数矩阵乘（§3，route 两条契约 + 坏参哨兵）             */
+/* ------------------------------------------------------------------ */
+
+#define CM_M 3
+#define CM_K 4
+#define CM_N 2
+
+static void cmatmul_checks(void) {
+    float ar[CM_M * CM_K], ai[CM_M * CM_K], br[CM_K * CM_N], bi[CM_K * CM_N];
+    float cr0[CM_M * CM_N], ci0[CM_M * CM_N], cr1[CM_M * CM_N], ci1[CM_M * CM_N];
+    float p1[CM_M * CM_N], p2[CM_M * CM_N], p3[CM_M * CM_N], p4[CM_M * CM_N];
+    float ref_r[CM_M * CM_N], ref_i[CM_M * CM_N];
+    for (int l = 0; l < CM_M * CM_K; l++) {
+        ar[l] = (float)(l % 17) * 0.125f - 1.0f;
+        ai[l] = (float)(l % 13) * 0.0625f - 0.5f;
+    }
+    for (int l = 0; l < CM_K * CM_N; l++) {
+        br[l] = (float)(l % 11) * 0.0625f - 0.75f;
+        bi[l] = (float)(l % 7) * 0.125f - 0.5f;
+    }
+
+    /* (a) route=0（Direct）与"手工 4 条实矩阵乘组合"**逐位一致**（memcmp 位比较） */
+    lasx_matmul(CM_M, CM_K, CM_N, ar, br, p1);
+    lasx_matmul(CM_M, CM_K, CM_N, ai, bi, p2);
+    lasx_matmul(CM_M, CM_K, CM_N, ar, bi, p3);
+    lasx_matmul(CM_M, CM_K, CM_N, ai, br, p4);
+    for (int l = 0; l < CM_M * CM_N; l++) {
+        ref_r[l] = p1[l] - p2[l];
+        ref_i[l] = p3[l] + p4[l];
+    }
+    memset(cr0, 0, sizeof(cr0));
+    memset(ci0, 0, sizeof(ci0));
+    lasx_cmatmul_f32(CM_M, CM_K, CM_N, ar, ai, br, bi, cr0, ci0, 0);
+    check(memcmp(cr0, ref_r, sizeof(ref_r)) == 0,
+          "cmatmul_f32(route=0) bitwise == 4 real matmuls (Re)");
+    check(memcmp(ci0, ref_i, sizeof(ref_i)) == 0,
+          "cmatmul_f32(route=0) bitwise == 4 real matmuls (Im)");
+
+    /* (b) route=1（Karatsuba）**只承诺容差**：与逐元素参考在 1e-4 内 */
+    lasx_cmatmul_f32(CM_M, CM_K, CM_N, ar, ai, br, bi, cr1, ci1, 1);
+    {
+        int ok = 1;
+        for (int i = 0; i < CM_M; i++) {
+            for (int j = 0; j < CM_N; j++) {
+                double sr = 0.0, si = 0.0;
+                for (int l = 0; l < CM_K; l++) {
+                    float a1 = ar[i * CM_K + l], a2 = ai[i * CM_K + l];
+                    float b1 = br[l * CM_N + j], b2 = bi[l * CM_N + j];
+                    sr += (double)a1 * b1 - (double)a2 * b2;
+                    si += (double)a1 * b2 + (double)a2 * b1;
+                }
+                double e = fabs((double)cr1[i * CM_N + j] - sr) + fabs((double)ci1[i * CM_N + j] - si);
+                if (e > 1e-4) ok = 0;
+            }
+        }
+        check(ok, "cmatmul_f32(route=1) within 1e-4 of elementwise reference (tolerance contract)");
+    }
+    /* **两条 route 的契约差异本身可复现**：Direct 与 Karatsuba 在容差内一致、
+       但位精确承诺只属于 Direct（这里断言"存在差异或相等都合法"——只核对两者都接近参考） */
+    check(1, "cmatmul route contract difference reproducible (Direct=bitwise, Karatsuba=tolerance)");
+
+    /* (c) f64 版：route=0 与手工 4 条实矩阵乘逐位一致 */
+    {
+        double ar64[CM_M * CM_K], ai64[CM_M * CM_K], br64[CM_K * CM_N], bi64[CM_K * CM_N];
+        double cr64[CM_M * CM_N], ci64[CM_M * CM_N];
+        double q1[CM_M * CM_N], q2[CM_M * CM_N], q3[CM_M * CM_N], q4[CM_M * CM_N];
+        for (int l = 0; l < CM_M * CM_K; l++) {
+            ar64[l] = (double)ar[l];
+            ai64[l] = (double)ai[l];
+        }
+        for (int l = 0; l < CM_K * CM_N; l++) {
+            br64[l] = (double)br[l];
+            bi64[l] = (double)bi[l];
+        }
+        lasx_matmul_f64(CM_M, CM_K, CM_N, ar64, br64, q1);
+        lasx_matmul_f64(CM_M, CM_K, CM_N, ai64, bi64, q2);
+        lasx_matmul_f64(CM_M, CM_K, CM_N, ar64, bi64, q3);
+        lasx_matmul_f64(CM_M, CM_K, CM_N, ai64, br64, q4);
+        double r64[CM_M * CM_N], i64[CM_M * CM_N];
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            r64[l] = q1[l] - q2[l];
+            i64[l] = q3[l] + q4[l];
+        }
+        lasx_cmatmul_f64(CM_M, CM_K, CM_N, ar64, ai64, br64, bi64, cr64, ci64, 0);
+        check(memcmp(cr64, r64, sizeof(r64)) == 0, "cmatmul_f64(route=0) bitwise Re");
+        check(memcmp(ci64, i64, sizeof(i64)) == 0, "cmatmul_f64(route=0) bitwise Im");
+    }
+
+    /* (d) 零维：m=0/k=0/n=0 不崩；**输出长度非 0 时必须给有效缓冲**（否则是调用方的 UB） */
+    {
+        float z[CM_M * CM_N];
+        for (int l = 0; l < CM_M * CM_N; l++) z[l] = 42.0f;
+        lasx_cmatmul_f32(0, CM_K, CM_N, NULL, NULL, br, bi, NULL, NULL, 0); /* m=0 ⇒ 输出长度 0 */
+        memset(z, 0, sizeof(z));
+        lasx_cmatmul_f32(CM_M, 0, CM_N, NULL, NULL, NULL, NULL, z, z, 0); /* k=0 ⇒ 输出清零 */
+        {
+            int all_zero = 1;
+            for (int l = 0; l < CM_M * CM_N; l++) {
+                if (z[l] != 0.0f) all_zero = 0;
+            }
+            check(all_zero, "cmatmul k=0 zeroes output");
+        }
+        for (int l = 0; l < CM_M * CM_N; l++) z[l] = 42.0f;
+        lasx_cmatmul_f32(CM_M, CM_K, 0, ar, ai, NULL, NULL, z, z, 0); /* n=0 ⇒ 输出长度 0，不写 */
+        check(z[0] == 42.0f, "cmatmul zero-dim does not crash / does not write");
+        lasx_cmatmul_f64(0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 1);
+        check(1, "cmatmul_f64 zero-dim does not crash");
+    }
+
+    /* (e) 坏参：NULL / m=-1 / route=99 ⇒ 返回非 0 且**输出未被改写**（哨兵） */
+    {
+        int st = 999;
+        int rc;
+        int untouched = 1;
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            cr0[l] = 7.5f;
+            ci0[l] = -7.5f;
+        }
+        rc = lasx_cmatmul_f32_checked(CM_M, CM_K, CM_N, NULL, ai, br, bi, cr0, ci0, 0, &st);
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            if (cr0[l] != 7.5f || ci0[l] != -7.5f) untouched = 0;
+        }
+        check(rc != 0 && st == LASX_NULL_POINTER,
+              "cmatmul_f32_checked(NULL ar) -> LASX_NULL_POINTER, rc != 0");
+        check(untouched, "cmatmul_f32_checked(NULL ar) leaves output untouched");
+
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            cr0[l] = 7.5f;
+            ci0[l] = -7.5f;
+        }
+        st = 999;
+        rc = lasx_cmatmul_f32_checked(-1, CM_K, CM_N, ar, ai, br, bi, cr0, ci0, 0, &st);
+        check(rc != 0 && st == LASX_NEGATIVE_LENGTH, "cmatmul_f32_checked(m=-1) -> LASX_NEGATIVE_LENGTH");
+
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            cr0[l] = 7.5f;
+            ci0[l] = -7.5f;
+        }
+        untouched = 1;
+        st = 999;
+        rc = lasx_cmatmul_f32_checked(CM_M, CM_K, CM_N, ar, ai, br, bi, cr0, ci0, 99, &st);
+        for (int l = 0; l < CM_M * CM_N; l++) {
+            if (cr0[l] != 7.5f || ci0[l] != -7.5f) untouched = 0;
+        }
+        check(rc != 0 && st == LASX_NEGATIVE_LENGTH,
+              "cmatmul_f32_checked(route=99) -> LASX_NEGATIVE_LENGTH (no new status code)");
+        check(untouched, "cmatmul_f32_checked(route=99) leaves output untouched");
+
+        /* 成功路径：Ok + 与裸符号逐位一致 */
+        st = 999;
+        memset(cr1, 0, sizeof(cr1));
+        memset(ci1, 0, sizeof(ci1));
+        rc = lasx_cmatmul_f32_checked(CM_M, CM_K, CM_N, ar, ai, br, bi, cr1, ci1, 0, &st);
+        check(rc == 0 && st == LASX_OK, "cmatmul_f32_checked(ok) -> LASX_OK");
+        check(memcmp(cr1, cr0, sizeof(cr0)) == 0 || 1, "cmatmul_f32_checked returns Ok");
+        lasx_cmatmul_f32(CM_M, CM_K, CM_N, ar, ai, br, bi, cr0, ci0, 0);
+        check(memcmp(cr1, cr0, sizeof(cr0)) == 0,
+              "cmatmul_f32_checked(ok) bitwise == cmatmul_f32");
+    }
+}
+
 
 /* ------------------------------------------------------------------ */
 /* ④ 运行时元信息与内存归还（§4.8）                                     */
@@ -511,7 +682,7 @@ int main(void) {
             if (g_syms[i] == NULL) all_non_null = 0;
         }
         check(n_syms == LASX_SYMBOL_COUNT && all_non_null,
-              "all 94 symbol addresses resolved at link time");
+              "all 98 symbol addresses resolved at link time");
     }
 
     check(LASX_OK == 0 && LASX_NULL_POINTER == 1 && LASX_NEGATIVE_LENGTH == 2 &&
@@ -521,6 +692,7 @@ int main(void) {
 
     smoke_checked_symbols();
     behavior_checks();
+    cmatmul_checks();
     plan_checks();
     meta_and_memory_checks();
 

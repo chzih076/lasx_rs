@@ -40,6 +40,8 @@
 pub mod attitude;
 pub mod batch;
 pub mod checked;
+/// 复数矩阵乘（分平面紧凑行主序）：`lasx_cmatmul_{f32,f64}` + `_checked` 孪生（见 `docs/c-abi.md` §3）。
+pub mod cmatmul;
 pub mod matmul;
 /// 矩阵乘**计划句柄**：`lasx_matmul_prepare`/`_run`/`_run_threaded`/`_plan_destroy`（见 `docs/c-abi.md` 的"计划与句柄"一节）。
 pub mod matmul_plan;
