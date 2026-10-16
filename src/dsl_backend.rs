@@ -35,10 +35,13 @@
 //! **当前状态**：**未接、未测**（本后端单线程）。
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use simd_dsl::backend::{Backend, BackendError, Capability};
-use simd_dsl::call::CallOpts;
-use simd_dsl::equivalence::{EnginePath, ErrorBound, Fallback, PrecisionClaim, ScalarKind};
-use simd_dsl::packed::PackedB;
+// **bump 修法（R6-B-2）**：`simd_dsl` 在 M1–M5 分层重构后，把契约/判据/引擎各面**在 crate 根再导出**
+// （见 `simd_dsl/src/lib.rs` 的 `pub use contract::…` / `criteria::…`），旧的平铺模块路径
+// （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
+use simd_dsl::{
+    Backend, BackendError, CallOpts, Capability, EnginePath, ErrorBound, Fallback, PackedB,
+    PrecisionClaim, ScalarKind,
+};
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
 #[derive(Debug, Default, Clone, Copy)]
@@ -100,11 +103,11 @@ impl Backend for LasxBackend {
     /// 并把 `rows_fallback` / `route_taken` **如实**填进报告 —— **不静默假装走快档**。
     fn build_kernel_f32(
         &self,
-        spec: &simd_dsl::kernel::KernelSpec<'_>,
+        spec: &simd_dsl::KernelSpec<'_>,
         kc: &mut [f32],
         ks: &mut [f32],
-    ) -> Result<simd_dsl::kernel::KernelReport, BackendError> {
-        use simd_dsl::route::{FallbackReport, Route};
+    ) -> Result<simd_dsl::KernelReport, BackendError> {
+        use simd_dsl::{FallbackReport, Route};
         let (rows, n) = (spec.rows, spec.n);
         let expected = rows.checked_mul(n).ok_or(BackendError::ShapeOverflow {
             op: "build_kernel_f32",
@@ -129,7 +132,7 @@ impl Backend for LasxBackend {
             let om = spec.omega[j] as f64;
             let sg = spec.sigma[j] as f64;
             // **唯一守卫**：调用 `simd_dsl::safety::recurrence_safe`（阈值不在这里复制）
-            let safe = simd_dsl::safety::recurrence_safe(om, dt, n);
+            let safe = simd_dsl::recurrence_safe(om, dt, n);
             if !safe {
                 all_safe = false;
             }
@@ -163,7 +166,7 @@ impl Backend for LasxBackend {
         } else {
             Route::Recurrence
         };
-        Ok(simd_dsl::kernel::KernelReport::new(
+        Ok(simd_dsl::KernelReport::new(
             FallbackReport::new(route, rows_fallback),
             all_safe,
             rows,
@@ -454,8 +457,8 @@ mod tests {
     /// **③b-1 四条测试：守卫 + 逐行回退 + 计数 + 与默认实现一致（容差类，不断言逐位）**。
     #[test]
     fn kernel_guard_and_fallback_report() {
-        use simd_dsl::kernel::KernelSpec;
-        use simd_dsl::route::Route;
+        use simd_dsl::KernelSpec;
+        use simd_dsl::Route;
         let be = LasxBackend;
         let (rows, n) = (4usize, 64usize);
         let dt = 1.0f32 / 256.0;
@@ -520,7 +523,7 @@ mod tests {
         //     （`ScalarBackend::build_kernel_f32`）必须落在同一条**容差**内（**不断言逐位**）。
         let mut kc_sd = vec![0.0f32; rows * n];
         let mut ks_sd = vec![0.0f32; rows * n];
-        let _ = simd_dsl::mock::ScalarBackend.build_kernel_f32(&spec_off, &mut kc_sd, &mut ks_sd);
+        let _ = simd_dsl::ScalarBackend.build_kernel_f32(&spec_off, &mut kc_sd, &mut ks_sd);
         let (mut cross, mut peak) = (0.0f32, 0.0f32);
         for l in 0..rows * n {
             peak = peak.max(kc_sd[l].abs()).max(ks_sd[l].abs());
