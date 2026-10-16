@@ -14,6 +14,7 @@ name = "lasx_rs"
 version = "0.1.0"
 dependencies = [
  "lasx_rs_macros",
+ "simd_dsl",
 ]
 
 [[package]]
@@ -26,3 +27,16 @@ version = "0.1.0"
 dependencies = [
  "lasx_rs",
 ]
+
+[[package]]
+name = "simd_dsl"
+version = "0.1.0"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=fc57fc7#fc57fc7365378177d21ad477f9d895231ea05d2f"
+dependencies = [
+ "simd_dsl_macros",
+]
+
+[[package]]
+name = "simd_dsl_macros"
+version = "0.1.0"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=fc57fc7#fc57fc7365378177d21ad477f9d895231ea05d2f"

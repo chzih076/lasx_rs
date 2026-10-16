@@ -30,3 +30,12 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 # `version` 供发布后从 crates.io 解析；`path` 供本地开发（cargo 发布时会去掉 path 字段，
 # 见 `docs/dev.md` §22.2）。
 lasx_rs_macros = { path = "macros", version = "0.1.0" }
+# **可选**：`simd_dsl` 的 `Backend` 实现（③a）。**默认不启用** ⇒ 无 feature 时 cargo 不解析该依赖、
+# 不编译 `src/dsl_backend.rs`，默认构建逐字节不变。依赖方向 **`lasx_rs → simd_dsl` 单向**。
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "fc57fc7", optional = true }
+
+[features]
+# 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
+# **默认关**：`cargo build` / `cargo test` / CI 十三步都不受影响。
+dsl-backend = ["dep:simd_dsl"]
+

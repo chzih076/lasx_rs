@@ -110,6 +110,10 @@ extern crate self as lasx_rs;
 pub mod aligned;
 pub mod api;
 pub mod arch;
+/// **`simd_dsl::Backend` 的 `lasx_rs` 实现**（**feature 门控** `dsl-backend`；默认关 ⇒ 无依赖、无编译）
+/// ——见 [`dsl_backend`] 模块文档（③a 只接必需方法 `matmul_f32`/`dot_f32`）。
+#[cfg(feature = "dsl-backend")]
+pub mod dsl_backend;
 /// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。
 pub mod fast_trig;
 pub mod ffi;
