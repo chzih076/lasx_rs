@@ -357,4 +357,121 @@ fn main() {
            未做：matmul 64³（③b-5a″）、`192×768×3072`（③b-5b）、③b-4（打包接 `Prepared`、`CallOpts`、`Capability`）。"
         );
     }
+
+    // ==================== ③b-5a″：matmul 64×64×64 三臂（宏驱动、单共享缓冲） ====================
+    // 同缓冲口径（E）：**单个共享 `RefCell<Vec<f32>>`**，各臂闭包内 `let mut o = shared.borrow_mut();`
+    // 再调宏 —— **不先拆 `&mut`**（宏会再取一次 `&mut`，拆了会 `E0596`）。
+    println!("\n============ ③b-5a″：matmul 64×64×64 三臂（宏驱动） ============");
+    println!("loadavg = {:.2}", loadavg());
+    {
+        let (m, k, n) = (64usize, 64usize, 64usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
+        let shared = RefCell::new(vec![0.0f32; m * n]);
+        // **计时外**：逐臂跑一次并 clone 结果，判逐位（整数域试；matmul 三臂分块/累加次序不同 ⇒ 可能判不出）
+        let mut outs: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (arm, slot) in outs.iter_mut().enumerate() {
+            {
+                let mut o = shared.borrow_mut();
+                match arm {
+                    0 => simd_dsl::matmul!(lasx, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                    1 => simd_dsl::matmul!(idio, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                    _ => simd_dsl::matmul!(scalar, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                }
+            }
+            *slot = shared.borrow().clone();
+        }
+        let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (b01, b02, b12) = (
+            bits(&outs[0]) == bits(&outs[1]),
+            bits(&outs[0]) == bits(&outs[2]),
+            bits(&outs[1]) == bits(&outs[2]),
+        );
+        println!(
+            "  [计时外] matmul 逐位判定：lasx==idio {b01}｜lasx==scalar {b02}｜idio==scalar {b12} ⇒ {}",
+            if b01 && b02 {
+                "三臂逐位一致（整数域）⇒ **逐位类**"
+            } else {
+                "**非逐位** ⇒ 本场景按容差类报告（不假设逐位）"
+            }
+        );
+        let names = ["lasx", "idio", "scalar"];
+        let cls = [
+            class_of(&lasx, EnginePath::Default),
+            class_of(&idio, EnginePath::Default),
+            class_of(&scalar, EnginePath::Default),
+        ];
+        let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let (mut mx, mut it) = ([0.0f64; 3], [0u32; 3]);
+        for pair in 0..5 {
+            let order = if pair % 2 == 0 {
+                [0usize, 1, 2]
+            } else {
+                [2, 1, 0]
+            };
+            for arm in order {
+                let (mean, m2, i2) = measure(
+                    || {
+                        let mut o = shared.borrow_mut();
+                        match arm {
+                            0 => {
+                                simd_dsl::matmul!(lasx, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                            1 => {
+                                simd_dsl::matmul!(idio, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                            _ => {
+                                simd_dsl::matmul!(scalar, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                        }
+                    },
+                    0.05,
+                );
+                samples[arm].push(mean);
+                mx[arm] = mx[arm].max(m2);
+                it[arm] = it[arm].max(i2);
+            }
+        }
+        println!("  == matmul 64×64×64（三臂写同一块目的缓冲；5 对丢首对，正/逆序交替）==");
+        let mut med = [0.0f64; 3];
+        for arm in 0..3 {
+            let (md, rg) = median_range(&samples[arm][1..]);
+            med[arm] = md;
+            println!(
+                "  {:6} {:.5} ms  极差 {:.5}  ms_max {:.4}  iters {}  等价类 {}",
+                names[arm], md, rg, mx[arm], it[arm], cls[arm]
+            );
+        }
+        println!(
+            "  ⇒ lasx/idio = **{:.3}×**｜lasx/scalar = **{:.3}×**｜idio/scalar = **{:.3}×**",
+            med[0] / med[1],
+            med[0] / med[2],
+            med[1] / med[2]
+        );
+        println!(
+            "  判据：**不预设**（可能 <1 像 dot，也可能 ≈1 像 matmul 行）⇒ 拿多少报多少 + 归因。\n\
+           ⚠️ 边界：这是 **matmul 64³ 单形状**的数，**不代表整体**（大形状 192×768×3072 未测）。"
+        );
+
+        // ---- 三条路径小结（一眼看清"手写在哪些路径上真的多买到"） ----
+        println!("\n  【小结】已测三条路径的 `lasx/idio`（<1 ⇒ 手写快）：");
+        println!(
+            "    · 核构造 `build_kernel_f32`（递推，64×1024）：**0.996×** ⇒ 持平（该路径手写无 intrinsic）"
+        );
+        println!("    · `dot K=4096`（串行归约，公平臂重取后）：**0.473×** ⇒ 手写快 ≈2.12×");
+        println!(
+            "    · `matmul 64×64×64`（本场景）：**{:.3}×** ⇒ {}",
+            med[0] / med[1],
+            if med[0] / med[1] < 0.99 {
+                "手写更快（给倍数与归因）"
+            } else if med[0] / med[1] > 1.01 {
+                "手写更慢（如实报，归因见上）"
+            } else {
+                "≈持平（自动向量化已吃满）"
+            }
+        );
+        println!(
+            "  未做：`192×768×3072`（③b-5b）、③b-4（打包接 `Prepared`、`CallOpts`、`Capability`）。"
+        );
+    }
 }
