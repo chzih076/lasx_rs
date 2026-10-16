@@ -474,4 +474,120 @@ fn main() {
             "  未做：`192×768×3072`（③b-5b）、③b-4（打包接 `Prepared`、`CallOpts`、`Capability`）。"
         );
     }
+
+    // ============ ③b-5b：matmul 192×768×3072 三臂（大形状；`iters` 按单次耗时重设） ============
+    // 单次 ~50 ms 级 ⇒ 预算 0.25 s、`iters` 自然落在 1–5；**5 对丢首对保住**（不为凑 `iters` 牺牲对数）。
+    println!("\n============ ③b-5b：matmul 192×768×3072 三臂（宏驱动） ============");
+    println!("loadavg = {:.2}", loadavg());
+    {
+        let (m, k, n) = (192usize, 768usize, 3072usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
+        let shared = RefCell::new(vec![0.0f32; m * n]);
+        // 计时外逐位判定（大形状：分块/累加次序不同 ⇒ 可能判不出；如实标）
+        let mut outs: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (arm, slot) in outs.iter_mut().enumerate() {
+            {
+                let mut o = shared.borrow_mut();
+                match arm {
+                    0 => simd_dsl::matmul!(lasx, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                    1 => simd_dsl::matmul!(idio, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                    _ => simd_dsl::matmul!(scalar, o[m, n] = a[m, k] * w[k, n]).unwrap(),
+                }
+            }
+            *slot = shared.borrow().clone();
+        }
+        let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (b01, b02) = (
+            bits(&outs[0]) == bits(&outs[1]),
+            bits(&outs[0]) == bits(&outs[2]),
+        );
+        let peak = outs[2].iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let mut worst = 0.0f32;
+        for l in 0..m * n {
+            worst = worst.max(
+                (outs[0][l] - outs[1][l])
+                    .abs()
+                    .max((outs[0][l] - outs[2][l]).abs()),
+            );
+        }
+        println!(
+            "  [计时外] 逐位判定：lasx==idio {b01}｜lasx==scalar {b02} ⇒ {}；\
+           最大绝对差 {worst:.3e}（峰值 {peak:.3e}）⇒ 若非逐位则按**容差类**报告（界见下）",
+            if b01 && b02 {
+                "**逐位一致 ⇒ 逐位类**"
+            } else {
+                "**非逐位 ⇒ 容差类**"
+            }
+        );
+        let names = ["lasx", "idio", "scalar"];
+        let cls = [
+            class_of(&lasx, EnginePath::Default),
+            class_of(&idio, EnginePath::Default),
+            class_of(&scalar, EnginePath::Default),
+        ];
+        let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let (mut mx, mut it) = ([0.0f64; 3], [0u32; 3]);
+        for pair in 0..5 {
+            let order = if pair % 2 == 0 {
+                [0usize, 1, 2]
+            } else {
+                [2, 1, 0]
+            };
+            for arm in order {
+                let (mean, m2, i2) = measure(
+                    || {
+                        let mut o = shared.borrow_mut();
+                        match arm {
+                            0 => {
+                                simd_dsl::matmul!(lasx, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                            1 => {
+                                simd_dsl::matmul!(idio, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                            _ => {
+                                simd_dsl::matmul!(scalar, o[m, n] = a[m, k] * w[k, n]).unwrap();
+                            }
+                        }
+                    },
+                    0.25,
+                );
+                samples[arm].push(mean);
+                mx[arm] = mx[arm].max(m2);
+                it[arm] = it[arm].max(i2);
+            }
+        }
+        println!("  == matmul 192×768×3072（三臂写同一块目的缓冲；5 对丢首对，正/逆序交替）==");
+        let mut med = [0.0f64; 3];
+        for arm in 0..3 {
+            let (md, rg) = median_range(&samples[arm][1..]);
+            med[arm] = md;
+            println!(
+                "  {:6} {:.3} ms  极差 {:.3}  ms_max {:.3}  iters {}  等价类 {}",
+                names[arm], md, rg, mx[arm], it[arm], cls[arm]
+            );
+        }
+        println!(
+            "  ⇒ lasx/idio = **{:.3}×**｜lasx/scalar = **{:.3}×**｜idio/scalar = **{:.3}×**（`iters` 为 1–5 属正常：单次 ~50 ms 级）",
+            med[0] / med[1],
+            med[0] / med[2],
+            med[1] / med[2]
+        );
+        println!(
+            "\n  【四行小结】`lasx/idio`（<1 ⇒ 手写快；仅这几条路径，**不代表整体**）：\n\
+             · 核构造 `build_kernel_f32`（递推 64×1024）：**0.996×** ⇒ 持平（该路径无 intrinsic）\n\
+             · `dot K=4096`（串行归约，公平臂重取后）：**0.473×** ⇒ 手写快 ≈2.12×\n\
+             · `matmul 64×64×64`：**0.253×** ⇒ 手写快 ≈3.95×\n\
+             · `matmul 192×768×3072`（本场景）：**{:.3}×** ⇒ {}（单形状，不代表整体）",
+            med[0] / med[1],
+            if med[0] / med[1] < 0.99 {
+                "手写更快"
+            } else if med[0] / med[1] > 1.01 {
+                "手写更慢（如实报）"
+            } else {
+                "≈持平（自动向量化已吃满）"
+            }
+        );
+        println!("  未做：③b-4（打包接 `Prepared`、`CallOpts`、`Capability`）。");
+    }
 }
