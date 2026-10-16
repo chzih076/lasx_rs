@@ -186,6 +186,9 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 | [docs/ops.md](docs/ops.md) | **算子与用法（Rust 侧）**：数值契约与逐位确定性、降级覆盖分类、池与并行、矩阵视图/计划/形状层、NN 算子现状与缺口对照、int8/f32 判据；C ABI 见 `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **架构与性能**：分层与不可破坏的约定、测试与 CI、性能方法学、**全部实测数据**、矩阵乘与并行深挖、被否掉的方案清单、复现步骤与已知缺口 |
 | [docs/platform.md](docs/platform.md) | **平台约束与待补实现**：LA664 原子操作丢失更新（勘误、命中点、措施）与"库侧为什么必须自带 `_db`"、内核分支生命周期、消费 ONNX 契约引出的缺口（LayerNorm/Gather）、承诺边界待划定的项 |
+| [docs/dsl.md](docs/dsl.md) | **公式 DSL 设计文档**：四层架构（原语/变换/领域/应用宏）、下降链的三条纪律、等价类登记表、第 1 层缺口清单与语法/类型草案 |
+| [docs/dsl-macros-inventory.md](docs/dsl-macros-inventory.md) | **宏层清点**：现有宏逐条盘点的清单（能力、缺口与归属） |
+| [docs/dsl-rust-surface-inventory.md](docs/dsl-rust-surface-inventory.md) | **Rust 侧类型化面清点**：`view`/`plan`/`shape`/DSL 在 Rust 侧的可用面逐条盘点 |
 
 文档分工是硬约定：**C ABI 在 `docs/c-abi.md`（符号清单与 C 侧契约只在那里维护）**，
 Rust 侧契约与用法在 `docs/ops.md`，性能数据在 `docs/dev.md`，**同一份数字只存一处**。

@@ -193,6 +193,9 @@ and `lasx_rs::parallel`.
 | [docs/ops.md](docs/ops.md) | **Operators and usage (Rust side)**: numerical contracts and bitwise determinism, degradation coverage, pool and parallelism, matrix view/plan/shape layers, NN operator status and gap comparison, int8-vs-f32 decision rule; for the C ABI see `docs/c-abi.md` |
 | [docs/dev.md](docs/dev.md) | **Architecture and performance**: layers and invariants, tests and CI, performance methodology, **all measured data**, matmul and parallel deep dives, rejected-approach list, reproduction steps, known gaps |
 | [docs/platform.md](docs/platform.md) | **Platform constraints and open implementation**: the LA664 atomic lost-update erratum (hit points and mitigations) and why the library must emit `_db` itself, kernel-branch lifecycle, gaps implied by the ONNX contract (`LayerNormalization`/`Gather`), and promise boundaries still to be drawn |
+| [docs/dsl.md](docs/dsl.md) | **Formula-DSL design document**: the four layers (primitive / transform / domain / application macros), the three disciplines of the lowering chain, the equivalence-class registry, and the layer-1 gap list with syntax/type drafts |
+| [docs/dsl-macros-inventory.md](docs/dsl-macros-inventory.md) | **Macro-layer inventory**: an item-by-item survey of the macros that exist today (capabilities, gaps, ownership) |
+| [docs/dsl-rust-surface-inventory.md](docs/dsl-rust-surface-inventory.md) | **Rust-side typed-surface inventory**: an item-by-item survey of what `view`/`plan`/`shape`/the DSL expose to Rust callers |
 
 The division of labour is a hard rule: **the C ABI lives in `docs/c-abi.md`** (the symbol list and
 C-side contract are maintained only there), Rust contracts and usage live in `docs/ops.md`, and
