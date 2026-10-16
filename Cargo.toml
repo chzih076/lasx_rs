@@ -49,3 +49,9 @@ dsl-backend = ["dep:simd_dsl"]
 [[example]]
 name = "dsl_efficiency"
 required-features = ["dsl-backend"]
+
+# `lasx_vs_portable`（R6-B-3）：三档后端横向对比（手写 SIMD vs 可移植优化档 vs 下限臂）
+# ——同样需要 `simd_dsl` ⇒ **只在开 `dsl-backend` 时构建**，默认构建不碰它。
+[[example]]
+name = "lasx_vs_portable"
+required-features = ["dsl-backend"]
