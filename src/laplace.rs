@@ -656,6 +656,121 @@ mod fused_tests {
         println!("融合(递推) vs 物化(libm)：最大相对差 {worst:.3e}（f32）");
         assert!(worst < 1e-4, "容差类应 <1e-4，实测 {worst:e}");
     }
+
+    /// **价值判定测量（`#[ignore]`，env 驱动单臂进程）**：
+    /// `LASX_ARM=a|b|c1|c2`（a=物化+libm、b=物化+递推、c1=融合+libm、c2=融合+递推）、
+    /// `LASX_NB=2|64`。打印 ms/`iters`/`ms_max`/loadavg + **进程 RSS 高水位**（`VmHWM`）。
+    ///
+    /// 用法（每臂一个进程 ⇒ 可配 `perf stat -e llc-loads,llc-load-misses` 收分臂流量）：
+    /// `LASX_ARM=a LASX_NB=64 cargo test --release -p lasx_rs --lib raw_arm -- --ignored --nocapture`
+    #[test]
+    #[ignore = "价值判定：单臂测量（env: LASX_ARM/LASX_NB）"]
+    fn raw_arm() {
+        use std::time::Instant;
+        const M: usize = 64;
+        const N: usize = 1024;
+        let arm = std::env::var("LASX_ARM").unwrap_or_else(|_| "a".into());
+        let nb: usize = std::env::var("LASX_NB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..M).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..M).map(|j| (j % 8) as f64 * 0.003).collect();
+        let f: Vec<f32> = (0..N * nb)
+            .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+            .collect();
+        let hwm = || -> f64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmHWM:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<f64>().ok())
+                })
+                .unwrap_or(0.0)
+                / 1024.0
+        };
+        let before = hwm();
+        let mut iters = 0i32;
+        let mut ms_max = 0.0f64;
+        let t0 = Instant::now();
+        while t0.elapsed().as_secs_f64() < 0.2 {
+            let t1 = Instant::now();
+            match (arm.as_str(), nb) {
+                ("a", 2) => {
+                    std::hint::black_box(laplace_batch_f32::<M, N, 2>(&sig, &om, dt, &f));
+                }
+                ("a", _) => {
+                    std::hint::black_box(laplace_batch_f32::<M, N, 64>(&sig, &om, dt, &f));
+                }
+                ("b", 2) => {
+                    std::hint::black_box(laplace_batch_f32_recurrence::<M, N, 2>(
+                        &sig, &om, dt, &f,
+                    ));
+                }
+                ("b", _) => {
+                    std::hint::black_box(laplace_batch_f32_recurrence::<M, N, 64>(
+                        &sig, &om, dt, &f,
+                    ));
+                }
+                ("c1", 2) => {
+                    std::hint::black_box(laplace_batch_f32_fused::<M, N, 2>(
+                        &sig,
+                        &om,
+                        dt,
+                        &f,
+                        FusedMode::Libm,
+                    ));
+                }
+                ("c1", _) => {
+                    std::hint::black_box(laplace_batch_f32_fused::<M, N, 64>(
+                        &sig,
+                        &om,
+                        dt,
+                        &f,
+                        FusedMode::Libm,
+                    ));
+                }
+                ("c2", 2) => {
+                    std::hint::black_box(laplace_batch_f32_fused::<M, N, 2>(
+                        &sig,
+                        &om,
+                        dt,
+                        &f,
+                        FusedMode::Recurrence,
+                    ));
+                }
+                _ => {
+                    std::hint::black_box(laplace_batch_f32_fused::<M, N, 64>(
+                        &sig,
+                        &om,
+                        dt,
+                        &f,
+                        FusedMode::Recurrence,
+                    ));
+                }
+            }
+            let d = t1.elapsed().as_secs_f64();
+            if d > ms_max {
+                ms_max = d;
+            }
+            iters += 1;
+        }
+        let ms = t0.elapsed().as_secs_f64() / iters.max(1) as f64;
+        let after = hwm();
+        let l1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+            .unwrap_or_default();
+        println!(
+            "ARM={arm} NB={nb} ms={:.4} iters={iters} ms_max={:.3} loadavg={l1} VmHWM={after:.1} MiB (before {before:.1}, Δ={:.1})",
+            ms * 1e3,
+            ms_max * 1e3,
+            after - before
+        );
+    }
 }
 
 #[cfg(test)]

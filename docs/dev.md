@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**303 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**304 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -356,7 +356,9 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
   诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
   入口/判据/例外清单见 `docs/ops.md` §9.10.1。
-- **核↔矩阵乘融合 3 个**（`src/laplace.rs::fused_tests`，2026-10-16 加；**opt-in，默认路径不变**）：
+- **核↔矩阵乘融合 3 个 + 1 诊断**（`src/laplace.rs::fused_tests`，2026-10-16 加；**opt-in，默认路径不变**）：
+  诊断 `#[ignore]` `raw_arm`（env `LASX_ARM=a|b|c1|c2` + `LASX_NB=2|64` 单臂测量，可配
+  `perf stat -e llc-loads,llc-load-misses` 收分臂流量；打印 ms/`iters`/`ms_max`/loadavg + `VmHWM`）。
   `fused_libm_bitwise_same_as_materialized`（**现场 libm 生成 vs 物化 ⇒ `to_bits()` 逐位一致**，
   含实/虚部）、`fused_libm_bitwise_with_column_tail`（**列尾 NB=1/2/31/33 仍逐位**——尾列复用现有
   `row_tail_range_f32`，不新增标量路径）、`fused_recurrence_within_tolerance`（现场递推 ⇒ **容差类**）。
@@ -448,7 +450,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 303 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 304 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
