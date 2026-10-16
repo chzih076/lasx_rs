@@ -120,3 +120,13 @@ jobs:
           # （`rows` 那个 1.08× 扩展比就是静默退化的典型）。
           ./examples/c/matmul_mt_caller
           ./examples/c/matmul_mt_convenience
+      # **DSL 后端集成**（2026-10-16 加）：`lasx_rs` 实现 `simd_dsl::Backend` 的 **feature 门控**集成。
+      # 依赖从 panel 的 git 端点取（`rev` 已钉住），**默认构建完全不受影响**（无 feature 时
+      # `cargo tree` 里没有 `simd_dsl`）。这一步是**纯新增**：取不到依赖、或该 feature 下构建/测试
+      # 出问题，**都不许让前十三步变红** ⇒ `continue-on-error`。判据：日志里 `Finished` 与
+      # `test result: ok` 同时出现。
+      - name: DSL backend integration (feature-gated, additive)
+        continue-on-error: true
+        run: |
+          cargo build --release --features dsl-backend
+          cargo test --release --features dsl-backend
