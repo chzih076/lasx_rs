@@ -269,4 +269,88 @@ fn main() {
          （`git ls-remote <panel>` 取实值 + `cargo update -p simd_dsl`），否则本仓看到的是旧快照——\n\
          ③b-3b 就因此误判『未导出』。"
     );
+
+    // ======================== ③b-5a′：dot K=4096 三臂（算法由 DSL 宏生成） ========================
+    // **宏约束（本轮试出来的三条，也转给 simd_dsl 侧记档）**：
+    //  1. `dot!(arm, x[k] * w[k])` 里的 `k` **必须是作用域内的值/const 泛型**（不能只写字面量）；
+    //  2. 后端以**第一个 `ident`** 出现 ⇒ 需要作用域里有 `lasx`/`idio`/`scalar` 三个绑定；
+    //  3. dot 无输出缓冲 ⇒ §5 的"同缓冲"口径对它**自动成立**（matmul 场景才需要共享 `RefCell`，
+    //     且输出必须是 `let mut o = shared.borrow_mut();` 那个 `DerefMut` 绑定）。
+    println!("\n============ ③b-5a′：dot K=4096 三臂（宏驱动） ============");
+    println!("loadavg = {:.2}", loadavg());
+    {
+        let k = 4096usize;
+        let x: Vec<f32> = (0..k).map(|i| (i % 7) as f32 - 3.0).collect();
+        let w: Vec<f32> = (0..k).map(|i| (i % 5) as f32 - 2.0).collect();
+        // **计时外**：三臂值与逐位判定（整数域 ⇒ 各种累加次序都可能精确）
+        let v = [
+            simd_dsl::dot!(lasx, x[k] * w[k]).unwrap(),
+            simd_dsl::dot!(idio, x[k] * w[k]).unwrap(),
+            simd_dsl::dot!(scalar, x[k] * w[k]).unwrap(),
+        ];
+        let bitwise = v[0].to_bits() == v[1].to_bits() && v[0].to_bits() == v[2].to_bits();
+        println!(
+            "  [计时外] dot 三臂值：lasx={} idio={} scalar={} ⇒ {}",
+            v[0],
+            v[1],
+            v[2],
+            if bitwise {
+                "三臂逐位一致（整数域）⇒ **逐位类**"
+            } else {
+                "**非逐位** ⇒ 本场景按容差类报告（不假设逐位）"
+            }
+        );
+        let names = ["lasx", "idio", "scalar"];
+        let cls = [
+            class_of(&lasx, EnginePath::Default),
+            class_of(&idio, EnginePath::Default),
+            class_of(&scalar, EnginePath::Default),
+        ];
+        let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let (mut mx, mut it) = ([0.0f64; 3], [0u32; 3]);
+        for pair in 0..5 {
+            // 交替起跑次序（配合"互换"：正序 / 逆序各半）
+            let order = if pair % 2 == 0 {
+                [0usize, 1, 2]
+            } else {
+                [2, 1, 0]
+            };
+            for arm in order {
+                let (mean, m2, i2) = measure(
+                    || {
+                        let got = match arm {
+                            0 => simd_dsl::dot!(lasx, x[k] * w[k]).unwrap(),
+                            1 => simd_dsl::dot!(idio, x[k] * w[k]).unwrap(),
+                            _ => simd_dsl::dot!(scalar, x[k] * w[k]).unwrap(),
+                        };
+                        std::hint::black_box(got);
+                    },
+                    0.05,
+                );
+                samples[arm].push(mean);
+                mx[arm] = mx[arm].max(m2);
+                it[arm] = it[arm].max(i2);
+            }
+        }
+        println!("  == dot K=4096（5 对丢首对；正/逆序交替）==");
+        let mut med = [0.0f64; 3];
+        for arm in 0..3 {
+            let (md, rg) = median_range(&samples[arm][1..]);
+            med[arm] = md;
+            println!(
+                "  {:6} {:.5} ms  极差 {:.5}  ms_max {:.4}  iters {}  等价类 {}",
+                names[arm], md, rg, mx[arm], it[arm], cls[arm]
+            );
+        }
+        println!(
+            "  ⇒ lasx/idio = **{:.3}×**｜lasx/scalar = **{:.3}×**｜idio/scalar = **{:.3}×**",
+            med[0] / med[1],
+            med[0] / med[2],
+            med[1] / med[2]
+        );
+        println!(
+            "  注：判据先写死 —— `lasx/idio ≈ 0.99–1.01×` ⇒ 如实写『手写没多买到、自动向量化已吃满』。\n\
+           未做：matmul 64³（③b-5a″）、`192×768×3072`（③b-5b）、③b-4（打包接 `Prepared`、`CallOpts`、`Capability`）。"
+        );
+    }
 }
