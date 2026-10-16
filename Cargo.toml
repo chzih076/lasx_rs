@@ -39,3 +39,8 @@ simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "fc57fc7", 
 # **默认关**：`cargo build` / `cargo test` / CI 十三步都不受影响。
 dsl-backend = ["dep:simd_dsl"]
 
+# `dsl_efficiency` 需要可选依赖 `simd_dsl` ⇒ **只在开 `dsl-backend` 时才构建**；
+# 默认 `cargo build --all-targets` / CI 十三步不会碰到它（否则示例空 `main` 会报 E0601）。
+[[example]]
+name = "dsl_efficiency"
+required-features = ["dsl-backend"]
