@@ -107,6 +107,8 @@ pub mod ffi;
 pub mod ilaplace;
 /// **单边数值拉普拉斯变换**（用公式 DSL 表达的批量矩阵乘）——见 [`laplace`] 模块文档。
 pub mod laplace;
+/// **表达式级代数重写：模式识别 + 安全区分析**（原型；**默认路径行为不变**）——见 [`rewrite`]。
+pub mod rewrite;
 /// **复数矩阵乘核心**（A 阶：分平面 `(Re, Im)`、f32/f64、直算 4 条 / Karatsuba 3 条）——
 /// 见 [`cmatmul`] 模块文档（默认路线与位精确契约差异）。
 pub use ops::cmatmul;

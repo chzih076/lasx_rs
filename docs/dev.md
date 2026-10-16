@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**292 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**296 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,6 +342,12 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
+- **代数重写 pass 4 个**（`src/rewrite.rs::tests`，2026-10-16 加；**原型：只识别与判定，不生成代码**）：
+  `positive_literal_isometric`（等距字面量 + 索引线性 ⇒ 可改写且**编译期可判安全区**）、
+  `positive_runtime_const_needs_runtime_check`（运行期步长 ⇒ 可改写但**须运行期检查**）、
+  `negative_non_isometric_or_nonlinear`（**负例：非常量/非等距步长、参数非线性 ⇒ 完全不改写**）、
+  `safe_zone_uses_library_constants`（**安全区与库内同源**：`safe()` 转发 `laplace::recurrence_safe`，
+  常量与 `RECURRENCE_MAX_*` **相等**且判据逐点一致）。规约与卡点见 `docs/dev.md` §9.5.1/§9.5.2。
 - **递推核落地 3 个**（`src/laplace.rs::recurrence_tests`，2026-10-16 加）：`stability_scan_phase_and_n`
   （**误差 vs `ω·Δt` × `N` 全表**，全网格 ≤4.4e-14 ⇒ **安全区很宽**，并实证阈值内 <1e-9）、
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
@@ -426,7 +432,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 292 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 296 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -3137,6 +3143,43 @@ let x: Ranged<f32, -4, 4, 1e-6> = /* … */;
 ⇒ **建议：暂不扩 DSL 语法**；先把"递推核 + opt-in 契约"落成库内可选入口（下一轮），
 等有**真实用户场景**证明"范围声明能带来额外收益"（例如 `ω·Δt` 大时的表驱动优于递推）再议。
 详见 `docs/ops.md` §9.10。
+
+#### 9.5.1 表达式级代数重写（2026-10-16 追加；**用户改判后**）
+
+**用户把评价标准换成"让 DSL 更有优势"** ⇒ 上面"暂不扩语法"的结论**只管"取值范围注解驱动 LUT"
+那一半**；**"表达式级代数重写"要做进 DSL**（有价值证明：`docs/ops.md` §9.10.1 的 −43.5%/−59.0%）。
+
+**诚实的优势定义（不许吹）**：**DSL 的优势 = 把"专家级手工优化"变成默认可得**（用户不必知道
+等距/旋转这些技巧）；**不是**"比懂该技巧的专家更快"——手写递推就是**同一算法** ⇒ 措辞是
+"**免费拿到**"，不是"**超过**"。
+
+**本轮落地的部分**（`src/rewrite.rs`，**原型**）：**模式识别 + 安全区分析 + 负例测试**。
+**未落地**：改写代码生成与宏层集成（见 §9.5.2 的卡点）。
+
+**三条规约**（写进 `src/rewrite.rs` 模块文档）：
+1. **识别条件**：`t_i = base + i·step` **等距**且步长为**编译期字面量**；被调函数 ∈ {`exp`,`cos`,`sin`}；
+   参数是索引的**线性函数**（`a + i·b`）；**行可分**（每行一个 `(σ_j, ω_j)`）。参数是运行期量时
+   允许识别，但**只能生成运行期检查 + 逐行回退**。
+2. **改写规则**：等距 ⇒ `e^{−σΔt}` 逐次乘 + `cos/sin(ωΔt)` 旋转递推（~2 FMA/元素、**零超越调用**）。
+3. **不认识就完全不改写**：`StepKind::Varies`（步长非常量/非等距）或 `lin_in_index = false`
+   ⇒ **`Rewrite::None`**，**不静默改变语义**（负例测试 `negative_non_isometric_or_nonlinear`）。
+
+**安全区与库内同源（证据）**：`rewrite::safe()` **直接转发** `laplace::recurrence_safe`，
+`rewrite::safe_zone()` **转发** `laplace::RECURRENCE_MAX_PHASE_STEP/…_PHASE` ⇒
+**同一处定义、不各写一份**；测试 `safe_zone_uses_library_constants` 断言两者**逐点一致**且
+常量**相等**。
+
+**opt-in 与默认**：重写路径**与 libm 不逐位一致** ⇒ **必须显式 opt-in**（宏级属性草案
+`#[fast_trig]`）；**默认仍 libm/位精确**、**本轮不改任何默认行为**。
+
+#### 9.5.2 卡点（如实，未完成项）
+
+**卡在"改写落地"与"宏层集成"**（第 1、2 项）；**已完成**：模式识别、安全区同源分析、
+负例测试（`src/rewrite.rs` 4 个测试全过）。缺的两步是：
+1. **代码生成**：把 `Rewrite::Recurrence` 变成实际递推代码（含运行期检查 + 逐行回退分支）；
+2. **宏层集成**：在 `lasx_rs_macros` 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]` 属性。
+**为什么本轮不做**：宏层是独立 crate + 编译器插桩面，改动面大；**本轮预算不足**
+⇒ 按 Lead 的 ⑤ **不出半成品**。**下一轮可接着做**，判定逻辑已就绪、接口已定。
 
 ---
 
