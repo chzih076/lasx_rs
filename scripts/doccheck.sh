@@ -33,6 +33,7 @@ doc_key() {
     docs/ops.md) echo ops ;;
     docs/c-abi.md) echo cabi ;;
     docs/platform.md) echo platform ;;
+    docs/dsl.md) echo dsl ;;
     README.md) echo root ;;
     README.en.md) echo rooten ;;
     AGENTS.md) echo agents ;;
@@ -41,7 +42,7 @@ doc_key() {
 
 # ---- 收集各文档的编号集合 ----
 sections() { grep -oE '^#{1,4} [0-9]+(\.[0-9]+)*' "$1" 2>/dev/null | sed 's/^#* //' | sort -u; }
-for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/c-abi.md cabi" "docs/platform.md platform" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
+for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/c-abi.md cabi" "docs/platform.md platform" "docs/dsl.md dsl" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
   f="${pair%% *}"; k="${pair##* }"
   [ -f "$f" ] && sections "$f" > "$T/$k"
 done
@@ -59,12 +60,13 @@ check_refs() {
       target=""
       # 取**前缀里最后一次**出现的文档名（"就近"语义：一句里可以先提 dev 再提 ops）
       last_doc=$(printf '%s' "$prefix" |
-        grep -oE 'docs/c-abi\.md|docs/dev\.md|docs/ops\.md|docs/platform\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
+        grep -oE 'docs/c-abi\.md|docs/dev\.md|docs/ops\.md|docs/platform\.md|docs/dsl\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
       case "$last_doc" in
         docs/c-abi.md) target=cabi ;;
         docs/dev.md) target=dev ;;
         docs/ops.md) target=ops ;;
         docs/platform.md) target=platform ;;
+        docs/dsl.md) target=dsl ;;
         README.en.md) target=rooten ;;
         README.md) target=root ;;
         AGENTS.md) target=agents ;;
@@ -73,7 +75,7 @@ check_refs() {
       # 反例"判据不在本节（在 `docs/ops.md` §5.15）"里 §5.15 属于 ops（就近是 ops）。
       # 用字节偏移比较"最后一次出现"的位置。
       doc_off=$(printf '%s' "$prefix" |
-        grep -bo 'docs/c-abi\.md\|docs/dev\.md\|docs/ops\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
+        grep -bo 'docs/c-abi\.md\|docs/dev\.md\|docs/ops\.md\|docs/dsl\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
       self_off=$(printf '%s' "$prefix" | grep -bo '本文\|本节' | tail -1 | cut -d: -f1)
       if [ -n "${self_off:-}" ] && { [ -z "${doc_off:-}" ] || [ "$self_off" -gt "$doc_off" ]; }; then
         target=$(doc_key "$f")
@@ -89,7 +91,7 @@ check_refs() {
     done
   done < "$f"
 }
-for f in docs/dev.md docs/ops.md docs/c-abi.md docs/platform.md README.md README.en.md AGENTS.md; do
+for f in docs/dev.md docs/ops.md docs/c-abi.md docs/platform.md docs/dsl.md README.md README.en.md AGENTS.md; do
   [ -f "$f" ] && check_refs "$f"
 done
 
