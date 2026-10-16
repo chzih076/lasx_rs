@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**305 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**307 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 **8 个宏测试**（6 单测 + 2 直通集成测试）+ 19 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -356,6 +356,11 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
   诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
   入口/判据/例外清单见 `docs/ops.md` §9.10.1。
+- **锁步宽度扫描 2 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**形状机制实验**）：
+  `lockstep_widths_bitwise_same_as_lasx`（**`L ∈ {2,4,8,16}` 的惯用定长数组版与手写 LASX 逐位一致** ⇒
+  f64+无 `mul_add` = **逐位类**）、诊断 `#[ignore]` `diag_lockstep_width_sweep`
+  （**同源基准对比**：手写 LASX 0.1934 ms；`L=2` 1.16×、**`L=4` 0.99×（−1.3%，持平）**、
+  `L=8` 5.82×、`L=16` 19.01× ⇒ **没有变体达到"快 ≥3%"的超越门槛**）。
 - **核↔矩阵乘融合 3 个 + 1 诊断**（`src/laplace.rs::fused_tests`，2026-10-16 加；**opt-in，默认路径不变**）：
   诊断 `#[ignore]` `raw_arm`（env `LASX_ARM=a|b|c1|c2` + `LASX_NB=2|64` 单臂测量，可配
   `perf stat -e llc-loads,llc-load-misses` 收分臂流量；打印 ms/`iters`/`ms_max`/loadavg + `VmHWM`）。
@@ -450,7 +455,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 305 个单元测试（+ 8 个宏测试 + 19 个文档测试）
+cargo test --workspace --release        # 307 个单元测试（+ 8 个宏测试 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

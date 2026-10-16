@@ -265,6 +265,59 @@ pub fn recurrence_rows_lasx(
     (kc, ks)
 }
 
+/// **(B'') 锁步宽度参数化的惯用 Rust 版（`L` 行同时推进，无 intrinsic）**：
+/// 定长数组 `[f64; L]` + 定长下标循环 ⇒ **"形状机制"实验**用（扫描 `L ∈ {2,4,8,16}`）。
+///
+/// **与手写 LASX 版同累加次序** ⇒ 期望**逐位一致**（f64、不用 `mul_add`）。
+pub fn recurrence_rows_iter_l<const L: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    w: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    assert!(L > 0);
+    let m = sig.len();
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    let mut j = 0usize;
+    while j + L <= m {
+        let mut decay = [0.0f64; L];
+        let mut c1 = [0.0f64; L];
+        let mut s1 = [0.0f64; L];
+        for l in 0..L {
+            decay[l] = (-sig[j + l] * dt).exp();
+            c1[l] = (om[j + l] * dt).cos();
+            s1[l] = (om[j + l] * dt).sin();
+        }
+        let mut e = [1.0f64; L];
+        let mut c = [1.0f64; L];
+        let mut s = [0.0f64; L];
+        for i in 0..n {
+            let wi = w[i] * dt;
+            for l in 0..L {
+                kc[(j + l) * n + i] = e[l] * c[l] * wi;
+                ks[(j + l) * n + i] = e[l] * s[l] * wi;
+            }
+            for l in 0..L {
+                e[l] *= decay[l];
+            }
+            for l in 0..L {
+                let (cc, ss) = (c[l], s[l]);
+                c[l] = cc * c1[l] - ss * s1[l];
+                s[l] = ss * c1[l] + cc * s1[l];
+            }
+        }
+        j += L;
+    }
+    for j2 in j..m {
+        let (r, s2) = recurrence_row(sig[j2], om[j2], dt, n, w);
+        kc[j2 * n..(j2 + 1) * n].copy_from_slice(&r);
+        ks[j2 * n..(j2 + 1) * n].copy_from_slice(&s2);
+    }
+    (kc, ks)
+}
+
 /// **(B') 惯用迭代器/定长数组 Rust 版（同算法、同序、无 intrinsic）**：
 /// 用 **`[f64; 4]` 定长数组 + 定长下标循环**表达"4 行锁步"（rustc/LLVM 对定长数组循环
 /// 通常能自动向量化成 `F64x4`）⇒ 这是"编译器最容易优化好的形状"的候选写法。
@@ -350,6 +403,83 @@ pub fn recurrence_rows_scalar(
 mod recon {
     use super::*;
     use std::time::Instant;
+
+    /// **锁步宽度扫描（`#[ignore]`）**：`L ∈ {2,4,8,16}` 惯用 Rust（f64、无 `mul_add`）vs 手写 LASX。
+    /// **判据先写死**：任一变体比手写快 ≥3% ⇒ "机制+形状可超越手写"；否则如实写"未超越 + 最接近配置与差距"。
+    #[test]
+    #[ignore = "形状机制：锁步宽度扫描 vs 手写 LASX"]
+    fn diag_lockstep_width_sweep() {
+        let (m, n) = (64usize, 1024usize);
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..m).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..m).map(|j| (j % 8) as f64 * 0.003).collect();
+        let w = vec![1.0 / 3.0; n];
+        let time_it = |f: &mut dyn FnMut()| -> f64 {
+            let mut ts = Vec::new();
+            for _ in 0..7 {
+                let t0 = Instant::now();
+                for _ in 0..20 {
+                    f();
+                }
+                ts.push(t0.elapsed().as_secs_f64() / 20.0);
+            }
+            ts.sort_by(f64::total_cmp);
+            ts[ts.len() / 2]
+        };
+        let base = time_it(&mut || {
+            std::hint::black_box(recurrence_rows_lasx(&sig, &om, dt, n, &w));
+        });
+        println!("手写 LASX 基准：{:.4} ms（M={m}, N={n}）", base * 1e3);
+        for l in [2usize, 4, 8, 16] {
+            let med = time_it(&mut || match l {
+                2 => {
+                    std::hint::black_box(recurrence_rows_iter_l::<2>(&sig, &om, dt, n, &w));
+                }
+                4 => {
+                    std::hint::black_box(recurrence_rows_iter_l::<4>(&sig, &om, dt, n, &w));
+                }
+                8 => {
+                    std::hint::black_box(recurrence_rows_iter_l::<8>(&sig, &om, dt, n, &w));
+                }
+                _ => {
+                    std::hint::black_box(recurrence_rows_iter_l::<16>(&sig, &om, dt, n, &w));
+                }
+            });
+            println!(
+                "L={l:2}（惯用定长数组, f64, 无 mul_add）：{:.4} ms，相对手写 {:.2}×，差 {:+.1}%",
+                med * 1e3,
+                med / base,
+                (med - base) / base * 100.0
+            );
+        }
+        let l1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+            .unwrap_or_default();
+        println!("loadavg={l1}");
+    }
+
+    /// **锁步宽度变体与手写 LASX 逐位一致**（f64 + 无 `mul_add` ⇒ **逐位类**）：`L ∈ {2,4,8,16}`。
+    #[test]
+    fn lockstep_widths_bitwise_same_as_lasx() {
+        let (m, n) = (16usize, 256usize);
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..m).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..m).map(|j| (j % 8) as f64 * 0.003).collect();
+        let w = vec![1.0 / 3.0; n];
+        let (ar, ai) = recurrence_rows_lasx(&sig, &om, dt, n, &w);
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+        for l in [2usize, 4, 8, 16] {
+            let (br, bi) = match l {
+                2 => recurrence_rows_iter_l::<2>(&sig, &om, dt, n, &w),
+                4 => recurrence_rows_iter_l::<4>(&sig, &om, dt, n, &w),
+                8 => recurrence_rows_iter_l::<8>(&sig, &om, dt, n, &w),
+                _ => recurrence_rows_iter_l::<16>(&sig, &om, dt, n, &w),
+            };
+            assert_eq!(bits(&ar), bits(&br), "L={l} 实部与手写 LASX 不逐位");
+            assert_eq!(bits(&ai), bits(&bi), "L={l} 虚部与手写 LASX 不逐位");
+        }
+    }
 
     /// **LLVM 委派实验：逐位一致性**——(A) 手写 LASX 4 行锁步 vs (B) 同序朴素标量，
     /// 结果必须**逐位一致**（Rust 不开 fast-math ⇒ 不重结合、不做 FMA 收缩）。
