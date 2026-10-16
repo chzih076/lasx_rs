@@ -36,6 +36,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use simd_dsl::backend::{Backend, BackendError, Capability};
+use simd_dsl::call::CallOpts;
 use simd_dsl::equivalence::{EnginePath, ErrorBound, Fallback, PrecisionClaim, ScalarKind};
 use simd_dsl::packed::PackedB;
 
@@ -236,17 +237,172 @@ impl Backend for LasxBackend {
         Ok(PackedB::new(self.backend_tag(), k, n, blob))
     }
 
-    /// **只低估**：③a 只覆盖了 f32 的 `matmul_f32`/`dot_f32`，**没有** f64/逐元素/归约/超越/打包/
-    /// 多线程/复数组合步的专用实现 ⇒ **所有 `Capability` 一律 `false`**（"只报确实为真"）。
+    /// **`matmul_f32_packed`：解 blob 后走现有 packed 路径（预打包复用）。**
     ///
-    /// **注意（③b-4 进度）**：`pack_f32` 已实现，但 **`matmul_f32_packed` 尚未实现**、
-    /// **逐位断言尚未通过** ⇒ **`Capability::Packing` 仍不放**（只低估）。
-    fn supports(&self, _cap: Capability) -> bool {
-        false
+    /// 步骤：校验 `tag`（`ForeignPacked`）→ 校验 `shape()==(k,n)` 与 `blob.len()==k*n*4`
+    /// → 还原两区段 → **主 strips 逐块**调 `matmul_f32_packed_rows` →
+    /// **尾列用临时紧凑缓冲**调 `row_tail_range_f32(n = ntail, j0 = 0, j1 = ntail)`。
+    ///
+    /// **契约**：与 [`Backend::pack_f32`] **必须同后端配对**（blob 格式由本后端自定义；见模块文档）。
+    fn matmul_f32_packed(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        p: &PackedB,
+        out: &mut [f32],
+        opts: &CallOpts,
+    ) -> Result<(), BackendError> {
+        // `CallOpts` 只是**意图**：本后端单线程（留档结论见模块文档）；这里显式忽略。
+        let _ = opts;
+        if p.backend_tag() != self.backend_tag() {
+            return Err(BackendError::ForeignPacked {
+                op: "matmul_f32_packed",
+                tag: p.backend_tag(),
+                expected: self.backend_tag(),
+            });
+        }
+        if p.shape() != (k, n) {
+            return Err(len_err(
+                "matmul_f32_packed",
+                "packed_b 的形状(k×n)",
+                k.saturating_mul(n),
+                p.shape().0.saturating_mul(p.shape().1),
+            ));
+        }
+        let total = k.checked_mul(n).ok_or(BackendError::ShapeOverflow {
+            op: "matmul_f32_packed",
+            what: "k×n",
+        })?;
+        if a.len() != m * k {
+            return Err(len_err("matmul_f32_packed", "a", m * k, a.len()));
+        }
+        if out.len() != m * n {
+            return Err(len_err("matmul_f32_packed", "out", m * n, out.len()));
+        }
+        if p.blob().len() != total * 4 {
+            return Err(len_err(
+                "matmul_f32_packed",
+                "blob 字节数",
+                total * 4,
+                p.blob().len(),
+            ));
+        }
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        let n32 = n / 32 * 32;
+        let ntail = n - n32;
+        let blob = p.blob();
+        let f32_at = |idx: usize| -> f32 {
+            let mut w = [0u8; 4];
+            w.copy_from_slice(&blob[idx * 4..idx * 4 + 4]);
+            f32::from_le_bytes(w)
+        };
+        let m4 = m / 4 * 4;
+        // **主 strips 逐块**（与 `matmul_f32_packed` 同入口；`epi = Plain` 即 `C = acc`）
+        let nc_strips = crate::ops::matmul::pack_strips(k);
+        let strips_total = n32 / 32;
+        let mut s0 = 0;
+        while s0 < strips_total {
+            let s1 = (s0 + nc_strips).min(strips_total);
+            let jb = s0 * 32;
+            let nc = (s1 - s0) * 32;
+            let base = jb / 32 * k * 32; // 区段起点 = (jb/32)*k*32
+            let packed: Vec<f32> = (0..k * nc).map(|i| f32_at(base + i)).collect();
+            crate::ops::matmul::matmul_f32_packed_rows(
+                k,
+                n,
+                jb,
+                nc,
+                &packed,
+                a,
+                out,
+                m4,
+                crate::ops::matmul::Epi::Plain,
+            );
+            s0 = s1;
+        }
+        // **尾列**：`row_tail_range_f32` 的 `n` 既是 `b` 的行步长、也是 `c_row` 的列步长
+        // ⇒ 传**紧凑暂存行**（长度 `ntail`）算完后**拷回**真实行的 `[n32, n)` 段。
+        if ntail > 0 {
+            let tail_off = k * n32; // 列尾区段起点（以 f32 计）
+            let tail: Vec<f32> = (0..k * ntail).map(|i| f32_at(tail_off + i)).collect();
+            let mut staged = vec![0.0f32; ntail];
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                crate::ops::matmul::row_tail_range_f32(
+                    a_row,
+                    &mut staged,
+                    &tail,
+                    k,
+                    ntail,
+                    0,
+                    ntail,
+                    crate::ops::matmul::Epi::Plain,
+                );
+                let c_row = &mut out[i * n..(i + 1) * n];
+                c_row[n32..n].copy_from_slice(&staged);
+            }
+        }
+        Ok(())
+    }
+
+    /// **只低估**：`pack_f32` 与 `matmul_f32_packed` 都已实现、**逐位断言已过**（测试
+    /// `packed_bitwise_same_as_matmul`）⇒ **只打开 `Packing`**；其余能力（f64/逐元素/归约/超越/
+    /// 多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"）。
+    fn supports(&self, cap: Capability) -> bool {
+        matches!(cap, Capability::Packing)
     }
 }
 
 /// **③b-4 自洽测试**：blob 布局（长度 = `k*n*4`、主 strips 与列尾可定位）、`PackedB` 形状一致、
+/// 非法长度**返回 `LengthMismatch` 不 panic**。
+#[test]
+#[allow(clippy::too_many_lines)]
+fn packed_bitwise_same_as_matmul() {
+    let be = LasxBackend;
+    // **多形状**：含 `ntail != 0`（100、33）与 `ntail == 0`（64、96）；含 m 不是 4 的倍数（5、7）
+    for (m, k, n) in [
+        (5usize, 7usize, 100usize),
+        (7, 4, 33),
+        (8, 8, 64),
+        (6, 8, 96),
+    ] {
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 13) as f32) * 0.0625 - 0.5)
+            .collect();
+        // 参照：现有 `matmul_f32`（LASX 内核）
+        let mut want = vec![0.0f32; m * n];
+        be.matmul_f32(m, k, n, &a, &b, &mut want)
+            .expect("matmul_f32");
+        // 打包 → 复用打包面板乘
+        let p = be.pack_f32(k, n, &b).expect("pack_f32");
+        let mut got = vec![0.0f32; m * n];
+        let opts = CallOpts::single();
+        be.matmul_f32_packed(m, k, n, &a, &p, &mut got, &opts)
+            .expect("matmul_f32_packed");
+        assert_eq!(
+            got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "matmul_f32_packed 与 matmul_f32 不逐位（m={m}, k={k}, n={n}, ntail={}）",
+            n % 32
+        );
+    }
+    // 外来句柄 / 形状不符 ⇒ 报错不 panic
+    let p = be.pack_f32(4, 64, &vec![0.0f32; 256]).expect("pack");
+    let opts = CallOpts::single();
+    let mut out = vec![0.0f32; 4 * 64];
+    assert!(
+        be.matmul_f32_packed(4, 4, 32, &[0.0f32; 16], &p, &mut out, &opts)
+            .is_err()
+    );
+}
+
 /// 非法长度**返回 `LengthMismatch` 不 panic**。
 #[test]
 fn pack_f32_blob_layout_is_self_consistent() {
@@ -450,8 +606,12 @@ mod tests {
                 .is_none(),
             "f64 专用实现本轮未做 ⇒ 必须 None"
         );
-        // **只低估**：③a 覆盖面之外一律 false
-        assert!(!be.supports(Capability::Packing));
+        // **只低估**：③b-4 之后**只有 `Packing` 为真**（`pack_f32` + `matmul_f32_packed` 已实现且逐位断言过），
+        // 其余能力一律 false
+        assert!(
+            be.supports(Capability::Packing),
+            "Packing 已实现且逐位断言过 ⇒ 应为 true"
+        );
         assert!(!be.supports(Capability::MatmulF64));
         assert!(!be.supports(Capability::Transcendental));
     }
