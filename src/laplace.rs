@@ -265,6 +265,132 @@ pub fn laplace_batch_f32_recurrence<const M: usize, const N: usize, const NB: us
     (re, im, all_safe)
 }
 
+/// **融合核的生成模式**（现场生成核行，不落地核矩阵）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FusedMode {
+    /// 现场用 **libm** 表达式生成（**与物化版逐字相同** ⇒ 期望**逐位一致**）。
+    Libm,
+    /// 现场用**等距递推**生成（**容差类**：与物化 libm 差见 §9.10.1 的 5.5e-14 界）。
+    Recurrence,
+}
+
+/// **`f32` 批量正变换（融合路径：核不落地，opt-in）**。
+///
+/// 与 [`laplace_batch_f32`] 同接口。**核（`Kc`/`Ks`）不再物化**：在矩阵乘的打包阶段按需生成
+/// 核行（每个 k 块只保留 `4×k` 面板），两条乘（`Kc·f`、`Ks·f`）各生成一次。
+///
+/// **契约**：
+/// - `FusedMode::Libm` ⇒ **与物化版逐位一致**（同一 strip 布局、同一 k 分块、同一累加次序、
+///   同一表达式；测试 `fused_libm_bitwise_same_as_materialized`）；
+/// - `FusedMode::Recurrence` ⇒ **容差类**（现场递推 ≠ 物化 libm；测试
+///   `fused_recurrence_within_tolerance`）。**不许笼统说"融合是逐位的"。**
+///
+/// **默认路径不变**（本入口 opt-in）。
+pub fn laplace_batch_f32_fused<const M: usize, const N: usize, const NB: usize>(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    f: &[f32],
+    mode: FusedMode,
+) -> (Vec<f32>, Vec<f32>) {
+    use crate::ops::matmul::{Epi, matmul_f32_packed_gen};
+    assert_eq!(sig.len(), M);
+    assert_eq!(f.len(), N * NB);
+    let w = trapezoid_weights(N);
+    let mut re = vec![0.0f32; M * NB];
+    let mut im = vec![0.0f32; M * NB];
+    // —— Re F = Kc·f ——（核行现场生成）
+    {
+        let sig = sig.to_vec();
+        let om = om.to_vec();
+        let w = w.clone();
+        let mut row = vec![0.0f32; N];
+        matmul_f32_packed_gen(
+            M,
+            N,
+            NB,
+            f,
+            |j, out: &mut [f32]| {
+                gen_kernel_row(&sig, &om, dt, j, N, &w, mode, 1.0, &mut row);
+                out.copy_from_slice(&row);
+            },
+            &mut re,
+            Epi::Plain,
+        );
+    }
+    // —— Im F = −Ks·f ——（**先生成 `Ks`、算完再整体取负**，与物化版 `im = -ks·f` 的
+    //    取负时机完全一致 ⇒ 连"零的符号"都一致 ⇒ 逐位成立）
+    {
+        let sig = sig.to_vec();
+        let om = om.to_vec();
+        let w = w.clone();
+        let mut row = vec![0.0f32; N];
+        matmul_f32_packed_gen(
+            M,
+            N,
+            NB,
+            f,
+            |j, out: &mut [f32]| {
+                gen_kernel_row(&sig, &om, dt, j, N, &w, mode, -1.0, &mut row);
+                out.copy_from_slice(&row);
+            },
+            &mut im,
+            Epi::Plain,
+        );
+        for v in im.iter_mut() {
+            *v = -*v;
+        }
+    }
+    (re, im)
+}
+
+/// 现场生成核的一行（`Kc` 或 `−Ks`）。**`sign = 1.0` 给 `Kc`，`sign = -1.0` 给 `−Ks`**。
+///
+/// `FusedMode::Libm` 分支**逐字复用** `kernels64` 的表达式（`e = exp(-σt)*w_i*dt`，
+/// 再乘 `cos`/`sin`），故与物化版**逐位一致**。
+#[allow(clippy::too_many_arguments)]
+fn gen_kernel_row(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    j: usize,
+    n: usize,
+    w: &[f64],
+    mode: FusedMode,
+    sign: f64,
+    out: &mut [f32],
+) {
+    match mode {
+        FusedMode::Libm => {
+            for i in 0..n {
+                let t = i as f64 * dt;
+                let e = (-sig[j] * t).exp() * w[i] * dt;
+                let v = if sign > 0.0 {
+                    // `sign > 0` ⇒ cos 行（`Re F`）
+                    e * (om[j] * t).cos()
+                } else {
+                    // `sign < 0` ⇒ sin 行（`Ks`；**不在这里取负**，取负与物化版一样放在乘之后）
+                    e * (om[j] * t).sin()
+                };
+                out[i] = v as f32;
+            }
+        }
+        FusedMode::Recurrence => {
+            let (kc, ks) = crate::fast_trig::recurrence_row(sig[j], om[j], dt, n, w);
+            if sign > 0.0 {
+                for i in 0..n {
+                    out[i] = kc[i] as f32;
+                }
+            } else {
+                // `Ks`（**不在这里取负**；取负与物化版一样放在乘之后）
+                for i in 0..n {
+                    out[i] = ks[i] as f32;
+                }
+            }
+        }
+    }
+}
+
 /// **`f64` 批量正变换（等距递推核，opt-in）**：同 `f32` 版语义与契约。
 pub fn laplace_batch_f64_recurrence<const M: usize, const N: usize, const NB: usize>(
     sig: &[f64],
@@ -432,6 +558,104 @@ pub fn reference_f32_with<const M: usize, const N: usize, const NB: usize>(
         }
     }
     (re, im)
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    /// **情形 (i)：融合（现场 libm 生成）vs 物化 —— `to_bits()` 逐位一致**。
+    ///
+    /// 成立条件：同一 strip 布局、同一 k 分块、同一累加次序、同一核表达式。
+    /// **这条必须过**，融合才有"逐位类重写"的资格。
+    #[test]
+    fn fused_libm_bitwise_same_as_materialized() {
+        const M: usize = 6;
+        const N: usize = 128;
+        const NB: usize = 64; // 32 的倍数（尾列另行覆盖）
+        let dt = 1.0 / 64.0;
+        let sig: Vec<f64> = (0..M).map(|j| 0.5 + 0.25 * j as f64).collect();
+        let om: Vec<f64> = (0..M).map(|j| (j % 5) as f64 * 0.5).collect();
+        let f: Vec<f32> = (0..N * NB)
+            .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+            .collect();
+        let (br, bi) = laplace_batch_f32::<M, N, NB>(&sig, &om, dt, &f);
+        let (fr, fi) = laplace_batch_f32_fused::<M, N, NB>(&sig, &om, dt, &f, FusedMode::Libm);
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&fr), bits(&br), "融合(libm) 实部与物化版不逐位");
+        assert_eq!(bits(&fi), bits(&bi), "融合(libm) 虚部与物化版不逐位");
+    }
+
+    /// **情形 (i')：列尾覆盖**——`NB` 不是 32 的倍数（含 `NB=2`）时，尾列走**现有**
+    /// `row_tail_range_f32`，融合仍应与物化版**逐位一致**。
+    #[test]
+    fn fused_libm_bitwise_with_column_tail() {
+        const M: usize = 5;
+        const N: usize = 96;
+        for nb in [1usize, 2, 31, 33] {
+            let dt = 1.0 / 32.0;
+            let sig: Vec<f64> = (0..M).map(|j| 0.75 + 0.5 * j as f64).collect();
+            let om: Vec<f64> = (0..M).map(|j| (j % 3) as f64 * 0.75).collect();
+            let f: Vec<f32> = (0..N * nb)
+                .map(|i| ((i % 13) as f32) * 0.25 - 1.0)
+                .collect();
+            let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+            match nb {
+                1 => {
+                    let (br, bi) = laplace_batch_f32::<M, N, 1>(&sig, &om, dt, &f);
+                    let (fr, fi) =
+                        laplace_batch_f32_fused::<M, N, 1>(&sig, &om, dt, &f, FusedMode::Libm);
+                    assert_eq!(bits(&fr), bits(&br), "NB=1 实部不逐位");
+                    assert_eq!(bits(&fi), bits(&bi), "NB=1 虚部不逐位");
+                }
+                2 => {
+                    let (br, bi) = laplace_batch_f32::<M, N, 2>(&sig, &om, dt, &f);
+                    let (fr, fi) =
+                        laplace_batch_f32_fused::<M, N, 2>(&sig, &om, dt, &f, FusedMode::Libm);
+                    assert_eq!(bits(&fr), bits(&br), "NB=2 实部不逐位");
+                    assert_eq!(bits(&fi), bits(&bi), "NB=2 虚部不逐位");
+                }
+                31 => {
+                    let (br, bi) = laplace_batch_f32::<M, N, 31>(&sig, &om, dt, &f);
+                    let (fr, fi) =
+                        laplace_batch_f32_fused::<M, N, 31>(&sig, &om, dt, &f, FusedMode::Libm);
+                    assert_eq!(bits(&fr), bits(&br), "NB=31 实部不逐位");
+                    assert_eq!(bits(&fi), bits(&bi), "NB=31 虚部不逐位");
+                }
+                _ => {
+                    let (br, bi) = laplace_batch_f32::<M, N, 33>(&sig, &om, dt, &f);
+                    let (fr, fi) =
+                        laplace_batch_f32_fused::<M, N, 33>(&sig, &om, dt, &f, FusedMode::Libm);
+                    assert_eq!(bits(&fr), bits(&br), "NB=33 实部不逐位");
+                    assert_eq!(bits(&fi), bits(&bi), "NB=33 虚部不逐位");
+                }
+            }
+        }
+    }
+
+    /// **情形 (ii)：现场递推 vs 物化 libm ⇒ 容差类**（给界）。
+    #[test]
+    fn fused_recurrence_within_tolerance() {
+        const M: usize = 6;
+        const N: usize = 512;
+        const NB: usize = 64;
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..M).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..M).map(|j| (j % 4) as f64 * 0.003).collect(); // 安全区
+        let f: Vec<f32> = (0..N * NB)
+            .map(|i| ((i % 17) as f32) * 0.125 - 1.0)
+            .collect();
+        let (br, bi) = laplace_batch_f32::<M, N, NB>(&sig, &om, dt, &f);
+        let (fr, fi) =
+            laplace_batch_f32_fused::<M, N, NB>(&sig, &om, dt, &f, FusedMode::Recurrence);
+        let mut worst = 0.0f32;
+        for l in 0..M * NB {
+            worst = worst.max((fr[l] - br[l]).abs() / br[l].abs().max(1e-30));
+            worst = worst.max((fi[l] - bi[l]).abs() / bi[l].abs().max(1e-30));
+        }
+        println!("融合(递推) vs 物化(libm)：最大相对差 {worst:.3e}（f32）");
+        assert!(worst < 1e-4, "容差类应 <1e-4，实测 {worst:e}");
+    }
 }
 
 #[cfg(test)]

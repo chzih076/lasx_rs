@@ -561,6 +561,124 @@ pub(crate) fn matmul_f32_packed_rows(
     }
 }
 
+/// **融合入口（核不落地）的整条乘法**：与 [`matmul_f32_packed`] 同构，但 **A 的行由回调按需生成**，
+/// 不落地 `m×k` 的 A。
+///
+/// - **主 strips** 走 [`matmul_f32_packed_rows_gen`]（每 k 块只生成 `4×k` 面板）；
+/// - **列尾 `[n32, n)`** 复用**现有** `row_tail_range_f32`（它本来就吃"整行 A"）⇒ **不新增标量路径**。
+///
+/// ⇒ **strip 布局、k 分块、每个输出元素的累加次序与物化版完全一致**：只要 `gen_row` 写出的值与
+/// 物化版逐字相同，结果与 [`matmul_f32_packed`] **逐位一致**。
+pub(crate) fn matmul_f32_packed_gen<G: FnMut(usize, &mut [f32])>(
+    m: usize,
+    k: usize,
+    n: usize,
+    b: &[f32],
+    mut gen_row: G,
+    c: &mut [f32],
+    epi: Epi,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let m4 = m / 4 * 4;
+    let n32 = n / 32 * 32;
+    let strips_total = n32 / 32;
+    let nc_strips = pack_strips(k);
+    PACK_BUF.with(|buf| {
+        let mut packed = buf.borrow_mut();
+        packed.resize(k * nc_strips * 32, 0.0);
+        let mut s0 = 0;
+        while s0 < strips_total {
+            let s1 = (s0 + nc_strips).min(strips_total);
+            let jb = s0 * 32;
+            let nc = (s1 - s0) * 32;
+            pack_b(k, n, jb, nc, b, &mut packed);
+            // 注意：`gen_row` 是 `FnMut`，这里需要可变借用 ⇒ 用 `&mut gen_row` 转发。
+            matmul_f32_packed_rows_gen(m, k, n, jb, nc, &packed, &mut gen_row, c, m4, epi);
+            s0 = s1;
+        }
+    });
+    // 列尾：复用现有尾路径（吃整行 A）——行由回调生成到暂存
+    if n > n32 {
+        let mut row = vec![0.0f32; k];
+        for i in 0..m {
+            gen_row(i, &mut row);
+            let c_row = &mut c[i * n..(i + 1) * n];
+            row_tail_range_f32(&row, c_row, b, k, n, n32, n, epi);
+        }
+    }
+}
+
+/// **融合入口：核不落地**——把 `a_rows`（`m×k` 的整块 A）换成**按需生成 A 行**的回调。
+///
+/// `gen_row(row, out)` 必须把 A 的第 `row` 行 `[0..k]` 写进 `out`。
+/// 除"A 从哪来"之外与 [`matmul_f32_packed_rows`] 同构：同一 strip 打包布局、同一
+/// `tile4x32_chunk` / `row_tail_packed` 调用、**每个输出元素的 k 累加次序不变**
+/// ⇒ 若 `gen_row` 写出的值与物化版**相同**，结果**逐位一致**。
+///
+/// 内存上只保留 `4×k` 的暂存面板（`k=1024` 时 16 KB），**不落地 `m×k` 的核**。
+pub(crate) fn matmul_f32_packed_rows_gen<G: FnMut(usize, &mut [f32])>(
+    m: usize,
+    k: usize,
+    n: usize,
+    jb: usize,
+    nc: usize,
+    packed: &[f32],
+    mut gen_row: G,
+    c_rows: &mut [f32],
+    m4: usize,
+    epi: Epi,
+) {
+    let strips = nc / 32;
+    let kb_size = if k * 32 * 4 <= L1_BUDGET { k } else { K_CHUNK };
+    let mut scratch = vec![0.0f32; 4 * k];
+    let mut kb0 = 0;
+    while kb0 < k {
+        let kb = kb_size.min(k - kb0);
+        let first = kb0 == 0;
+        let epi = if kb0 + kb == k { epi } else { Epi::Plain };
+        let mut i = 0;
+        while i < m4 {
+            for r in 0..4 {
+                gen_row(i + r, &mut scratch[r * k..(r + 1) * k]);
+            }
+            for s in 0..strips {
+                let base = s * k * 32 + kb0 * 32;
+                let strip = &packed[base..base + kb * 32];
+                let j = jb + s * 32;
+                let ct = &mut c_rows[i * n..(i + 4) * n];
+                tile4x32_chunk(
+                    kb,
+                    first,
+                    strip,
+                    &scratch[kb0..kb0 + kb],
+                    &scratch[k + kb0..k + kb0 + kb],
+                    &scratch[2 * k + kb0..2 * k + kb0 + kb],
+                    &scratch[3 * k + kb0..3 * k + kb0 + kb],
+                    ct,
+                    n,
+                    j,
+                    epi,
+                );
+            }
+            i += 4;
+        }
+        while i < m {
+            gen_row(i, &mut scratch[..k]);
+            for s in 0..strips {
+                let base = s * k * 32 + kb0 * 32;
+                let strip = &packed[base..base + kb * 32];
+                let j = jb + s * 32;
+                let c_row = &mut c_rows[i * n..(i + 1) * n];
+                row_tail_packed(&scratch[kb0..kb0 + kb], strip, c_row, first, j, epi);
+            }
+            i += 1;
+        }
+        kb0 += kb;
+    }
+}
+
 /// 把 `B[p][jb..jb+nc]` 打成 `packed[(s*k + p)*32 + r]`。
 ///
 /// 布局决定了**只能让一侧顺序**：读是"每行 32 个 `f32`（128 B）、跨行跳 `n×4`"，

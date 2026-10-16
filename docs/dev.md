@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**300 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**303 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -356,6 +356,13 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
   诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
   入口/判据/例外清单见 `docs/ops.md` §9.10.1。
+- **核↔矩阵乘融合 3 个**（`src/laplace.rs::fused_tests`，2026-10-16 加；**opt-in，默认路径不变**）：
+  `fused_libm_bitwise_same_as_materialized`（**现场 libm 生成 vs 物化 ⇒ `to_bits()` 逐位一致**，
+  含实/虚部）、`fused_libm_bitwise_with_column_tail`（**列尾 NB=1/2/31/33 仍逐位**——尾列复用现有
+  `row_tail_range_f32`，不新增标量路径）、`fused_recurrence_within_tolerance`（现场递推 ⇒ **容差类**）。
+  入口 `laplace_batch_f32_fused(..., FusedMode::{Libm,Recurrence})`；融合内核
+  `ops::matmul::matmul_f32_packed_gen` / `matmul_f32_packed_rows_gen`（**A 行按需生成，只留 `4×k` 面板**）。
+  **流量/A-B/峰值内存未测**（见本条之后的说明）。
 - **委派 LLVM 实验 2 个**（`src/fast_trig.rs::recon`，2026-10-16 加，**第四轮扩为四变体**）：
   `lasx_vs_scalar_bitwise_same_order`（**(A) 手写 LASX = (B) 朴素 = (B') 惯用迭代器 三者逐位一致**，
   核 8 行×N=1024 实/虚部 + 组合步 n=4096 三种实现；`to_bits()` 全等 ⇒ "不开 fast-math 不重结合/
@@ -441,7 +448,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 300 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 303 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -1778,6 +1785,12 @@ pthread 档每次
 > cpu-migrations` 全档报 **0/0**，但**同一进程** `/proc/<pid>/status` 的 `voluntary_ctxt_switches`
 > 实测**非零**（26→28）⇒ **perf 的软件事件在这台机器上没统计到这些线程**（继承/口径问题），
 > **不是"没有切换/迁移"**。⇒ 本节**不再用这两个计数**支撑任何结论；需要时改用 `/proc/<pid>/status`。
+>
+> **⚠️ 更正（2026-10-16，"不可用"只对软件事件成立）**：**硬件事件在本机可用** ——
+> 实测 `perf stat -e llc-loads,llc-load-misses true` ⇒ **3,622 / 1,065**（非 0、可复现）。
+> ⇒ **带宽类结论可以用 `llc-loads`/`llc-load-misses` 真测**（上面的 `DRAM 估计` 公式仍适用）；
+> **不可用的只是软件事件**（`context-switches`/`cpu-migrations`）⇒ 那两类仍需 `/proc` 计数。
+> 之前"本机 perf 不可用"的写法**过宽**，此处收窄。
 
 ※ Rust 池档 = `#[ignore]` 诊断测试 `parallel::diag_pool_vs_plan`（同进程交替 7 次池 + 7 次计划）
 ⇒ 它的计数**包含两条路线**（"每对"= 池一次 + 计划一次），只能当量级参考，不能当纯池的账。
