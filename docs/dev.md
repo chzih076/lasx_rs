@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**296 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**298 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -342,12 +342,15 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
   `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
   f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
-- **代数重写 pass 4 个**（`src/rewrite.rs::tests`，2026-10-16 加；**原型：只识别与判定，不生成代码**）：
+- **代数重写 pass 6 个**（`src/rewrite.rs::tests`，2026-10-16 加；**识别+判定+守卫/回退，宏 crate 未集成**）：
   `positive_literal_isometric`（等距字面量 + 索引线性 ⇒ 可改写且**编译期可判安全区**）、
   `positive_runtime_const_needs_runtime_check`（运行期步长 ⇒ 可改写但**须运行期检查**）、
   `negative_non_isometric_or_nonlinear`（**负例：非常量/非等距步长、参数非线性 ⇒ 完全不改写**）、
   `safe_zone_uses_library_constants`（**安全区与库内同源**：`safe()` 转发 `laplace::recurrence_safe`，
-  常量与 `RECURRENCE_MAX_*` **相等**且判据逐点一致）。规约与卡点见 `docs/dev.md` §9.5.1/§9.5.2。
+  常量与 `RECURRENCE_MAX_*` **相等**且判据逐点一致）、
+  `no_opt_in_means_no_rewrite`（**未挂 `#[fast_trig]` ⇒ 完全不重写**；挂上则可改写，作对照）、
+  `generated_path_guard_and_fallback`（**安全区行 <1e-9；超区行 `ω·Δt=2.0` 与 libm 逐位一致**、
+  `all_safe=false`）。规约/进度/未测项见 `docs/dev.md` §9.5.1/§9.5.2。
 - **递推核落地 3 个**（`src/laplace.rs::recurrence_tests`，2026-10-16 加）：`stability_scan_phase_and_n`
   （**误差 vs `ω·Δt` × `N` 全表**，全网格 ≤4.4e-14 ⇒ **安全区很宽**，并实证阈值内 <1e-9）、
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
@@ -432,7 +435,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 296 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 298 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -3172,14 +3175,25 @@ let x: Ranged<f32, -4, 4, 1e-6> = /* … */;
 **opt-in 与默认**：重写路径**与 libm 不逐位一致** ⇒ **必须显式 opt-in**（宏级属性草案
 `#[fast_trig]`）；**默认仍 libm/位精确**、**本轮不改任何默认行为**。
 
-#### 9.5.2 卡点（如实，未完成项）
+#### 9.5.2 落地进度（2026-10-16 第二轮更新）
 
-**卡在"改写落地"与"宏层集成"**（第 1、2 项）；**已完成**：模式识别、安全区同源分析、
-负例测试（`src/rewrite.rs` 4 个测试全过）。缺的两步是：
-1. **代码生成**：把 `Rewrite::Recurrence` 变成实际递推代码（含运行期检查 + 逐行回退分支）；
-2. **宏层集成**：在 `lasx_rs_macros` 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]` 属性。
-**为什么本轮不做**：宏层是独立 crate + 编译器插桩面，改动面大；**本轮预算不足**
-⇒ 按 Lead 的 ⑤ **不出半成品**。**下一轮可接着做**，判定逻辑已就绪、接口已定。
+**已落地**（`src/rewrite.rs`，6 个测试全过）：
+1. **识别 + 负例**（上一轮）：等距字面量 + 索引线性 + 行可分；非常量步长/非线性 ⇒ **完全不改写**；
+2. **未 opt-in ⇒ 完全不重写**：`KernelPattern::fast_trig_opt_in = false` ⇒ `Rewrite::None`
+   （测试 `no_opt_in_means_no_rewrite`，并用"同一 pattern 挂上属性后可改写"做对照）；
+3. **生成侧的行为链路**：**守卫与回退走库内入口**（`laplace_batch_*_recurrence`，
+   内部 = **同源 `recurrence_safe` + 逐行回退 libm**）；测试 `generated_path_guard_and_fallback`：
+   **安全区行**（递推）与 libm 差 <1e-9；**超区行**（`ω·Δt=2.0`）**与 libm 逐位一致**、
+   且返回 `all_safe=false`。
+   —— 即"生成 + 守卫 + 逐行回退"三件事的**行为**已可测；本原型**不生成源码文本**，
+   将来宏层只需把 `plan()` 的结果接到库内入口（见 `rewrite::GENERATION_VIA_LIBRARY_ENTRY`）。
+
+**仍未落地（如实）**：
+1. **宏 crate 集成**：`lasx_rs_macros` 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]`
+   —— **未做**（独立 crate + 编译器插桩面，本轮预算不足）；
+2. **"同一份 DSL 公式两种编译"的 A/B** —— **未测**（因为①未做）。
+   可给的**同源实测**是库内 opt-in 入口的 A/B（`docs/ops.md` §9.10.1：小 NB −43.5%、大 NB −59.0%），
+   它与宏层改写**会生成同一条路径**，**但不是**宏层两种编译的实测 ⇒ **不许当成交付数字**。
 
 ---
 

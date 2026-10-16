@@ -61,6 +61,8 @@ pub struct KernelPattern {
     pub op: TrigOp,
     /// 参数是否**只由索引线性构成**（`arg = a + i·b`，`b` 与索引步长同源）。
     pub lin_in_index: bool,
+    /// **显式 opt-in**（宏级属性 `#[fast_trig]` 的等价物）：**未挂属性 = `false` ⇒ 完全不重写**。
+    pub fast_trig_opt_in: bool,
 }
 
 /// 判定结果。
@@ -80,6 +82,10 @@ pub enum Rewrite {
 /// - 运行期步长/运行期 `(σ, ω)` ⇒ 允许改写，但 `compile_time_safe = false`
 ///   （宏层须生成**运行期检查**：`recurrence_safe` 不过 ⇒ 该行**回退 libm**）。
 pub fn plan(pattern: &KernelPattern) -> Rewrite {
+    // **未挂 `#[fast_trig]` ⇒ 完全不重写**（默认路径行为一字不改）
+    if !pattern.fast_trig_opt_in {
+        return Rewrite::None;
+    }
     if !pattern.lin_in_index {
         return Rewrite::None;
     }
@@ -110,6 +116,14 @@ pub fn safe_zone() -> (f64, f64) {
     (RECURRENCE_MAX_PHASE_STEP, RECURRENCE_MAX_PHASE)
 }
 
+/// **生成侧说明（本轮的真实边界）**：本原型**不生成源码文本**，宏层将来在做代码生成时只需：
+/// ① 调 [`plan`] 拿判定；② 走 `Rewrite::Recurrence` 时调用**库内已落地的**
+/// `laplace_batch_{f32,f64}_recurrence`（它内部就是**同源守卫 + 逐行回退 libm**）。
+/// 因此"生成 + 守卫 + 逐行回退"这条链路的**行为**已由库内入口 + 下面的测试覆盖；
+/// **尚未落地**的是"宏 crate 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]`"（见 `docs/dev.md` §9.5.2）。
+pub const GENERATION_VIA_LIBRARY_ENTRY: &str =
+    "recurrence 生成走 laplace_batch_*_recurrence（同源守卫 + 逐行回退）";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,7 +135,28 @@ mod tests {
             n: 1024,
             op,
             lin_in_index: lin,
+            fast_trig_opt_in: true,
         }
+    }
+
+    /// **未挂 `#[fast_trig]` ⇒ 完全不重写**（默认路径位精确/libm 不变）。
+    #[test]
+    fn no_opt_in_means_no_rewrite() {
+        let mut p = pat(StepKind::Literal(1.0 / 256.0), TrigOp::Exp, true);
+        p.fast_trig_opt_in = false;
+        assert_eq!(
+            plan(&p),
+            Rewrite::None,
+            "属性未挂时必须完全不重写（不许静默改写语义）"
+        );
+        // 反面：同一个 pattern 挂上属性 ⇒ 可改写（证明是"属性"在起作用，不是别的条件）
+        p.fast_trig_opt_in = true;
+        assert_eq!(
+            plan(&p),
+            Rewrite::Recurrence {
+                compile_time_safe: true
+            }
+        );
     }
 
     /// **正例**：等距字面量步长 + 索引线性 ⇒ 可改写，且编译期可判安全区。
@@ -196,5 +231,64 @@ mod tests {
         );
         assert!(!safe(200.0, 0.01, 512), "ω·Δt 超限应为 false");
         assert!(!safe(0.5, 0.01, 2_000_000), "相位总量超限应为 false");
+    }
+
+    /// **③ 生成链路的真实行为测试（`N=1024` 特化）**：
+    /// - **安全区内的 pattern**：重写路径（库内递推入口）与 libm 路径**容差内一致**；
+    /// - **超安全区的 pattern**：**逐行回退 libm** ⇒ 与 libm 路径**逐位一致**（
+    ///   这正是"守卫 + 回退"那条链路的验收）。
+    #[test]
+    fn generated_path_guard_and_fallback() {
+        const M: usize = 2;
+        const N: usize = 1024;
+        const NB: usize = 1;
+        let dt = 1.0 / 256.0;
+        let f = vec![1.0f64; N * NB];
+
+        // (a) 安全区内
+        let sig = [1.0f64, 2.0];
+        let om = [0.05f64, 0.10]; // ω·Δt = 1.95e-4 / 3.9e-4 ⇒ 安全
+        let p = KernelPattern {
+            base: 0.0,
+            step: StepKind::Literal(dt),
+            n: N,
+            op: TrigOp::Exp,
+            lin_in_index: true,
+            fast_trig_opt_in: true,
+        };
+        assert!(matches!(plan(&p), Rewrite::Recurrence { .. }));
+        assert!(safe(om[0], dt, N) && safe(om[1], dt, N));
+        let (rr, ri, all_safe) =
+            crate::laplace::laplace_batch_f64_recurrence::<M, N, NB>(&sig, &om, dt, &f);
+        assert!(all_safe, "安全区内 all_safe 应为 true");
+        let (br, bi) = crate::laplace::laplace_batch_f64::<M, N, NB>(&sig, &om, dt, &f);
+        let mut worst = 0.0f64;
+        for k in 0..M * NB {
+            worst = worst.max((rr[k] - br[k]).abs() / br[k].abs().max(1e-30));
+            worst = worst.max((ri[k] - bi[k]).abs() / bi[k].abs().max(1e-30));
+        }
+        assert!(
+            worst < 1e-9,
+            "安全区内递推 vs libm 应 <1e-9，实测 {worst:e}"
+        );
+
+        // (b) **超安全区**：ω·Δt = 2.0 > RECURRENCE_MAX_PHASE_STEP ⇒ 该行回退 libm
+        let om_big = [2.0 / dt, 0.05];
+        assert!(!safe(om_big[0], dt, N), "ω·Δt=2.0 应在安全区外");
+        let (r2, i2, safe2) =
+            crate::laplace::laplace_batch_f64_recurrence::<M, N, NB>(&sig, &om_big, dt, &f);
+        assert!(!safe2, "含超区行时 all_safe 应为 false");
+        let (b2r, b2i) = crate::laplace::laplace_batch_f64::<M, N, NB>(&sig, &om_big, dt, &f);
+        // **按行**：第 0 行超区 ⇒ 逐位回退 libm；第 1 行在安全区 ⇒ 允许舍入级差异
+        for b in 0..NB {
+            assert_eq!(
+                r2[b].to_bits(),
+                b2r[b].to_bits(),
+                "超区行应逐位回退到 libm（实部）"
+            );
+            assert_eq!(i2[b].to_bits(), b2i[b].to_bits(), "虚部");
+            let e = (r2[NB + b] - b2r[NB + b]).abs() / b2r[NB + b].abs().max(1e-30);
+            assert!(e < 1e-9, "安全行只允许舍入级差异，实测 {e:e}");
+        }
     }
 }
