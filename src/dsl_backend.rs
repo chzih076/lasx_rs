@@ -152,12 +152,22 @@ impl Backend for LasxBackend {
                 }
             } else {
                 rows_fallback += 1;
-                // 回退：与引擎默认路径**同一式子**（f32 libm 逐元素）
+                // 回退：与引擎默认路径**同一式子**（f32 libm 逐元素）。
+                // ⚠️ **与引擎同式（本轮修）**：引擎在 R17 把相位改成**约减到 `[−π,π]`**
+                // （`ω` 峰值可达数千 rad/s，f32 直接算 `ω·t` 自带 ~1e-4 绝对误差，见 `simd_dsl`
+                // 的 `performance.md §14.5/§14.6`）⇒ 这里**转调同一份判据/本体**，否则两档不同式，
+                // 且本档在 `opt_in = false` 或某行超安全区时会把那个误差带进核表。
+                let reduce = simd_dsl::criteria::safety::phase_reduction_needed(om, dt, n);
                 for i in 0..n {
                     let t = i as f32 * spec.dt;
                     let e = (-spec.sigma[j] * t).exp();
-                    kc[j * n + i] = e * (spec.omega[j] * t).cos();
-                    ks[j * n + i] = -(e * (spec.omega[j] * t).sin());
+                    let arg = if reduce {
+                        simd_dsl::criteria::safety::reduced_phase_f32(om, dt, i)
+                    } else {
+                        spec.omega[j] * t
+                    };
+                    kc[j * n + i] = e * arg.cos();
+                    ks[j * n + i] = -(e * arg.sin());
                 }
             }
         }
