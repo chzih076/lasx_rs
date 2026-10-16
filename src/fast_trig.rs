@@ -265,6 +265,68 @@ pub fn recurrence_rows_lasx(
     (kc, ks)
 }
 
+/// **(B') 惯用迭代器/定长数组 Rust 版（同算法、同序、无 intrinsic）**：
+/// 用 **`[f64; 4]` 定长数组 + 定长下标循环**表达"4 行锁步"（rustc/LLVM 对定长数组循环
+/// 通常能自动向量化成 `F64x4`）⇒ 这是"编译器最容易优化好的形状"的候选写法。
+///
+/// **与 (A) 同累加次序** ⇒ 期望**逐位一致**（Rust 默认不重结合、不自动 FMA 收缩）。
+pub fn recurrence_rows_iter(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    w: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    const R: usize = 4;
+    let m = sig.len();
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    let mut j = 0usize;
+    while j + R <= m {
+        // 定长数组（编译器知道长度 ⇒ 内层循环可向量化）
+        let mut decay = [0.0f64; R];
+        let mut c1 = [0.0f64; R];
+        let mut s1 = [0.0f64; R];
+        for l in 0..R {
+            decay[l] = (-sig[j + l] * dt).exp();
+            c1[l] = (om[j + l] * dt).cos();
+            s1[l] = (om[j + l] * dt).sin();
+        }
+        let mut e = [1.0f64; R];
+        let mut c = [1.0f64; R];
+        let mut s = [0.0f64; R];
+        for i in 0..n {
+            let wi = w[i] * dt;
+            for l in 0..R {
+                kc[(j + l) * n + i] = e[l] * c[l] * wi;
+                ks[(j + l) * n + i] = e[l] * s[l] * wi;
+            }
+            for l in 0..R {
+                e[l] *= decay[l];
+            }
+            for l in 0..R {
+                let (cc, ss) = (c[l], s[l]);
+                c[l] = cc * c1[l] - ss * s1[l];
+                s[l] = ss * c1[l] + cc * s1[l];
+            }
+        }
+        j += R;
+    }
+    for j2 in j..m {
+        let (r, s2) = recurrence_row(sig[j2], om[j2], dt, n, w);
+        kc[j2 * n..(j2 + 1) * n].copy_from_slice(&r);
+        ks[j2 * n..(j2 + 1) * n].copy_from_slice(&s2);
+    }
+    (kc, ks)
+}
+
+/// **(B') 惯用迭代器的组合步**（`out = a − b − c`；切片/迭代器链，无 intrinsic）。
+pub fn sub3_iter(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
+    out.iter_mut()
+        .zip(a.iter().zip(b.iter()).zip(c.iter()))
+        .for_each(|(o, ((&x, &y), &z))| *o = x - y - z);
+}
+
 /// **(B) 朴素标量 Rust 版：同算法、同序，无任何 intrinsic**（交给 LLVM `-O3` 自动向量化）。
 pub fn recurrence_rows_scalar(
     sig: &[f64],
@@ -303,6 +365,34 @@ mod recon {
         let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
         assert_eq!(bits(&ar), bits(&br), "手写 LASX vs 同序标量 实部不逐位");
         assert_eq!(bits(&ai), bits(&bi), "手写 LASX vs 同序标量 虚部不逐位");
+        // **(B') 惯用迭代器/定长数组**也必须在同序下逐位一致
+        let (cr2, ci2) = recurrence_rows_iter(&sig, &om, dt, n, &w);
+        assert_eq!(bits(&ar), bits(&cr2), "手写 LASX vs 惯用迭代器 实部不逐位");
+        assert_eq!(bits(&ai), bits(&ci2), "手写 LASX vs 惯用迭代器 虚部不逐位");
+        assert_eq!(bits(&br), bits(&cr2), "朴素标量 vs 惯用迭代器 不逐位");
+        // 组合步三变体（LASX / 朴素标量 / 惯用迭代器）逐位一致
+        let len = 4096usize;
+        let x: Vec<f32> = (0..len).map(|i| ((i % 17) as f32) * 0.125 - 1.0).collect();
+        let y: Vec<f32> = (0..len).map(|i| ((i % 13) as f32) * 0.0625 - 0.5).collect();
+        let z: Vec<f32> = (0..len).map(|i| ((i % 11) as f32) * 0.25 - 1.25).collect();
+        let (mut o_lasx, mut o_naive, mut o_iter) =
+            (vec![0.0f32; len], vec![0.0f32; len], vec![0.0f32; len]);
+        crate::ops::cmatmul::combine::sub3_f32(&x, &y, &z, &mut o_lasx);
+        for l in 0..len {
+            o_naive[l] = x[l] - y[l] - z[l];
+        }
+        sub3_iter(&x, &y, &z, &mut o_iter);
+        let bits32 = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(
+            bits32(&o_lasx),
+            bits32(&o_iter),
+            "组合步 LASX vs 迭代器 不逐位"
+        );
+        assert_eq!(
+            bits32(&o_naive),
+            bits32(&o_iter),
+            "组合步 朴素 vs 迭代器 不逐位"
+        );
     }
 
     /// **委派实验（同源交替 A/B，`#[ignore]`）**：核构造 (A) 手写 LASX / (B) 朴素标量 /
@@ -317,13 +407,13 @@ mod recon {
         let om: Vec<f64> = (0..m).map(|j| (j % 8) as f64 * 0.003).collect();
         let w = vec![1.0 / 3.0; n];
         // ---- 件 1：核构造（三路线）----
-        let mut rows1: Vec<(f64, f64, f64, i32, f64, String)> = Vec::new();
+        let mut rows1: Vec<(f64, f64, f64, f64, i32, f64, String)> = Vec::new();
         for pair in 0..6 {
-            let mut t = [0.0f64; 3];
+            let mut t = [0.0f64; 4];
             let mut iters = 0i32;
             let mut ms_max = 0.0f64;
-            for step in 0..3 {
-                let which = (pair + step) % 3;
+            for step in 0..4 {
+                let which = (pair + step) % 4;
                 let mut cnt = 0i32;
                 let mut mx = 0.0f64;
                 let t0 = Instant::now();
@@ -335,6 +425,10 @@ mod recon {
                         }
                         1 => {
                             std::hint::black_box(recurrence_rows_scalar(&sig, &om, dt, n, &w));
+                        }
+                        2 => {
+                            // **(B') 惯用迭代器/定长数组**
+                            std::hint::black_box(recurrence_rows_iter(&sig, &om, dt, n, &w));
                         }
                         _ => {
                             // (C) libm 基线（逐元素 exp/cos/sin）
@@ -359,40 +453,53 @@ mod recon {
                 .ok()
                 .and_then(|s| s.split_whitespace().next().map(str::to_owned))
                 .unwrap_or_default();
-            rows1.push((t[0], t[1], t[2], iters, ms_max * 1e3, l1));
+            rows1.push((t[0], t[1], t[2], t[3], iters, ms_max * 1e3, l1));
         }
-        let med = |rows: &Vec<(f64, f64, f64, i32, f64, String)>, i: usize| -> f64 {
+        let med = |rows: &Vec<(f64, f64, f64, f64, i32, f64, String)>, i: usize| -> f64 {
             let mut v: Vec<f64> = rows[1..]
                 .iter()
                 .map(|r| match i {
                     0 => r.0,
                     1 => r.1,
-                    _ => r.2,
+                    2 => r.2,
+                    _ => r.3,
                 })
                 .collect();
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
-        let (la, ls, lc) = (med(&rows1, 0), med(&rows1, 1), med(&rows1, 2));
+        let (la, ls, li, lc) = (
+            med(&rows1, 0),
+            med(&rows1, 1),
+            med(&rows1, 2),
+            med(&rows1, 3),
+        );
         for (i, r) in rows1.iter().enumerate() {
             println!(
-                "核 pair{} lasx={:.4}ms scalar={:.4}ms libm={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                "核 pair{} lasx={:.4}ms naive={:.4}ms iter={:.4}ms libm={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
                 i + 1,
                 r.0 * 1e3,
                 r.1 * 1e3,
                 r.2 * 1e3,
-                r.3,
+                r.3 * 1e3,
                 r.4,
                 r.5,
+                r.6,
                 if i == 0 { " (dropped)" } else { "" }
             );
         }
         println!(
-            "核构造中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms｜libm {:.4} ms ⇒ **(B)/(A) = {:.2}×**（标量/手写），(C)/(A) = {:.2}×",
+            "核构造中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms｜**惯用迭代器 {:.4} ms**｜libm {:.4} ms",
             la * 1e3,
             ls * 1e3,
-            lc * 1e3,
+            li * 1e3,
+            lc * 1e3
+        );
+        println!(
+            "⇒ **(B)/(A) = {:.2}×**，**(B')/(A) = {:.2}×**，委派到位率 (B') = **{:.0}%**，(C)/(A) = {:.2}×",
             ls / la,
+            li / la,
+            100.0 * la / li,
             lc / la
         );
         // ---- 件 2：组合步（LASX vs 朴素标量）----
@@ -403,26 +510,33 @@ mod recon {
         let z: Vec<f32> = (0..len).map(|i| ((i % 11) as f32) * 0.25 - 1.25).collect();
         let mut out = vec![0.0f32; len];
         let mut out_s = vec![0.0f32; len];
-        let mut rows2: Vec<(f64, f64, i32, f64, String)> = Vec::new();
+        let mut out_i = vec![0.0f32; len];
+        let mut rows2: Vec<(f64, f64, f64, i32, f64, String)> = Vec::new();
         for pair in 0..6 {
-            let mut t = [0.0f64; 2];
+            let mut t = [0.0f64; 3];
             let mut iters = 0i32;
             let mut ms_max = 0.0f64;
-            for step in 0..2 {
-                let which = (pair + step) % 2;
+            for step in 0..3 {
+                let which = (pair + step) % 3;
                 let mut cnt = 0i32;
                 let mut mx = 0.0f64;
                 let t0 = Instant::now();
                 while t0.elapsed().as_secs_f64() < 0.05 {
                     let t1 = Instant::now();
-                    if which == 0 {
-                        combine::sub3_f32(&x, &y, &z, &mut out);
-                    } else {
-                        // (B) 朴素标量同序
-                        for l in 0..len {
-                            out_s[l] = x[l] - y[l] - z[l];
+                    match which {
+                        0 => combine::sub3_f32(&x, &y, &z, &mut out),
+                        1 => {
+                            // (B) 朴素标量同序
+                            for l in 0..len {
+                                out_s[l] = x[l] - y[l] - z[l];
+                            }
+                            std::hint::black_box(&out_s);
                         }
-                        std::hint::black_box(&out_s);
+                        _ => {
+                            // **(B') 惯用迭代器**
+                            sub3_iter(&x, &y, &z, &mut out_i);
+                            std::hint::black_box(&out_i);
+                        }
                     }
                     let d = t1.elapsed().as_secs_f64();
                     if d > mx {
@@ -440,34 +554,45 @@ mod recon {
                 .ok()
                 .and_then(|s| s.split_whitespace().next().map(str::to_owned))
                 .unwrap_or_default();
-            rows2.push((t[0], t[1], iters, ms_max, l1));
+            rows2.push((t[0], t[1], t[2], iters, ms_max, l1));
         }
         let med2 = |i: usize| -> f64 {
             let mut v: Vec<f64> = rows2[1..]
                 .iter()
-                .map(|r| if i == 0 { r.0 } else { r.1 })
+                .map(|r| match i {
+                    0 => r.0,
+                    1 => r.1,
+                    _ => r.2,
+                })
                 .collect();
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
-        let (ca, cs) = (med2(0), med2(1));
+        let (ca, cs, ci) = (med2(0), med2(1), med2(2));
         for (i, r) in rows2.iter().enumerate() {
             println!(
-                "组合 pair{} lasx={:.4}ms scalar={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                "组合 pair{} lasx={:.4}ms naive={:.4}ms iter={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
                 i + 1,
                 r.0 * 1e3,
                 r.1 * 1e3,
-                r.2,
+                r.2 * 1e3,
                 r.3,
                 r.4,
+                r.5,
                 if i == 0 { " (dropped)" } else { "" }
             );
         }
         println!(
-            "组合步中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms ⇒ **(B)/(A) = {:.2}×**",
+            "组合步中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms｜**惯用迭代器 {:.4} ms**",
             ca * 1e3,
             cs * 1e3,
-            cs / ca
+            ci * 1e3
+        );
+        println!(
+            "⇒ **(B)/(A) = {:.2}×**，**(B')/(A) = {:.2}×**，委派到位率 (B') = **{:.0}%**",
+            cs / ca,
+            ci / ca,
+            100.0 * ca / ci
         );
     }
 
