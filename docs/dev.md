@@ -276,8 +276,8 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**304 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
-`cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
+当前核心规模：**305 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+`cargo test --workspace --release` 另含 **8 个宏测试**（6 单测 + 2 直通集成测试）+ 19 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
 与总数分开维护：
@@ -450,7 +450,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 304 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 305 个单元测试（+ 8 个宏测试 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

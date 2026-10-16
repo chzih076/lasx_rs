@@ -959,6 +959,19 @@ pub fn gemv(input: TokenStream) -> TokenStream {
     vec::expand_gemv(input)
 }
 
+/// **`#[fast_trig]`：占位属性，当前是"无操作直通"**。
+///
+/// **现状（2026-10-16）**：**原样返回 `item`**，不做任何解析/降级/发射 ⇒ **语义逐字不变**。
+/// **为什么先立槽位**：战略调整 —— **"识别模式"难、"命名内建"便宜** ⇒ 快速超越函数的正式入口将改为
+/// **库侧类型化内建**（形状进类型、用户点名调用、库内 `rewrite::plan()` + `recurrence_safe` 自动选
+/// libm/递推）。**本属性降级为将来的糖（可选），不是前置条件。**
+///
+/// **明确不做**（留待将来）：属性参数解析、表达式形状识别、描述符发射、接重写路径。
+#[proc_macro_attribute]
+pub fn fast_trig(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

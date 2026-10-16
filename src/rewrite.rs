@@ -233,6 +233,73 @@ mod tests {
         assert!(!safe(0.5, 0.01, 2_000_000), "相位总量超限应为 false");
     }
 
+    /// **对齐用例矩阵（"判据唯一在库内"的锚点）**：把将来**宏降级出的描述符**会覆盖的用例
+    /// 全部直接喂 [`plan()`]/[`safe()`]，逐例钉住结论。
+    ///
+    /// **正例**：字面量等距（`N=8/64`）；**负例**：`RuntimeConst`/`Varies`、非线性参数；
+    /// **边界**：`N` 非 32 倍（`N=1/31/33`）、极小 `N`。**每一例都断言结论**，
+    /// 并断言 `safe()` 与库内 [`recurrence_safe`] **同源**（逐例相等）。
+    #[test]
+    fn alignment_case_matrix_for_descriptor_lowering() {
+        // (step, n, lin, opt_in, 期望是否可改写)
+        let cases: &[(StepKind, usize, bool, bool, bool)] = &[
+            // 正例：字面量等距
+            (StepKind::Literal(1.0 / 256.0), 8, true, true, true),
+            (StepKind::Literal(1.0 / 256.0), 64, true, true, true),
+            // 边界：N 非 32 倍 / 极小 N
+            (StepKind::Literal(1.0 / 256.0), 1, true, true, true),
+            (StepKind::Literal(1.0 / 256.0), 31, true, true, true),
+            (StepKind::Literal(1.0 / 256.0), 33, true, true, true),
+            // 负例：非常量步长
+            (StepKind::RuntimeConst, 64, true, true, true), // 可改写，但须运行期检查
+            (StepKind::Varies, 64, true, true, false),      // **完全不改写**
+            // 负例：非线性参数
+            (StepKind::Literal(0.01), 64, false, true, false),
+            // 负例：未 opt-in（属性未挂的等价物）
+            (StepKind::Literal(0.01), 64, true, false, false),
+            (StepKind::Varies, 64, false, false, false),
+        ];
+        for &(step, n, lin, opt_in, should_rewrite) in cases {
+            let p = KernelPattern {
+                base: 0.0,
+                step,
+                n,
+                op: TrigOp::Exp,
+                lin_in_index: lin,
+                fast_trig_opt_in: opt_in,
+            };
+            let got = plan(&p);
+            let is_rec = matches!(got, Rewrite::Recurrence { .. });
+            assert_eq!(
+                is_rec, should_rewrite,
+                "用例 {step:?}/N={n}/lin={lin}/opt_in={opt_in} 结论不符：{got:?}"
+            );
+            // 运行期常量档必须是"可改写但需运行期检查"
+            if step == StepKind::RuntimeConst && lin && opt_in {
+                assert_eq!(
+                    got,
+                    Rewrite::Recurrence {
+                        compile_time_safe: false
+                    }
+                );
+            }
+        }
+        // **安全区判定与库内同源**：同一批 (ω, dt, N) 上 `safe()` 与 `recurrence_safe()` 逐例相等
+        for &(om, dt, n) in &[
+            (0.0f64, 1.0 / 256.0, 8usize),
+            (0.5, 1.0 / 256.0, 64),
+            (0.5, 1.0 / 256.0, 1),
+            (2.0 / 256.0, 1.0 / 256.0, 31), // ω·Δt = 2.0 > 1.5 ⇒ 不安全
+            (0.5, 1.0 / 256.0, 2_000_000),  // 相位总量超限 ⇒ 不安全
+        ] {
+            assert_eq!(
+                safe(om, dt, n),
+                recurrence_safe(om, dt, n),
+                "safe() 必须与库内 recurrence_safe() 同源：om={om} dt={dt} n={n}"
+            );
+        }
+    }
+
     /// **③ 生成链路的真实行为测试（`N=1024` 特化）**：
     /// - **安全区内的 pattern**：重写路径（库内递推入口）与 libm 路径**容差内一致**；
     /// - **超安全区的 pattern**：**逐行回退 libm** ⇒ 与 libm 路径**逐位一致**（
