@@ -103,7 +103,6 @@ impl Backend for LasxBackend {
             return Err(len_err("build_kernel_f32", "omega", rows, spec.omega.len()));
         }
         let dt = spec.dt as f64;
-        let w = crate::laplace::trapezoid_weights(n);
         let mut rows_fallback = 0usize;
         let mut all_safe = true;
         for j in 0..rows {
@@ -114,21 +113,28 @@ impl Backend for LasxBackend {
             if !safe {
                 all_safe = false;
             }
+            // **权重约定 = 引擎约定**（③b-2 选 (b)）：`kc = e^{−σt}·cos(ωt)`、`ks = −e^{−σt}·sin(ωt)`
+            // —— **无权重、无 `dt` 因子**，与 `simd_dsl::kernel::build` 的默认路径**同式**。
             if spec.opt_in && safe {
-                // 递推（库内已落地实现）
-                let (rk, rs) = crate::fast_trig::recurrence_row(sg, om, dt, n, &w);
+                // 等距递推（行内）：`e *= e^{−σΔt}`、`(c,s)` 旋转
+                let (decay, c1, s1) = ((-sg * dt).exp(), (om * dt).cos(), (om * dt).sin());
+                let (mut e, mut c, mut s) = (1.0f64, 1.0f64, 0.0f64);
                 for i in 0..n {
-                    kc[j * n + i] = rk[i] as f32;
-                    ks[j * n + i] = rs[i] as f32;
+                    kc[j * n + i] = (e * c) as f32;
+                    ks[j * n + i] = (-e * s) as f32;
+                    e *= decay;
+                    let (nc, ns) = (c * c1 - s * s1, s * c1 + c * s1);
+                    c = nc;
+                    s = ns;
                 }
             } else {
                 rows_fallback += 1;
-                // 回退：libm 逐元素（与 `simd_dsl` 默认实现同一式子）
+                // 回退：与引擎默认路径**同一式子**（f32 libm 逐元素）
                 for i in 0..n {
-                    let t = i as f64 * dt;
-                    let e = (-sg * t).exp() * w[i] * dt;
-                    kc[j * n + i] = (e * (om * t).cos()) as f32;
-                    ks[j * n + i] = (e * (om * t).sin()) as f32;
+                    let t = i as f32 * spec.dt;
+                    let e = (-spec.sigma[j] * t).exp();
+                    kc[j * n + i] = e * (spec.omega[j] * t).cos();
+                    ks[j * n + i] = -(e * (spec.omega[j] * t).sin());
                 }
             }
         }
@@ -153,14 +159,16 @@ impl Backend for LasxBackend {
                 "参照物 = lasx_rs::api（同一 LASX 内核）",
             )),
             // **③b-1：递推路径 = 容差类 + 界**（与 `guard_of(IsometricRecurrence)` 的"逐行回退"一致）
+            // **参照物写准**：相对的是**引擎默认路径**（`simd_dsl::kernel::build` 的 libm 口径），
+            // 因为覆盖版按**引擎权重约定**实现（③b-2 选 (b)：`kc=e^{−σt}cos`、`ks=−e^{−σt}sin`，无权重无 dt）。
             (EnginePath::IsometricRecurrence, ScalarKind::F32) => Some(PrecisionClaim::tolerance(
                 ErrorBound::rel(1e-4),
-                "等距递推核（相对 libm 路径）；守卫 = simd_dsl::safety::recurrence_safe，超界逐行回退",
+                "等距递推核，参照物 = 引擎默认路径（simd_dsl::kernel::build）；守卫 = simd_dsl::safety::recurrence_safe，超界逐行回退",
                 Fallback::PerRowDefault,
             )),
             (EnginePath::IsometricRecurrence, ScalarKind::F64) => Some(PrecisionClaim::tolerance(
                 ErrorBound::masked_rel(5.5e-14),
-                "等距递推核（掩码相对 libm 路径）；守卫 = simd_dsl::safety::recurrence_safe，超界逐行回退",
+                "等距递推核（掩码相对），参照物 = 引擎默认路径（simd_dsl::kernel::build）；守卫 = simd_dsl::safety::recurrence_safe，超界逐行回退",
                 Fallback::PerRowDefault,
             )),
             _ => None,
@@ -243,18 +251,22 @@ mod tests {
             worst < 1e-3,
             "安全行的递推应与 libm 落在容差内，实测 {worst:e}"
         );
-        // ④b **跨库约定差异如实记录**（不当作失败）：`simd_dsl` 默认实现用自己的权重约定，
-        //     与 `lasx_rs` 的梯形权重不同 ⇒ 两者**不应**逐值一致。这里只打印差值，作为"约定不同"的证据。
+        // ④b **等价性断言（③b-2 的 ①）**：覆盖版（全回退档）与**引擎默认路径**
+        //     （`ScalarBackend::build_kernel_f32`）必须落在同一条**容差**内（**不断言逐位**）。
         let mut kc_sd = vec![0.0f32; rows * n];
         let mut ks_sd = vec![0.0f32; rows * n];
         let _ = simd_dsl::mock::ScalarBackend.build_kernel_f32(&spec_off, &mut kc_sd, &mut ks_sd);
-        let mut cross = 0.0f32;
+        let (mut cross, mut peak) = (0.0f32, 0.0f32);
         for l in 0..rows * n {
-            cross = cross.max((kc_fb[l] - kc_sd[l]).abs() / kc_sd[l].abs().max(1e-30));
+            peak = peak.max(kc_sd[l].abs()).max(ks_sd[l].abs());
+            cross = cross.max((kc_fb[l] - kc_sd[l]).abs());
+            cross = cross.max((ks_fb[l] - ks_sd[l]).abs());
         }
-        println!(
-            "⚠️ 跨库约定差异（lasx_rs 梯形权重 vs simd_dsl 默认权重）：最大相对差 {cross:.3e} \
-             ⇒ **不要求逐值一致**，此处只记录、不断言"
+        let rel = cross / peak.max(1e-30);
+        println!("覆盖版（全回退）vs 引擎默认路径：最大绝对差 {cross:.3e}，相对峰值 {rel:.3e}");
+        assert!(
+            rel < 1e-4,
+            "覆盖版必须与引擎默认路径在容差内等价（③b-2 的①），实测相对 {rel:e}"
         );
     }
 
