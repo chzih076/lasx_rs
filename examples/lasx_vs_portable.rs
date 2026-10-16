@@ -460,6 +460,143 @@ fn main() {
         );
     }
 
+    // ---------------- ⑥ DSL 转发开销（R7-B）：DSL 宏路径 vs **直接调内核** ----------------
+    {
+        use lasx_rs::api;
+        use simd_dsl::{dot, matmul};
+        // 宏的第一个参数必须是**后端变量**（不能写 `&lasx`）
+        let dsl = &lasx;
+
+        println!(
+            "\n== ⑥ DSL 转发开销（R7-B）：① `matmul!`/`dot!` 宏路径走 `LasxBackend` vs ② 直接调 `lasx_rs::api` 内核 =="
+        );
+        println!(
+            "   口径同 §5；**正确性在计时之外断言**（参照物 = ② 直接内核；`dsl_backend` 文档称两者逐位一致）"
+        );
+
+        // ---- ② matmul：小/大两形状 ----
+        let mats2: Vec<(usize, usize, usize)> = if smoke {
+            vec![(16, 16, 16)]
+        } else {
+            vec![(64, 64, 64), (192, 768, 3072)]
+        };
+        for (m, kk, n) in mats2 {
+            let a = vec_of(m * kk, 3);
+            let b = vec_of(kk * n, 5);
+            let (r, c, kx) = (m, n, kk);
+
+            // 正确性：① 宏路径 vs ② 直接内核
+            let mut w_dsl = vec![0.0f32; m * n];
+            {
+                let mut o = &mut w_dsl;
+                matmul!(dsl; o[r, c] = a[r, kx] * b[kx, c]).unwrap();
+            }
+            let mut w_direct = vec![0.0f32; m * n];
+            api::matmul_into(m, kk, n, &a, &b, &mut w_direct).unwrap();
+            println!(
+                "{}",
+                class_line(
+                    &format!("⑥ matmul {m}×{kk}×{n}"),
+                    "① DSL 宏路径",
+                    &w_dsl,
+                    &w_direct,
+                    "② 直接内核 `api::matmul_into`"
+                )
+            );
+
+            let (p2, i2) = if smoke || m * kk * n > 100_000_000 {
+                (3u32, 1u32)
+            } else {
+                (pairs, iters)
+            };
+            let shared = RefCell::new(vec![0.0f32; m * n]);
+            let mut arms: Vec<Arm<'_>> = vec![
+                (
+                    "① DSL 宏路径",
+                    "`matmul!` → `LasxBackend::matmul_f32`",
+                    Box::new(|| {
+                        let mut guard = shared.borrow_mut();
+                        let mut o = &mut *guard;
+                        matmul!(dsl; o[r, c] = a[r, kx] * b[kx, c]).unwrap();
+                    }),
+                ),
+                (
+                    "② 直接内核",
+                    "`lasx_rs::api::matmul_into`（不经 DSL）",
+                    Box::new(|| {
+                        let mut guard = shared.borrow_mut();
+                        api::matmul_into(m, kk, n, &a, &b, &mut guard).unwrap();
+                    }),
+                ),
+            ];
+            run_workload(
+                "⑥ DSL 转发开销 matmul",
+                &format!("{m}×{kk}×{n}"),
+                &mut arms,
+                p2,
+                i2,
+                smoke,
+            );
+        }
+
+        // ---- ② 点积：两个长度 ----
+        for kk in if smoke {
+            vec![256usize]
+        } else {
+            vec![1024, 65536]
+        } {
+            let x = vec_of(kk, 1);
+            let y = vec_of(kk, 7);
+            let kx = kk;
+            let d_dsl = dot!(dsl; x[kx] * y[kx]).unwrap();
+            let d_direct = api::dot(&x, &y).unwrap();
+            println!(
+                "{}",
+                class_line(
+                    &format!("⑥ dot K={kk}"),
+                    "① DSL 宏路径",
+                    &[d_dsl],
+                    &[d_direct],
+                    "② 直接内核 `api::dot`"
+                )
+            );
+
+            let shared = RefCell::new(0.0f32);
+            let mut arms: Vec<Arm<'_>> = vec![
+                (
+                    "① DSL 宏路径",
+                    "`dot!` → `LasxBackend::dot_f32`",
+                    Box::new(|| {
+                        let mut s = shared.borrow_mut();
+                        *s = dot!(dsl; x[kx] * y[kx]).unwrap();
+                    }),
+                ),
+                (
+                    "② 直接内核",
+                    "`lasx_rs::api::dot`（不经 DSL）",
+                    Box::new(|| {
+                        let mut s = shared.borrow_mut();
+                        *s = api::dot(&x, &y).unwrap();
+                    }),
+                ),
+            ];
+            run_workload(
+                "⑥ DSL 转发开销 dot",
+                &format!("K={kk}"),
+                &mut arms,
+                pairs,
+                iters,
+                smoke,
+            );
+        }
+
+        println!(
+            "   ⚠️ **轴归约（rows）没有 ② 对应物**：`lasx_rs` 侧没有原生 rows 归约内核、\
+             `LasxBackend` 也未覆盖该入口（R6-B-3 实测 Lasx ≡ Idiomatic）⇒ 该负载上\
+             \"DSL 转发开销\"**未定义**（不是 0）。"
+        );
+    }
+
     println!(
         "\n== 装置只出数，不做结论性断言；三档归因与**负结果**（手写 SIMD 在哪些形状不快）见 `docs/dev.md` 的新小节。=="
     );
