@@ -177,10 +177,299 @@ pub fn table_row(sig: f64, om: f64, dt: f64, n: usize, w: &[f64]) -> (Vec<f64>, 
     (kc, ks)
 }
 
+/// **(A) 手写 LASX 版：4 行锁步递推**（`f64`，`F64x4`；行间并行、行内递推）。
+///
+/// 与 [`recurrence_rows_scalar`] **同累加次序**（每行都是 `e *= decay` 再旋转），
+/// 只是 4 行一起算 ⇒ 用于回答"LLVM 自动向量化能吃到手写的百分之多少"。
+pub fn recurrence_rows_lasx(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    w: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::arch::lasx;
+    use std::arch::loongarch64::*;
+    let m = sig.len();
+    assert_eq!(om.len(), m);
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    let mut j = 0usize;
+    while j + 4 <= m {
+        let decay = [
+            (-sig[j] * dt).exp(),
+            (-sig[j + 1] * dt).exp(),
+            (-sig[j + 2] * dt).exp(),
+            (-sig[j + 3] * dt).exp(),
+        ];
+        let c1 = [
+            (om[j] * dt).cos(),
+            (om[j + 1] * dt).cos(),
+            (om[j + 2] * dt).cos(),
+            (om[j + 3] * dt).cos(),
+        ];
+        let s1 = [
+            (om[j] * dt).sin(),
+            (om[j + 1] * dt).sin(),
+            (om[j + 2] * dt).sin(),
+            (om[j + 3] * dt).sin(),
+        ];
+        // SAFETY: 都是栈上 4 元素数组；`load_f64x4` 只需 4 个可读元素。
+        let (vdecay, vc1, vs1) = unsafe {
+            (
+                lasx::load_f64x4(decay.as_ptr()),
+                lasx::load_f64x4(c1.as_ptr()),
+                lasx::load_f64x4(s1.as_ptr()),
+            )
+        };
+        let one = lasx::splat_f64(1.0);
+        let (mut ve, mut vc, mut vs) = (one, one, lasx::splat_f64(0.0));
+        let mut tmp = vec![0.0f64; 4];
+        for i in 0..n {
+            let vw = lasx::splat_f64(w[i] * dt);
+            // SAFETY: 纯逐元素向量运算 + 4 元素可写槽（与标量版同式同序）。
+            unsafe {
+                let b = lasx_xvfmul_d(lasx_xvfmul_d(ve, vc), vw);
+                lasx::store_f64x4(tmp.as_mut_ptr(), b);
+            }
+            for l in 0..4 {
+                kc[(j + l) * n + i] = tmp[l];
+            }
+            // SAFETY: 同上。
+            unsafe {
+                let b = lasx_xvfmul_d(lasx_xvfmul_d(ve, vs), vw);
+                lasx::store_f64x4(tmp.as_mut_ptr(), b);
+            }
+            for l in 0..4 {
+                ks[(j + l) * n + i] = tmp[l];
+            }
+            // SAFETY: 同上的逐元素运算；次序与标量版一致。
+            unsafe {
+                ve = lasx_xvfmul_d(ve, vdecay);
+                let t1 = lasx_xvfmul_d(vc, vc1);
+                let t2 = lasx_xvfmul_d(vs, vs1);
+                let t3 = lasx_xvfmul_d(vs, vc1);
+                let t4 = lasx_xvfmul_d(vc, vs1);
+                vc = lasx_xvfsub_d(t1, t2);
+                vs = lasx_xvfadd_d(t3, t4);
+            }
+        }
+        j += 4;
+    }
+    while j < m {
+        let (r, s) = recurrence_row(sig[j], om[j], dt, n, w);
+        kc[j * n..(j + 1) * n].copy_from_slice(&r);
+        ks[j * n..(j + 1) * n].copy_from_slice(&s);
+        j += 1;
+    }
+    (kc, ks)
+}
+
+/// **(B) 朴素标量 Rust 版：同算法、同序，无任何 intrinsic**（交给 LLVM `-O3` 自动向量化）。
+pub fn recurrence_rows_scalar(
+    sig: &[f64],
+    om: &[f64],
+    dt: f64,
+    n: usize,
+    w: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let m = sig.len();
+    let mut kc = vec![0.0f64; m * n];
+    let mut ks = vec![0.0f64; m * n];
+    for j in 0..m {
+        let (r, s) = recurrence_row(sig[j], om[j], dt, n, w);
+        kc[j * n..(j + 1) * n].copy_from_slice(&r);
+        ks[j * n..(j + 1) * n].copy_from_slice(&s);
+    }
+    (kc, ks)
+}
+
 #[cfg(test)]
 mod recon {
     use super::*;
     use std::time::Instant;
+
+    /// **LLVM 委派实验：逐位一致性**——(A) 手写 LASX 4 行锁步 vs (B) 同序朴素标量，
+    /// 结果必须**逐位一致**（Rust 不开 fast-math ⇒ 不重结合、不做 FMA 收缩）。
+    #[test]
+    fn lasx_vs_scalar_bitwise_same_order() {
+        let (m, n) = (8usize, 1024usize);
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..m).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..m).map(|j| (j % 8) as f64 * 0.003).collect();
+        let w = vec![1.0 / 3.0; n];
+        let (ar, ai) = recurrence_rows_lasx(&sig, &om, dt, n, &w);
+        let (br, bi) = recurrence_rows_scalar(&sig, &om, dt, n, &w);
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&ar), bits(&br), "手写 LASX vs 同序标量 实部不逐位");
+        assert_eq!(bits(&ai), bits(&bi), "手写 LASX vs 同序标量 虚部不逐位");
+    }
+
+    /// **委派实验（同源交替 A/B，`#[ignore]`）**：核构造 (A) 手写 LASX / (B) 朴素标量 /
+    /// (C) libm 基线；组合步 (A) 手写 LASX / (B) 朴素标量。
+    #[test]
+    #[ignore = "委派实验：手写 LASX vs 朴素标量 vs libm"]
+    fn diag_delegate_to_llvm() {
+        use std::time::Instant;
+        let (m, n) = (64usize, 1024usize);
+        let dt = 1.0 / 256.0;
+        let sig: Vec<f64> = (0..m).map(|j| 0.5 + 0.05 * j as f64).collect();
+        let om: Vec<f64> = (0..m).map(|j| (j % 8) as f64 * 0.003).collect();
+        let w = vec![1.0 / 3.0; n];
+        // ---- 件 1：核构造（三路线）----
+        let mut rows1: Vec<(f64, f64, f64, i32, f64, String)> = Vec::new();
+        for pair in 0..6 {
+            let mut t = [0.0f64; 3];
+            let mut iters = 0i32;
+            let mut ms_max = 0.0f64;
+            for step in 0..3 {
+                let which = (pair + step) % 3;
+                let mut cnt = 0i32;
+                let mut mx = 0.0f64;
+                let t0 = Instant::now();
+                while t0.elapsed().as_secs_f64() < 0.05 {
+                    let t1 = Instant::now();
+                    match which {
+                        0 => {
+                            std::hint::black_box(recurrence_rows_lasx(&sig, &om, dt, n, &w));
+                        }
+                        1 => {
+                            std::hint::black_box(recurrence_rows_scalar(&sig, &om, dt, n, &w));
+                        }
+                        _ => {
+                            // (C) libm 基线（逐元素 exp/cos/sin）
+                            for j in 0..m {
+                                std::hint::black_box(baseline_row(sig[j], om[j], dt, n, &w));
+                            }
+                        }
+                    }
+                    let d = t1.elapsed().as_secs_f64();
+                    if d > mx {
+                        mx = d;
+                    }
+                    cnt += 1;
+                }
+                t[which] = t0.elapsed().as_secs_f64() / cnt.max(1) as f64;
+                iters = cnt;
+                if mx > ms_max {
+                    ms_max = mx;
+                }
+            }
+            let l1 = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+                .unwrap_or_default();
+            rows1.push((t[0], t[1], t[2], iters, ms_max * 1e3, l1));
+        }
+        let med = |rows: &Vec<(f64, f64, f64, i32, f64, String)>, i: usize| -> f64 {
+            let mut v: Vec<f64> = rows[1..]
+                .iter()
+                .map(|r| match i {
+                    0 => r.0,
+                    1 => r.1,
+                    _ => r.2,
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (la, ls, lc) = (med(&rows1, 0), med(&rows1, 1), med(&rows1, 2));
+        for (i, r) in rows1.iter().enumerate() {
+            println!(
+                "核 pair{} lasx={:.4}ms scalar={:.4}ms libm={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                i + 1,
+                r.0 * 1e3,
+                r.1 * 1e3,
+                r.2 * 1e3,
+                r.3,
+                r.4,
+                r.5,
+                if i == 0 { " (dropped)" } else { "" }
+            );
+        }
+        println!(
+            "核构造中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms｜libm {:.4} ms ⇒ **(B)/(A) = {:.2}×**（标量/手写），(C)/(A) = {:.2}×",
+            la * 1e3,
+            ls * 1e3,
+            lc * 1e3,
+            ls / la,
+            lc / la
+        );
+        // ---- 件 2：组合步（LASX vs 朴素标量）----
+        use crate::ops::cmatmul::combine;
+        let len = 192 * 3072;
+        let x: Vec<f32> = (0..len).map(|i| ((i % 17) as f32) * 0.125 - 1.0).collect();
+        let y: Vec<f32> = (0..len).map(|i| ((i % 13) as f32) * 0.0625 - 0.5).collect();
+        let z: Vec<f32> = (0..len).map(|i| ((i % 11) as f32) * 0.25 - 1.25).collect();
+        let mut out = vec![0.0f32; len];
+        let mut out_s = vec![0.0f32; len];
+        let mut rows2: Vec<(f64, f64, i32, f64, String)> = Vec::new();
+        for pair in 0..6 {
+            let mut t = [0.0f64; 2];
+            let mut iters = 0i32;
+            let mut ms_max = 0.0f64;
+            for step in 0..2 {
+                let which = (pair + step) % 2;
+                let mut cnt = 0i32;
+                let mut mx = 0.0f64;
+                let t0 = Instant::now();
+                while t0.elapsed().as_secs_f64() < 0.05 {
+                    let t1 = Instant::now();
+                    if which == 0 {
+                        combine::sub3_f32(&x, &y, &z, &mut out);
+                    } else {
+                        // (B) 朴素标量同序
+                        for l in 0..len {
+                            out_s[l] = x[l] - y[l] - z[l];
+                        }
+                        std::hint::black_box(&out_s);
+                    }
+                    let d = t1.elapsed().as_secs_f64();
+                    if d > mx {
+                        mx = d;
+                    }
+                    cnt += 1;
+                }
+                t[which] = t0.elapsed().as_secs_f64() / cnt.max(1) as f64;
+                iters = cnt;
+                if mx > ms_max {
+                    ms_max = mx;
+                }
+            }
+            let l1 = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+                .unwrap_or_default();
+            rows2.push((t[0], t[1], iters, ms_max, l1));
+        }
+        let med2 = |i: usize| -> f64 {
+            let mut v: Vec<f64> = rows2[1..]
+                .iter()
+                .map(|r| if i == 0 { r.0 } else { r.1 })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (ca, cs) = (med2(0), med2(1));
+        for (i, r) in rows2.iter().enumerate() {
+            println!(
+                "组合 pair{} lasx={:.4}ms scalar={:.4}ms iters={} ms_max={:.3} loadavg={}{}",
+                i + 1,
+                r.0 * 1e3,
+                r.1 * 1e3,
+                r.2,
+                r.3,
+                r.4,
+                if i == 0 { " (dropped)" } else { "" }
+            );
+        }
+        println!(
+            "组合步中位：手写 LASX {:.4} ms｜朴素标量 {:.4} ms ⇒ **(B)/(A) = {:.2}×**",
+            ca * 1e3,
+            cs * 1e3,
+            cs / ca
+        );
+    }
 
     /// 表大小与缓存占用（字节）。
     #[test]

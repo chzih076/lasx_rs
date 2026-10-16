@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**298 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**300 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 6 个宏单测 + 18 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -356,6 +356,11 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
   诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
   入口/判据/例外清单见 `docs/ops.md` §9.10.1。
+- **委派 LLVM 实验 2 个**（`src/fast_trig.rs::recon`，2026-10-16 加）：
+  `lasx_vs_scalar_bitwise_same_order`（**手写 LASX 4 行锁步 vs 同序朴素标量 ⇒ 逐位一致**，
+  `to_bits()` 全等 ⇒ "不开 fast-math 不重结合/FMA 收缩"的实测锚点）、
+  诊断 `#[ignore]` `diag_delegate_to_llvm`（**(B)/(A)：核 6.00×、组合 3.19×** ⇒ LLVM 只吃到
+  17%/31%）。架构结论见 `docs/dev.md` §9.5.3。
 - **超越函数 recon 4 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**原型、opt-in、不改默认**）：
   `table_size_report`（共享表 **129 项 × 16 B = 2064 B**）、`accuracy_vs_libm`（(b) 表+多项式
   绝对 2.37e-10 / 掩码相对 1.39e-6 / f32 ULP 16；**(c) 等距递推 1.36e-17 / 5.47e-14 / ULP 0**）、
@@ -435,7 +440,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 298 个单元测试（+ 6 个宏单测 + 19 个文档测试）
+cargo test --workspace --release        # 300 个单元测试（+ 6 个宏单测 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -3194,6 +3199,35 @@ let x: Ranged<f32, -4, 4, 1e-6> = /* … */;
 2. **"同一份 DSL 公式两种编译"的 A/B** —— **未测**（因为①未做）。
    可给的**同源实测**是库内 opt-in 入口的 A/B（`docs/ops.md` §9.10.1：小 NB −43.5%、大 NB −59.0%），
    它与宏层改写**会生成同一条路径**，**但不是**宏层两种编译的实测 ⇒ **不许当成交付数字**。
+
+#### 9.5.3 "委派给 LLVM"的收益缺口（2026-10-16 第三轮，**实验**）
+
+**架构前提（用户澄清）**：DSL 是 **LLVM 的宏观优化前端**——我们做**结构/数学重写与检查**，
+**微观优化交给 LLVM**（Halide/TVM/XLA 一路）。本实验回答：**微观到底能委派多少**。
+
+**两件各测（同源交替 6 对丢首对，`M=64, N=1024`；A=手写 LASX、B=朴素标量（release `-O3`、
+无 intrinsic、无 fast-math）、C=libm 基线）**
+
+| 件 | (A) 手写 LASX | (B) 朴素标量 | (C) libm | **(B)/(A)** | 委派到位率 |
+|---|---|---|---|---|---|
+| **核构造**（4 行锁步递推） | **0.1387 ms** | 0.8316 ms | 1.9517 ms | **6.00×** | **≈17%** |
+| **组合步**（`a−b−c`, 192×3072） | **0.2776 ms** | 0.8857 ms | — | **3.19×** | **≈31%** |
+
+（`iters` 361/181、`ms_max` 2.639/0.001 ms、loadavg 4.76。）
+
+**② 逐位一致性（关键，关系到硬承诺）**：**(A) 与 (B) 在"同累加次序"下逐位一致** ✓
+—— 测试 `lasx_vs_scalar_bitwise_same_order`（核：`to_bits()` 全等）、B0 的
+`combine_bit_exact_vs_scalar`（组合：`n=1..40` 全扫、三种运算全等）。
+⇒ **结论句（可引用）**：**不开 fast-math 时，Rust/LLVM 不重结合、不做 FMA 收缩
+⇒ 手写向量版与朴素标量版在"同序"下逐位一致 ⇒ 位精确硬承诺在"宏观前端 + LLVM"架构下守得住**
+（`#[target_feature]`/自动向量化只改**并行度**，不改**每个归约的次序**）。
+
+**③ 架构结论（量化）**：**差得远（核 6.00×、组合 3.19×）** ⇒ **不能指望 LLVM 自动向量化替代手写内核**；
+**我们的 LASX 内核定位 = "降级目标库"**（DSL 重写后发出对这些原语的调用）。
+**但差距的成因值得记**：核构造的朴素标量版**每行有串行依赖**（`e *= decay`、旋转递推），
+LLVM 无法自行证明"行间独立"⇒ 不会做**行锁步**交错；而**手写版正是靠"4 行锁步"拿到 SIMD**。
+⇒ **"行锁步/交错"这种"结构重写"恰恰是 DSL 前端该做、且 LLVM 做不了的事**：
+架构应是 **"宏观结构重写 + 调用手写原语"**，而不是"重写后就撒手交给 LLVM"。
 
 ---
 
