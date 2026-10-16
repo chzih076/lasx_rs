@@ -23,6 +23,101 @@ use simd_dsl::mock::ScalarBackend;
 const ROWS: usize = 64;
 const N: usize = 1024;
 
+/// **本地"惯用 Rust（自动向量化）"档**（③b-3b）。
+///
+/// **为什么是本地副本**：`simd_dsl::IdiomaticBackend` **尚未作为库内公开类型导出**
+/// （实测远端 HEAD 仍 `fc57fc7`；该类型目前只定义在 `simd_dsl/examples/dsl_efficiency.rs` 内）。
+/// **待库导出后替换为 `use simd_dsl::IdiomaticBackend;`——不要让它变成第二份长期实现。**
+///
+/// 与参考实现同精神：**不用 intrinsic、不写 `unsafe`**，只有纯 Rust 循环（交给 LLVM 自动向量化）；
+/// `build_kernel_f32` 用**行内等距递推**（与 `LasxBackend` 同算法、同引擎权重约定），
+/// 守卫同样**只调** `simd_dsl::safety::recurrence_safe`。
+struct IdiomaticBackend;
+
+impl Backend for IdiomaticBackend {
+    fn name(&self) -> &'static str {
+        "idiomatic(local)"
+    }
+
+    fn matmul_f32(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), simd_dsl::backend::BackendError> {
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for l in 0..k {
+                    s += a[i * k + l] * b[l * n + j];
+                }
+                out[i * n + j] = s;
+            }
+        }
+        Ok(())
+    }
+
+    fn dot_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, simd_dsl::backend::BackendError> {
+        let mut s = 0.0f32;
+        for l in 0..a.len() {
+            s += a[l] * b[l];
+        }
+        Ok(s)
+    }
+
+    fn build_kernel_f32(
+        &self,
+        spec: &KernelSpec<'_>,
+        kc: &mut [f32],
+        ks: &mut [f32],
+    ) -> Result<simd_dsl::kernel::KernelReport, simd_dsl::backend::BackendError> {
+        use simd_dsl::route::{FallbackReport, Route};
+        let (rows, n) = (spec.rows, spec.n);
+        let dt = spec.dt as f64;
+        let (mut rows_fallback, mut all_safe) = (0usize, true);
+        for j in 0..rows {
+            let (om, sg) = (spec.omega[j] as f64, spec.sigma[j] as f64);
+            let safe = simd_dsl::safety::recurrence_safe(om, dt, n); // 同源守卫
+            if !safe {
+                all_safe = false;
+            }
+            if spec.opt_in && safe {
+                let (decay, c1, s1) = ((-sg * dt).exp(), (om * dt).cos(), (om * dt).sin());
+                let (mut e, mut c, mut s) = (1.0f64, 1.0f64, 0.0f64);
+                for i in 0..n {
+                    kc[j * n + i] = (e * c) as f32;
+                    ks[j * n + i] = (-e * s) as f32;
+                    e *= decay;
+                    let (nc, ns) = (c * c1 - s * s1, s * c1 + c * s1);
+                    c = nc;
+                    s = ns;
+                }
+            } else {
+                rows_fallback += 1;
+                for i in 0..n {
+                    let t = i as f32 * spec.dt;
+                    let e = (-spec.sigma[j] * t).exp();
+                    kc[j * n + i] = e * (spec.omega[j] * t).cos();
+                    ks[j * n + i] = -(e * (spec.omega[j] * t).sin());
+                }
+            }
+        }
+        let route = if rows_fallback == rows {
+            Route::Default
+        } else {
+            Route::Recurrence
+        };
+        Ok(simd_dsl::kernel::KernelReport::new(
+            FallbackReport::new(route, rows_fallback),
+            all_safe,
+            rows,
+        ))
+    }
+}
+
 fn loadavg() -> f64 {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
@@ -203,8 +298,67 @@ fn main() {
         "  ⇒ Scalar/Lasx = **{:.3}×**（>1 表示手写多买到）",
         s_med / l_med
     );
+
+    // ============ ③b-3b 第三臂：惯用 Rust（自动向量化）—— 三臂同口径 ============
+    let idio = IdiomaticBackend;
+    let mut i_ms = Vec::new();
+    let (mut i_max, mut i_it) = (0.0f64, 0u32);
+    let mut l2_ms = Vec::new();
+    let (mut l2_max, mut l2_it) = (0.0f64, 0u32);
+    for pair in 0..6 {
+        let first_is_idio = pair % 2 == 0;
+        let order = if first_is_idio { [0usize, 1] } else { [1, 0] };
+        for which in order {
+            let mut d = dest.borrow_mut();
+            let (kc, ks) = &mut *d;
+            let (mean, mx, it) = if which == 0 {
+                measure(
+                    || {
+                        idio.build_kernel_f32(&spec_rec, kc, ks).unwrap();
+                    },
+                    0.05,
+                )
+            } else {
+                measure(
+                    || {
+                        lasx.build_kernel_f32(&spec_rec, kc, ks).unwrap();
+                    },
+                    0.05,
+                )
+            };
+            if which == 0 {
+                i_ms.push(mean);
+                i_max = i_max.max(mx);
+                i_it = i_it.max(it);
+            } else {
+                l2_ms.push(mean);
+                l2_max = l2_max.max(mx);
+                l2_it = l2_it.max(it);
+            }
+        }
+    }
+    let (i_med, i_rng) = median_range(&i_ms[2..]);
+    let (l2_med, l2_rng) = median_range(&l2_ms[2..]);
+    println!("\n== ③b-3b 三臂（同一 `build_kernel_f32` 请求、同一对 kc/ks 缓冲）==");
     println!(
-        "\n注：`simd_dsl` 的 `IdiomaticBackend` **未导出**（定义在它的 example 内）⇒ 本 example **只用 ScalarBackend**；\n\
-         等它提升为库内公开类型后，再补『惯用 Rust』那一档（③b-3b）。"
+        "  LasxBackend（手写 LASX 通路的递推核） {l2_med:.4} ms  极差 {l2_rng:.4}  ms_max {l2_max:.3}  iters {l2_it}  等价类 {}",
+        class_of(&lasx, EnginePath::IsometricRecurrence)
+    );
+    println!(
+        "  惯用 Rust（本地副本，自动向量化）  {i_med:.4} ms  极差 {i_rng:.4}  ms_max {i_max:.3}  iters {i_it}  等价类 {}",
+        class_of(&idio, EnginePath::IsometricRecurrence)
+    );
+    println!(
+        "  ScalarBackend（笨标量）            {s_med:.4} ms  极差 {s_rng:.4}  ms_max {s_max:.3}  iters {s_it}  等价类 {}",
+        class_of(&scalar, EnginePath::Default)
+    );
+    println!(
+        "  ⇒ 惯用/Lasx = **{:.3}×**（>1 ⇒ 手写领先；≈1 ⇒ 持平）｜惯用/Scalar = **{:.3}×**",
+        i_med / l2_med,
+        i_med / s_med
+    );
+    println!(
+        "\n注：`simd_dsl::IdiomaticBackend` **未导出**（实测远端 HEAD `fc57fc7`，该类型只在它的 example 内）\n\
+         ⇒ 本例的『惯用 Rust』档是**本地副本**，**待库导出后替换**，不作为第二份长期实现。"
     );
 }
