@@ -15,10 +15,29 @@
 //!
 //! # `Capability` **只低估**
 //! 只报"确实为真"的能力位；拿不准的一律不报。
+//!
+//! # 留档结论（③b-4）：`CallOpts{threads}` **未接 —— 原因是接口/工作量，不是能力问题**
+//!
+//! **依据（真实签名）**：lasx_rs **有**多线程设施，`src/parallel.rs`：
+//! ```text
+//! pub fn matmul_f32(pool: &WorkerPool, m, k, n, a: &mut [f32], b: &[f32], c: &mut [f32]) -> Result<(), Error>
+//! //   内部：let pick = crate::pool::pick_rows(m, pool.threads(), 4);
+//! ```
+//! ⇒ **"按线程数挑行块"这件事在本库做得到**，所以**不是能力问题**。**未接的两条具体约束**：
+//! 1. **入口不匹配**：`parallel::matmul_f32` **不接受已打包的 `PackedB`**（它自己打包），
+//!    与"预打包复用"不是同一条入口 ⇒ 要接 `CallOpts` 必须**新增"已打包面板 + 线程挑行块"的组合入口**
+//!    （工作量，且要同时动并行层与打包层的接口）；
+//! 2. **池的所有权**：`Backend: Send + Sync` ⇒ 后端要持 `WorkerPool` 就得先定**池的共享/生命周期**
+//!    方案（静态池 vs 每调用建池）——这是**接口设计问题**，不是"写不出来"。
+//!
+//! **语义澄清**：`simd_dsl` 的 `CallOpts` 明确只是**意图**、不是保证（其默认实现里就是 `let _ = opts;`）
+//! ⇒ 即便将来接上，也只能声明"**尽量按意图**"，不能声明"保证 N 线程"。
+//! **当前状态**：**未接、未测**（本后端单线程）。
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use simd_dsl::backend::{Backend, BackendError, Capability};
 use simd_dsl::equivalence::{EnginePath, ErrorBound, Fallback, PrecisionClaim, ScalarKind};
+use simd_dsl::packed::PackedB;
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
 #[derive(Debug, Default, Clone, Copy)]
@@ -175,11 +194,101 @@ impl Backend for LasxBackend {
         }
     }
 
+    /// **`pack_f32`：走现有打包设施（`ops::matmul::pack_b`），blob 自带列尾。**
+    ///
+    /// **blob 布局**（本后端自定义；`blob` 只给产出它的后端解析）：
+    /// ```text
+    /// [0, k·n32·4)                    ：主 strips 的打包面板（`pack_b(k, n, 0, n32, b, …)` 的原始字节）
+    ///                                    布局 = `packed[(s*k + p)*32 + r]`，`s` 为 32 列宽的条带
+    /// [k·n32·4, (k·n32 + k·ntail)·4)  ：列尾 `n%32` 的**紧凑行主序**副本（每行 `ntail` 个 f32）
+    /// ```
+    /// 其中 `n32 = n/32*32`、`ntail = n - n32` ⇒ **`blob.len() == k*n*4`**（自洽测试钉住）。
+    /// **为什么尾列要进 blob**：`matmul_f32_packed` 的入参里**没有 `b`**，尾列数据必须随 blob 携带，
+    /// 否则尾列无从计算（列尾将用紧凑缓冲喂 `row_tail_range_f32`，`n = ntail, j0 = 0, j1 = ntail`）。
+    fn pack_f32(&self, k: usize, n: usize, b: &[f32]) -> Result<PackedB, BackendError> {
+        let expected = k.checked_mul(n).ok_or(BackendError::ShapeOverflow {
+            op: "pack_f32",
+            what: "k×n",
+        })?;
+        if b.len() != expected {
+            return Err(len_err("pack_f32", "b", expected, b.len()));
+        }
+        let n32 = n / 32 * 32;
+        let ntail = n - n32;
+        // 主 strips：整段一次 `pack_b`（`nc = n32` ⇒ 条带连续排布）
+        let mut packed = vec![0.0f32; k * n32];
+        if n32 > 0 {
+            crate::ops::matmul::pack_b(k, n, 0, n32, b, &mut packed);
+        }
+        // 列尾：紧凑行主序
+        let mut tail = vec![0.0f32; k * ntail];
+        for p in 0..k {
+            for t in 0..ntail {
+                tail[p * ntail + t] = b[p * n + n32 + t];
+            }
+        }
+        // 拼字节（`f32` → little-endian 字节；本机为小端，`to_le_bytes` 保证可移植）
+        let mut blob = Vec::with_capacity(expected * 4);
+        for v in packed.iter().chain(tail.iter()) {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        debug_assert_eq!(blob.len(), expected * 4);
+        Ok(PackedB::new(self.backend_tag(), k, n, blob))
+    }
+
     /// **只低估**：③a 只覆盖了 f32 的 `matmul_f32`/`dot_f32`，**没有** f64/逐元素/归约/超越/打包/
     /// 多线程/复数组合步的专用实现 ⇒ **所有 `Capability` 一律 `false`**（"只报确实为真"）。
+    ///
+    /// **注意（③b-4 进度）**：`pack_f32` 已实现，但 **`matmul_f32_packed` 尚未实现**、
+    /// **逐位断言尚未通过** ⇒ **`Capability::Packing` 仍不放**（只低估）。
     fn supports(&self, _cap: Capability) -> bool {
         false
     }
+}
+
+/// **③b-4 自洽测试**：blob 布局（长度 = `k*n*4`、主 strips 与列尾可定位）、`PackedB` 形状一致、
+/// 非法长度**返回 `LengthMismatch` 不 panic**。
+#[test]
+fn pack_f32_blob_layout_is_self_consistent() {
+    let be = LasxBackend;
+    let (k, n) = (4usize, 100usize); // n32 = 96, ntail = 4 ⇒ 两个分支都覆盖
+    let b: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 - 5.0).collect();
+    let p = be.pack_f32(k, n, &b).expect("pack");
+    assert_eq!(p.shape(), (k, n), "PackedB 形状应与请求一致");
+    assert_eq!(p.backend_tag(), be.backend_tag(), "标签应为本后端");
+    assert_eq!(p.blob().len(), k * n * 4, "blob 长度应为 k*n*4");
+    // 主 strips：`blob[(s*k + p)*32 + r]` == `b[p*n + s*32 + r]`
+    let f32_at = |off: usize| {
+        let mut w = [0u8; 4];
+        w.copy_from_slice(&p.blob()[off..off + 4]);
+        f32::from_le_bytes(w)
+    };
+    let (n32, ntail) = (96usize, 4usize);
+    for s in 0..n32 / 32 {
+        for row in 0..k {
+            for r in 0..32 {
+                let got = f32_at(((s * k + row) * 32 + r) * 4);
+                assert_eq!(
+                    got,
+                    b[row * n + s * 32 + r],
+                    "主 strips 布局不符 s={s} row={row} r={r}"
+                );
+            }
+        }
+    }
+    // 列尾：紧凑行主序，起点 = k*n32*4
+    let tail_off = k * n32 * 4;
+    for row in 0..k {
+        for t in 0..ntail {
+            let got = f32_at(tail_off + (row * ntail + t) * 4);
+            assert_eq!(got, b[row * n + n32 + t], "列尾布局不符 row={row} t={t}");
+        }
+    }
+    // n 是 32 的倍数 ⇒ 无尾列
+    let p2 = be.pack_f32(2, 64, &vec![1.0f32; 128]).expect("pack");
+    assert_eq!(p2.blob().len(), 2 * 64 * 4);
+    // 非法长度 ⇒ LengthMismatch（不 panic）
+    assert!(be.pack_f32(2, 3, &[0.0f32; 5]).is_err());
 }
 
 #[cfg(test)]
