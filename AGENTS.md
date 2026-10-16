@@ -356,3 +356,19 @@ heredoc 占位"）。**教训重复第 13 次那条**：需要占位就用 shell
   `read`/`edit`/`write`；随后自报并记录 ⇒ **记录不加辩解。**
   **值得记的一点**：这是本项目**第一次由主代理在"任务口径"里已经反复强调黑名单之后**仍然踩到，
   且发生在**已经连续多轮零违规**之后 ⇒ 说明"知道规则"依然不能替代"敲之前扫一眼"。
+
+## 12. 第 39 条（**不是黑名单违规，是验证纪律**；`simd_dsl` R2c-2a 那一轮，主代理侧）
+
+- **事实**：`simd_dsl` 提交 `9bb2a38`（`UnaryOp::Rcp` + 显式广播）**推上去红了**（run `1792151635`，
+  红在 `Clippy (zero warnings guard)`）：`map_binary_rows_f32` 里 `for r in 0..rows { let wv = w[r]; … }`
+  触发 **`clippy::needless_range_loop`**；已由 `5a585af` 修正（改 `w.iter().enumerate()`）⇒ CI 回绿。
+- **根因不是那条 lint，而是"假验证"**：推之前我跑过本地 clippy，输出里是
+  `could not compile simd_dsl (lib)`——**当时 `macros/src/lib.rs` 正被另一条任务改到半途**，
+  workspace clippy 根本没走到我的代码。我把"**没跑成功**"当成了"**通过**"。
+- **判据（写进习惯）**：门禁命令必须确认**跑完且到达本次改动**（全量通过，或至少看到
+  `Checking simd_dsl` 之后无 `error`）。**"编译不过所以跳过"不能充当通过**；
+  被别人的在写文件挡住时，用 **`/tmp` 的干净 worktree** 在 `HEAD + 自己的 diff` 上跑全部门禁
+  （同一轮 `docs-ops` 就是这么做的，做法是对的），或**明确报告"该门禁本轮未验证"**——
+  **不能默默当作已过**。
+- **影响**：一个红 run（已修正前滚，未 amend/强推）；其余门禁（fmt/test/rustdoc/namecheck/portcheck/
+  opcheck/layercheck）当时确实是绿。**记录不加辩解。**
