@@ -15,11 +15,8 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use lasx_rs::dsl_backend::LasxBackend;
-use simd_dsl::IdiomaticBackend;
-use simd_dsl::backend::Backend;
-use simd_dsl::equivalence::{EnginePath, ScalarKind};
-use simd_dsl::kernel::KernelSpec;
-use simd_dsl::mock::ScalarBackend;
+// **bump 修法（R6-B-2）**：`simd_dsl` 分层重构后旧的平铺模块路径已不存在，各面在 **crate 根**再导出。
+use simd_dsl::{Backend, EnginePath, IdiomaticBackend, KernelSpec, ScalarBackend, ScalarKind};
 
 const ROWS: usize = 64;
 const N: usize = 1024;
