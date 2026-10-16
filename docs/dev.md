@@ -2935,7 +2935,7 @@ cargo run --release --features dsl-backend --example lasx_vs_portable -- --smoke
 （少往返 2.1–2.2×、后端向量化 1.1–6.6×）；本节量的是**同一批 DSL 调用换后端**的收益。
 两者结论一致：**收益来自"实现档 + 少往返"，不来自"DSL 比手写聪明"**。
 
-**§7.13.1 R7-B：DSL 转发开销实测（`loadavg = 3.26 3.41 3.22`；pairs 5 / iters 4；同缓冲、交替、丢首对）**
+#### 7.13.1 R7-B：DSL 转发开销实测（`loadavg = 3.26 3.41 3.22`；pairs 5 / iters 4；同缓冲、交替、丢首对）
 
 臂定义：**①** `matmul!`/`dot!` **宏路径**走 `LasxBackend`（= 消费者实际写法）vs **②** 直接调
 `lasx_rs::api::{matmul_into, dot}`（**不经 DSL**，同目的缓冲）。装置：`examples/lasx_vs_portable.rs`
