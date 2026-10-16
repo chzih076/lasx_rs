@@ -302,6 +302,33 @@ pub(crate) fn group(delim: Delimiter, inner: TokenStream) -> TokenTree {
     TokenTree::Group(Group::new(delim, inner))
 }
 
+/// `::`：第一个 `:` 必须是 `Joint`，否则 rustc 读到的是两个独立冒号（踩过：报
+/// `expected expression, found ':'`）。
+pub(crate) fn colon2() -> [TokenTree; 2] {
+    [
+        TokenTree::Punct(Punct::new(':', Spacing::Joint)),
+        TokenTree::Punct(Punct::new(':', Spacing::Alone)),
+    ]
+}
+
+/// `lasx_rs::seg1::seg2…`（**绝对路径**：生成代码不依赖用户 `use` 了什么）。
+///
+/// 生成代码卫生的统一口径：`dot!`/`gemv!` 从落地起就走它，`matmul!` 现在是同一条
+/// （此前发的是裸类型名 `Mat`/`MatBuf`…，要求调用方自己 `use lasx_rs::shape::…`）。
+///
+/// 前提是调用方作用域里能解析 `lasx_rs`：对下游 crate 天然成立（宏就是从 `lasx_rs` 取的）；
+/// 对**本 crate 自身**由 `src/lib.rs` 的 `extern crate self as lasx_rs;` 提供
+/// （crate 不能用自己的名字当路径根，而 `src/laplace.rs`/`src/ilaplace.rs` 里就有 `matmul!`）。
+pub(crate) fn path_of(segments: &[&str]) -> TokenStream {
+    let mut ts = TokenStream::new();
+    ts.extend([id("lasx_rs")]);
+    for s in segments {
+        ts.extend(colon2());
+        ts.extend([id(s)]);
+    }
+    ts
+}
+
 /// `compile_error!("…")`，**所有 token 的 Span 都设成 `span`**。
 ///
 /// 只给字符串字面量设 Span 是不够的：rustc 把 `compile_error!` 的诊断定位在它自己那次
@@ -361,7 +388,10 @@ fn lifetime_underscore() -> TokenStream {
     ts
 }
 
-/// `let _: &Ty<'_, _, {K}, {N}> = &x;`（元素类型用 `_` 推；用户 token 的 Span 保留）。
+/// `let _: &lasx_rs::shape::Ty<'_, _, {K}, {N}> = &x;`（元素类型用 `_` 推；用户 token 的 Span 保留）。
+///
+/// 类型走**绝对路径**（[`path_of`]）：与 `dot!`/`gemv!` 同一条卫生口径，调用方不必
+/// `use lasx_rs::shape::…`。crate 自身的使用由 `src/lib.rs` 的 `extern crate self as lasx_rs;` 兜住。
 ///
 /// `view` 为真表示该类型带生命周期参数（`Mat`/`MatDyn`），此时泛型表是 `'_, _, 常量…`；
 /// 否则是 `_, 常量…`（`MatBuf`/`MatBufDyn`）。顺序错了就会得到 E0747。
@@ -376,8 +406,8 @@ fn annotate(ty: &str, view: bool, consts: Vec<TokenTree>, value: &Ident) -> Toke
         generics.extend([p(',')]);
         generics.extend([c]);
     }
-    let mut ty_ts = TokenStream::new();
-    ty_ts.extend([id(ty), p('<')]);
+    let mut ty_ts = path_of(&["shape", ty]);
+    ty_ts.extend([p('<')]);
     ty_ts.extend(generics);
     ty_ts.extend([p('>')]);
     let mut ts = TokenStream::new();

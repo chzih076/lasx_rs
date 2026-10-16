@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**307 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**308 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 **8 个宏测试**（6 单测 + 2 直通集成测试）+ 19 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -306,6 +306,10 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
   `lasx_matmul` 逐位一致（1/0 线程都覆盖）、`_checked` 状态码与"失败不触碰输出"、
   **`prepare`/`run` 不建池**（线程本地建池计数，契约证据；**不是**数 `/proc/self/task`——
   那种写法在并行测试框架下 flaky，CI run 1792063289 就是这么红的）。
+- `matmul`/`matmul_f64` 的 `_into` 孪生 1 个（DSL 整顿 slice 1，`src/api.rs`）：脏缓冲 `NaN` 起步 ⇒
+  与分配版**逐位一致**（同时证明"整块覆盖、无旧值泄漏"）、f32 侧与 `matmul_scaled_into(1,0)` 同源、
+  **`k = 0`** 整块写 `+0.0`（脏缓冲实测，锁住内核行为而不是靠零初始化）、空形状与
+  `a`/`b`/`out` 三条 `Error::Shape`。
 - 诊断/口径 1 个（`#[ignore]`）：`parallel::diag_pool_vs_plan`——**同进程交替**对照"池 vs 计划"
   两条并行驱动（跨台架公平性要求里新增的那一条就是靠它落地的）；默认不跑，按需
   `cargo test --release -p lasx_rs --lib diag_pool_vs_plan -- --ignored --nocapture`。
@@ -455,7 +459,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 307 个单元测试（+ 8 个宏测试 + 19 个文档测试）
+cargo test --workspace --release        # 308 个单元测试（+ 8 个宏测试 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）

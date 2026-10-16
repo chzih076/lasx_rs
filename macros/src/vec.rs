@@ -43,7 +43,7 @@
 
 use proc_macro::{Delimiter, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 
-use crate::{Diagnostic, Kind, amp, const_arg, group, id, method, p};
+use crate::{Diagnostic, Kind, amp, const_arg, group, id, method, p, path_of};
 
 /* ==================== 纯规则层（可单测） ==================== */
 
@@ -452,26 +452,6 @@ fn stream_of(tt: TokenTree) -> TokenStream {
     let mut ts = TokenStream::new();
     ts.extend([tt]);
     ts
-}
-
-/// `lasx_rs::seg1::seg2…`（绝对路径：生成代码不依赖用户 `use` 了什么）。
-fn path_of(segments: &[&str]) -> TokenStream {
-    let mut ts = TokenStream::new();
-    ts.extend([id("lasx_rs")]);
-    for s in segments {
-        ts.extend(colon2());
-        ts.extend([id(s)]);
-    }
-    ts
-}
-
-/// `::`：第一个 `:` 必须是 `Joint`，否则 rustc 读到的是两个独立冒号（踩过：报
-/// `expected expression, found ':'`）。
-fn colon2() -> [TokenTree; 2] {
-    [
-        TokenTree::Punct(Punct::new(':', Spacing::Joint)),
-        TokenTree::Punct(Punct::new(':', Spacing::Alone)),
-    ]
 }
 
 /* ------------------------------ 类型标注 ------------------------------ */

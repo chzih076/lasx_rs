@@ -97,6 +97,16 @@ compile_error!(
      否则 x86/arm 上的 CI 会停在这一行（有意为之）。"
 );
 
+// **crate 自身的名字别名**：`lasx_rs_macros` 生成的代码一律走**绝对路径**
+// （`lasx_rs::shape::{Mat, MatBuf, MatDyn, MatBufDyn}`、`lasx_rs::shape::vec::dot_of`），
+// 这样调用方不必 `use` 任何类型。但 Rust 里 crate **不能用自己的名字当路径根**
+// （实测 `selfpath::…` ⇒ E0433），而本 crate 自己就是这些宏的消费者
+// （`src/laplace.rs`、`src/ilaplace.rs` 里有 `matmul!`）⇒ 需要这条**私有**别名，
+// 让生成代码里的 `lasx_rs::…` 在 crate 内部也可解析。
+//
+// 私有（无 `pub`）⇒ **对外不可见**，不改任何公开签名/行为，也不进产物符号表。
+extern crate self as lasx_rs;
+
 pub mod aligned;
 pub mod api;
 pub mod arch;

@@ -972,6 +972,53 @@ pub fn matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Alig
     Ok(c)
 }
 
+/// [`matmul`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须 `m × n`）。
+///
+/// 与 [`matmul`] **逐位一致**（同一条内核、同一套长度校验）：分配版每次调用都要
+/// `AlignedVec::new`（分配 **+ 清零**），逐层/逐帧反复算 `A·B` 时把这笔开销省掉。
+/// 这也是 [`matmul_scaled_into`] 在 `alpha = 1, beta = 0` 时走的那条路径（收尾 `Epi::Plain`），
+/// 所以三个入口（`matmul` / 本函数 / `matmul_scaled_into(1, 0)`）的数值完全同源。
+///
+/// 输出**整块被覆盖**，`out` 里的旧值不影响结果：`k = 0` 时 `C` 是零矩阵，内核会把 `m×n`
+/// 个元素全部写成 `+0.0`（实测，含流式与列块两条路径；`beta = 0` 不读旧值）。
+///
+/// # Errors
+/// - `a`/`b` 长度不等于 `m×k`/`k×n`（[`Error::Shape`]）；
+/// - `out.len() != m × n`（[`Error::Shape`]，`what = "out"`）；
+/// - `m×k`、`k×n` 或 `m×n` 溢出 `usize`（[`Error::Overflow`]）。
+pub fn matmul_into(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    expect_len(
+        "matmul_into",
+        "a",
+        a.len(),
+        checked_mul("matmul_into", "m×k", m, k)?,
+    )?;
+    expect_len(
+        "matmul_into",
+        "b",
+        b.len(),
+        checked_mul("matmul_into", "k×n", k, n)?,
+    )?;
+    expect_len(
+        "matmul_into",
+        "out",
+        out.len(),
+        checked_mul("matmul_into", "m×n", m, n)?,
+    )?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    crate::ops::matmul::matmul_f32(m, k, n, a, b, out);
+    Ok(())
+}
+
 /// 强制走"打包 B 面板"路径的 [`matmul`]（小 m、大 n 或大 k 时更快）。
 ///
 /// 与 [`matmul`] **逐位一致**（每个输出元素的累加次序相同）。`matmul` 会按形状自动
@@ -1096,6 +1143,49 @@ pub fn matmul_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64]) -> Result<
     let mut c = AlignedVec::<f64>::new(checked_mul("matmul_f64", "m×n", m, n)?);
     crate::ops::matmul_f64::matmul_f64(m, k, n, a, b, c.as_mut_slice());
     Ok(c)
+}
+
+/// [`matmul_f64`] 的**免分配**版本：结果写进调用方给的 `out`（长度必须 `m × n`）。
+///
+/// 与 [`matmul_f64`] **逐位一致**（同一条内核、同一套长度校验）；理由与 [`matmul_into`] 相同
+/// （省掉 `AlignedVec::new` 的分配 **+ 清零**）。输出同样**整块被覆盖**：`k = 0` 时 `C` 是零矩阵，
+/// 内核把 `m×n` 个元素全部写成 `+0.0`。
+///
+/// # Errors
+/// - `a`/`b` 长度不等于 `m×k`/`k×n`（[`Error::Shape`]）；
+/// - `out.len() != m × n`（[`Error::Shape`]，`what = "out"`）；
+/// - `m×k`、`k×n` 或 `m×n` 溢出 `usize`（[`Error::Overflow`]）。
+pub fn matmul_f64_into(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f64],
+    b: &[f64],
+    out: &mut [f64],
+) -> Result<()> {
+    expect_len(
+        "matmul_f64_into",
+        "a",
+        a.len(),
+        checked_mul("matmul_f64_into", "m×k", m, k)?,
+    )?;
+    expect_len(
+        "matmul_f64_into",
+        "b",
+        b.len(),
+        checked_mul("matmul_f64_into", "k×n", k, n)?,
+    )?;
+    expect_len(
+        "matmul_f64_into",
+        "out",
+        out.len(),
+        checked_mul("matmul_f64_into", "m×n", m, n)?,
+    )?;
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    crate::ops::matmul_f64::matmul_f64(m, k, n, a, b, out);
+    Ok(())
 }
 
 /* ==================== 批量几何 ==================== */
@@ -3287,6 +3377,119 @@ mod tests {
         ));
         // 空形状不 panic、也不写
         assert!(matmul_scaled_into(0, 3, 4, 1.5, 0.5, &[], &b, &mut []).is_ok());
+    }
+
+    /// `matmul_into` / `matmul_f64_into` 的**免分配**孪生：位精确（对分配版，`to_bits()`）+ 契约。
+    ///
+    /// ① **逐位一致**：`out` 先填成 `NaN`，结果必须与分配版逐位相同 ⇒ 同时证明"整块被覆盖、
+    ///    没有旧值/NaN 泄漏"；
+    /// ② f32 侧与 `matmul_scaled_into(.., 1.0, 0.0, ..)` 同源（它就是 `Epi::Plain` 那条内核）；
+    /// ③ **`k = 0`**：`C` 是零矩阵，脏缓冲上必须得到 `+0.0`——这条锁住"内核对 `k = 0` 会整块写"，
+    ///    否则分配版只是被 `AlignedVec::new` 的零初始化掩盖（实测覆盖流式与列块两条路径）；
+    /// ④ 空形状（`m = 0` 或 `n = 0`）：`Ok`（输出长度本来就是 0）；
+    /// ⑤ `a`/`b`/`out` 长度不对各报一次 `Error::Shape`。
+    ///
+    /// 形状与 `test_matmul_scaled_into_bit_exact_and_contract` 同一组：打包（单 k 块）、
+    /// 列块（极宽 n）、打包 + k 分块（`k > 384`）、行/列尾，外加一个 `k = 0`。
+    #[test]
+    fn test_matmul_into_matches_allocating_bit_for_bit() {
+        use crate::ops::testutil::Lcg;
+        let mut rng = Lcg(0x1a2b_3c4d);
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (5, 7, 40),
+            (6, 0, 40),
+            (32, 64, 96),
+            (33, 65, 31),
+            (100, 64, 4096),
+            (100, 448, 1024),
+        ] {
+            let a32: Vec<f32> = (0..m * k).map(|_| rng.f64() as f32).collect();
+            let b32: Vec<f32> = (0..k * n).map(|_| rng.f64() as f32).collect();
+            let want32 = matmul(m, k, n, &a32, &b32).unwrap();
+            let mut got32 = vec![f32::NAN; m * n];
+            matmul_into(m, k, n, &a32, &b32, &mut got32).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    got32[i].to_bits(),
+                    want32[i].to_bits(),
+                    "f32 {m}×{k}×{n} @ {i}: matmul_into 与 matmul 不逐位一致"
+                );
+            }
+            if k == 0 {
+                assert!(
+                    got32.iter().all(|v| v.to_bits() == 0.0f32.to_bits()),
+                    "f32 {m}×0×{n}: k = 0 必须整块写成 +0.0（脏缓冲上出现了旧值/NaN）"
+                );
+            }
+            // ② 与 alpha = 1, beta = 0 的融合入口同源
+            let mut s32 = vec![f32::NAN; m * n];
+            matmul_scaled_into(m, k, n, 1.0, 0.0, &a32, &b32, &mut s32).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    got32[i].to_bits(),
+                    s32[i].to_bits(),
+                    "f32 {m}×{k}×{n} @ {i}: matmul_into 与 matmul_scaled_into(1,0) 不一致"
+                );
+            }
+
+            let a64: Vec<f64> = (0..m * k).map(|_| rng.f64()).collect();
+            let b64: Vec<f64> = (0..k * n).map(|_| rng.f64()).collect();
+            let want64 = matmul_f64(m, k, n, &a64, &b64).unwrap();
+            let mut got64 = vec![f64::NAN; m * n];
+            matmul_f64_into(m, k, n, &a64, &b64, &mut got64).unwrap();
+            for i in 0..m * n {
+                assert_eq!(
+                    got64[i].to_bits(),
+                    want64[i].to_bits(),
+                    "f64 {m}×{k}×{n} @ {i}: matmul_f64_into 与 matmul_f64 不逐位一致"
+                );
+            }
+            if k == 0 {
+                assert!(
+                    got64.iter().all(|v| v.to_bits() == 0.0f64.to_bits()),
+                    "f64 {m}×0×{n}: k = 0 必须整块写成 +0.0（脏缓冲上出现了旧值/NaN）"
+                );
+            }
+        }
+
+        // ④ 空形状：Ok（输出长度 0，不触碰任何元素）
+        assert!(matmul_into(0, 3, 4, &[], &[0.0; 12], &mut []).is_ok());
+        assert!(matmul_into(2, 3, 0, &[0.0; 6], &[], &mut []).is_ok());
+        assert!(matmul_f64_into(0, 3, 4, &[], &[0.0; 12], &mut []).is_ok());
+        assert!(matmul_f64_into(2, 3, 0, &[0.0; 6], &[], &mut []).is_ok());
+
+        // ⑤ 错误路径：a / b / out 各一条（f32 与 f64）
+        let a32 = vec![0f32; 6];
+        let b32 = vec![0f32; 12];
+        let mut out32 = vec![0f32; 8];
+        assert!(matches!(
+            matmul_into(2, 3, 4, &a32[..5], &b32, &mut out32),
+            Err(Error::Shape { what: "a", .. })
+        ));
+        assert!(matches!(
+            matmul_into(2, 3, 4, &a32, &b32[..11], &mut out32),
+            Err(Error::Shape { what: "b", .. })
+        ));
+        assert!(matches!(
+            matmul_into(2, 3, 4, &a32, &b32, &mut out32[..7]),
+            Err(Error::Shape { what: "out", .. })
+        ));
+        let a64 = vec![0f64; 6];
+        let b64 = vec![0f64; 12];
+        let mut out64 = vec![0f64; 8];
+        assert!(matches!(
+            matmul_f64_into(2, 3, 4, &a64[..5], &b64, &mut out64),
+            Err(Error::Shape { what: "a", .. })
+        ));
+        assert!(matches!(
+            matmul_f64_into(2, 3, 4, &a64, &b64[..11], &mut out64),
+            Err(Error::Shape { what: "b", .. })
+        ));
+        assert!(matches!(
+            matmul_f64_into(2, 3, 4, &a64, &b64, &mut out64[..7]),
+            Err(Error::Shape { what: "out", .. })
+        ));
     }
 
     /// 五个小批量几何算子的 `_into` 孪生：**位精确**（对分配型入口，`to_bits()`）+ 契约。
