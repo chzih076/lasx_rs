@@ -1,7 +1,7 @@
 //! **R6-B-3：三档后端横向对比**——`LasxBackend`（手写 SIMD / LASX）vs
 //! `simd_dsl::IdiomaticBackend`（可移植优化档）vs `simd_dsl::ScalarBackend`（**下限臂**）。
 //!
-//! 口径严格照 `simd_dsl/docs/bench.md` §5：**同进程交替**、**所有臂写同一块目的缓冲**、
+//! 口径严格照 `simd_dsl/docs/performance.md` §5：**同进程交替**、**所有臂写同一块目的缓冲**、
 //! **≥5 对且丢弃首对**、报**中位 + 极差 + `iters` + `ms_max` + `loadavg`**；
 //! **正确性在计时之外断言**（先跑一遍、比完再计时）；**每行标等价类**（逐位 / 容差 + 实测界 + 参照物）。
 //! **CI 不对耗时设阈值**，本 example 只在 `--features dsl-backend` 下构建。
@@ -68,7 +68,7 @@ fn loadavg() -> String {
         .unwrap_or_else(|_| "n/a".into())
 }
 
-/// 掩码相对误差（`simd_dsl/docs/bench.md` 的既有口径）。
+/// 掩码相对误差（`simd_dsl/docs/performance.md` 的既有口径）。
 fn masked_rel(got: &[f32], want: &[f32]) -> f32 {
     let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
     let floor = 1.0e-3 * peak;
@@ -202,7 +202,7 @@ fn main() {
         "== R6-B-3：LasxBackend（手写 SIMD）vs IdiomaticBackend（可移植优化）vs ScalarBackend（下限）=="
     );
     println!(
-        "口径：simd_dsl/docs/bench.md §5（同进程交替、同一块目的缓冲、丢首对、中位 + 极差 + ms_max）"
+        "口径：simd_dsl/docs/performance.md §5（同进程交替、同一块目的缓冲、丢首对、中位 + 极差 + ms_max）"
     );
     println!("loadavg = {}", loadavg());
     println!(

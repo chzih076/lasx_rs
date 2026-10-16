@@ -1,7 +1,7 @@
 //! **后端效率对照（③b-3a）**：`LasxBackend` 内部"递推档 vs 全回退档"，以及
 //! `LasxBackend`（手写）vs `simd_dsl::mock::ScalarBackend`（笨可移植）。
 //!
-//! **口径严格照 `simd_dsl/docs/bench.md` §5**：
+//! **口径严格照 `simd_dsl/docs/performance.md` §5**：
 //! - **目的缓冲口径 E（强制）**：一条对比的两条臂**写同一块目的缓冲**（本文件里就是同一对 `kc/ks`）；
 //! - **同进程交替、≥5 对、丢第一对**；每对内部 `iters` 次取均值，输出**中位 + 极差 + `ms_max` + `iters`**；
 //! - 打印 **loadavg**：**≥1.0 时绝对毫秒不可比**，只看同进程比值；

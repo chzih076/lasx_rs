@@ -2884,7 +2884,7 @@ cargo run --release --features dsl-backend --example lasx_vs_portable
 cargo run --release --features dsl-backend --example lasx_vs_portable -- --smoke
 ```
 
-**口径**：照 `simd_dsl/docs/bench.md` §5——**同进程交替**、**三臂写同一块目的缓冲**、
+**口径**：照 `simd_dsl/docs/performance.md` §5——**同进程交替**、**三臂写同一块目的缓冲**、
 **5 对丢首对**（大 matmul 降至 3 对、`iters = 1`，如实标注）、报**中位 + 极差 + `ms_max` + `iters`**、
 `loadavg` 随行打印；**正确性在计时之外先断言**（参照物 = `ScalarBackend`）。
 
@@ -2950,7 +2950,7 @@ cargo run --release --features dsl-backend --example lasx_vs_portable -- --smoke
 
 **结论句（只写实测支撑的）**：**同一内核下 DSL 至多持平——实测 `DSL/直接` = 0.996–1.002
 （唯一超出的是 `K=1024` 的 1.233，但该点中位数落在 100 ns 刻度上、属量化噪声）⇒ 宏与 trait 转发
-没有可测开销（<1.05×）**；**能赢的地方只在"跨步融合/少往返"**（`simd_dsl/docs/bench.md` §17 的
+没有可测开销（<1.05×）**；**能赢的地方只在"跨步融合/少往返"**（`simd_dsl/docs/performance.md` §17 的
 **2.0–2.2×**，以及 §18 规则⑥ 的 **1.72–1.89×**）。**轴归约（rows）没有 ② 对应物**：`lasx_rs` 侧
 没有原生 rows 归约内核、`LasxBackend` 也未覆盖该入口（§7.13 的 ③④ 行已实测 Lasx ≡ Idiomatic）
 ⇒ 该负载上"DSL 转发开销"**未定义**（不是 0，装置里也这么标注）。
@@ -3415,7 +3415,7 @@ LLVM 无法自行证明"行间独立"⇒ 不会做**行锁步**交错；而**手
 > **不再作为库级硬要求**；现定级为"**`lasx_rs` 这个后端自己的实现选择/局部保证**"。
 > 涉及处已同步改措辞：`docs/ops.md §9.06`、`docs/dev.md §9.5.4`（第 2 条理由）、`docs/dsl.md`（选项 A/B）。
 >
-> **④ 放宽的实测依据（本仓四行小结，`examples/dsl_efficiency.rs`，口径照 `simd_dsl/docs/bench.md §5`）**：
+> **④ 放宽的实测依据（本仓四行小结，`examples/dsl_efficiency.rs`，口径照 `simd_dsl/docs/performance.md §5`）**：
 > `lasx/idio`（<1 ⇒ 手写快）＝ **dot K=4096 `0.473×`（手写 2.12×）**、
 > **matmul 64³ `0.253×`（3.95×）**、**matmul 192×768×3072 `0.115×`（8.7×）**，
 > 而 **核构造 `build_kernel_f32`（递推 64×1024）`0.996×`（≈持平，该路径手写无 intrinsic）**
