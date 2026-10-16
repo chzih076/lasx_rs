@@ -32,7 +32,12 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 lasx_rs_macros = { path = "macros", version = "0.1.0" }
 # **可选**：`simd_dsl` 的 `Backend` 实现（③a）。**默认不启用** ⇒ 无 feature 时 cargo 不解析该依赖、
 # 不编译 `src/dsl_backend.rs`，默认构建逐字节不变。依赖方向 **`lasx_rs → simd_dsl` 单向**。
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "fc57fc7", optional = true }
+#
+# ⚠️ **流程规则（③b-3c 记）**：这里的 `rev` 是**钉死的**。**引擎（`simd_dsl`）一移动，就必须显式 bump 本行**
+# （`git ls-remote <panel>` 取实值），否则本仓看到的是**旧快照**——③b-3b 就是因为 rev 钉在 `fc57fc7`
+# 而误判"`IdiomaticBackend` 未导出"（实际 `521e837` 已 `pub use idiomatic::IdiomaticBackend;`）。
+# 改完必须 `cargo update -p simd_dsl` 让 `Cargo.lock` 跟上。
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "521e837", optional = true }
 
 [features]
 # 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
