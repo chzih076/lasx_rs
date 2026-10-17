@@ -6596,6 +6596,75 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 
 **数字家**：本文件（`simd_dsl/docs/performance.md` / `optimizations.md` 只引不抄）。
 
+## 7.28 DSL 后端线程化：GEMM 内核自动并行（默认开、阈值 32M）+ 覆盖矩阵
+
+**用户裁决**：Q1 = **默认开**（自动并行是后端自己的事）；"用编译期尺寸是对的"（`matmul_f32_pinned` 归宏侧另派）。
+**契约零改动**：`simd_dsl` 一行未动、`Backend` 方法**不加线程参数**、`LasxBackend` 仍是单元结构体（`Copy`）、**`nm -D` 仍 98**。
+
+### 7.28.1 做了什么
+1. **`ops/matmul.rs`**：`matmul_f32`（本仓公开内核）拆为「自动分派 + `matmul_f32_single`（原实现逐行未改）」：
+   `work = m·k·n ≥ PAR_MIN_WORK = 32M` 且 `pool::global().threads() > 1` ⇒ **`pool::global()` + `parallel::matmul_f32`**；
+   否则走原单线程主体（打包 / 列块 / 流式三路径不变）。
+   池版要求 `a: &mut [f32]`（行内核就地整理）⇒ **用内部 scratch 消化**，**对内对外签名仍是 `&[f32]`**。
+2. **`dsl_backend.rs::matmul_f32` override** 改调 **`api::matmul_into`**（删掉了早先"自己复制 A"的写法）⇒ **DSL 侧零复制**。
+3. **逃生门**：`pool::init_global(1)`（首次使用前调用）强制单线程；不调用则按 `WorkerPool::auto()`（物理核，`pool/mod.rs:360`）。
+
+### 7.28.2 阈值来源 = 实测（不是猜）
+分进程（`OnceLock` 全进程只能一种线程配置）实测 1t vs auto（`examples/matmul_auto_threshold.rs`）：
+
+| 尺寸 | work | 1t 中位 | auto 中位 | 1t/auto |
+|---|---|---|---|---|
+| 256³ | 16.7M | 0.546 ms | 0.544 ms | 1.00× |
+| 320³ | **32.8M（≈阈值）** | 1.091 ms | 1.094 ms | **1.00×（中性）** |
+| 384³ | 56.6M | 1.865 ms | **0.454 ms** | **4.11×** |
+| 512³ | 134M | 4.509 ms | **1.086 ms** | **4.15×** |
+
+⇒ 交叉点落在 32.8M–56.6M 之间；**取 32M 是安全下界**（该点并行中性、不产生回归；56.6M 起收益 4.11×）。
+
+### 7.28.3 四形状实测：DSL 抽象层税 ≈ 0、1t→auto 4.11–6.35×
+**分进程、非同进程交替**（表头必须这样读）；`nice -n 10`；loadavg 全程 5.13/5.17/4.56（**GUI 基线噪声**：Firefox/cosmic-comp/pipewire，**非团队构建**）。
+
+| 形状 | 1t 直调 | 1t DSL | DSL/直调 | auto 直调 | auto DSL | DSL/直调 | 1t→auto | auto GFLOPS |
+|---|---|---|---|---|---|---|---|---|
+| 512³ | 4.431 ms | 4.413 ms | 0.9958 | 0.863 ms | 0.879 | 1.0184 | **5.13×** | 310.9 |
+| 1024³ | 39.721 ms | 39.297 ms | 0.9893 | 6.251 ms | 6.072 | 0.9714 | **6.35×** | 343.6 |
+| 192×768×3072 | 15.297 ms | 15.225 ms | 0.9953 | 2.978 ms | 3.018 | 1.0135 | **5.14×** | 304.3 |
+| 256×64×4096 | 2.167 ms | 2.172 ms | 1.0024 | 0.527 ms | 0.536 | 1.0177 | **4.11×** | 254.8 |
+
+**两臂同走 `api::matmul_into`**（DSL 臂 = `LasxBackend::matmul_f32`），差异只在一次 `Backend` 分派 ⇒ **八个比值全在 0.97–1.02**，即**抽象层税 ≈ 0**。
+
+### 7.28.4 逐位（硬约束）
+池版**只按输出行切、绝不 split-K** ⇒ 每个输出元素的累加顺序与单线程完全相同 ⇒ **数值逐位不变**（`api::matmul` 的**时间行为**变了，**数值未变**——这是用户批准的默认升级）。
+递归风险已排除：`parallel::matmul_f32` → `matmul_f32_picked` 只调 `matmul::matmul_f32_packed_rows`，**不回调** `ops::matmul::matmul_f32`。
+
+### 7.28.5 覆盖矩阵（`simd_dsl::Backend` 55 方法 × 状态）
+> 基线：本表以 `docs-dev` 的只读审计 `audit_lasx_caps.md`（file:line）为准，正则统计只作交叉核对。
+
+**A. 已覆盖（走 LASX 专核，22 项）**：`matmul_f32`（**本轮改走自动并行**）、`matmul_f32_packed`、`pack_f32`、`dot_f32`、`map_affine_f32`、`map_binary_f32`、`reduce_sum_f32`、`reduce_sum_cols_f32`、`reduce_weighted_sum_cols_f32`、`reduce_centered_sq_sum_cols_f32`、`build_kernel_f32`、`gather_rows_f32`、`gather_rows_i8`、`scatter_rows_f32`、`copy_strided_f32`、`map_unary_strided_f32`、`map_binary_strided_f32`、`fft_strided_f32`、`matmul_pair_psd_f32`、`name`、`precision_claim`、`supports`。
+
+**B. 无 lasx 内核 ⇒ engine 默认即最优（保持回落，不硬造）**：
+- `reduce_sum_rows_f32` / `reduce_rows_map_f32`：`lasx_rs/src/**` **零命中**；engine 默认 `scalar::reduce_sum_rows_f32`（`simd_dsl/src/kernels/scalar.rs:637`）**已是多累加器、可向量化** ⇒ 再包一层 LASX 只是重复实现。**等价类 = 容差类（累加次序不同），不给逐位承诺**。
+- `map_unary_f32`：本仓只有 `map_affine`/`map_binary`（`dsl_map.rs`）与**跨步** unary（P5-b），**无通用一元内核** ⇒ 保持回落。
+- **触发条件（将来才做）**：实测 engine 默认在真实负载上成为瓶颈时才特化，**不因为"能写"就写**。
+
+**C. 其余缺失项（回落 portable，待补优先级）**：`reduce_max_f32`/`reduce_min_f32`、`reduce_max_cols_f32`/`reduce_min_cols_f32`、`reduce_max_rows_f32`/`reduce_min_rows_f32`、`reduce_cols_map_f32`、`reduce_sum_f64`、`reduce_weighted_sum_f32`/`_f64`、`dot_f64`、`dot_f32_pinned`、`matmul_f64`、`matmul_bt_f32`、`matmul_f32_pinned`、`map_unary_f32_routed`、`map_unary_f64`、`map_unary_masked_f32`、`map_binary_rows_f32`、`map_binary_cols_f32`、`map_binary_scalar_f32`、`map_ternary_f32`、`stencil_rows_f32`、`build_banded_kernel_f32`。
+**判据**：有现成内核且**能逐位**的先补（`reduce_max/min_*` 与 `map_binary_scalar_f32` 属此类）；不能逐位的如实标等价类后再补。
+
+**`capabilities()` 缺口（如实）**：目前只有 `Capability::Packing` 为 `true`（"只报确实为真"）；线程化**不是能力位**，`capabilities()` 不报（`Backend` 没有线程相关能力项，这是设计使然，不是漏）。
+
+### 7.28.6 谁守（契约归属）
+| 契约 | 谁守 | 违反后果 |
+|---|---|---|
+| 线程数 = 全局池（`pool::global()` / `init_global`） | 后端实现（`lasx_rs`） | 不崩，但性能不符合预期 |
+| 自动并行阈值 `PAR_MIN_WORK = 32M` | 后端常量（本仓） | 同上；无正确性影响 |
+| **逐位**（只切行、不 split-K） | 后端实现 + 测试 | **错结果**（若改成 split-K） |
+| 默认行为变更（时间行为变、数值不变） | 用户裁决 + 本节记录 | —— |
+
+### 7.28.7 与审计的冲突（如实）
+审计快照（`audit_lasx_caps.md` §3.2 行 108）写"**`LasxBackend`（DSL）单线程**（`dsl_backend.rs:35` 明写未接未测）"——**该结论在本提交后已过时**：`dsl_backend.rs` 的 `matmul_f32` 现在调 `api::matmul_into` ⇒ 经由 `ops::matmul::matmul_f32` 的自动分派**默认并行**。审计的 file:line 当时仍然正确（历史状态），**冲突项以本节的实测为准**。
+另：审计文件（`audit_lasx_caps.md`，第 3.4 节）记录 `shape::auto_threads`（`shape.rs:420`）已有"`rows/4≥2` 且 `rows·k·n ≥ AUTO_MIN_WORK=4M` 才并行"的形状自适应阈值 ⇒ **本仓现在有两条独立阈值**（typed shape 4M、GEMM 内核 32M），**二者服务于不同入口、不互相覆盖**；后续若要统一，应在后端层做（仍不进 DSL）。
+
+
 
 
 
