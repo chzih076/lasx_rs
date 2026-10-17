@@ -83,6 +83,12 @@ required-features = ["dsl-backend"]
 name = "fused_ab"
 required-features = ["dsl-backend"]
 
+# `auto_ab`（阶段4 最终验收 / task-44）：`ops_dsl::*_auto`（能力探测：supports 真走 1 趟融合）
+# vs `api::*`；另复核批1 matmul/matmul_f64。判据 ≥0.98，逐位优先。
+[[example]]
+name = "auto_ab"
+required-features = ["dsl-backend"]
+
 # `composed_ab`（阶段3 批2）：**纯宏组合版 vs LASX 融合核**的 A/B——softmax/rms/layer/gelu_quick/
 # axpy/amax/rope 七个算子；同进程交替、丢首对、取中位，先等价类（逐位/容差+实测界）再谈性能。
 # 需要 `simd_dsl`/`ops_dsl` ⇒ 只在开 `dsl-backend` 时构建（默认档不碰）。
