@@ -14,6 +14,7 @@ name = "lasx_rs"
 version = "0.1.0"
 dependencies = [
  "lasx_rs_macros",
+ "ops_dsl",
  "simd_dsl",
 ]
 
@@ -29,9 +30,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ops_dsl"
+version = "0.1.0"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=1c72bf98b8627e5f2d12e8412cb0f602459cdd3d#1c72bf98b8627e5f2d12e8412cb0f602459cdd3d"
+dependencies = [
+ "simd_dsl",
+]
+
+[[package]]
 name = "simd_dsl"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=60ebd70a657541f6ff85a66bf695c655f8034029#60ebd70a657541f6ff85a66bf695c655f8034029"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=1c72bf98b8627e5f2d12e8412cb0f602459cdd3d#1c72bf98b8627e5f2d12e8412cb0f602459cdd3d"
 dependencies = [
  "simd_dsl_macros",
 ]
@@ -39,4 +48,4 @@ dependencies = [
 [[package]]
 name = "simd_dsl_macros"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=60ebd70a657541f6ff85a66bf695c655f8034029#60ebd70a657541f6ff85a66bf695c655f8034029"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=1c72bf98b8627e5f2d12e8412cb0f602459cdd3d#1c72bf98b8627e5f2d12e8412cb0f602459cdd3d"
