@@ -353,8 +353,12 @@ impl WorkerPool {
     /// 24 线程 163.9 / 135.1 µs、全局池（24 线程）144.1 / 186.6 µs** ⇒ 超线程在这类批量内核上
     /// **更差**（SMT 兄弟互抢 L1/L2）。这与本函数旧注释"没有额外收益，**也不会更差**"相反——
     /// 旧说法来自早期较宽松的扫描，已被本次更严格的三臂对照推翻。
-    /// **影响面**：`global()` = 本函数 ⇒ 所有走自动并行路径的调用方（`api::matmul`、`api::gemv`、
-    /// 各 `_batch`、以及公式 DSL `matmul!`）都受益；后者原先因此有 **45%** 的缺口。
+    /// **影响面（2026-10-18 按 audit §10 #1 复核更正）**：`global()` = 本函数，**当前实际调用点只有**
+    /// `ops::matmul::matmul_f32`（`work ≥ 32M` 时，§7.28）与 `shape::Prepared` 的默认策略（`Auto`
+    /// 且 `threads > 1`）。经前者受益的是 `api::matmul`/`api::matmul_into`/`api::matmul_scaled_into`
+    /// 的融合分支、以及公式 DSL `matmul!`。**不走它**：`api::gemv*`、各 `_batch`、
+    /// `api::matmul_f64`（f64 GEMM 尚无池版接线）、`parallel::*`（那些用调用方显式传入的池）。
+    /// 旧注释写"所有走自动并行路径的调用方都受益"，把影响面写大了（audit 已记）。
     ///
     /// 想固定线程数仍用 [`WorkerPool::new`] / [`init_global`]（本函数只改**默认**）。
     pub fn auto() -> Self {

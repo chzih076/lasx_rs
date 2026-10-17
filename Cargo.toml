@@ -70,3 +70,10 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "dsl_perf_report"
 required-features = ["dsl-backend"]
+
+# `migrate_ab`（IS-9，阶段3 批1）：**迁移 A/B 统一装置**——旧 `api::*` vs `ops_dsl::*`（经 `LasxBackend`）
+# 同进程交替 ≥5 轮丢首轮取中位，并打印 `threads`/`work`/`loadavg`；另含 IS-1/IS-2 的"接线前后"对照。
+# 需要 `simd_dsl`/`ops_dsl` ⇒ 只在开 `dsl-backend` 时构建（默认档不碰）。
+[[example]]
+name = "migrate_ab"
+required-features = ["dsl-backend"]
