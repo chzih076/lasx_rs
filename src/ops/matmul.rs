@@ -158,6 +158,31 @@ impl Epi {
 /// 同样的内联"造成的（基线 A/B 测到，改回内联后回到 7.6）。融合入口自己复制那十几行判据。
 #[inline]
 pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    // **自动并行默认开（§7.28；用户裁决 Q1=默认开，数值逐位不变）**。
+    //
+    // 判据：`work = m·k·n` 低于阈值 ⇒ 走原单线程主体（小形状并行只会更慢）；
+    // 否则走**进程级全局池** `pool::global()`（`OnceLock`，默认 `WorkerPool::auto()` = 物理核）。
+    // 线程数由 `pool::init_global(n)` 或环境决定；**`init_global(1)` 是逃生门**（强制单线程）。
+    //
+    // **逐位**：池版只按输出行切、**绝不 split-K** ⇒ 每个输出元素的累加顺序与单线程相同。
+    // **scratch 说明（如实）**：池版入口要求 `a: &mut [f32]`（行内核就地整理），本轮用**内部
+    // scratch** 消化这次 `&mut` ⇒ 调用方（含 DSL override）签名仍是 `&[f32]`、**不需要自己复制**。
+    // 这次复制发生在后端内核内部，**不算 DSL 抽象税**（但真实成本存在，见 §7.28 的实测）。
+    const PAR_MIN_WORK: u128 = 32 * 1024 * 1024; // 阈值：work ≥ 32M ≈ 320³ 量级，待实测校准
+    let work = (m as u128) * (k as u128) * (n as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_WORK && pool.threads() > 1 {
+        let mut a_scratch = a.to_vec();
+        if crate::parallel::matmul_f32(pool, m, k, n, &mut a_scratch, b, c).is_ok() {
+            return;
+        }
+    }
+    matmul_f32_single(m, k, n, a, b, c)
+}
+
+/// **单线程主体**（原 `matmul_f32` 的实现，逐行未改）：按形状选 打包/列块/流式 三条路径。
+#[inline]
+fn matmul_f32_single(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     if m == 0 || n == 0 {
         return;
     }

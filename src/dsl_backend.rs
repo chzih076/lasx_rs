@@ -83,19 +83,21 @@ impl Backend for LasxBackend {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        // **C 线（§7.28）：走进程级全局池**。`crate::pool::global()` 是 `OnceLock` 懒建
-        // （默认 `WorkerPool::auto()` = 物理核）；线程数由 `crate::pool::init_global(n)`
-        // **在首次使用前**决定 ⇒ **DSL 侧不感知线程数**（零契约改动、零新类型）。
+        // **§7.28：走后端自己的公开自动入口** `api::matmul_into`。
         //
-        // **为什么需要 `a` 的副本**：池版入口 `parallel::matmul_f32(pool, m,k,n, a: &mut [f32], b, c)`
-        // 要求 A 可写（按行打包/复用内部会就地整理）⇒ 每次调用复制一份 A（一次分配 + 一次拷贝）。
-        // **逐位不变**：池版**只按输出行切、绝不 split-K** ⇒ 每个输出元素的累加顺序与单线程完全相同。
-        let pool = crate::pool::global();
-        let mut a_work = a.to_vec();
-        // 形状/长度已在上方校验；池入口只会在这些前置条件上失败 ⇒ 若真失败则回落单线程（行为不变、不吞错）。
-        if crate::parallel::matmul_f32(pool, m, k, n, &mut a_work, b, out).is_err() {
-            crate::ops::matmul::matmul_f32(m, k, n, a, b, out);
-        }
+        // 为什么不再自己拼池：`ops::matmul::matmul_f32`（本仓公开内核）**自己**在 work ≥ 阈值时
+        // 走 `pool::global()` + 按输出行切（绝不 split-K ⇒ **逐位不变**），并把池版要求的
+        // `&mut A` 用**内部 scratch** 消化 ⇒ **DSL override 侧零复制、零税**（签名仍是 `&[f32]`）。
+        // 线程数由全局池决定（`pool::init_global(n)` 或默认 `auto()`）；`init_global(1)` = 逃生门。
+        crate::api::matmul_into(m, k, n, a, b, out).map_err(|_e| {
+            // 长度/形状在上方已校验 ⇒ 这里只可能是溢出；映射成 DSL 的可诊断错误（不吞、不 panic）。
+            BackendError::LengthMismatch {
+                op: "matmul_f32",
+                what: "matmul_into（形状/溢出）",
+                expected: m * n,
+                got: out.len(),
+            }
+        })?;
         Ok(())
     }
 
