@@ -50,7 +50,16 @@ pub mod dsl_map;
 /// ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控，见 AGENTS.md #49）。
 #[cfg(feature = "dsl-backend")]
 pub mod fused;
+
 pub mod gather;
+/// **P5-a：gather / scatter 的 LASX 内核**（签名按 `simd_dsl/docs/structure.md §7` 的**解冻最终契约**：
+/// `stride` 显式、`ids: &[u32]`、越界 ⇒ `Err`）。行拷贝 8 lane（i8 用 32 B 块）。
+///
+/// **为什么带 `test` 门控**：`simd_dsl` 的 trait 尚未声明这 3 个方法 ⇒ 本轮无生产调用方；
+/// 只挂 feature 会被 `dead_code`（`-D warnings`）判死，又禁止 `#[allow(dead_code)]`（#49）。
+/// **等 trait 方法落地 + `dsl_backend.rs` 加 override 后删掉 `, test`**（这就是交接单）。
+#[cfg(all(feature = "dsl-backend", test))]
+pub mod gather_scatter;
 pub mod gelu_erf;
 pub mod gelu_quick;
 pub mod gemv_i8;
