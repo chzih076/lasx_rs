@@ -6248,6 +6248,36 @@ A = 该档 `matmul_f32`×2、B = 转置 + 连续 FFT、**C = 跨步 FFT**：
 ② 两臂共享同样的可移植非 matmul 步骤 ⇒ 比值只反映 DFT 的变化。
 **口径**：本节数字与 `simd_dsl/docs/performance.md` 的 R19-D 小节同一批探针（**两边记同一组数**）。
 
+### 7.16 归约 / 逐元素族接 LASX（R19-E）——帧级 `1.057×`，且**输出逐位一致**
+
+**接了什么**（`src/ops/dsl_map.rs` + `LasxBackend` 覆写 5 条）：
+`map_binary_f32`（`Add`/`Sub`/`Mul`/`Div`）、`map_affine_f32`、`reduce_sum_f32`、
+`reduce_sum_cols_f32`、`reduce_weighted_sum_cols_f32`。
+
+**等价类（逐条钉住，测试 `r19e_elementwise_and_axis_reduce_are_bitwise_vs_scalar`）**：
+* 逐元素四条 + `map_affine` + 两条按列归约 ⇒ **与 `simd_dsl::kernels::scalar` 的参照逐位**：
+  逐元素无归约；轴归约保持"**每列一条 lane、按行序**累加"（累加次序与参照相同）；
+  **`map_affine` 故意不融 FMA**（`a·x` 再 `+b`，两步 ⇒ 与参照同舍入）；
+* `reduce_sum_f32` 的参照本身是**多累加器**（容差类）⇒ 本仓 LASX 归约同性质；
+* **`Max`/`Min` 不在本文件实现**：NaN 语义按 Rust（`f32::max`）而 LASX `xvfmax` 是 IEEE
+  ⇒ **委托标量参照**（`BinaryOp` 是 `#[non_exhaustive]`，未知变体也一律委托）。
+
+**同进程 A/B**（`LasxBackend` vs **`LasxBackendHybrid`**，后者 = matmul/建核/打包照旧 LASX、
+逐元素/归约回落可移植默认 ⇒ "接族之前"；同进程交替、同一目的缓冲、6 对丢首对、中位+极差、
+`loadavg 3.02 3.52 3.02`、真实工作点 `n=4096,p=513,b=256`、`DftMode::Fft`）：
+
+| 指标 | 接族前（hybrid） | **接族后（LASX）** | 比值 |
+|---|---|---|---|
+| 帧体（预建计划） | `48.4248 ms`（极差 0.6797） | **`45.8299 ms`**（极差 3.0408） | **`1.057×`** |
+| 一次性 `detect` | `50.2413 ms`（极差 3.7140） | **`48.1958 ms`**（极差 3.2540） | **`1.042×`** |
+| 输出（前后对比） | — | **`masked_rel = 0.000e0`（逐位一致）** | ✓ |
+
+**⇒ 两条结论**：① 这一族**真的有收益但不大**（帧级 `4–6%`），与"它只占帧的一小段"一致；
+② **接完之后，帧里最大的剩余块是"可移植 FFT 本体"**——按 §7.15 的变换级实测该部分约 `28.9 ms`
+（占当前 `48.2 ms` 的 **≈60%**）⇒ **下一个大杠杆是 LASX 向量化的跨步 FFT**，不是继续堆逐元素。
+**如实边界**：FFT 臂仍是可移植实现；`reduce_sum_rows_f32`/`map_unary_f32`（超越函数，含 `ln`/`exp`/`cos`）
+**本轮未接**（前者默认已可向量化、后者需要 LASX 的 `log/exp` 近似且牵扯精度口径 ⇒ 另开一轮评估）。
+
 
 
 

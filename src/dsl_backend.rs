@@ -39,8 +39,8 @@
 // （见 `simd_dsl/src/lib.rs` 的 `pub use contract::…` / `criteria::…`），旧的平铺模块路径
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
-    Backend, BackendError, CallOpts, Capability, EnginePath, ErrorBound, Fallback, PackedB,
-    PrecisionClaim, ScalarKind,
+    Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
+    PackedB, PrecisionClaim, ScalarKind,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -101,6 +101,132 @@ impl Backend for LasxBackend {
     /// **守卫只调 `simd_dsl::safety::recurrence_safe`**（不复制阈值、不存第二份常量）；
     /// `opt_in == false` 或**该行不安全** ⇒ **该行回退 libm**（与默认实现同式），
     /// 并把 `rows_fallback` / `route_taken` **如实**填进报告 —— **不静默假装走快档**。
+    /// **归约 / 逐元素族接 LASX（R19-E）**：帧里 matmul 之外的多数开销在这五条上。
+    ///
+    /// **等价类（逐条钉住）**：
+    /// * `map_affine_f32` / `map_binary_f32`（`Add`/`Sub`/`Mul`/`Div`）/ `reduce_*_cols_f32`：
+    ///   **与 `simd_dsl::kernels::scalar` 的参照逐位**——逐元素无归约；轴归约保"每列一条 lane、
+    ///   **按行序**累加"（累加次序与参照相同）；`map_affine` **故意不融 FMA**（`a*x` 再 `+b`）。
+    /// * `reduce_sum_f32`：参照本身就是**多累加器**（容差类）⇒ 这里用本仓 LASX 归约，**同性质**。
+    /// * `Max`/`Min`：NaN 语义按 Rust（`f32::max`：另一侧是数就返回它），而 LASX `xvfmax` 是 IEEE
+    ///   语义（NaN 传播不同）⇒ **这两条委托标量参照**，不冒险。
+    fn reduce_sum_f32(&self, x: &[f32]) -> Result<f32, BackendError> {
+        Ok(crate::ops::dsl_map::reduce_sum(x))
+    }
+
+    fn map_affine_f32(
+        &self,
+        x: &[f32],
+        a: f32,
+        b: f32,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        if out.len() != x.len() {
+            return Err(len_err("map_affine_f32", "out", x.len(), out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "map_affine_f32: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::map_affine(a, b, x, out);
+        Ok(())
+    }
+
+    fn map_binary_f32(
+        &self,
+        x: &[f32],
+        y: &[f32],
+        out: &mut [f32],
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        if y.len() != x.len() {
+            return Err(len_err("map_binary_f32", "y", x.len(), y.len()));
+        }
+        if out.len() != x.len() {
+            return Err(len_err("map_binary_f32", "out", x.len(), out.len()));
+        }
+        let fast = match op {
+            BinaryOp::Add => Some(crate::ops::dsl_map::BinOp::Add),
+            BinaryOp::Sub => Some(crate::ops::dsl_map::BinOp::Sub),
+            BinaryOp::Mul => Some(crate::ops::dsl_map::BinOp::Mul),
+            BinaryOp::Div => Some(crate::ops::dsl_map::BinOp::Div),
+            // NaN 语义按 Rust ⇒ 交给标量参照（不用 LASX 的 IEEE max/min）
+            // `BinaryOp` 是 `#[non_exhaustive]` ⇒ 将来新增的变体也一律**委托标量**（保守、正确优先）
+            _ => None,
+        };
+        match fast {
+            Some(fop) => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+                    "map_binary_f32: out 不得与 x 重叠（契约）"
+                );
+                debug_assert!(
+                    !std::ptr::eq(y.as_ptr(), out.as_ptr()),
+                    "map_binary_f32: out 不得与 y 重叠（契约）"
+                );
+                crate::ops::dsl_map::map_binary(x, y, out, fop);
+            }
+            None => simd_dsl::kernels::scalar::map_binary_f32(x, y, out, op)?,
+        }
+        Ok(())
+    }
+
+    fn reduce_sum_cols_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_sum_cols_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if out.len() != cols {
+            return Err(len_err(op, "out", cols, out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_sum_cols(x, rows, cols, out);
+        Ok(())
+    }
+
+    fn reduce_weighted_sum_cols_f32(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_weighted_sum_cols_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if w.len() != rows {
+            return Err(len_err(op, "w", rows, w.len()));
+        }
+        if out.len() != cols {
+            return Err(len_err(op, "out", cols, out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_weighted_sum_cols(x, w, rows, cols, out);
+        Ok(())
+    }
+
     fn build_kernel_f32(
         &self,
         spec: &simd_dsl::KernelSpec<'_>,
@@ -370,6 +496,63 @@ impl Backend for LasxBackend {
     }
 }
 
+/// **A/B 用的"接之前"形态**（R19-E）：`matmul`/`dot`/建核/打包**照旧走 LASX**，但
+/// **逐元素与归约族用 `Backend` 的可移植默认实现** —— 这正是 `R19-E` 之前的 `LasxBackend` 行为。
+///
+/// **为什么要有它**：要给出"接归约/逐元素族带来的收益"的**同进程**硬数（§5 口径），
+/// 必须在**同一个进程内交替**跑"接之前"与"接之后"两种后端 ⇒ 用两个后端类型，而不是改全局开关。
+/// **不改任何数值口径**：它只是把 5 条方法落回默认实现，其余与 [`LasxBackend`] 完全一致。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LasxBackendHybrid;
+
+impl Backend for LasxBackendHybrid {
+    fn name(&self) -> &'static str {
+        "lasx_rs(hybrid: LASX matmul/kernel + portable elementwise/reduce)"
+    }
+
+    fn matmul_f32(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        LasxBackend.matmul_f32(m, k, n, a, b, out)
+    }
+
+    fn dot_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, BackendError> {
+        LasxBackend.dot_f32(a, b)
+    }
+
+    fn build_kernel_f32(
+        &self,
+        spec: &simd_dsl::KernelSpec<'_>,
+        kc: &mut [f32],
+        ks: &mut [f32],
+    ) -> Result<simd_dsl::KernelReport, BackendError> {
+        LasxBackend.build_kernel_f32(spec, kc, ks)
+    }
+
+    fn pack_f32(&self, k: usize, n: usize, b: &[f32]) -> Result<PackedB, BackendError> {
+        LasxBackend.pack_f32(k, n, b)
+    }
+
+    fn matmul_f32_packed(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        p: &PackedB,
+        out: &mut [f32],
+        opts: &CallOpts,
+    ) -> Result<(), BackendError> {
+        LasxBackend.matmul_f32_packed(m, k, n, a, p, out, opts)
+    }
+}
+
 /// **③b-4 自洽测试**：blob 布局（长度 = `k*n*4`、主 strips 与列尾可定位）、`PackedB` 形状一致、
 /// 非法长度**返回 `LengthMismatch` 不 panic**。
 #[test]
@@ -627,5 +810,79 @@ mod tests {
         );
         assert!(!be.supports(Capability::MatmulF64));
         assert!(!be.supports(Capability::Transcendental));
+    }
+
+    /// **R19-E：逐元素/轴归约族必须与标量参照逐位**（`map_affine` 不融 FMA；轴归约按行序累加），
+    /// 并覆盖形状错误路径（不 panic、返回 `LengthMismatch`）。
+    #[test]
+    fn r19e_elementwise_and_axis_reduce_are_bitwise_vs_scalar() {
+        let be = LasxBackend;
+        let n = 1029; // 非 8 的倍数 ⇒ 覆盖尾部处理
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 3.1).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.11).cos() * 1.7 - 0.4)
+            .collect();
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Max,
+            BinaryOp::Min,
+        ] {
+            let mut a = vec![0.0f32; n];
+            be.map_binary_f32(&x, &y, &mut a, op).expect("map_binary");
+            let mut b = vec![0.0f32; n];
+            simd_dsl::kernels::scalar::map_binary_f32(&x, &y, &mut b, op).expect("scalar");
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&a), bits(&b), "map_binary({op:?}) 必须与标量参照逐位");
+        }
+        let mut a = vec![0.0f32; n];
+        be.map_affine_f32(&x, -0.5, 0.25, &mut a).expect("affine");
+        let mut b = vec![0.0f32; n];
+        simd_dsl::kernels::scalar::map_affine_f32(&x, -0.5, 0.25, &mut b).expect("scalar");
+        assert!(
+            a.iter().zip(&b).all(|(u, v)| u.to_bits() == v.to_bits()),
+            "map_affine 必须逐位（故意不融 FMA）"
+        );
+        // 轴归约（rows=7, cols=13：8 的倍数与非倍数都覆盖）
+        let (rows, cols) = (7usize, 13usize);
+        let x2: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.19).sin() + 0.3)
+            .collect();
+        let w: Vec<f32> = (0..rows).map(|r| 0.5 + r as f32 * 0.13).collect();
+        let mut c1 = vec![0.0f32; cols];
+        be.reduce_sum_cols_f32(&x2, rows, cols, &mut c1)
+            .expect("sum_cols");
+        let mut c2 = vec![0.0f32; cols];
+        simd_dsl::kernels::scalar::reduce_sum_cols_f32(&x2, rows, cols, &mut c2).expect("scalar");
+        assert!(
+            c1.iter().zip(&c2).all(|(u, v)| u.to_bits() == v.to_bits()),
+            "reduce_sum_cols 必须逐位（每列一条 lane、按行序）"
+        );
+        let mut d1 = vec![0.0f32; cols];
+        be.reduce_weighted_sum_cols_f32(&x2, &w, rows, cols, &mut d1)
+            .expect("wsum_cols");
+        let mut d2 = vec![0.0f32; cols];
+        simd_dsl::kernels::scalar::reduce_weighted_sum_cols_f32(&x2, &w, rows, cols, &mut d2)
+            .expect("scalar");
+        assert!(
+            d1.iter().zip(&d2).all(|(u, v)| u.to_bits() == v.to_bits()),
+            "reduce_weighted_sum_cols 必须逐位"
+        );
+        // 形状错误：一律 `LengthMismatch`、不 panic
+        assert!(
+            be.reduce_sum_cols_f32(&x2[..rows * cols - 1], rows, cols, &mut c1)
+                .is_err()
+        );
+        assert!(
+            be.reduce_weighted_sum_cols_f32(&x2, &w[..rows - 1], rows, cols, &mut d1)
+                .is_err()
+        );
+        assert!(
+            be.map_binary_f32(&x, &y[..n - 1], &mut a, BinaryOp::Add)
+                .is_err()
+        );
+        assert!(be.map_affine_f32(&x, 1.0, 0.0, &mut a[..n - 1]).is_err());
     }
 }

@@ -8,7 +8,7 @@
 //! **如实边界**：LASX 档只覆盖 `matmul_f32`/`dot_f32`/`build_kernel_f32`/`matmul_f32_packed`；
 //! 帧里其余步骤（归约/逐元素/超越函数）走 `Backend` 的**可移植默认实现** ⇒ 两臂在这部分开销相同；
 //! FFT 臂用的也是**可移植** `fft_strided_f32`（LASX 尚无向量化 FFT）。
-use lasx_rs::dsl_backend::LasxBackend;
+use lasx_rs::dsl_backend::{LasxBackend, LasxBackendHybrid};
 use ops_dsl::spectral::{
     DftMode, SpectralCfg, build_plan, detect, detect_stages, detect_with_plan,
 };
@@ -58,6 +58,7 @@ macro_rules! ab {
 
 fn main() {
     let lasx = LasxBackend;
+    let hybrid = LasxBackendHybrid; // "接 R19-E 之前"的形态：逐元素/归约走可移植默认
     let port = IdiomaticBackend;
     let (n, p, b) = (4096usize, 513usize, 256usize);
     let base = SpectralCfg {
@@ -172,5 +173,43 @@ fn main() {
     println!(
         "⑤ 一次性 detect（Direct）    可移植 {p_dir:9.4} ms（极差 {p_dir_r:7.4}） | **LASX {l_dir:9.4} ms（极差 {l_dir_r:7.4}）** ⇒ 可移植/LASX = **{:.3}×**",
         p_dir / l_dir
+    );
+
+    // ---- ⑥⑦ **同进程 A/B：接族后 vs 接族前**（`LasxBackend` vs `LasxBackendHybrid`）----
+    // hybrid = matmul/建核/打包照旧 LASX，但逐元素/归约走**可移植默认** ⇒ "接 R19-E 之前"的形态。
+    let (h_frame, h_frame_r, n_frame, n_frame_r) = ab!(
+        6,
+        {
+            detect_with_plan(&hybrid, &plan_fft, &x, &threshold, &fw, &mut out_a).unwrap();
+        },
+        {
+            detect_with_plan(&lasx, &plan_fft, &x, &threshold, &fw, &mut out_b).unwrap();
+        }
+    );
+    println!(
+        "⑥ 帧体（FFT，预建）  接族前 {h_frame:9.4} ms（极差 {h_frame_r:7.4}） | **接族后 {n_frame:9.4} ms（极差 {n_frame_r:7.4}）** ⇒ **{:.3}×**",
+        h_frame / n_frame
+    );
+    let (h_one, h_one_r, n_one, n_one_r) = ab!(
+        6,
+        {
+            detect(&hybrid, &c_fft, &x, &threshold, &fw, &mut out_a).unwrap();
+        },
+        {
+            detect(&lasx, &c_fft, &x, &threshold, &fw, &mut out_b).unwrap();
+        }
+    );
+    println!(
+        "⑦ 一次性 detect（FFT）接族前 {h_one:9.4} ms（极差 {h_one_r:7.4}） | **接族后 {n_one:9.4} ms（极差 {n_one_r:7.4}）** ⇒ **{:.3}×**",
+        h_one / n_one
+    );
+    // 正确性：接族前后的输出应当**非常接近**（逐元素/归约都声明与标量参照逐位/同类）
+    let mut oa = vec![0.0f32; b];
+    let mut ob = vec![0.0f32; b];
+    detect(&hybrid, &c_fft, &x, &threshold, &fw, &mut oa).unwrap();
+    detect(&lasx, &c_fft, &x, &threshold, &fw, &mut ob).unwrap();
+    println!(
+        "   ⑥⑦ 正确性（接族前 vs 后）：out masked_rel = {:.3e}",
+        masked_rel(&ob, &oa)
     );
 }

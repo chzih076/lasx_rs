@@ -29,6 +29,10 @@ pub mod dot_f16;
 pub mod dot_f64;
 pub mod dot_i8;
 pub mod dot_q4;
+/// **DSL 后端的逐元素/轴归约 LASX 内核**（R19-E）：`map_binary`(Add/Sub/Mul/Div)、`map_affine`、
+/// `reduce_sum_cols`/`reduce_weighted_sum_cols`、`reduce_sum`。**与标量参照逐位**（`map_affine`
+/// 故意不融 FMA；轴归约每列一条 lane、按行序累加）——理由见文件头。
+pub mod dsl_map;
 pub mod gather;
 pub mod gelu_erf;
 pub mod gelu_quick;
