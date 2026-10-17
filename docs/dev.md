@@ -6664,6 +6664,33 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 审计快照（`audit_lasx_caps.md` §3.2 行 108）写"**`LasxBackend`（DSL）单线程**（`dsl_backend.rs:35` 明写未接未测）"——**该结论在本提交后已过时**：`dsl_backend.rs` 的 `matmul_f32` 现在调 `api::matmul_into` ⇒ 经由 `ops::matmul::matmul_f32` 的自动分派**默认并行**。审计的 file:line 当时仍然正确（历史状态），**冲突项以本节的实测为准**。
 另：审计文件（`audit_lasx_caps.md`，第 3.4 节）记录 `shape::auto_threads`（`shape.rs:420`）已有"`rows/4≥2` 且 `rows·k·n ≥ AUTO_MIN_WORK=4M` 才并行"的形状自适应阈值 ⇒ **本仓现在有两条独立阈值**（typed shape 4M、GEMM 内核 32M），**二者服务于不同入口、不互相覆盖**；后续若要统一，应在后端层做（仍不进 DSL）。
 
+## 7.29 阶段1 落地：群论可分离 ⇒ 引擎编译期发射（**稠密 4.73–4.79× 采纳；稀疏 5 点 BelowThreshold**）
+
+**原型审计**（`/home/lik/tmp_keep/audit_simd_prototypes.md`，`simd_dsl` 侧只读）：`perceive_stencil_grid`/`perceive_index`/
+`perceive_symmetry`/`criteria::group` 全部"只判不算"（零生产消费者）；`⑪` 2D 对角化**缺 2D 成本模型**（现委托 1D 判据）
+⇒ 只作能力储备不发射；`perceive_symmetry` 传播退化（`kept_by` 只返回 `{BatchPerm}`，两条 const 断言空真）。
+
+**落地（`simd_dsl`，零新契约）**：`Stencil2Sym`/`Tap2` 下沉 `contract/stencil.rs`（解 layercheck 陷阱）；
+`select_separable` 改收**画像**、只出"可分离候选"（`separable_saving_ppm` 降为账本上界，**不再决定发射**）；
+`engine/rewrite.rs` 新增 2D 可分离发射（行 pass + 列 pass，**零转置**：行主序下行/列偏移都连续）；
+`stencil_cols_f32` 契约**曾加又删**（实测证明零新契约即可，符合 P4 护栏）。
+
+**实测（引擎内，同进程交替 5 对丢首对中位；loadavg 4.88/5.34/4.98）**：
+| 负载 | 直接 | 两趟 | 结论 |
+|---|---|---|---|
+| 稠密 7×7 256² | 8.5998 ms（49 抽头） | 1.7959 ms（14 抽头） | **4.789× 采纳** |
+| 稠密 7×7 512² | 33.8188 ms | 7.1487 ms | **4.731× 采纳** |
+| 稀疏 5 点 256² | 0.2623 ms | 0.8310 ms | **0.316× ⇒ BelowThreshold（不发射）** |
+| 稀疏 5 点 512² | 1.0504 ms | 3.2118 ms | **0.327× ⇒ 同上** |
+
+**`ops_dsl` 独立 A/B 同向**：稠密 7×7 **3.631×/3.373×/3.615×**（512²/1024×768/2048²，浮点核容差类
+`max|sep−dir| ≤ 3.58e-7`；整数核其内部两实现逐位）；稀疏 5 点 **0.60–0.76×**（反例，保留在 example 输出）。
+
+**诚实 negatives**：① 引擎发射是**容差类不是逐位**（两趟/直接求和次序不同：整数核 `max rel 8.9e-6`，618/768 元素位模式不同）
+——与 `ops_dsl` 的"其内部逐位"**不一致**，逐位对齐是已记录缺口；② 稀疏 5 点实测更慢 ⇒ 不发射；③ ⑪ 不发射（2D 成本模型缺失）；
+④ 通用化后稀疏 5 点从早期特化的"1.74×"掉到 0.32× ⇒ **早期特化数字不能当结论**。
+**数字家**：本文件（`simd_dsl/docs/structure.md §7` / `optimizations.md §10` 只引不抄）。
+
 
 
 
