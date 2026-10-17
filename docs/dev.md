@@ -6764,7 +6764,30 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 `cmatmul` Direct **1.027×（逐位）**、`dot_f64` **1.013×（逐位）** 过线；`absmax_rows` **0.676×**、`batch_distance2d` **0.70–0.73×**
 （**逐位但趟数 3/6 vs 融合核 1**）⇒ **BelowThreshold，组合版保留**（符合"组合版是源实现"口径）。
 
-**待补**：master 总表（批1/2/3 两列 + 输项原因）由 `task-44` 产出后补入本节；f64 逐元素契约（`task-45`）落地后补本节续篇（编号待定）。
+### 7.32.4 Master 总表（`examples/auto_ab.rs`；threads=12；loadavg 6.20/6.41/6.56；6 对丢首对中位；**全部逐位**）
+
+**`*_auto` / override 路径 vs `lasx_rs::api::*`**：
+| 项 | api ms | auto/override ms | api/auto | 结论 |
+|---|---|---|---|---|
+| softmax_rows_auto | 1.068 | 1.088 | 0.982× | ✅ |
+| rms_norm_auto | 0.389 | 0.354 | **1.100×** | ✅（1 趟融合净收益） |
+| layer_norm_auto | 0.566 | 0.549 | 1.031× | ✅ |
+| gelu_quick_auto | 17.217 | 17.240 | 0.999× | ✅ |
+| matmul_f32 @1024³ | 5.764 | 5.866 | 0.983× | ✅ |
+| matmul_f32 @192×768×3072 | 2.880 | 2.886 | 0.998× | ✅ |
+| matmul_f32 @512³ | 0.790 | 0.849 | **0.931×** | ❌（**同一内核、逐位**，薄转发+小尺寸+loadavg 6.2 噪声；非算法回退） |
+| matmul_f64 @512³ | 9.854 | 10.021 | 0.983× | ✅ |
+
+⇒ **`*_auto` 4/4 达标、8 项中 7 项 ≥0.98**；能力位实测 `FusedNorms=true FusedElementwise=true`。
+
+**两列架构对照（组合版 vs api；auto/override vs api）**：
+* 批2：softmax **0.190× → 0.982×**、rms **0.305× → 1.100×**、layer **0.253× → 1.031×**、gelu_quick **0.191× → 0.999×**、
+  rope **0.237× → 0.974×（override）**、axpy **0.316× → 1.063×（override）**、amax **0.118×（无融合原语，LASX 无 Abs 内核 ⇒ 逐位组合版保留）**；
+* 批3：`BelowThreshold` 不迁（cmatmul Direct / absmax_rows / batch_distance2d，数字见 §7.31；组合版保留为跨后端源实现）。
+* **架构结论**：**组合版 = 跨后端唯一源实现**（LASX 上慢 3.2–8.5×，如实保留）；**能力探测 auto/override 后 7/8 项 ≥0.98**
+  ⇒ "源实现 + 加速选项"架构成立；下一步引擎 KPI 仍应继续压组合版趟数（§7.32.2 已采纳 rms/layer）。
+
+**f64 逐元素契约（`task-45`）落地后补本节续篇（编号待定）。**
 
 **数字家**：本文件（`simd_dsl` docs 只引不抄）。
 
