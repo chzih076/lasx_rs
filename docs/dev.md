@@ -6789,6 +6789,45 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 
 **f64 逐元素契约（`task-45`）落地后补本节续篇（编号待定）。**
 
+## 7.33 阶段4 收尾：f64 契约（P0 6 方法）+ f64 几何五入口（**全部 BelowThreshold，源实现先跑通**）
+
+### 7.33.1 f64 逐元素/轴归约契约（`Backend` 56 → 62；portable 默认，无 LASX override）
+| 方法 | 等价类 |
+|---|---|
+| `map_binary_f64` / `map_ternary_f64` / `map_affine_f64` | **逐位** |
+| `reduce_sum_cols_f64` / `reduce_weighted_sum_cols_f64` | **逐位** |
+| `reduce_sum_rows_f64` | **容差**，实测 **rel ≤ 1.233e-15**（1024×4096，non-dyadic 数据） |
+
+**能力位**：本仓**无 f64 逐元素内核** ⇒ 不报 `F64Elementwise`/`Reduction`；生产路径 = portable 默认（跨后端可用）。
+**教训**：f64 数据取二进制精确值（0.125）时多累加器与顺序累加**完全相同**，测不出容差差 ⇒ 必须用 non-dyadic 数据。
+
+### 7.33.2 f64 几何五入口（`ops_dsl`，SoA 布局；组合版源实现）
+| 入口 | 趟数 | 等价类 vs `lasx_rs::api` |
+|---|---|---|
+| `vec3_add_scaled_f64` | 6 | 容差（lasx FMA 单舍入 vs 两步；≤1 ulp） |
+| `norm3_batch_f64` | 6 | **逐位** |
+| `unitize3_batch_f64` | 9 | 容差（≤1 ulp）；**已知差异：零向量 lasx=(0,0,0)、本实现 NaN**（契约无 f64 选择原语，已文档化钉住） |
+| `cross3_batch_f64` | 9 | **逐位** |
+| `mat3_mul_vec3_batch_f64` | 15 | **逐位** |
+
+**A/B（n=1M，threads=12，loadavg 3.95，6 对丢首对中位）**：
+| 用例 | api ms | ops ms | ratio |
+|---|---|---|---|
+| vec3_add_scaled | 8.747 | 20.473 | **0.427** |
+| norm3_batch | 4.905 | 22.452 | **0.218** |
+| unitize3_batch | 9.135 | 36.284 | **0.252** |
+| cross3_batch | 10.327 | 39.029 | **0.265** |
+| mat3_mul_vec3 | 26.550 | 63.361 | **0.419** |
+
+⇒ **五项全部 `BelowThreshold`（0.22–0.43×），不替换生产入口**：LASX **无 f64 逐元素 override** ⇒
+组合版是 **6–15 趟 portable 标量** vs **1 趟向量融合核**。这正是"**源实现先跑通、加速选项待后端覆盖**"的活例：
+* 若要加速：给 LASX 加 f64 逐元素 override（`map_binary/affine/ternary_f64` 的 LASX 实现）或几何融合核；
+  按 P4 护栏需 portable 默认已存在（✅）+ 能力探测 + 实测门限。
+* **未迁移（8 个，`NotMigrated`，理由入模块头）**：`quat_*`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch`
+  —— f64 SoA 交叉索引 + 领域融合语义，建议做领域库而非塞 `Backend`。
+
+**数字家**：本文件（`simd_dsl` docs 只引不抄）。
+
 **数字家**：本文件（`simd_dsl` docs 只引不抄）。
 
 
