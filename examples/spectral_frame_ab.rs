@@ -15,7 +15,7 @@ use ops_dsl::spectral::{
 use simd_dsl::IdiomaticBackend;
 use std::time::Instant;
 
-fn median(v: &mut Vec<f64>) -> f64 {
+fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
 }
@@ -24,7 +24,6 @@ fn range(v: &[f64]) -> f64 {
     let hi = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     hi - lo
 }
-/// §5：交替采样，丢弃首对，返回 (A 中位, A 极差, B 中位, B 极差)。
 
 fn masked_rel(got: &[f32], want: &[f32]) -> f64 {
     let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0) as f64;

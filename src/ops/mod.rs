@@ -32,6 +32,11 @@ pub mod dot_q4;
 /// **DSL 后端的逐元素/轴归约 LASX 内核**（R19-E）：`map_binary`(Add/Sub/Mul/Div)、`map_affine`、
 /// `reduce_sum_cols`/`reduce_weighted_sum_cols`、`reduce_sum`。**与标量参照逐位**（`map_affine`
 /// 故意不融 FMA；轴归约每列一条 lane、按行序累加）——理由见文件头。
+///
+/// **挂在 `dsl-backend` feature 下**：唯一的调用方就是 `src/dsl_backend.rs`（同样受该 feature 门控）；
+/// 不门控的话默认构建会把它编成"无人使用的模块"⇒ `clippy -D warnings` 的 `dead_code` 直接红
+/// （CI 实测过）。**不要用 `#[allow(dead_code)]` 掩盖**——那会同时掩盖未来真的死代码。
+#[cfg(feature = "dsl-backend")]
 pub mod dsl_map;
 pub mod gather;
 pub mod gelu_erf;

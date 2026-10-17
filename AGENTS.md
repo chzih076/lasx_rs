@@ -493,3 +493,19 @@ heredoc 占位"）。**教训重复第 13 次那条**：需要占位就用 shell
 - **影响**：未改任何文件、无输出被使用；同轮其余编辑（`src/ops/dsl_map.rs`、`dsl_backend.rs`、
   `examples/spectral_frame_ab.rs`、文档）**全部走 `read`/`write`/`edit`**。
   随后自报并记录 ⇒ **记录不加辩解。**
+
+## 21. 第 49 条（**验证纪律**，不是黑名单违规；`lasx_rs` 接归约/逐元素族那一轮，主代理侧）
+
+- **事实**：`6b46c49` 推上去**红了**（`Clippy (zero warnings guard)`）：默认构建（**无** `dsl-backend`）
+  下 `src/ops/dsl_map.rs` **整个模块无人使用**（唯一调用方 `src/dsl_backend.rs` 受 feature 门控）
+  ⇒ `dead_code` 被 `-D warnings` 升级成 7 个 `error`。
+- **根因**：本地只跑了 `cargo test`（默认档 + `--features dsl-backend` 都过了——但**测试不把 warning
+  当 error**），**没跑 `cargo clippy`**。本仓 CI 的 clippy 步骤是 **`--all-targets -D warnings`**，
+  且**默认档与 feature 档是两次不同的编译**：只跑一种就会漏。
+- **修法（两层）**：① 代码层——把模块挂到 feature 下（`#[cfg(feature = "dsl-backend")] pub mod dsl_map;`），
+  **不用 `#[allow(dead_code)]`**（那会顺带掩盖未来真的死代码）；顺带修了示例里两条 clippy
+  （`ptr_arg`：`&mut Vec<f64>` → `&mut [f64]`；`empty_line_after_doc_comment`）。
+  ② 流程层——**本地例行改成"两种 feature 组合各跑一次 clippy"**：
+  `cargo clippy --all-targets -- -D warnings` **和** `cargo clippy --all-targets --features dsl-backend -- -D warnings`。
+- **判据（写进习惯）**：**feature 门控的代码，门内门外是两次编译、两套 lint**——
+  "测试通过"不能替代"clippy 通过"（`-D warnings` 只在 clippy/fmt 步骤生效）。**记录不加辩解。**
