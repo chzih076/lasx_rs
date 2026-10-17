@@ -1,17 +1,29 @@
 //! **`simd_dsl::Backend` 的 `lasx_rs` 实现**（步骤 ③a；**feature 门控**：`dsl-backend`）。
 //!
-//! # 范围（③a，**只做必需方法**）
-//! - **必需方法**（trait 无默认值）只有两个：`matmul_f32`、`dot_f32` ⇒ **接到现有 LASX 内核**
+//! # 范围（**当前状态，阶段3 批1 之后**）
+//! - **必需方法**（trait 无默认值）：`matmul_f32`、`dot_f32` ⇒ **接到现有 LASX 内核**
 //!   （`ops::matmul::matmul_f32` / `ops::dot::dot`）——**不绕开、不新写算法、不改语义**；
-//! - **其余方法全部先用 `simd_dsl` 的默认实现**（标量回退；**不 panic**），包括
-//!   `matmul_f64`/`dot_f64`/`reduce_sum_*`/`map_unary_*`/`pack_*`/`build_kernel_f32` 等；
-//! - **本轮不做**：`build_kernel_f32` 覆盖（手写递推核）、`pack_f32`/`matmul_f32_packed`
-//!   （现有 `Prepared`）、完整 `precision_claim` —— 留到 ③b。
+//! - **已覆盖（本仓有内核可接的）**：`matmul_f32`/`dot_f32`、**`matmul_f64`/`dot_f64`（IS-2）**、
+//!   **`matmul_bt_f32`（IS-1）**、`reduce_sum_f32`、`map_affine_f32`、`map_binary_f32`、
+//!   `reduce_{sum,weighted_sum,centered_sq_sum}_cols_f32`、`matmul_pair_psd_f32`、
+//!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
+//!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
+//!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`；
+//! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约、`max/min_{cols,rows}`、
+//!   `map_unary_f32`/`map_binary_scalar_f32`、banded/stencil、f64 逐元素族 ⇒ **走 `simd_dsl` 标量默认**
+//!   （**不 panic**；性能必然不如 api 版，迁移时按"无内核 ⇒ 不替换"如实记）；
+//! - **线程**：`CallOpts{threads}` **未接**（本后端不按 opts 派活，见文末 ③b-4 留档）；但 **GEMM 内核
+//!   自己**在 `work ≥ 32M` 时走**进程级全局池**（`ops::matmul::matmul_f32`，§7.28；`init_global(1)`
+//!   是逃生门）⇒ **大形状 A/B 的 `threads` 会 >1**，必须在表里打印（`examples/migrate_ab.rs` 已照做）。
 //!
 //! # `precision_claim` 只填**能如实声明**的部分
-//! `matmul_f32`/`dot_f32` 走的是**现有 LASX 实内核**，与 `api::matmul`/`api::dot` **逐位一致**
-//! （有测试 `bitwise_same_as_api` 钉住）⇒ 声明为**逐位类**并**点名参照物** = `lasx_rs::api`。
-//! **其余路径一律 `None`**（未测未做 ⇒ 不声明）。
+//! `(Default, F32/F64)` 上被覆盖的**内核方法**（`matmul_f32`/`dot_f32`/`matmul_f64`/`dot_f64`）
+//! 与 `lasx_rs::api` **逐位一致**（同一内核；测试 `bitwise_same_as_api` 与
+//! `matmul_f64_and_dot_f64_bitwise_vs_api` 钉住）⇒ 声明为**逐位类**并**点名参照物** = `lasx_rs::api`。
+//!
+//! **IS-4 校正（audit §10 #2）**：`map_affine_f32` 与 `reduce_weighted_sum_cols_f32` 用 **FMA**
+//! （`ops/dsl_map.rs`）⇒ 它们是**容差类**（实测相对峰值 ≤ 1e-5），**不在上面那条逐位声明里**。
+//! 旧版本模块文档把这两条写成"逐位、map_affine 故意不融 FMA"，与代码事实相反 —— 已更正。
 //!
 //! # `Capability` **只低估**
 //! 只报"确实为真"的能力位；拿不准的一律不报。
@@ -32,7 +44,9 @@
 //!
 //! **语义澄清**：`simd_dsl` 的 `CallOpts` 明确只是**意图**、不是保证（其默认实现里就是 `let _ = opts;`）
 //! ⇒ 即便将来接上，也只能声明"**尽量按意图**"，不能声明"保证 N 线程"。
-//! **当前状态**：**未接、未测**（本后端单线程）。
+//! **当前状态**：`CallOpts{threads}` **未接、未测**；但 **GEMM 内核自动并行**（§7.28，`work ≥ 32M` 时
+//! 自走 `pool::global()`）已经生效 ⇒ 大形状下"本后端单线程"这个旧说法**不再成立**，A/B 表必须打印
+//! 实际 `threads`（本文件的 `examples/migrate_ab.rs` 就是这么做的）。
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 // **bump 修法（R6-B-2）**：`simd_dsl` 在 M1–M5 分层重构后，把契约/判据/引擎各面**在 crate 根再导出**
@@ -109,6 +123,87 @@ impl Backend for LasxBackend {
         Ok(crate::ops::dot::dot(a, b))
     }
 
+    /// **IS-1（阶段3 批1）：`Backend::matmul_bt_f32` → 本仓 LASX NT-GEMM 内核**。
+    ///
+    /// NT 形态：B 行主序 `n×k`（`out[i·n+j] = Σ_t a[i·k+t]·b[j·k+t]`），**不物化转置**、
+    /// 两个操作数都按 `k` 连续读。内核本身就是按 `Result`/`LengthMismatch` 契约写的
+    /// （`ops/matmul_bt.rs`：形状校验在**写入之前**跑完、不 panic）⇒ 这里**直接转发**，不复制校验。
+    ///
+    /// **等价类：逐位类** —— 内核严格按 `t` 顺序单累加器累加、无 FMA/多累加器/重排 ⇒ 与
+    /// "物化 `Bᵀ` 再 `api::matmul_into`"以及 `simd_dsl` 的标量默认**同序**
+    /// （测试 `matmul_bt_bitwise_same_as_api_and_scalar` 用 `to_bits()` 钉住；
+    /// `examples/migrate_ab` 先跑逐位、只在不逐位时才谈界）。
+    fn matmul_bt_f32(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        crate::ops::matmul_bt::matmul_bt_f32(m, k, n, a, b, out)
+    }
+
+    /// **IS-2（阶段3 批1）：`Backend::matmul_f64` → 本仓 LASX f64 GEMM**。
+    ///
+    /// 默认实现是 `simd_dsl::kernels::scalar::matmul_f64`（标量回退）⇒ 这里接上 LASX f64 内核
+    /// （`ops::matmul_f64`：流式 + 打包两条路径，与 [`crate::api::matmul_f64`] 同一条）。
+    ///
+    /// **等价类（实测，2026-10-18）**：
+    /// * 对**旧入口 `api::matmul_f64`**：**逐位**（同一条内核 ⇒ `to_bits()` 相等；测试
+    ///   `matmul_f64_and_dot_f64_bitwise_vs_api` 钉住）；
+    /// * 对**标量默认**（接线前的路径）：**容差类**——LASX 侧 4-lane 累加/打包次序与顺序累加不同，
+    ///   实测相对峰值 **≤ 3.4e-16**（形状 33×65×31 / 100×448×1024 / 512×512×512）。
+    ///
+    /// **不接** `parallel::matmul_f64`（池版几何 = 批3 的事，本批只接线、不改线程口径）。
+    fn matmul_f64(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        b: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        let op = "matmul_f64";
+        let need_a = m
+            .checked_mul(k)
+            .ok_or(BackendError::ShapeOverflow { op, what: "m×k" })?;
+        let need_b = k
+            .checked_mul(n)
+            .ok_or(BackendError::ShapeOverflow { op, what: "k×n" })?;
+        let need_out = m
+            .checked_mul(n)
+            .ok_or(BackendError::ShapeOverflow { op, what: "m×n" })?;
+        if a.len() != need_a {
+            return Err(len_err(op, "a", need_a, a.len()));
+        }
+        if b.len() != need_b {
+            return Err(len_err(op, "b", need_b, b.len()));
+        }
+        if out.len() != need_out {
+            return Err(len_err(op, "out", need_out, out.len()));
+        }
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        crate::ops::matmul_f64::matmul_f64(m, k, n, a, b, out);
+        Ok(())
+    }
+
+    /// **IS-2（阶段3 批1）：`Backend::dot_f64` → 本仓 LASX f64 点积**（默认是标量回退）。
+    ///
+    /// **等价类（实测，2026-10-18）**：对**旧入口 `api::dot_f64` 逐位**（同内核）；对**标量默认**
+    /// 是**容差类**——LASX 侧 4-lane 累加 + 水平归约，与顺序累加不同序 ⇒ 实测相对 **≤ 2.4e-14**
+    /// （n = 4096；n ≤ 8 时恰好逐位）。
+    fn dot_f64(&self, a: &[f64], b: &[f64]) -> Result<f64, BackendError> {
+        if a.len() != b.len() {
+            return Err(len_err("dot_f64", "b", a.len(), b.len()));
+        }
+        Ok(crate::ops::dot_f64::dot_f64(a, b))
+    }
+
     /// **③b-1：`build_kernel_f32` 覆盖 —— 手写等距递推核（每行守卫 + 逐行回退 + 如实上报）**。
     ///
     /// **守卫只调 `simd_dsl::safety::recurrence_safe`**（不复制阈值、不存第二份常量）；
@@ -116,13 +211,17 @@ impl Backend for LasxBackend {
     /// 并把 `rows_fallback` / `route_taken` **如实**填进报告 —— **不静默假装走快档**。
     /// **归约 / 逐元素族接 LASX（R19-E）**：帧里 matmul 之外的多数开销在这五条上。
     ///
-    /// **等价类（逐条钉住）**：
-    /// * `map_affine_f32` / `map_binary_f32`（`Add`/`Sub`/`Mul`/`Div`）/ `reduce_*_cols_f32`：
-    ///   **与 `simd_dsl::kernels::scalar` 的参照逐位**——逐元素无归约；轴归约保"每列一条 lane、
-    ///   **按行序**累加"（累加次序与参照相同）；`map_affine` **故意不融 FMA**（`a*x` 再 `+b`）。
+    /// **等价类（逐条钉住；每条都有测试）**：
+    /// * `map_binary_f32`（`Add`/`Sub`/`Mul`/`Div`）：**与 `simd_dsl::kernels::scalar` 逐位**——
+    ///   逐元素无归约。`Max`/`Min`：NaN 语义按 Rust（`f32::max`：另一侧是数就返回它），而 LASX
+    ///   `xvfmax` 是 IEEE 语义（NaN 传播不同）⇒ **这两条委托标量参照**，不冒险。
+    /// * `reduce_sum_cols_f32`：**逐位**——每列一条 lane、**按行序**累加（与参照同序）。
+    /// * **`map_affine_f32` / `reduce_weighted_sum_cols_f32`：容差类**（**IS-4 校正**，audit §10 #2）——
+    ///   两者都用 **FMA**（`a·x + b` / `v·w + acc`，见 `ops/dsl_map.rs` 的 `lasx_xvfmadd_s`），
+    ///   舍入与"先乘后加"不同，**不是逐位**；实测相对峰值 ≤ 1e-5（`r19e_elementwise_and_axis_reduce_classes`
+    ///   的 R19-G 断言，用非 2 的幂系数才测得出差）。旧注释写成"逐位、故意不融 FMA"，与代码事实相反。
+    ///   若将来改回"先乘后加"，才可回到逐位类（必须重测后才改声明）。
     /// * `reduce_sum_f32`：参照本身就是**多累加器**（容差类）⇒ 这里用本仓 LASX 归约，**同性质**。
-    /// * `Max`/`Min`：NaN 语义按 Rust（`f32::max`：另一侧是数就返回它），而 LASX `xvfmax` 是 IEEE
-    ///   语义（NaN 传播不同）⇒ **这两条委托标量参照**，不冒险。
     fn reduce_sum_f32(&self, x: &[f32]) -> Result<f32, BackendError> {
         Ok(crate::ops::dsl_map::reduce_sum(x))
     }
@@ -499,13 +598,22 @@ impl Backend for LasxBackend {
         ))
     }
 
-    /// **只声明能如实声明的**：默认路径 + f32 上的 `matmul_f32`/`dot_f32` 走的是**现有 LASX 内核**，
-    /// 与 `lasx_rs::api` **逐位一致**（测试 `bitwise_same_as_api` 钉住）⇒ **逐位类 + 点名参照物**。
-    /// **其余（`IsometricRecurrence`、f64 等）一律 `None`** —— 未做未测 ⇒ 不声明。
+    /// **只声明能如实声明的**：`(Default, F32)` 与 `(Default, F64)` 上被**覆盖的内核方法**
+    /// （`matmul_f32`/`dot_f32`/`matmul_f64`/`dot_f64`）与 `lasx_rs::api` **逐位一致**（同一内核；
+    /// 测试 `bitwise_same_as_api`、`matmul_f64_and_dot_f64_bitwise_vs_api` 钉住）⇒ **逐位类 + 点名参照物**。
+    /// **注意（IS-4 校正）**：这条 `bit_exact` **不覆盖 FMA 族**——`map_affine_f32` 与
+    /// `reduce_weighted_sum_cols_f32` 用 FMA ⇒ **容差类**（界见方法文档与 `r19e_*` 测试的 R19-G 断言）；
+    /// 旧版本把这两条也写成逐位，是 audit §10 #2 记的错误。
+    /// **其余路径（未覆盖的方法族、`FrontendForward` 等）一律 `None`** —— 未做未测 ⇒ 不声明。
     fn precision_claim(&self, path: EnginePath, scalar: ScalarKind) -> Option<PrecisionClaim> {
         match (path, scalar) {
             (EnginePath::Default, ScalarKind::F32) => Some(PrecisionClaim::bit_exact(
-                "参照物 = lasx_rs::api（同一 LASX 内核）",
+                "参照物 = lasx_rs::api（matmul_f32/dot_f32 同一 LASX 内核）；FMA 族方法（map_affine_f32 / reduce_weighted_sum_cols_f32）另行按容差类声明",
+            )),
+            // **IS-2**：f64 两个 override 接的是 LASX 内核，与 `api::matmul_f64`/`api::dot_f64` 逐位；
+            // 与"接线前的 simd_dsl 标量回退"相差 ~1e-16（这是接线收益/差异，不是本声明的参照物）。
+            (EnginePath::Default, ScalarKind::F64) => Some(PrecisionClaim::bit_exact(
+                "参照物 = lasx_rs::api::matmul_f64 / api::dot_f64（同一 LASX 内核）",
             )),
             // **③b-1：递推路径 = 容差类 + 界**（与 `guard_of(IsometricRecurrence)` 的"逐行回退"一致）
             // **参照物写准**：相对的是**引擎默认路径**（`simd_dsl::kernel::build` 的 libm 口径），
@@ -678,11 +786,15 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
-    /// **只低估**：`pack_f32` 与 `matmul_f32_packed` 都已实现、**逐位断言已过**（测试
-    /// `packed_bitwise_same_as_matmul`）⇒ **只打开 `Packing`**；其余能力（f64/逐元素/归约/超越/
-    /// 多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"）。
+    /// **只低估**：已实现且**有测试**的能力才打开。
+    /// * `Packing`：`pack_f32` + `matmul_f32_packed`（逐位断言已过，测试 `packed_bitwise_same_as_matmul`）；
+    /// * `MatmulF64`：**IS-2 已接** `matmul_f64`/`dot_f64` → LASX f64 内核（与 `api::*` 逐位，
+    ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）。
+    ///
+    /// 其余（逐元素/归约/超越/多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"；
+    /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     fn supports(&self, cap: Capability) -> bool {
-        matches!(cap, Capability::Packing)
+        matches!(cap, Capability::Packing | Capability::MatmulF64)
     }
 
     /// **P5-b：跨步拷贝** → `ops::strided::copy_strided_f32`（`col==1` 走 memcpy 行拷贝）。
@@ -1106,6 +1218,152 @@ mod tests {
         );
     }
 
+    /// **IS-1 等价类**：`matmul_bt_f32` 对 **`simd_dsl` 标量默认逐位**（trait 文档点名的参照物 =
+    /// "先物化 `Bᵀ` 再 `Backend::matmul_f32`"，两者同序）；对 **"物化转置 + `api::matmul"`** 是
+    /// **容差类**（LASX GEMM 用 FMA ⇒ 舍入不同，实测 rel ≤ 1.3e-7）——**两个参照物别混**。
+    #[test]
+    fn matmul_bt_bitwise_same_as_api_and_scalar() {
+        use simd_dsl::kernels::scalar;
+        let be = LasxBackend;
+        for &(m, k, n) in &[(7usize, 37usize, 11usize), (33, 65, 31), (100, 448, 1024)] {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+                .collect();
+            // NT：B 是 n×k（按 j 行主序，k 方向连续）
+            let bt: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 53 % 97) as f32) * 0.1 + 1.3)
+                .collect();
+            let mut got = vec![f32::NAN; m * n];
+            be.matmul_bt_f32(m, k, n, &a, &bt, &mut got)
+                .expect("backend.matmul_bt_f32");
+            // ① 标量默认（trait 文档的参照物）⇒ **逐位**
+            let mut want = vec![f32::NAN; m * n];
+            scalar::matmul_bt_f32(m, k, n, &a, &bt, &mut want).expect("scalar::matmul_bt_f32");
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{m}×{k}×{n}: matmul_bt_f32 与标量默认不逐位"
+            );
+            // ② 物化转置 + api::matmul_into ⇒ **容差类**（⾮逐位；界 ≤ 1e-6，实测 ≤1.3e-7）
+            let mut bmat = vec![0.0f32; k * n];
+            for j in 0..n {
+                for t in 0..k {
+                    bmat[t * n + j] = bt[j * k + t];
+                }
+            }
+            let mut api = vec![f32::NAN; m * n];
+            crate::api::matmul_into(m, k, n, &a, &bmat, &mut api).expect("api::matmul_into");
+            let peak = api.iter().fold(0.0f32, |p, v| p.max(v.abs())).max(1e-30) as f64;
+            let rel = got
+                .iter()
+                .zip(&api)
+                .fold(0.0f64, |w, (g, s)| w.max((*g - *s).abs() as f64))
+                / peak;
+            assert!(
+                rel <= 1e-6,
+                "{m}×{k}×{n}: matmul_bt vs 物化转置+api::matmul 超界 {rel:e}（LASX GEMM 用 FMA）"
+            );
+        }
+        // 零维：k == 0 ⇒ out 全 +0.0（与默认实现同口径）
+        let mut z = vec![f32::NAN; 6];
+        be.matmul_bt_f32(2, 0, 3, &[], &[], &mut z)
+            .expect("k=0 合法空操作");
+        assert!(
+            z.iter().all(|v| v.to_bits() == 0.0f32.to_bits()),
+            "k=0 时 out 必须是 +0.0"
+        );
+        // 长度/形状错误 ⇒ Err（不 panic）
+        let mut o = vec![0.0f32; 4];
+        assert!(
+            be.matmul_bt_f32(2, 3, 2, &[0.0; 5], &[0.0; 6], &mut o)
+                .is_err()
+        );
+        assert!(
+            be.matmul_bt_f32(2, 3, 2, &[0.0; 6], &[0.0; 5], &mut o)
+                .is_err()
+        );
+    }
+
+    /// **IS-2 等价类（matmul_f64）**：对**旧入口 `api::matmul_f64` 逐位**（同一 LASX 内核）；
+    /// 对**标量默认**（接线前的路径）是**容差类**（4-lane 累加/打包次序不同）——实测 rel ≤ 3.4e-16。
+    #[test]
+    fn matmul_f64_bitwise_vs_api_and_tolerance_vs_scalar() {
+        use simd_dsl::kernels::scalar;
+        let be = LasxBackend;
+        for &(m, k, n) in &[
+            (5usize, 7usize, 3usize),
+            (33, 65, 31),
+            (100, 448, 1024), // 打包路径
+        ] {
+            let a: Vec<f64> = (0..m * k)
+                .map(|i| ((i * 37 % 101) as f64) * 0.1 - 6.07)
+                .collect();
+            let b: Vec<f64> = (0..k * n)
+                .map(|i| ((i * 53 % 97) as f64) * 0.1 + 1.3)
+                .collect();
+            let api = crate::api::matmul_f64(m, k, n, &a, &b).expect("api::matmul_f64");
+            let mut got = vec![f64::NAN; m * n];
+            be.matmul_f64(m, k, n, &a, &b, &mut got)
+                .expect("backend.matmul_f64");
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                api.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{m}×{k}×{n}: matmul_f64 与 api::matmul_f64 不逐位"
+            );
+            // 对标量默认：容差类（实测 ≤ 3.4e-16，界留到 1e-15）
+            let mut sc = vec![f64::NAN; m * n];
+            scalar::matmul_f64(m, k, n, &a, &b, &mut sc).expect("scalar::matmul_f64");
+            let peak = sc.iter().fold(0.0f64, |p, v| p.max(v.abs())).max(1e-300);
+            let rel = got
+                .iter()
+                .zip(&sc)
+                .fold(0.0f64, |w, (g, s)| w.max((*g - *s).abs()))
+                / peak;
+            assert!(
+                rel <= 1e-15,
+                "{m}×{k}×{n}: matmul_f64 vs 标量默认超界 {rel:e}"
+            );
+        }
+        // 长度错误 ⇒ Err（不 panic）
+        let mut o = vec![0.0f64; 4];
+        assert!(
+            be.matmul_f64(2, 3, 2, &[0.0; 5], &[0.0; 6], &mut o)
+                .is_err()
+        );
+        assert!(
+            be.matmul_f64(2, 3, 2, &[0.0; 6], &[0.0; 6], &mut o[..3])
+                .is_err()
+        );
+    }
+
+    /// **IS-2 等价类（dot_f64）**：对 `api::dot_f64` **逐位**；对标量默认**容差类**（4-lane 累加 +
+    /// 水平归约 vs 顺序累加，实测 rel ≤ 2.4e-14 @ n=4096；n ≤ 8 恰好逐位）。
+    #[test]
+    fn dot_f64_bitwise_vs_api_and_tolerance_vs_scalar() {
+        use simd_dsl::kernels::scalar;
+        let be = LasxBackend;
+        for &n in &[0usize, 1, 3, 7, 8, 33, 4096] {
+            let a: Vec<f64> = (0..n)
+                .map(|i| ((i * 11 % 37) as f64) * 0.25 - 3.0)
+                .collect();
+            let b: Vec<f64> = (0..n)
+                .map(|i| ((i * 7 % 53) as f64) * 0.125 - 1.0)
+                .collect();
+            let api = crate::api::dot_f64(&a, &b).expect("api::dot_f64");
+            let got = be.dot_f64(&a, &b).expect("backend.dot_f64");
+            assert_eq!(
+                got.to_bits(),
+                api.to_bits(),
+                "n={n}: dot_f64 与 api::dot_f64 不逐位"
+            );
+            let sc = scalar::dot_f64(&a, &b).expect("scalar::dot_f64");
+            let rel = (got - sc).abs() / sc.abs().max(1e-300);
+            assert!(rel <= 1e-12, "n={n}: dot_f64 vs 标量默认超界 {rel:e}");
+        }
+        // 长度错误 ⇒ Err（不 panic）
+        assert!(be.dot_f64(&[0.0; 3], &[0.0; 4]).is_err());
+    }
+
     /// **长度不符 ⇒ 报错（不 panic）**。
     #[test]
     fn length_mismatch_is_an_error() {
@@ -1120,7 +1378,9 @@ mod tests {
         assert!(be.dot_f32(&a, &b[..5]).is_err());
     }
 
-    /// **只声明能如实声明的**：默认路径/f32 为逐位类（点名参照物）；未做路径为 `None`。
+    /// **只声明能如实声明的**：`(Default, F32/F64)` 为逐位类（点名参照物 = `lasx_rs::api`）；
+    /// 递推路径为容差类 + 界；未做路径为 `None`。`supports` 同步（`Packing`/`MatmulF64` 为真，
+    /// `Threaded` 仍 false）。
     #[test]
     fn precision_claim_is_honest() {
         let be = LasxBackend;
@@ -1135,17 +1395,27 @@ mod tests {
         );
         assert!(
             be.precision_claim(EnginePath::Default, ScalarKind::F64)
-                .is_none(),
-            "f64 专用实现本轮未做 ⇒ 必须 None"
+                .is_some(),
+            "IS-2 后 f64 有专用实现（与 api::* 逐位）⇒ 应声明为逐位类"
         );
-        // **只低估**：③b-4 之后**只有 `Packing` 为真**（`pack_f32` + `matmul_f32_packed` 已实现且逐位断言过），
-        // 其余能力一律 false
+        // 未做的路径仍然 None（未测未做 ⇒ 不声明）
+        assert!(
+            be.precision_claim(EnginePath::IsometricRecurrence, ScalarKind::F64)
+                .is_some(),
+            "递推 f64 已在 ③b-1 声明"
+        );
+        // **只低估**：`Packing`（packed 已接线且逐位断言过）与 `MatmulF64`（IS-2 已接）为真；
+        // 其余能力一律 false（`Threaded` 仍 false：`CallOpts` 未接，见 ③b-4 留档）
         assert!(
             be.supports(Capability::Packing),
             "Packing 已实现且逐位断言过 ⇒ 应为 true"
         );
-        assert!(!be.supports(Capability::MatmulF64));
+        assert!(
+            be.supports(Capability::MatmulF64),
+            "IS-2 后 matmul_f64/dot_f64 有专用实现 ⇒ 应为 true"
+        );
         assert!(!be.supports(Capability::Transcendental));
+        assert!(!be.supports(Capability::Threaded));
     }
 
     /// **R19-E：逐元素/轴归约族必须与标量参照逐位**（`map_affine` 不融 FMA；轴归约按行序累加），
