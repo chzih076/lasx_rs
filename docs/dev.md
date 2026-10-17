@@ -6508,6 +6508,31 @@ W10 另两档（同进程）：`LASX(hybrid)`＝**51.5754 ms**（只 matmul 走 
 `Layout` 跨步与 2D stencil **继续冻结**（触发条件不变）。
 **数字家**：本文件。**口径**：单机单次、`loadavg` 未记录；①/③ 为测试内朴素实现，非 `api::matmul`。
 
+## 7.26 P5-b 跨步原语：**三次 A/B 全过门限 ⇒ 推广**（`Strides` + copy/map_unary/map_binary）
+
+**契约（simd_dsl 侧 `50a23fc`，`Backend` 47 → 50）**：`Strides{row,col}`（元素单位，连续 = `{cols,1}`）+
+`copy_strided_f32` / `map_unary_strided_f32` / `map_binary_strided_f32`（**输入与输出均可跨步**）；
+新错误变体 `StridedOutOfRange{op,what,index,len}`（`Err` 时**不部分写入**）；**等价类逐位**——跨步版与连续版
+**共用同一个逐元素函数**（`apply_unary`/`apply_binary`），8 个 `UnaryOp` × 6 个 `BinaryOp` × 两档后端 `to_bits` 相等。
+
+**LASX 覆盖（本仓）**：`copy_strided` → `col==1` 走 **memcpy 行拷贝**（依据 P5-a：手写 8-lane 拷贝慢 23×）；
+`map_unary_strided` 仅 `Sqrt`/`Rcp`、`map_binary_strided` 仅 `Add`/`Mul`/`Div` 走快路径，**其余变体委托
+`simd_dsl::kernels::scalar::*`**（逐位不变）；门控已转生产档 `cfg(feature = "dsl-backend")`（有调用方，`#49`）。
+
+**A/B（同进程、5 轮丢首轮、中位；`rows=1024, cols=768, src_st.col=2`；臂① 物化连续副本+连续 op，臂② 跨步直接）**：
+
+| 轮次 | 臂① | 臂② | 比值 |
+|---|---|---|---|
+| 1 | 2.414 ms | 2.003 ms | **1.205×** |
+| 2 | 2.327 ms | 1.822 ms | **1.277×** |
+| 3 | 1.835 ms | 1.618 ms | **1.134×** |
+
+**判定：三次全部 ≥1.10× ⇒ 达到门限 ⇒ 推广**（此前单次 1.127× 确在噪声带，故按"三次复跑"规则裁决）。
+
+**边界（如实）**：`rows/cols==0` ⇒ 空操作且 dst 不写；溢出 ⇒ `ShapeOverflow`；视图越界 ⇒ `StridedOutOfRange`；
+**`src`/`dst` 别名冲突 = 未定义**，仅 `debug_assert` + 文档声明，**测试不引 `unsafe` 造重叠 ⇒ 该分支未测**。
+**口径**：单机单次测量，`loadavg` 未记录。**数字家**：本文件（`optimizations.md` 只引不抄）。
+
 
 
 
