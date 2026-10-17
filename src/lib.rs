@@ -114,6 +114,10 @@ pub mod arch;
 /// ——见 [`dsl_backend`] 模块文档（③a 只接必需方法 `matmul_f32`/`dot_f32`）。
 #[cfg(feature = "dsl-backend")]
 pub mod dsl_backend;
+/// **融合原语 override 的就绪骨架**（阶段 3 批 2 收尾；等 `simd_dsl` 契约合入后启用）。
+/// 当前 `#[cfg(any())]` 关闭（方法尚不存在于 pin 版本）；映射表/等价类界/启用步骤见模块文档。
+#[cfg(feature = "dsl-backend")]
+pub mod dsl_backend_fused;
 /// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。
 pub mod fast_trig;
 pub mod ffi;
