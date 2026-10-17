@@ -65,3 +65,8 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "spectral_frame_ab"
 required-features = ["dsl-backend"]
+
+# `dsl_perf_report`（R19-F）：完整性能报表（LASX / 可移植 / 抽象层损失）
+[[example]]
+name = "dsl_perf_report"
+required-features = ["dsl-backend"]
