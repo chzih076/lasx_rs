@@ -44,14 +44,11 @@ pub mod dsl_fft;
 pub mod dsl_map;
 
 /// **P4-b 融合内核**（`energy_dc` 单遍去均值能量、`psd_pair` 成对 epilogue）——
-/// **本轮为纯标量、与便携参照逐位**；LASX FMA 版留待拿到正确封装名后补（其容差界届时实测）。
+/// **纯标量、与便携参照逐位**（`to_bits()` 相等）；LASX FMA 版留待拿到正确封装名后补（其容差界届时实测）。
 ///
-/// **为什么还多一个 `test` 门控**：`simd_dsl` 的 trait **尚未**声明这两个方法（等 Lead 统一 bump rev），
-/// 所以**本轮没有生产调用方** ⇒ 只挂 `dsl-backend` 会被 `dead_code`（`-D warnings`）判死；
-/// 又**不许用 `#[allow(dead_code)]`**（AGENTS.md #49：那会掩盖未来真的死代码）。
-/// ⇒ 暂用 `#[cfg(all(feature = "dsl-backend", test))]`：**库构建不编、测试能跑**；
-/// **等 trait 方法落地、`dsl_backend.rs` 加上 override 后，删掉 `, test` 即可**（这行注释就是交接单）。
-#[cfg(all(feature = "dsl-backend", test))]
+/// **门控已转为生产档**：`simd_dsl` 的 trait 已声明这两个原语、`dsl_backend.rs` 已有 LASX override
+/// ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控，见 AGENTS.md #49）。
+#[cfg(feature = "dsl-backend")]
 pub mod fused;
 pub mod gather;
 pub mod gelu_erf;

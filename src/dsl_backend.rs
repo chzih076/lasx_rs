@@ -227,6 +227,87 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
+    /// **P4-a 原语（LASX 覆盖）**：`out[c] = Σ_r (x[r·cols+c] − mean[c])²`，**单遍**（无 `x_dc` 中间缓冲）。
+    ///
+    /// **等价类：逐位**——`ops::fused::energy_dc` 是**纯标量、与便携参照同序**（单累加器、`r` 递增），
+    /// 与 `kernels::scalar::reduce_centered_sq_sum_cols_f32` 的 `to_bits()` 相等（LASX 侧测试钉住）。
+    /// **注意**：若将来改成 FMA/多累加器，会**静默离开逐位类** ⇒ 必须改声明为容差类并回填实测界。
+    fn reduce_centered_sq_sum_cols_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        mean: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_centered_sq_sum_cols_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if mean.len() != cols {
+            return Err(len_err(op, "mean", cols, mean.len()));
+        }
+        if out.len() != cols {
+            return Err(len_err(op, "out", cols, out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::fused::energy_dc(x, rows, cols, mean, out);
+        Ok(())
+    }
+
+    /// **P4-a 原语（LASX 覆盖）**：`out[j·n+c] = ((Σ_t a·x)² + (Σ_t b·x)²)·inv[c]`，**成对 epilogue**
+    /// （无 `re2/im2/psd` 三块中间缓冲）。
+    ///
+    /// **等价类：逐位**——`ops::fused::psd_pair` 纯标量、与便携参照同序（单累加器、`t` 递增）；
+    /// 与 `kernels::scalar::matmul_pair_psd_f32` 的 `to_bits()` 相等（LASX 侧测试钉住）。
+    /// **`k = 0` 时输出是 `(0+0)·inv[c]`，`inv` 含负值时是 `-0.0`**（不可图省事 `fill(0.0)`）。
+    fn matmul_pair_psd_f32(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        x: &[f32],
+        inv: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "matmul_pair_psd_f32";
+        let mk = m
+            .checked_mul(k)
+            .ok_or(BackendError::ShapeOverflow { op, what: "m×k" })?;
+        let kn = k
+            .checked_mul(n)
+            .ok_or(BackendError::ShapeOverflow { op, what: "k×n" })?;
+        let mn = m
+            .checked_mul(n)
+            .ok_or(BackendError::ShapeOverflow { op, what: "m×n" })?;
+        if a.len() != mk {
+            return Err(len_err(op, "a", mk, a.len()));
+        }
+        if b.len() != mk {
+            return Err(len_err(op, "b", mk, b.len()));
+        }
+        if x.len() != kn {
+            return Err(len_err(op, "x", kn, x.len()));
+        }
+        if inv.len() != n {
+            return Err(len_err(op, "inv", n, inv.len()));
+        }
+        if out.len() != mn {
+            return Err(len_err(op, "out", mn, out.len()));
+        }
+        crate::ops::fused::psd_pair(a, b, x, m, k, n, inv, out);
+        Ok(())
+    }
+
     /// **LASX 原地按列 radix-2 复数 FFT（R19-H）**：沿列 8 路向量化、**不转置**。
     ///
     /// **等价类：容差类**（与 `kernels::scalar::fft_radix2_strided_f32` 的 **f64 内部**实现比）：
