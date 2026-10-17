@@ -51,6 +51,15 @@ pub mod dsl_map;
 #[cfg(feature = "dsl-backend")]
 pub mod fused;
 
+/// **P5-b：跨步原语**（`copy_strided_f32` / `map_unary_strided_f32` / `map_binary_strided_f32`，
+/// 统一 `Strides{row,col}`）。**内层连续（`col==1`）⇒ memcpy 行拷贝**（P5-a 实测手写 8-lane 更慢）；
+/// 跨步 ⇒ 标量按 `(r,c)`。空形状空操作、越界 ⇒ `Err`。
+///
+/// **为什么带 `test` 门控**：trait 尚未声明这 3 个方法 ⇒ 本轮无生产调用方；只挂 feature 会被
+/// `dead_code`（`-D warnings`）判死，又禁止 `#[allow(dead_code)]`（#49）⇒ **override 落地后删 `, test`**。
+#[cfg(all(feature = "dsl-backend", test))]
+pub mod strided;
+
 /// **P5-b：NT-GEMM 内核**（`out[i*n+j] = Σ_t a[i*k+t]·b[j*k+t]`；`b` 行主序 ⇒ **不需要物化转置**）。
 /// **逐位类**：严格按 `t` 顺序累加、无 FMA/无多累加器/无重排。
 ///
