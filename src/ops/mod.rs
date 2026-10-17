@@ -51,6 +51,15 @@ pub mod dsl_map;
 #[cfg(feature = "dsl-backend")]
 pub mod fused;
 
+/// **P5-b：NT-GEMM 内核**（`out[i*n+j] = Σ_t a[i*k+t]·b[j*k+t]`；`b` 行主序 ⇒ **不需要物化转置**）。
+/// **逐位类**：严格按 `t` 顺序累加、无 FMA/无多累加器/无重排。
+///
+/// **为什么带 `test` 门控**：trait 尚未声明 `matmul_bt_f32` ⇒ 本轮无生产调用方；
+/// 只挂 feature 会被 `dead_code`（`-D warnings`）判死，又禁止 `#[allow(dead_code)]`（#49）。
+/// **等 override 落地后删掉 `, test`**（这就是交接单）。
+#[cfg(all(feature = "dsl-backend", test))]
+pub mod matmul_bt;
+
 pub mod gather;
 /// **P5-a：gather / scatter 的 LASX 内核**（签名按 `simd_dsl/docs/structure.md §7` 的**解冻最终契约**：
 /// `stride` 显式、`ids: &[u32]`、越界 ⇒ `Err`）。行拷贝：**memcpy 上限**（手写 8-lane 实测更慢，见 `dev.md §7.23`）。
