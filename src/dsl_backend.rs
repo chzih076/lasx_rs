@@ -794,7 +794,109 @@ impl Backend for LasxBackend {
     /// 其余（逐元素/归约/超越/多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     fn supports(&self, cap: Capability) -> bool {
-        matches!(cap, Capability::Packing | Capability::MatmulF64)
+        // 阶段4：`FusedNorms` / `FusedElementwise` **只报真**——6 个融合方法**全部**在本文件
+        // override 到 LASX 内核后才报 `true`（只报确实覆盖的族）。
+        matches!(
+            cap,
+            Capability::Packing
+                | Capability::MatmulF64
+                | Capability::FusedNorms
+                | Capability::FusedElementwise
+        )
+    }
+
+    // ============ 阶段4：融合原语**加速选项**（源实现仍是 portable 组合版）============
+    //
+    // 等价类（界来自批2 A/B 实测）：softmax rel 2.79e-9、rms 1.83e-7、layer 2.08e-7、
+    // **gelu_quick 5.26e-3（tanh 近似 vs σ(2z)，不是 1e-5 级）**、rope 6.92e-8、axpy 8.27e-8。
+    // ES：`axpy_f32` 的 `y: &mut` 与 `x` 不得重叠（借用检查器守 + `debug_assert` 基地址）。
+
+    fn softmax_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        crate::api::softmax_rows_into(x, None, rows, cols, 1.0, out).map_err(|_| {
+            BackendError::Unsupported {
+                op: "softmax_rows_f32",
+                cap: Capability::FusedNorms,
+            }
+        })
+    }
+
+    fn rms_norm_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        crate::api::rms_norm_into(x, None, rows, cols, eps, out).map_err(|_| {
+            BackendError::Unsupported {
+                op: "rms_norm_rows_f32",
+                cap: Capability::FusedNorms,
+            }
+        })
+    }
+
+    fn layer_norm_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        crate::api::layer_norm_into(x, None, None, rows, cols, eps, out).map_err(|_| {
+            BackendError::Unsupported {
+                op: "layer_norm_rows_f32",
+                cap: Capability::FusedNorms,
+            }
+        })
+    }
+
+    fn gelu_quick_f32(&self, x: &[f32], out: &mut [f32]) -> Result<(), BackendError> {
+        crate::api::gelu_quick_into(x, out).map_err(|_| BackendError::Unsupported {
+            op: "gelu_quick_f32",
+            cap: Capability::FusedElementwise,
+        })
+    }
+
+    fn rope_apply_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        n_dims: usize,
+        cos: &[f32],
+        sin: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        crate::api::rope_into(
+            x,
+            cos,
+            sin,
+            rows,
+            cols,
+            n_dims,
+            crate::api::RopeMode::NeoX,
+            out,
+        )
+        .map_err(|_| BackendError::Unsupported {
+            op: "rope_apply_f32",
+            cap: Capability::FusedElementwise,
+        })
+    }
+
+    fn axpy_f32(&self, y: &mut [f32], x: &[f32], alpha: f32) -> Result<(), BackendError> {
+        debug_assert_ne!(x.as_ptr(), y.as_ptr(), "axpy_f32：x/y 不得重叠");
+        crate::api::axpy(alpha, x, y).map_err(|_| BackendError::Unsupported {
+            op: "axpy_f32",
+            cap: Capability::FusedElementwise,
+        })
     }
 
     /// **P5-b：跨步拷贝** → `ops::strided::copy_strided_f32`（`col==1` 走 memcpy 行拷贝）。
