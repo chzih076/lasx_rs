@@ -95,3 +95,13 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "composed_ab"
 required-features = ["dsl-backend"]
+
+# `geomf64_ab`（阶段4 收尾）：**f64 几何五入口** A/B——A = `api::*_into`（LASX 向量核），
+# B = `ops_dsl::geometry::*_f64(&LasxBackend, …)`（组合版源实现；f64 契约六方法拼出来）。
+# 同进程交替 ≥5 对丢首对取中位、先等价类再谈性能；**预期组合版全部 BelowThreshold**
+# （LASX 没有 f64 逐元素 override）——如实记录，不硬造"不输"。
+# ⚠️ 依赖 `ops_dsl` 的几何 f64 入口（`simd_dsl` 仓 `geomf64` 分支，`ops_dsl` 提交 `f525549`）；
+# **合入前 `--features dsl-backend` 档编译不过**（rev 还是 `9069ff1`）⇒ 与 rev bump 同批合入。
+[[example]]
+name = "geomf64_ab"
+required-features = ["dsl-backend"]
