@@ -308,6 +308,65 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
+    /// **P5-a 索引读写（LASX 覆盖）**：`out[i, 0..row_len] = table[ids[i], 0..row_len]`。
+    ///
+    /// **等价类：逐位**（纯行拷贝，无算术）；`stride` 显式 ⇒ 支持跨步表/跨步输出。
+    /// 校验与 `Err` 语义在 LASX 内核里（越界 ⇒ `IndexOutOfRange`、溢出 ⇒ `ShapeOverflow`、
+    /// **`Err` 时 `out` 不被部分写入**）。
+    fn gather_rows_f32(
+        &self,
+        table: &[f32],
+        row_len: usize,
+        table_stride: usize,
+        ids: &[u32],
+        out: &mut [f32],
+        out_stride: usize,
+    ) -> Result<(), BackendError> {
+        crate::ops::gather_scatter::gather_rows_f32(
+            table,
+            row_len,
+            table_stride,
+            ids,
+            out,
+            out_stride,
+        )
+    }
+
+    /// **P5-a 索引读写（LASX 覆盖，i8 表）**：与 [`Backend::gather_rows_f32`] 同形；**逐位**。
+    fn gather_rows_i8(
+        &self,
+        table: &[i8],
+        row_len: usize,
+        table_stride: usize,
+        ids: &[u32],
+        out: &mut [i8],
+        out_stride: usize,
+    ) -> Result<(), BackendError> {
+        crate::ops::gather_scatter::gather_rows_i8(
+            table,
+            row_len,
+            table_stride,
+            ids,
+            out,
+            out_stride,
+        )
+    }
+
+    /// **P5-a 索引写（LASX 覆盖）**：`cache[ids[i], 0..row_len] = src[i, 0..row_len]`。
+    ///
+    /// **等价类：逐位**（纯行拷贝）；**同 id 多次出现 ⇒ 调用方顺序 last-write-wins**（内核按顺序写）。
+    fn scatter_rows_f32(
+        &self,
+        src: &[f32],
+        src_stride: usize,
+        ids: &[u32],
+        row_len: usize,
+        out: &mut [f32],
+        out_stride: usize,
+    ) -> Result<(), BackendError> {
+        crate::ops::gather_scatter::scatter_rows_f32(src, src_stride, ids, row_len, out, out_stride)
+    }
+
     /// **LASX 原地按列 radix-2 复数 FFT（R19-H）**：沿列 8 路向量化、**不转置**。
     ///
     /// **等价类：容差类**（与 `kernels::scalar::fft_radix2_strided_f32` 的 **f64 内部**实现比）：

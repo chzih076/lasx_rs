@@ -53,12 +53,11 @@ pub mod fused;
 
 pub mod gather;
 /// **P5-a：gather / scatter 的 LASX 内核**（签名按 `simd_dsl/docs/structure.md §7` 的**解冻最终契约**：
-/// `stride` 显式、`ids: &[u32]`、越界 ⇒ `Err`）。行拷贝 8 lane（i8 用 32 B 块）。
+/// `stride` 显式、`ids: &[u32]`、越界 ⇒ `Err`）。行拷贝：**memcpy 上限**（手写 8-lane 实测更慢，见 `dev.md §7.23`）。
 ///
-/// **为什么带 `test` 门控**：`simd_dsl` 的 trait 尚未声明这 3 个方法 ⇒ 本轮无生产调用方；
-/// 只挂 feature 会被 `dead_code`（`-D warnings`）判死，又禁止 `#[allow(dead_code)]`（#49）。
-/// **等 trait 方法落地 + `dsl_backend.rs` 加 override 后删掉 `, test`**（这就是交接单）。
-#[cfg(all(feature = "dsl-backend", test))]
+/// **门控已转生产档**：`simd_dsl` trait 已声明这 3 个方法、`dsl_backend.rs` 已有 override ⇒ 有调用方 ⇒
+/// 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test`，见 AGENTS.md #49）。
+#[cfg(feature = "dsl-backend")]
 pub mod gather_scatter;
 pub mod gelu_erf;
 pub mod gelu_quick;

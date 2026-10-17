@@ -6447,6 +6447,28 @@ W10 另两档（同进程）：`LASX(hybrid)`＝**51.5754 ms**（只 matmul 走 
 
 **口径**：单机单次测量；`loadavg` 未记录；天花板是**用实测分子（微基准）+ 实测分母（整帧）算出的比例**，不是外推模型。
 
+## 7.23 P5-a：gather/scatter —— **1.037×（memcpy 上限），两条负结果比正结果更有价值**
+
+**契约**（`simd_dsl/docs/structure.md §7`，零兼容垫层）：`gather_rows_f32` / `gather_rows_i8` / `scatter_rows_f32`，
+`stride` 显式（`row_len` 与 `*_stride` 分开）、`ids: &[u32]`、越界 ⇒ `Err`（非 UB/截断）、scatter 同 id ⇒
+**调用方顺序 last-write-wins**、`Err` 时 `out` **不被部分写入**；等价类 **逐位**（纯行拷贝、无算术）。
+
+**性能实测**（§5 口径：同进程交替、5 轮丢首轮取中位数；`n_rows=4096, row_len=768`，256 行）：
+* 内核 **0.0642 ms** vs 朴素 **0.0665 ms** ⇒ **1.037×**（≥1.0 达标，未达 1.2 目标）；
+* 原因如实：**纯行拷贝已到 memcpy/内存带宽上限**（768 KB / 0.064 ms ≈ **12 GB/s**），朴素版本身就是 memcpy
+  ⇒ **上限即 memcpy 速度，不是实现缺陷**。
+
+**负结果①（照要求"手写 8-lane"却被数据否掉）**：`load_f32x8`/`store_f32x8` 手写 8 lane 版本实测
+**0.042×（比朴素慢 23×）**——那两个封装**未内联/未展开**，每 8 元素一次函数调用 ⇒ 改 `copy_nonoverlapping`
+（编成 memcpy）。**结论**：**手写 8-lane 只在行内还有算术时才有价值；纯拷贝没有**（已写进内核注释）。
+
+**负结果②（校验位置决定 25%）**：逐行 `checked_mul` + 错误闭包在 256 行就吃掉约 **25%**（实测 **0.769×**）
+⇒ 改为**先一次校验 `max_id`、主循环只做算术**，才拿到 1.037×。
+
+**边界与门控**：`#[cfg(all(feature = "dsl-backend", test))]` → 现已转生产档（trait 方法落地 + 3 个 override）；
+`nm -D` 仍 **98**；默认/feature 两档 clippy 通过；`ops::gather_scatter` 6 passed。
+**数字家**：本文件（`docs/optimizations.md` 只引不抄）。
+
 
 
 
