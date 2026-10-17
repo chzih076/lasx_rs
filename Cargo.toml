@@ -77,3 +77,10 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "migrate_ab"
 required-features = ["dsl-backend"]
+
+# `composed_ab`（阶段3 批2）：**纯宏组合版 vs LASX 融合核**的 A/B——softmax/rms/layer/gelu_quick/
+# axpy/amax/rope 七个算子；同进程交替、丢首对、取中位，先等价类（逐位/容差+实测界）再谈性能。
+# 需要 `simd_dsl`/`ops_dsl` ⇒ 只在开 `dsl-backend` 时构建（默认档不碰）。
+[[example]]
+name = "composed_ab"
+required-features = ["dsl-backend"]
