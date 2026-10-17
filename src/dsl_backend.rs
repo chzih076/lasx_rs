@@ -83,8 +83,19 @@ impl Backend for LasxBackend {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        // **现有 LASX 内核**（与 `api::matmul` 同一条路径）
-        crate::ops::matmul::matmul_f32(m, k, n, a, b, out);
+        // **C 线（§7.28）：走进程级全局池**。`crate::pool::global()` 是 `OnceLock` 懒建
+        // （默认 `WorkerPool::auto()` = 物理核）；线程数由 `crate::pool::init_global(n)`
+        // **在首次使用前**决定 ⇒ **DSL 侧不感知线程数**（零契约改动、零新类型）。
+        //
+        // **为什么需要 `a` 的副本**：池版入口 `parallel::matmul_f32(pool, m,k,n, a: &mut [f32], b, c)`
+        // 要求 A 可写（按行打包/复用内部会就地整理）⇒ 每次调用复制一份 A（一次分配 + 一次拷贝）。
+        // **逐位不变**：池版**只按输出行切、绝不 split-K** ⇒ 每个输出元素的累加顺序与单线程完全相同。
+        let pool = crate::pool::global();
+        let mut a_work = a.to_vec();
+        // 形状/长度已在上方校验；池入口只会在这些前置条件上失败 ⇒ 若真失败则回落单线程（行为不变、不吞错）。
+        if crate::parallel::matmul_f32(pool, m, k, n, &mut a_work, b, out).is_err() {
+            crate::ops::matmul::matmul_f32(m, k, n, a, b, out);
+        }
         Ok(())
     }
 
