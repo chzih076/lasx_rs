@@ -227,6 +227,43 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
+    /// **LASX 原地按列 radix-2 复数 FFT（R19-H）**：沿列 8 路向量化、**不转置**。
+    ///
+    /// **等价类：容差类**（与 `kernels::scalar::fft_radix2_strided_f32` 的 **f64 内部**实现比）：
+    /// 旋转因子 f64 预算后降 f32、蝶形在 f32 里做 ⇒ 每级有舍入。**实测界**由
+    /// `r19h_fft_matches_the_scalar_reference_within_a_measured_bound` 钉住并打印。
+    /// **形状契约**：`n` 必须是 2 的幂（否则 `Unsupported`）、`re/im` 长度都是 `n*b`。
+    fn fft_strided_f32(
+        &self,
+        re: &mut [f32],
+        im: &mut [f32],
+        n: usize,
+        b: usize,
+    ) -> Result<(), BackendError> {
+        let op = "fft_strided_f32";
+        if n <= 1 || b == 0 {
+            return Ok(());
+        }
+        if !n.is_power_of_two() {
+            // 与可移植参照同一条错误（`n` 非 2 的幂 ⇒ 该复系数路径不可服务）
+            return Err(BackendError::Unsupported {
+                op,
+                cap: Capability::ComplexRoutes,
+            });
+        }
+        let total = n
+            .checked_mul(b)
+            .ok_or(BackendError::ShapeOverflow { op, what: "n×b" })?;
+        if re.len() != total {
+            return Err(len_err(op, "re", total, re.len()));
+        }
+        if im.len() != total {
+            return Err(len_err(op, "im", total, im.len()));
+        }
+        crate::ops::dsl_fft::fft_strided(re, im, n, b);
+        Ok(())
+    }
+
     fn build_kernel_f32(
         &self,
         spec: &simd_dsl::KernelSpec<'_>,
@@ -815,7 +852,7 @@ mod tests {
     /// **R19-E：逐元素/轴归约族必须与标量参照逐位**（`map_affine` 不融 FMA；轴归约按行序累加），
     /// 并覆盖形状错误路径（不 panic、返回 `LengthMismatch`）。
     #[test]
-    fn r19e_elementwise_and_axis_reduce_are_bitwise_vs_scalar() {
+    fn r19e_elementwise_and_axis_reduce_classes() {
         let be = LasxBackend;
         let n = 1029; // 非 8 的倍数 ⇒ 覆盖尾部处理
         let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 3.1).collect();
@@ -837,13 +874,24 @@ mod tests {
             let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&a), bits(&b), "map_binary({op:?}) 必须与标量参照逐位");
         }
+        // 系数**故意取非精确二进制值**（0.7 / 0.3）：2 的幂系数会让 `a*x` 精确、两步与 FMA 恰好同值，
+        // 那就测不出 FMA 的舍入差（本测试初版用 -0.5/0.25 就得到 0.000e0，如实记在这里）。
+        let (ca, cb) = (0.7f32, 0.3f32);
         let mut a = vec![0.0f32; n];
-        be.map_affine_f32(&x, -0.5, 0.25, &mut a).expect("affine");
+        be.map_affine_f32(&x, ca, cb, &mut a).expect("affine");
         let mut b = vec![0.0f32; n];
-        simd_dsl::kernels::scalar::map_affine_f32(&x, -0.5, 0.25, &mut b).expect("scalar");
+        simd_dsl::kernels::scalar::map_affine_f32(&x, ca, cb, &mut b).expect("scalar");
+        // **R19-G（用户批准 FMA）**：这两条从"逐位"改为**容差类**——FMA 的舍入与"先乘后加"不同。
+        let peak = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30) as f64;
+        let worst_affine = a
+            .iter()
+            .zip(&b)
+            .fold(0.0f64, |m, (u, v)| m.max((*u - *v).abs() as f64))
+            / peak;
+        eprintln!("R19-G：map_affine(FMA) vs 标量参照 = {worst_affine:.3e}（相对峰值）");
         assert!(
-            a.iter().zip(&b).all(|(u, v)| u.to_bits() == v.to_bits()),
-            "map_affine 必须逐位（故意不融 FMA）"
+            worst_affine <= 1e-5,
+            "FMA 舍入差应 ≤ 1e-5（相对峰值），实测 {worst_affine:e}"
         );
         // 轴归约（rows=7, cols=13：8 的倍数与非倍数都覆盖）
         let (rows, cols) = (7usize, 13usize);
@@ -866,9 +914,19 @@ mod tests {
         let mut d2 = vec![0.0f32; cols];
         simd_dsl::kernels::scalar::reduce_weighted_sum_cols_f32(&x2, &w, rows, cols, &mut d2)
             .expect("scalar");
+        // **R19-G**：加权轴归约也改 FMA（`v·w + acc`）⇒ **容差类**，界同上。
+        let peak = d2.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30) as f64;
+        let worst_wsum = d1
+            .iter()
+            .zip(&d2)
+            .fold(0.0f64, |m, (u, v)| m.max((*u - *v).abs() as f64))
+            / peak;
+        eprintln!(
+            "R19-G：reduce_weighted_sum_cols(FMA) vs 标量参照 = {worst_wsum:.3e}（相对峰值）"
+        );
         assert!(
-            d1.iter().zip(&d2).all(|(u, v)| u.to_bits() == v.to_bits()),
-            "reduce_weighted_sum_cols 必须逐位"
+            worst_wsum <= 1e-5,
+            "FMA 舍入差应 ≤ 1e-5（相对峰值），实测 {worst_wsum:e}"
         );
         // 形状错误：一律 `LengthMismatch`、不 panic
         assert!(
@@ -884,5 +942,46 @@ mod tests {
                 .is_err()
         );
         assert!(be.map_affine_f32(&x, 1.0, 0.0, &mut a[..n - 1]).is_err());
+    }
+
+    /// **R19-H：LASX 按列 FFT 与可移植参照的实测界**（容差类：参照是 **f64 内部**实现、
+    /// 本实现旋转因子 f64 预算后降 f32、蝶形在 f32 里做 ⇒ 每级有舍入）。
+    #[test]
+    fn r19h_fft_matches_the_scalar_reference_within_a_measured_bound() {
+        let be = LasxBackend;
+        for &(n, b) in &[
+            (64usize, 24usize),
+            (1024usize, 32usize),
+            (4096usize, 256usize),
+        ] {
+            let r0: Vec<f32> = (0..n * b).map(|i| (i % 97) as f32 * 0.05 - 2.0).collect();
+            let i0: Vec<f32> = (0..n * b).map(|i| (i % 53) as f32 * 0.02 - 0.5).collect();
+            let (mut r1, mut i1) = (r0.clone(), i0.clone());
+            let (mut r2, mut i2) = (r0.clone(), i0.clone());
+            be.fft_strided_f32(&mut r1, &mut i1, n, b).unwrap();
+            simd_dsl::kernels::scalar::fft_radix2_strided_f32(&mut r2, &mut i2, n, b).unwrap();
+            let peak = r2
+                .iter()
+                .chain(i2.iter())
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+                .max(1e-30) as f64;
+            let worst = r1
+                .iter()
+                .chain(i1.iter())
+                .zip(r2.iter().chain(i2.iter()))
+                .fold(0.0f64, |m, (u, v)| m.max((*u - *v).abs() as f64))
+                / peak;
+            eprintln!("R19-H：LASX-FFT(n={n},b={b}) vs f64 参照 = {worst:.3e}（相对峰值）");
+            assert!(worst <= 1e-4, "n={n},b={b}：实测 {worst:e} 超过 1e-4");
+        }
+        // 形状契约：n 非 2 的幂 ⇒ `Unsupported`；长度不符 ⇒ `LengthMismatch`
+        assert!(
+            be.fft_strided_f32(&mut [0.0f32; 12], &mut [0.0f32; 12], 6, 2)
+                .is_err()
+        );
+        assert!(
+            be.fft_strided_f32(&mut [0.0f32; 8], &mut [0.0f32; 8], 8, 2)
+                .is_err()
+        );
     }
 }

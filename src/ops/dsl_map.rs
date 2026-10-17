@@ -1,12 +1,12 @@
 //! `dsl_map` —— 给 `simd_dsl::Backend` 的**逐元素与轴归约族**提供 LASX 内核（R19-E）。
 //!
-//! **为什么这些能逐位**（与 `simd_dsl::kernels::scalar` 的参照实现对比）：
-//! * `map_binary_*`：逐元素 `f32` 运算、**每个元素独立** ⇒ 向量化不改变任何数；
-//! * `map_affine`：契约是 `a·x + b`（**两步**）⇒ 这里**故意不用 FMA**（`xvfmul` 再 `xvfadd`），
-//!   否则舍入与标量参照不同、就不是逐位类了；
-//! * `reduce_sum_cols` / `reduce_weighted_sum_cols`：参照是"每列一个 `f32` 累加器、**按行序**累加"
-//!   ⇒ 这里**每条 lane 只负责一列**、也按行序遍历 ⇒ **每列累加次序与参照完全相同** ⇒ 逐位。
-//!   （对照：`reduce_sum_f32` 的参照本身是多累加器 ⇒ 那条**只能**容差类，见 `dsl_backend` 的说明。）
+//! **等价类（逐条；R19-G 起有两类）**：
+//! * **逐位**（与 `simd_dsl::kernels::scalar` 参照完全相同的结果）：
+//!   `map_binary_*`（逐元素、无归约）、`reduce_sum_cols`（每列一条 lane、按行序累加 ⇒ 次序同参照）；
+//! * **容差类**（R19-G，用户 2026-10-17 批准"允许 FMA"）：`map_affine`、`reduce_weighted_sum_cols`
+//!   —— 用 **FMA 单指令**（`a·x + b` / `v·w + acc`）替代"先乘后加"两步，**指令数减半**；
+//!   代价是舍入与标量参照不同 ⇒ **不再逐位**，实测界由 `dsl_backend.rs` 的测试钉住并打印。
+//!   （对照：`reduce_sum_f32` 的参照本身是多累加器 ⇒ 那条也是容差类，见 `dsl_backend` 的说明。）
 //!
 //! **本文件不依赖 `simd_dsl`**（本仓内核保持独立）⇒ 用一个本地 `BinOp` 枚举做 op 分派。
 //! **注意**：`Max`/`Min` 的 NaN 语义（Rust `f32::max`：另一侧是数就返回它）与 LASX `xvfmax` 的
@@ -47,19 +47,45 @@ fn bin_scalar(op: BinOp, a: f32, b: f32) -> f32 {
 #[inline]
 pub(crate) fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
     let n = x.len();
+    // **4 路展开（32 元素/迭代）**：逐元素运算没有归约 ⇒ 展开**不改变任何数值**（按构造逐位安全），
+    // 只为摊薄循环开销、给访存更多并行度。动机是实测：单路版本在 1 MiB 档比 LLVM 自动向量化的
+    // 可移植档慢约 10%（见 `ops/axpy.rs` 的同款教训）；本文件 W5/W6 的 §5 复测确认了这一点。
+    // 展开成宏而不是 `unsafe fn`：edition 2024 下 `unsafe fn` 体内不再隐式 unsafe（会触发
+    // `unsafe_op_in_unsafe_fn` 告警），而宏展开进已有的 `unsafe { }` 块里就够了。
+    macro_rules! vec_op {
+        ($a:expr, $b:expr, $op:expr) => {
+            match $op {
+                BinOp::Add => lasx_xvfadd_s($a, $b),
+                BinOp::Sub => lasx_xvfsub_s($a, $b),
+                BinOp::Mul => lasx_xvfmul_s($a, $b),
+                BinOp::Div => lasx_xvfdiv_s($a, $b),
+            }
+        };
+    }
     let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` ⇒ 四组 8 元素访存分别落在 [i,i+8)/[i+8,i+16)/[i+16,i+24)/[i+24,i+32)，
+        // 全在切片内；非别名由调用方保证。
+        unsafe {
+            let (pa, pb, po) = (
+                x.as_ptr().add(i),
+                y.as_ptr().add(i),
+                out.as_mut_ptr().add(i),
+            );
+            for u in [0usize, 8, 16, 24] {
+                let a = lasx::load_f32x8(pa.add(u));
+                let b = lasx::load_f32x8(pb.add(u));
+                lasx::store_f32x8(po.add(u), vec_op!(a, b, op));
+            }
+        }
+        i += 32;
+    }
     while i + 8 <= n {
-        // SAFETY: `i + 8 <= n` ⇒ 三次 8 元素访存都在切片内；非别名由调用方保证。
+        // SAFETY: `i + 8 <= n` ⇒ 三次 8 元素访存都在切片内。
         unsafe {
             let a = lasx::load_f32x8(x.as_ptr().add(i));
             let b = lasx::load_f32x8(y.as_ptr().add(i));
-            let r = match op {
-                BinOp::Add => lasx_xvfadd_s(a, b),
-                BinOp::Sub => lasx_xvfsub_s(a, b),
-                BinOp::Mul => lasx_xvfmul_s(a, b),
-                BinOp::Div => lasx_xvfdiv_s(a, b),
-            };
-            lasx::store_f32x8(out.as_mut_ptr().add(i), r);
+            lasx::store_f32x8(out.as_mut_ptr().add(i), vec_op!(a, b, op));
         }
         i += 8;
     }
@@ -77,18 +103,32 @@ pub(crate) fn map_affine(a: f32, b: f32, x: &[f32], out: &mut [f32]) {
     let n = x.len();
     let va = lasx::splat_f32(a);
     let vb = lasx::splat_f32(b);
+    // 4 路展开（32 元素/迭代）：逐元素、无归约 ⇒ 展开不改数值；动机同 `map_binary`（访存摊薄）。
     let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` ⇒ 四组访存全在切片内；非别名由调用方保证。
+        unsafe {
+            let px = x.as_ptr().add(i);
+            let po = out.as_mut_ptr().add(i);
+            for u in [0usize, 8, 16, 24] {
+                let v = lasx::load_f32x8(px.add(u));
+                // **R19-G：FMA 单指令**（`a·x + b`）——比"先乘后加"少一条指令；
+                // 代价：舍入与标量参照不同 ⇒ 本函数是**容差类**（界见 `dsl_backend.rs` 测试）。
+                lasx::store_f32x8(po.add(u), lasx_xvfmadd_s(va, v, vb));
+            }
+        }
+        i += 32;
+    }
     while i + 8 <= n {
         // SAFETY: `i + 8 <= n` ⇒ 访存落在切片内；非别名由调用方保证。
         unsafe {
             let v = lasx::load_f32x8(x.as_ptr().add(i));
-            let r = lasx_xvfadd_s(lasx_xvfmul_s(va, v), vb);
-            lasx::store_f32x8(out.as_mut_ptr().add(i), r);
+            lasx::store_f32x8(out.as_mut_ptr().add(i), lasx_xvfmadd_s(va, v, vb));
         }
         i += 8;
     }
     for j in i..n {
-        out[j] = a * x[j] + b;
+        out[j] = a.mul_add(x[j], b);
     }
 }
 
@@ -142,7 +182,8 @@ pub(crate) fn reduce_weighted_sum_cols(
             // SAFETY: 同 `reduce_sum_cols`；`*wv` 是标量广播。
             unsafe {
                 let v = lasx::load_f32x8(x.as_ptr().add(off));
-                acc = lasx_xvfadd_s(acc, lasx_xvfmul_s(v, lasx::splat_f32(*wv)));
+                // **R19-G：FMA**（`v·w + acc`）——省一条指令；舍入与"先乘后加"不同 ⇒ **容差类**。
+                acc = lasx_xvfmadd_s(v, lasx::splat_f32(*wv), acc);
             }
         }
         // SAFETY: `c + 8 <= cols == out.len()`。
@@ -152,7 +193,7 @@ pub(crate) fn reduce_weighted_sum_cols(
     for cc in c..cols {
         let mut acc = 0.0f32;
         for (r, wv) in w.iter().enumerate().take(rows) {
-            acc += x[r * cols + cc] * *wv;
+            acc = x[r * cols + cc].mul_add(*wv, acc);
         }
         out[cc] = acc;
     }

@@ -421,4 +421,44 @@ fn main() {
         ];
         run("W10", &format!("谱检测整帧 detect n={n} p={p} b={b}"), arms);
     }
+
+    // ---- W11: 原地按列 FFT 本体（4096×256，帧里 DFT 的核心；R19-H 接 LASX）----
+    {
+        let (n, b) = (4096usize, 256usize);
+        let re0: Vec<f32> = (0..n * b)
+            .map(|i| ((i * 37 % 101) as f32) * 0.05 - 2.5)
+            .collect();
+        let im0: Vec<f32> = (0..n * b)
+            .map(|i| ((i * 11 % 71) as f32) * 0.03 - 1.0)
+            .collect();
+        let (rc, ic) = (RefCell::new(re0), RefCell::new(im0));
+        let arms = vec![
+            // 可移植参照（`kernels::scalar` 的 f64 内部实现）**直调** ⇒ LASX 臂的"手写照"。
+            // 注意：每跑一次输入就被变换一次（数据随时序变化，但耗时与数据无关）；**正确性另在测试里验**。
+            Arm::new("L0_port", || {
+                let mut r = rc.borrow_mut();
+                let mut i = ic.borrow_mut();
+                simd_dsl::kernels::scalar::fft_radix2_strided_f32(
+                    r.as_mut_slice(),
+                    i.as_mut_slice(),
+                    n,
+                    b,
+                )
+                .unwrap();
+            }),
+            Arm::new("DSL+LASX", || {
+                let mut r = rc.borrow_mut();
+                let mut i = ic.borrow_mut();
+                lasx.fft_strided_f32(r.as_mut_slice(), i.as_mut_slice(), n, b)
+                    .unwrap();
+            }),
+            Arm::new("DSL+可移植", || {
+                let mut r = rc.borrow_mut();
+                let mut i = ic.borrow_mut();
+                port.fft_strided_f32(r.as_mut_slice(), i.as_mut_slice(), n, b)
+                    .unwrap();
+            }),
+        ];
+        run("W11", &format!("按列 FFT n={n} b={b}"), arms);
+    }
 }
