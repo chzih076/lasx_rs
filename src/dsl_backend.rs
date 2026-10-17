@@ -40,7 +40,7 @@
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
-    PackedB, PrecisionClaim, ScalarKind,
+    PackedB, PrecisionClaim, ScalarKind, UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -671,6 +671,152 @@ impl Backend for LasxBackend {
     fn supports(&self, cap: Capability) -> bool {
         matches!(cap, Capability::Packing)
     }
+
+    /// **P5-b：跨步拷贝** → `ops::strided::copy_strided_f32`（`col==1` 走 memcpy 行拷贝）。
+    ///
+    /// **别名未测**（如实）：本轮**没有**做 `src`/`dst` 重叠检测或测试；契约与 `simd_dsl` 默认实现一致
+    /// ——**调用方保证不重叠**（重叠是未定义行为，不是 `Err`）。
+    fn copy_strided_f32(
+        &self,
+        src: &[f32],
+        src_st: simd_dsl::Strides,
+        dst: &mut [f32],
+        dst_st: simd_dsl::Strides,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        crate::ops::strided::copy_strided_f32(
+            src,
+            strided_of(src_st),
+            dst,
+            strided_of(dst_st),
+            rows,
+            cols,
+        )
+    }
+
+    /// **P5-b：跨步一元映射** → `ops::strided` 内核；**未覆盖的变体委托标量**
+    /// （`simd_dsl::kernels::scalar::map_unary_f32` 走"跨步→连续物化 → 标量 → 写回"，逐位不变）。
+    fn map_unary_strided_f32(
+        &self,
+        src: &[f32],
+        src_st: simd_dsl::Strides,
+        dst: &mut [f32],
+        dst_st: simd_dsl::Strides,
+        rows: usize,
+        cols: usize,
+        op: UnaryOp,
+    ) -> Result<(), BackendError> {
+        let fast = match op {
+            UnaryOp::Sqrt => Some(crate::ops::strided::UnaryOpStrided::Sqrt),
+            UnaryOp::Rcp => Some(crate::ops::strided::UnaryOpStrided::Rcp),
+            // 其余（Exp/Sin/Cos/Ln/Erf/… 及 `#[non_exhaustive]` 将来变体）⇒ **委托标量**（保守、逐位）
+            _ => None,
+        };
+        match fast {
+            Some(o) => crate::ops::strided::map_unary_strided_f32(
+                src,
+                strided_of(src_st),
+                dst,
+                strided_of(dst_st),
+                rows,
+                cols,
+                o,
+            ),
+            None => {
+                // 物化 → 标量 → 写回（逐位；代价是多两次搬运，正确性优先）
+                let mut tmp = vec![0.0f32; rows * cols];
+                crate::ops::strided::copy_strided_f32(
+                    src,
+                    strided_of(src_st),
+                    &mut tmp,
+                    crate::ops::strided::Strides::new(cols, 1),
+                    rows,
+                    cols,
+                )?;
+                let mut out_tmp = vec![0.0f32; rows * cols];
+                simd_dsl::kernels::scalar::map_unary_f32(&tmp, &mut out_tmp, op)?;
+                crate::ops::strided::copy_strided_f32(
+                    &out_tmp,
+                    crate::ops::strided::Strides::new(cols, 1),
+                    dst,
+                    strided_of(dst_st),
+                    rows,
+                    cols,
+                )
+            }
+        }
+    }
+
+    /// **P5-b：跨步二元映射** → `ops::strided` 内核；**未覆盖的变体委托标量**（同上一律逐位）。
+    fn map_binary_strided_f32(
+        &self,
+        x: &[f32],
+        x_st: simd_dsl::Strides,
+        y: &[f32],
+        y_st: simd_dsl::Strides,
+        dst: &mut [f32],
+        dst_st: simd_dsl::Strides,
+        rows: usize,
+        cols: usize,
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        let fast = match op {
+            BinaryOp::Add => Some(crate::ops::strided::BinaryOpStrided::Add),
+            BinaryOp::Mul => Some(crate::ops::strided::BinaryOpStrided::Mul),
+            BinaryOp::Div => Some(crate::ops::strided::BinaryOpStrided::Div),
+            _ => None,
+        };
+        match fast {
+            Some(o) => crate::ops::strided::map_binary_strided_f32(
+                x,
+                strided_of(x_st),
+                y,
+                strided_of(y_st),
+                dst,
+                strided_of(dst_st),
+                rows,
+                cols,
+                o,
+            ),
+            None => {
+                let mut xt = vec![0.0f32; rows * cols];
+                let mut yt = vec![0.0f32; rows * cols];
+                let mut out_tmp = vec![0.0f32; rows * cols];
+                let cont = crate::ops::strided::Strides::new(cols, 1);
+                crate::ops::strided::copy_strided_f32(
+                    x,
+                    strided_of(x_st),
+                    &mut xt,
+                    cont,
+                    rows,
+                    cols,
+                )?;
+                crate::ops::strided::copy_strided_f32(
+                    y,
+                    strided_of(y_st),
+                    &mut yt,
+                    cont,
+                    rows,
+                    cols,
+                )?;
+                simd_dsl::kernels::scalar::map_binary_f32(&xt, &yt, &mut out_tmp, op)?;
+                crate::ops::strided::copy_strided_f32(
+                    &out_tmp,
+                    cont,
+                    dst,
+                    strided_of(dst_st),
+                    rows,
+                    cols,
+                )
+            }
+        }
+    }
+}
+
+/// `simd_dsl::Strides` → `ops::strided::Strides`（同字段，**显式转换**避免类型混用）。
+const fn strided_of(s: simd_dsl::Strides) -> crate::ops::strided::Strides {
+    crate::ops::strided::Strides::new(s.row, s.col)
 }
 
 /// **A/B 用的"接之前"形态**（R19-E）：`matmul`/`dot`/建核/打包**照旧走 LASX**，但

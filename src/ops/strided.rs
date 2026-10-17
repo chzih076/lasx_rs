@@ -35,7 +35,10 @@ pub struct Strides {
 }
 
 impl Strides {
-    /// 连续布局（`rows*cols` 行主序）。
+    /// **1-D 连续视图**的步长（`row=1, col=0`：只有一行、彼此相邻）。
+    ///
+    /// **只在测试里用** ⇒ `#[cfg(test)]`（避免非测试构建的 `dead_code`，AGENTS #49 禁 `allow(dead_code)`）。
+    #[cfg(test)]
     pub const CONTIGUOUS: Strides = Strides { row: 1, col: 0 };
 
     /// 构造。
@@ -228,7 +231,8 @@ pub enum UnaryOpStrided {
     Rcp,
     /// `√x`。
     Sqrt,
-    /// `−x`。
+    /// `−x`（**只在测试里构造**，避免非测试构建 `dead_code`；不是生产变体）。
+    #[cfg(test)]
     Neg,
 }
 
@@ -238,6 +242,7 @@ impl UnaryOpStrided {
         match self {
             UnaryOpStrided::Rcp => 1.0 / v,
             UnaryOpStrided::Sqrt => v.sqrt(),
+            #[cfg(test)]
             UnaryOpStrided::Neg => -v,
         }
     }
