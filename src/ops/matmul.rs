@@ -93,14 +93,17 @@ pub(crate) struct KernelCfg {
 }
 
 impl Default for KernelCfg {
-    /// **生产默认 = 改动前行为**（`task-73` 的候选组合不采纳，只作为"叠加候选"留在探针里；
-    /// 见 `gemm_l1_bench` 的 `adopted(strip_outer)` 行：1t 内核态 +5.1%/+11.3%，
-    /// 但 C ABI 口径仍 <0.95×，且 1t 用例会被库内自动并行污染 ⇒ 本轮不动生产默认）。
+    /// **生产默认**：`strip_outer = true`（条带主序）——`task-73` 实测 1t 内核态
+    /// **1024³ +5.1%、1536³ +11.3%**（逐位不变；`k块→strip` 旧次序是现默认的对照）。
+    ///
+    /// 采纳依据：① 亲和性修复（`pool::auto` 尊重可用 CPU 数）后 1t C ABI 不再被 12 线程
+    /// 派发污染，实测 1t 对内核对齐到 **≈0.98–0.99×** OB 纯内核；② 叠加本项后 1536³ 有望
+    /// 越过 0.95× 目标；③ `legacy()`（并行路径）保持旧次序不变 ⇒ 多线程路径逐位/行为不变。
     fn default() -> Self {
         KernelCfg {
             k_chunk: K_CHUNK,
             l1_budget: L1_BUDGET,
-            strip_outer: false,
+            strip_outer: true,
             c_strip_buf: false,
             prefetch: false,
             panel_bytes: 2 * 1024 * 1024,

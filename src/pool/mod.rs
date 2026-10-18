@@ -362,11 +362,19 @@ impl WorkerPool {
     ///
     /// 想固定线程数仍用 [`WorkerPool::new`] / [`init_global`]（本函数只改**默认**）。
     pub fn auto() -> Self {
-        Self::new(physical_cores().unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(1)
-        }))
+        // **按可用 CPU 数封顶**：`available_parallelism()` 尊重 `sched_getaffinity`/cgroup，
+        // 而 `physical_cores()` 读 sysfs 拓扑、**不看进程的亲和性**。进程被 `taskset` 绑到
+        // 1 个核时，只按物理核建池会在 1 个核上跑 12 个线程——实测 1t GEMM 用例因此
+        // 多付 **+8.2%（1024³）/ +6.6%（1536³）** 的派发与争用开销（`§7.44` 的 0.878/0.825
+        // 口径就带了这个伪影）。空闲全机时两者都=12，行为不变。
+        let avail = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        let n = match physical_cores() {
+            Some(p) => p.min(avail).max(1),
+            None => avail,
+        };
+        Self::new(n)
     }
 }
 
