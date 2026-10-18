@@ -389,83 +389,22 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
-    // ============ P1-5：i8 量化族 4 个 override（`Capability::Quant`）============
+    // ============ P1-5：i8 量化族 → **P1 批3 起迁入 `exec_fused_plan`**（`FusedPlan` 自带 i8/i32 缓冲）============
     //
-    // **语义红线**（契约写死，与 `kernels::scalar` **逐位**）：
-    // * `quantize_i8_rows_f32`：`x/scale[r]` → **ties-even** → **再 clamp [-128,127]**；
-    //   `NaN ⇒ 0`、`+inf ⇒ 127`、`-inf ⇒ -128`（**先舍入后 clamp**，不可换序——除非证明等价，
-    //   内核里用的是"浮点钳位端点为整数 ⇒ 与先取整再钳位等价"的论证 + 边界单测钉住）。
-    // * `dequantize_i8_rows_f32`：`(q as f32) * scale[r]` 一次乘法。
-    // * `dot_i8` / `gemv_i8`：**i64 精确累加 + 末端一次饱和到 i32**（**不是**中途
-    //   `saturating_add`——那会引入累加顺序依赖、违反契约"结果与顺序无关"）。
-    // 等价类：全部**逐位**（整数映射 / 一次乘法 / i64 精确和），见 `ops::quant_i8` 单测。
-
-    fn quantize_i8_rows_f32(
-        &self,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        scale: &[f32],
-        out: &mut [i8],
-    ) -> Result<(), BackendError> {
-        let op = "quantize_i8_rows_f32";
-        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-            op,
-            what: "rows×cols",
-        })?;
-        if x.len() != total {
-            return Err(len_err(op, "x", total, x.len()));
-        }
-        if out.len() != total {
-            return Err(len_err(op, "out", total, out.len()));
-        }
-        if scale.len() != rows {
-            return Err(len_err(op, "scale", rows, scale.len()));
-        }
-        // 注：`x: &[f32]` 与 `out: &mut [i8]` 在**安全 Rust** 下不可能重叠（类型不同 + 借用检查器），
-        // 所以这里不需要（也无法用 `std::ptr::eq` 表达）别名断言——契约由类型系统守。
-        // SAFETY: 三个长度已校验；`out` 与 `x` 不重叠由契约 + `&mut`/`&` 借用保证。
-        unsafe { crate::ops::quant_i8::quantize_i8_rows_contract(x, rows, cols, scale, out) };
-        Ok(())
-    }
-
-    // **P1-5 未接 `dequantize_i8_rows_f32`**（如实记）：LASX 拓宽类指令是 128-bit lane 语义
-    // （`xvsllwil_h_b` 取每个半区低 8 字节，链到 w 后 lane 顺序为 `[b0..b3,b16..b19]`，实测），
-    // 要拼成连续 8 字节块需要 4 次 unaligned load + `xvpermi_q` 合并，收益不足以抵消复杂度 ⇒
-    // 本方法**走便携默认**；因此 `Capability::Quant` **不置真**（该位语义是"4 个方法全有专用实现"）。
-
-    fn dot_i8(&self, a: &[i8], b: &[i8]) -> Result<i32, BackendError> {
-        let op = "dot_i8";
-        if a.len() != b.len() {
-            return Err(len_err(op, "b", a.len(), b.len()));
-        }
-        Ok(crate::ops::dot_i8::dot_i8_saturating(a, b))
-    }
-
-    fn gemv_i8(
-        &self,
-        j: usize,
-        k: usize,
-        a: &[i8],
-        x: &[i8],
-        out: &mut [i32],
-    ) -> Result<(), BackendError> {
-        let op = "gemv_i8";
-        let total = j
-            .checked_mul(k)
-            .ok_or(BackendError::ShapeOverflow { op, what: "j×k" })?;
-        if a.len() != total {
-            return Err(len_err(op, "a", total, a.len()));
-        }
-        if x.len() != k {
-            return Err(len_err(op, "x", k, x.len()));
-        }
-        if out.len() != j {
-            return Err(len_err(op, "out", j, out.len()));
-        }
-        crate::ops::gemv_i8::gemv_i8_i32(j, k, a, x, out);
-        Ok(())
-    }
+    // 批3（`fd37e6b`）删除了 `quantize_i8_rows_f32` / `dequantize_i8_rows_f32` / `dot_i8` / `gemv_i8`
+    // 四个具名方法（`Backend` 66→62），改成 `FusedPlan::{QuantizeI8Rows,DequantizeI8Rows,DotI8,GemvI8}`。
+    // **本后端映射**（Plan 臂在 `exec_fused_plan` 里实现）：
+    // * `QuantizeI8Rows` → `ops::quant_i8::quantize_i8_rows_contract`（LASX 向量核；ties-even +
+    //   先舍入后 clamp（内核用"浮点钳位端点为整数 ⇒ 与先取整再钳位等价"论证 + 边界单测钉住）、
+    //   `NaN⇒0`、`±inf⇒±端点`）；
+    // * `DotI8` → `ops::dot_i8::dot_i8_saturating`（i64 精确累加 + **末端一次**饱和到 i32）；
+    // * `GemvI8` → `ops::gemv_i8::gemv_i8_i32`（逐行复用饱和 dot；**不是**中途 `saturating_add`）；
+    // * **`DequantizeI8Rows` 未接 LASX 核**（如实）：LASX 拓宽类指令是 128-bit lane 语义
+    //   （`xvsllwil_h_b` 取每个半区低 8 字节 ⇒ 链到 w 后 lane 顺序 `[b0..b3,b16..b19]`），
+    //   拼成连续 8 字节块需 4 次 unaligned load + `xvpermi_q`，收益不足 ⇒
+    //   `supports_plan(DequantizeI8Rows) = false`、`exec_fused_plan` 该臂**回退 portable 解释**
+    //   （`scalar::dequantize_i8_rows_f32`）——**不虚报**。
+    // ⇒ `Capability::Quant` 语义由 `supports_plan` 探测；本后端**不报**该位（只低估）。
 
     fn reduce_sum_cols_f32(
         &self,
@@ -1037,13 +976,13 @@ impl Backend for LasxBackend {
     /// 其余（归约/超越/多线程/复数组合步）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     ///
-    /// **P1-5 的 `Quant` 仍为 `false`**：4 个方法里 `dequantize_i8_rows_f32` **未 override**
-    /// （LASX 拓宽指令的 128-bit lane 语义使连续 i8 块需要额外的多次 load + 重排，收益不足，
-    /// 见上面注释）⇒ 该位语义是"4 个全有专用实现"，**只接 3 个就不报**（只低估）。
+    /// **`Capability::Quant` 自 P1 批3 起不报**：4 个具名方法已被 `FusedPlan` 取代（批3 删除），
+    /// 该位语义（"4 方法全 override"）不再成立；量化能力由 `supports_plan` 的 4 个 kind 承载
+    /// （本后端 `QuantizeI8Rows`/`DotI8`/`GemvI8` = true；`DequantizeI8Rows` = false，见 Plan 注释）。
     fn supports(&self, cap: Capability) -> bool {
         // 阶段4：`FusedNorms` / `FusedElementwise` **只报真**——对应方法全部 override 到 LASX 内核才报。
-        // **`FusedGeometry` 自 P1 批2 起不报**：5 个具名方法已被 `FusedPlan` 取代（批2 删除），
-        // 该位语义（"5 方法全 override"）不再成立；几何融合能力由 `supports_plan` 的 5 个 kind 承载。
+        // **`FusedGeometry`（批2）/ `Quant`（批3）不再报**：对应具名方法已被 `FusedPlan` 取代；
+        // 融合能力由 `supports_plan` 的 kind 承载（本后端几何 5 kind 全真、量化 3/4 真）。
         matches!(
             cap,
             Capability::Packing
@@ -1112,22 +1051,26 @@ impl Backend for LasxBackend {
     // （softmax 2.79e-9、rms 1.83e-7、layer 2.08e-7、gelu 5.26e-3、rope 6.92e-8、axpy 8.27e-8）。
 
     fn supports_plan(&self, kind: PatternKind) -> bool {
-        // **11 个 kind 全报 true**：批1 的 6 个（f32 融合原语）+ 批2 的 5 个 f64 几何
-        // 都已接 LASX 融合核（按 PatternKind 粒度、只低估）。
-        matches!(
-            kind,
+        // **批1 的 6 个 f32 + 批2 的 5 个 f64 几何 + 批3 的 quantize/dot/gemv：全部 true**；
+        // **`DequantizeI8Rows` 明确 false**（LASX 无连续 i8 块的高效拓宽路径 ⇒ 不虚报；
+        // `exec_fused_plan` 该臂回退 portable 解释，见下方注释）。
+        match kind {
             PatternKind::Axpy
-                | PatternKind::SoftmaxRows
-                | PatternKind::RmsNormRows
-                | PatternKind::LayerNormRows
-                | PatternKind::GeluQuick
-                | PatternKind::RopeApply
-                | PatternKind::Vec3AddScaledF64
-                | PatternKind::Norm3BatchF64
-                | PatternKind::Unitize3BatchF64
-                | PatternKind::Cross3BatchF64
-                | PatternKind::Mat3MulVec3BatchF64
-        )
+            | PatternKind::SoftmaxRows
+            | PatternKind::RmsNormRows
+            | PatternKind::LayerNormRows
+            | PatternKind::GeluQuick
+            | PatternKind::RopeApply
+            | PatternKind::Vec3AddScaledF64
+            | PatternKind::Norm3BatchF64
+            | PatternKind::Unitize3BatchF64
+            | PatternKind::Cross3BatchF64
+            | PatternKind::Mat3MulVec3BatchF64
+            | PatternKind::QuantizeI8Rows
+            | PatternKind::DotI8
+            | PatternKind::GemvI8 => true,
+            PatternKind::DequantizeI8Rows => false,
+        }
     }
 
     fn exec_fused_plan(&self, plan: FusedPlan<'_>, io: FusedIo<'_>) -> Result<(), BackendError> {
@@ -1413,6 +1356,89 @@ impl Backend for LasxBackend {
                         cap: Capability::FusedGeometry,
                     }
                 })
+            }
+            // ---- P1 批3（task-70）：i8 量化族 4 pattern。缓冲（i8/i32）在 plan 值里，`io` 不参与。
+            //      语义红线：quantize = ties-even + 先舍入后 clamp（NaN⇒0、±inf⇒±端点）；
+            //      dot/gemv = **i64 精确累加 + 末端一次饱和**（不是中途 saturating_add）。
+            FusedPlan::QuantizeI8Rows {
+                rows,
+                cols,
+                x,
+                scale,
+                out,
+            } => {
+                let op = "exec_fused_plan(QuantizeI8Rows)";
+                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+                    op,
+                    what: "rows×cols",
+                })?;
+                if x.len() != total {
+                    return Err(len_err(op, "x", total, x.len()));
+                }
+                if out.len() != total {
+                    return Err(len_err(op, "out", total, out.len()));
+                }
+                if scale.len() != rows {
+                    return Err(len_err(op, "scale", rows, scale.len()));
+                }
+                if total == 0 {
+                    return Ok(());
+                }
+                // SAFETY: 三个长度已校验；`x: &[f32]` 与 `out: &mut [i8]` 类型不同 ⇒ 安全 Rust 下
+                // 不可能重叠（别名契约由类型系统 + 借用检查器守）。
+                unsafe {
+                    crate::ops::quant_i8::quantize_i8_rows_contract(x, rows, cols, scale, out)
+                };
+                Ok(())
+            }
+            FusedPlan::DequantizeI8Rows {
+                rows,
+                cols,
+                x,
+                scale,
+                out,
+            } => {
+                // **未接 LASX 核 ⇒ 回退 portable 解释**（与契约默认同序列、逐位；不虚报能力）。
+                let op = "exec_fused_plan(DequantizeI8Rows)";
+                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+                    op,
+                    what: "rows×cols",
+                })?;
+                if x.len() != total {
+                    return Err(len_err(op, "x", total, x.len()));
+                }
+                if out.len() != total {
+                    return Err(len_err(op, "out", total, out.len()));
+                }
+                if scale.len() != rows {
+                    return Err(len_err(op, "scale", rows, scale.len()));
+                }
+                simd_dsl::kernels::scalar::dequantize_i8_rows_f32(x, rows, cols, scale, out)
+            }
+            FusedPlan::DotI8 { a, b, out } => {
+                let op = "exec_fused_plan(DotI8)";
+                if a.len() != b.len() {
+                    return Err(len_err(op, "b", a.len(), b.len()));
+                }
+                *out = crate::ops::dot_i8::dot_i8_saturating(a, b);
+                Ok(())
+            }
+            FusedPlan::GemvI8 { j, k, a, x, out } => {
+                let op = "exec_fused_plan(GemvI8)";
+                let total = j
+                    .checked_mul(k)
+                    .ok_or(BackendError::ShapeOverflow { op, what: "j×k" })?;
+                if a.len() != total {
+                    return Err(len_err(op, "a", total, a.len()));
+                }
+                if x.len() != k {
+                    return Err(len_err(op, "x", k, x.len()));
+                }
+                if out.len() != j {
+                    return Err(len_err(op, "out", j, out.len()));
+                }
+                crate::ops::gemv_i8::gemv_i8_i32(j, k, a, x, out);
+                Ok(())
             }
         }
     }
@@ -2260,12 +2286,18 @@ mod tests {
             PatternKind::Unitize3BatchF64,
             PatternKind::Cross3BatchF64,
             PatternKind::Mat3MulVec3BatchF64,
+            // 批3：quantize/dot/gemv 已接；**DequantizeI8Rows 明确不接**（见下）
+            PatternKind::QuantizeI8Rows,
+            PatternKind::DotI8,
+            PatternKind::GemvI8,
         ];
-        // ① 能力位：按 PatternKind 粒度、只低估——本后端 11 个都接；portable 11 个都 false
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端 14 个接；portable 全 false。
         for k in kinds {
             assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
             assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
         }
+        // **DequantizeI8Rows 如实不报**（无 LASX 核；exec 走 portable 回退，见下）
+        assert!(!be.supports_plan(PatternKind::DequantizeI8Rows));
         /// 空 `FusedIo` 构造（`cos`/`sin` 只 RopeApply 用）。
         fn io<'a>(x: &'a [f32], y: &'a mut [f32], out: &'a mut [f32]) -> FusedIo<'a> {
             FusedIo {
@@ -2617,6 +2649,182 @@ mod tests {
             empty_io(),
         )
         .unwrap();
+
+        // ⑥b 批3：i8 量化 4 pattern —— quantize/dot/gemv：Plan 路 ≡ portable 标量（**逐位**）；
+        //      dequantize：本后端**未接** ⇒ Plan 臂回退 portable 解释（**逐位**；`supports_plan` = false）。
+        let (qrows, qcols) = (3usize, 257usize);
+        let qn = qrows * qcols;
+        // ties-even / clamp / NaN / ±inf 边界样本（其余补 0.75）
+        let mut qx: Vec<f32> = vec![
+            0.5,
+            -0.5,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            127.5,
+            -127.5,
+            128.5,
+            -128.5,
+            129.5,
+            -129.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+        ];
+        qx.resize(qn, 0.75);
+        let qscale: Vec<f32> = (0..qrows).map(|r| 0.5 + r as f32).collect();
+        let (mut q_plan, mut q_port) = (vec![0i8; qn], vec![0i8; qn]);
+        be.exec_fused_plan(
+            FusedPlan::QuantizeI8Rows {
+                rows: qrows,
+                cols: qcols,
+                x: &qx,
+                scale: &qscale,
+                out: &mut q_plan,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        simd_dsl::kernels::scalar::quantize_i8_rows_f32(&qx, qrows, qcols, &qscale, &mut q_port)
+            .unwrap();
+        assert_eq!(
+            q_plan, q_port,
+            "QuantizeI8Rows：Plan 路与 portable 标量不逐位（ties-even/clamp/NaN/±inf 边界）"
+        );
+        // dequantize：Plan 回退 ≡ portable（逐位）
+        let (mut dq_plan, mut dq_port) = (vec![0.0f32; qn], vec![0.0f32; qn]);
+        be.exec_fused_plan(
+            FusedPlan::DequantizeI8Rows {
+                rows: qrows,
+                cols: qcols,
+                x: &q_plan,
+                scale: &qscale,
+                out: &mut dq_plan,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        simd_dsl::kernels::scalar::dequantize_i8_rows_f32(
+            &q_plan,
+            qrows,
+            qcols,
+            &qscale,
+            &mut dq_port,
+        )
+        .unwrap();
+        for (a, b) in dq_plan.iter().zip(&dq_port) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "DequantizeI8Rows 回退与 portable 不逐位"
+            );
+        }
+        // dot：普通形状 + 正/负饱和（k 足够大 ⇒ i32::MAX/MIN）
+        for &dn in &[0usize, 1, 31, 32, 33, 1029] {
+            let da: Vec<i8> = (0..dn)
+                .map(|i| ((i * 53 % 251) as i32 - 125) as i8)
+                .collect();
+            let db: Vec<i8> = (0..dn)
+                .map(|i| ((i * 97 % 241) as i32 - 120) as i8)
+                .collect();
+            let mut got = 0i32;
+            be.exec_fused_plan(
+                FusedPlan::DotI8 {
+                    a: &da,
+                    b: &db,
+                    out: &mut got,
+                },
+                empty_io(),
+            )
+            .unwrap();
+            assert_eq!(
+                got,
+                simd_dsl::kernels::scalar::dot_i8(&da, &db).unwrap(),
+                "DotI8：Plan 路与 portable 不逐位（n={dn}）"
+            );
+        }
+        let sat_n = 200_000usize;
+        let sat_a = vec![127i8; sat_n];
+        let sat_b = vec![127i8; sat_n];
+        let mut got = 0i32;
+        be.exec_fused_plan(
+            FusedPlan::DotI8 {
+                a: &sat_a,
+                b: &sat_b,
+                out: &mut got,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            i32::MAX,
+            "DotI8 正饱和必须是 i32::MAX（i64 累加 + 末端一次饱和）"
+        );
+        // gemv：普通 + 饱和
+        for &(j, k) in &[(0usize, 5usize), (4, 31), (3, 1024)] {
+            let ga: Vec<i8> = (0..j * k)
+                .map(|i| ((i * 41 % 251) as i32 - 125) as i8)
+                .collect();
+            let gx: Vec<i8> = (0..k)
+                .map(|i| ((i * 59 % 241) as i32 - 120) as i8)
+                .collect();
+            let (mut go, mut gwant) = (vec![0i32; j], vec![0i32; j]);
+            be.exec_fused_plan(
+                FusedPlan::GemvI8 {
+                    j,
+                    k,
+                    a: &ga,
+                    x: &gx,
+                    out: &mut go,
+                },
+                empty_io(),
+            )
+            .unwrap();
+            simd_dsl::kernels::scalar::gemv_i8(j, k, &ga, &gx, &mut gwant).unwrap();
+            assert_eq!(go, gwant, "GemvI8：Plan 路与 portable 不逐位（{j}×{k}）");
+        }
+        // 量化错误路径 ⇒ Err（不 panic）
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::QuantizeI8Rows {
+                    rows: 2,
+                    cols: 3,
+                    x: &[0.0; 5],
+                    scale: &[1.0; 2],
+                    out: &mut [0i8; 6],
+                },
+                empty_io(),
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::DotI8 {
+                    a: &[1i8; 3],
+                    b: &[1i8; 2],
+                    out: &mut 0i32,
+                },
+                empty_io(),
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::GemvI8 {
+                    j: 2,
+                    k: 3,
+                    a: &[1i8; 5],
+                    x: &[1i8; 3],
+                    out: &mut [0i32; 2],
+                },
+                empty_io(),
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
 
         // ⑦ 形状/长度错 ⇒ Err（不 panic）
         assert!(matches!(
