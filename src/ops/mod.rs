@@ -43,6 +43,16 @@ pub mod dsl_fft;
 #[cfg(feature = "dsl-backend")]
 pub mod dsl_map;
 
+/// **f64 逐元素内核**（P1-4：`map_binary_f64`/`map_ternary_f64`/`map_affine_f64` 的 LASX 向量版）。
+///
+/// **4 f64/lane（LASX 256 位）+ 4 路展开 + 尾部标量兜底**；`Add`/`Sub`/`Mul`/`Div`、
+/// `SubSub`、`a·x+b`（**故意不融 FMA**）全部与 `simd_dsl::kernels::scalar` 参照 **逐位**
+/// （`Max`/`Min` 的 NaN 语义不同 ⇒ 仍委托标量，见 `dsl_backend.rs`）。
+/// **挂在 `dsl-backend` feature 下**：唯一调用方是 `src/dsl_backend.rs`（同 feature 门控）；
+/// 不门控会被 `dead_code` 判死（AGENTS #49 的教训）——**不要**用 `#[allow(dead_code)]` 掩盖。
+#[cfg(feature = "dsl-backend")]
+pub mod f64_map;
+
 /// **P4-b 融合内核**（`energy_dc` 单遍去均值能量、`psd_pair` 成对 epilogue）——
 /// **纯标量、与便携参照逐位**（`to_bits()` 相等）；LASX FMA 版留待拿到正确封装名后补（其容差界届时实测）。
 ///
