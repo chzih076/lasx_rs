@@ -71,6 +71,56 @@ pub(crate) const PACK_MIN_WORK: u128 = 8_000_000;
 /// k ≤ 384 时条带 ≤ 48 KB，直接一整块跑，避免白白多读写 C。
 const L1_BUDGET: usize = 48 * 1024;
 const K_CHUNK: usize = 256;
+
+/// **路线 B 实验旋钮**（`task-73`）：把上面两个常量 + 三个次序/写策略变体参数化，
+/// 生产路径默认用 `KernelCfg::default()`（= 与本轮改动前**逐条指令相同**），
+/// 仅在 `#[cfg(test)]` 的 perf 探针里用别的组合做 A/B；采纳时只改 `default()` 的字段值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KernelCfg {
+    /// k 块长（条带 `k_chunk×32×4` 字节）。
+    pub k_chunk: usize,
+    /// 条带 ≤ 该字节数时不分块。
+    pub l1_budget: usize,
+    /// 循环次序：`false` = `k块 → strip → 行块`（现状）；`true` = `strip → k块 → 行块`。
+    pub strip_outer: bool,
+    /// C 写策略：`true` = 每个 strip 先在**独立缓冲**里累完全部 k 块，最后写 C 一次
+    /// （消除每 k 块一次 C 读+写；缓冲逐位精确，累加次序不变）。
+    pub c_strip_buf: bool,
+    /// 对下一个 strip 的 B 做 `preld` 预取（只在标量循环边界处发 2 条预取，不改变数值）。
+    pub prefetch: bool,
+    /// 打包面板的 L2 预算（字节）：`nc_strips = panel_bytes / (k×32×4)`。
+    pub panel_bytes: usize,
+}
+
+impl Default for KernelCfg {
+    /// **生产默认 = 改动前行为**（`task-73` 的候选组合不采纳，只作为"叠加候选"留在探针里；
+    /// 见 `gemm_l1_bench` 的 `adopted(strip_outer)` 行：1t 内核态 +5.1%/+11.3%，
+    /// 但 C ABI 口径仍 <0.95×，且 1t 用例会被库内自动并行污染 ⇒ 本轮不动生产默认）。
+    fn default() -> Self {
+        KernelCfg {
+            k_chunk: K_CHUNK,
+            l1_budget: L1_BUDGET,
+            strip_outer: false,
+            c_strip_buf: false,
+            prefetch: false,
+            panel_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl KernelCfg {
+    /// **改动前行为**（并行路径固定用它，保证多线程路径的循环次序与本轮改动前完全一致）。
+    pub(crate) fn legacy() -> Self {
+        KernelCfg {
+            k_chunk: K_CHUNK,
+            l1_budget: L1_BUDGET,
+            strip_outer: false,
+            c_strip_buf: false,
+            prefetch: false,
+            panel_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
 use std::arch::loongarch64::*;
 
 /// 输出那一遍的缩放口径：`C = alpha·acc + beta·C_old`（`acc` 是沿 k 从 0 起的完整累加）。
@@ -478,14 +528,28 @@ pub(crate) fn matmul_f32_packed(
     c: &mut [f32],
     epi: Epi,
 ) {
+    matmul_f32_packed_at(m, k, n, a, b, c, epi, KernelCfg::default());
+}
+
+/// 路线 B 的可配置整条乘法（生产包装 [`matmul_f32_packed`] 用默认配置）。
+pub(crate) fn matmul_f32_packed_at(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    epi: Epi,
+    cfg: KernelCfg,
+) {
     if m == 0 || n == 0 {
         return;
     }
     let m4 = m / 4 * 4;
     let n32 = n / 32 * 32;
     let strips_total = n32 / 32;
-    // 一次打包的列数：面板 `k×nc×4` 要留在 L2（3 MiB/核）里，预算取 2 MiB
-    let nc_strips = pack_strips(k);
+    // 一次打包的列数：面板 `k×nc×4` 要留在 L2（3 MiB/核）里，预算默认取 2 MiB
+    let nc_strips = (cfg.panel_bytes / (k * 32 * 4).max(1)).clamp(1, 256);
 
     PACK_BUF.with(|buf| {
         let mut packed = buf.borrow_mut();
@@ -498,7 +562,7 @@ pub(crate) fn matmul_f32_packed(
             pack_b(k, n, jb, nc, b, &mut packed);
             // 面板打包好后，交给"用已打包面板算一个行块"的入口（并行层复用同一个入口，
             // 于是打包只做一次、面板跨线程共享）。
-            matmul_f32_packed_rows(k, n, jb, nc, &packed, a, c, m4, epi);
+            matmul_f32_packed_rows_at(k, n, jb, nc, &packed, a, c, m4, epi, cfg);
             s0 = s1;
         }
     });
@@ -533,56 +597,291 @@ pub(crate) fn matmul_f32_packed_rows(
     m4: usize,
     epi: Epi,
 ) {
+    matmul_f32_packed_rows_at(
+        k,
+        n,
+        jb,
+        nc,
+        packed,
+        a_rows,
+        c_rows,
+        m4,
+        epi,
+        // **并行路径固定用改动前次序**（任务红线："多线程路径不变"）。
+        KernelCfg::legacy(),
+    );
+}
+
+/// 单 strip、单 k 块的行块主体（路线 B 的公共内核）：`use_buf` 为真时写到 `cbuf`（stride 32），
+/// 否则直接写 `c_rows`（stride `n`、列偏移 `j`）。两者累加次序相同 ⇒ 逐位一致。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_strip_chunk(
+    m4: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    j: usize,
+    kb0: usize,
+    kb: usize,
+    strip: &[f32],
+    a_rows: &[f32],
+    first: bool,
+    epi: Epi,
+    c_rows: &mut [f32],
+    cbuf: &mut [f32],
+    use_buf: bool,
+) {
+    let mut i = 0;
+    if use_buf {
+        while i < m4 {
+            let ct = &mut cbuf[i * 32..(i + 4) * 32];
+            tile4x32_chunk(
+                kb,
+                first,
+                strip,
+                &a_rows[i * k + kb0..i * k + kb0 + kb],
+                &a_rows[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
+                &a_rows[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
+                &a_rows[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
+                ct,
+                32,
+                0,
+                epi,
+            );
+            i += 4;
+        }
+        while i < m {
+            row_tail_packed(
+                &a_rows[i * k + kb0..i * k + kb0 + kb],
+                strip,
+                &mut cbuf[i * 32..(i + 1) * 32],
+                first,
+                0,
+                epi,
+            );
+            i += 1;
+        }
+    } else {
+        while i < m4 {
+            let ct = &mut c_rows[i * n..(i + 4) * n];
+            tile4x32_chunk(
+                kb,
+                first,
+                strip,
+                &a_rows[i * k + kb0..i * k + kb0 + kb],
+                &a_rows[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
+                &a_rows[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
+                &a_rows[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
+                ct,
+                n,
+                j,
+                epi,
+            );
+            i += 4;
+        }
+        while i < m {
+            row_tail_packed(
+                &a_rows[i * k + kb0..i * k + kb0 + kb],
+                strip,
+                &mut c_rows[i * n..(i + 1) * n],
+                first,
+                j,
+                epi,
+            );
+            i += 1;
+        }
+    }
+}
+
+/// 把每 strip 的 C 缓冲（`m×32`，已含完整 k 累加）按 `epi` 写到 C 的真实位置。
+fn finish_cbuf(cbuf: &[f32], c_rows: &mut [f32], m: usize, n: usize, j: usize, epi: Epi) {
+    for i in 0..m {
+        let src = &cbuf[i * 32..i * 32 + 32];
+        let dst = &mut c_rows[i * n + j..i * n + j + 32];
+        match epi {
+            Epi::Plain => dst.copy_from_slice(src),
+            Epi::Scale(alpha) => {
+                for (d, v) in dst.iter_mut().zip(src) {
+                    *d = alpha * *v;
+                }
+            }
+            Epi::Fma(alpha, beta) => {
+                for (d, v) in dst.iter_mut().zip(src) {
+                    *d = beta.mul_add(*d, alpha * *v);
+                }
+            }
+        }
+    }
+}
+
+/// `preld` 预取一条缓存行（LASX 上就是普通标量预取；不改变任何数值语义）。
+#[inline]
+unsafe fn prefetch_line(p: *const f32) {
+    // SAFETY: 调用方传的是仍存活的 `packed` 切片内地址；`preld` 对非法地址也只是 no-op，
+    // 不影响正确性（这里额外保证地址有效）。
+    unsafe {
+        core::arch::asm!("preld 0, {}, 0", in(reg) p, options(nostack, preserves_flags));
+    }
+}
+
+/// 预取下一个 strip 的 B 面板（均匀抽样：每 8 行预取 1 条）。
+fn prefetch_strip(packed: &[f32], s: usize, k: usize) {
+    let base = s * k * 32;
+    let mut q = 0;
+    while q < k {
+        // SAFETY: `base + q*32 < packed.len()`（调用方保证 s < strips）。
+        unsafe { prefetch_line(packed.as_ptr().add(base + q * 32)) };
+        q += 8;
+    }
+}
+
+/// 路线 B 的可配置入口：生产包装 [`matmul_f32_packed_rows`] 用默认配置；
+/// 只有 perf 探针/实验会传别的 [`KernelCfg`]。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f32_packed_rows_at(
+    k: usize,
+    n: usize,
+    jb: usize,
+    nc: usize,
+    packed: &[f32],
+    a_rows: &[f32],
+    c_rows: &mut [f32],
+    m4: usize,
+    epi: Epi,
+    cfg: KernelCfg,
+) {
     // k == 0 时不会走进这个入口（调用方已提前返回），用 checked_div 让 clippy 与读者都放心
     let m = a_rows.len().checked_div(k).unwrap_or(0);
     let strips = nc / 32;
     // 宏内核：**k 分块在外、行块在内**。这样每个 k 块打包后的 B
     //（K_CHUNK×32×4 = 32 KB）会被所有行块反复命中，并与 A 的 4 行、C 的 4×32
     // 一起待在 L1 里。代价是 C 每块读写一次（k=1024 时多 3 次），相对算力可忽略。
-    let kb_size = if k * 32 * 4 <= L1_BUDGET { k } else { K_CHUNK };
-    let mut kb0 = 0;
-    while kb0 < k {
-        let kb = kb_size.min(k - kb0);
-        let first = kb0 == 0;
-        // 只有最后一个 k 块才应用输出口径；中间的块写的是**部分和**，必须原样落盘。
-        let epi = if kb0 + kb == k { epi } else { Epi::Plain };
+    let kb_size = if k * 32 * 4 <= cfg.l1_budget {
+        k
+    } else {
+        cfg.k_chunk.max(1)
+    };
+    let use_buf = cfg.c_strip_buf && kb_size < k;
+    let mut cbuf_storage: Vec<f32> = Vec::new();
+    if use_buf {
+        cbuf_storage.resize(m * 32, 0.0);
+    }
+    // C 独立缓冲**只对单个 strip 有意义**：它的生命周期是"一个 strip 的全部 k 块"，
+    // 所以必须配 strip 主序（`strip → k块 → 行块`）；chunk 主序下缓冲会被下一个 strip 覆盖。
+    let strip_major = cfg.strip_outer || use_buf;
+    if strip_major {
         for s in 0..strips {
-            let base = s * k * 32 + kb0 * 32;
-            let strip = &packed[base..base + kb * 32];
             let j = jb + s * 32;
-            let mut i = 0;
-            while i < m4 {
-                let ct = &mut c_rows[i * n..(i + 4) * n];
-                tile4x32_chunk(
-                    kb,
-                    first,
-                    strip,
-                    &a_rows[i * k + kb0..i * k + kb0 + kb],
-                    &a_rows[(i + 1) * k + kb0..(i + 1) * k + kb0 + kb],
-                    &a_rows[(i + 2) * k + kb0..(i + 2) * k + kb0 + kb],
-                    &a_rows[(i + 3) * k + kb0..(i + 3) * k + kb0 + kb],
-                    ct,
-                    n,
-                    j,
-                    epi,
-                );
-                i += 4;
+            if cfg.prefetch && s + 1 < strips {
+                prefetch_strip(packed, s + 1, k);
             }
-            // 不足 4 行的尾部行
-            while i < m {
-                let c_row = &mut c_rows[i * n..(i + 1) * n];
-                row_tail_packed(
-                    &a_rows[i * k + kb0..i * k + kb0 + kb],
-                    strip,
-                    c_row,
-                    first,
-                    j,
-                    epi,
-                );
-                i += 1;
+            let mut kb0 = 0;
+            while kb0 < k {
+                let kb = kb_size.min(k - kb0);
+                let first = kb0 == 0;
+                let base = s * k * 32 + kb0 * 32;
+                let strip = &packed[base..base + kb * 32];
+                if use_buf {
+                    run_strip_chunk(
+                        m4,
+                        m,
+                        n,
+                        k,
+                        j,
+                        kb0,
+                        kb,
+                        strip,
+                        a_rows,
+                        first,
+                        Epi::Plain,
+                        c_rows,
+                        &mut cbuf_storage,
+                        true,
+                    );
+                } else {
+                    let epi = if kb0 + kb == k { epi } else { Epi::Plain };
+                    run_strip_chunk(
+                        m4,
+                        m,
+                        n,
+                        k,
+                        j,
+                        kb0,
+                        kb,
+                        strip,
+                        a_rows,
+                        first,
+                        epi,
+                        c_rows,
+                        &mut [],
+                        false,
+                    );
+                }
+                kb0 += kb;
+            }
+            if use_buf {
+                finish_cbuf(&cbuf_storage, c_rows, m, n, j, epi);
             }
         }
-        kb0 += kb;
+    } else {
+        let mut kb0 = 0;
+        while kb0 < k {
+            let kb = kb_size.min(k - kb0);
+            let first = kb0 == 0;
+            // 只有最后一个 k 块才应用输出口径；中间的块写的是**部分和**，必须原样落盘。
+            let epi_chunk = if kb0 + kb == k { epi } else { Epi::Plain };
+            for s in 0..strips {
+                let base = s * k * 32 + kb0 * 32;
+                let strip = &packed[base..base + kb * 32];
+                let j = jb + s * 32;
+                if cfg.prefetch && s + 1 < strips {
+                    prefetch_strip(packed, s + 1, k);
+                }
+                if use_buf {
+                    run_strip_chunk(
+                        m4,
+                        m,
+                        n,
+                        k,
+                        j,
+                        kb0,
+                        kb,
+                        strip,
+                        a_rows,
+                        first,
+                        Epi::Plain,
+                        c_rows,
+                        &mut cbuf_storage,
+                        true,
+                    );
+                } else {
+                    run_strip_chunk(
+                        m4,
+                        m,
+                        n,
+                        k,
+                        j,
+                        kb0,
+                        kb,
+                        strip,
+                        a_rows,
+                        first,
+                        epi_chunk,
+                        c_rows,
+                        &mut [],
+                        false,
+                    );
+                }
+            }
+            kb0 += kb;
+        }
+        if use_buf {
+            for s in 0..strips {
+                let j = jb + s * 32;
+                finish_cbuf(&cbuf_storage, c_rows, m, n, j, epi);
+            }
+        }
     }
 }
 
@@ -1405,6 +1704,344 @@ mod cols_exp {
                 got.iter().all(|v| v.is_finite()),
                 "{m}×{k}×{n}: beta == 0 时读了 C（NaN 传播）"
             );
+        }
+    }
+
+    /// **路线 B 候选组合逐位等价**（`task-73`）：`KernelCfg` 的 strip 主序 / C 独立缓冲 /
+    /// 预取 / 面板预算变体，对 ragged 形状与列尾都要与改动前配置**逐位一致**。
+    ///
+    /// 生产默认 = `legacy`（候选不采纳），但候选留在探针里供 Lead 叠加；这条测试保证
+    /// "一旦有人把默认切到候选，数值不会变"。
+    #[test]
+    fn gemm_kernel_cfg_variants_stay_bitwise() {
+        let cfgs = [
+            (
+                "strip_outer",
+                KernelCfg {
+                    strip_outer: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+l1=64K",
+                KernelCfg {
+                    strip_outer: true,
+                    l1_budget: 64 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+cbuf",
+                KernelCfg {
+                    strip_outer: true,
+                    c_strip_buf: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+prefetch",
+                KernelCfg {
+                    strip_outer: true,
+                    prefetch: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+panel3M",
+                KernelCfg {
+                    strip_outer: true,
+                    panel_bytes: 3 * 1024 * 1024,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (m, k, n) in [(37usize, 64usize, 45usize), (128, 256, 96), (513, 448, 130)] {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| (((i * 37 + 11) % 101) as f32) * 0.01 - 0.5)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| (((i * 53 + 7) % 97) as f32) * 0.01 - 0.5)
+                .collect();
+            let mut c_legacy = vec![0f32; m * n];
+            matmul_f32_packed_at(
+                m,
+                k,
+                n,
+                &a,
+                &b,
+                &mut c_legacy,
+                Epi::Plain,
+                KernelCfg::legacy(),
+            );
+            for (name, cfg) in cfgs {
+                let mut c = vec![0f32; m * n];
+                matmul_f32_packed_at(m, k, n, &a, &b, &mut c, Epi::Plain, cfg);
+                for (i, (x, y)) in c.iter().zip(&c_legacy).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "{m}×{k}×{n} cfg={name} @ {i}: {} vs {}",
+                        x,
+                        y
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// **路线 B perf 探针（`task-73`）**：`cargo test --release --lib gemm_l1_bench -- --ignored --nocapture`。
+///
+/// 对 1024³/1536³ 用多个 [`KernelCfg`] 组合跑 1t 打包内核：先与默认配置**逐位**对比，
+/// 再进程内交替 5 轮（丢首轮、取中位）计时。生产路径不受影响（默认配置 = 改动前行为）。
+#[cfg(test)]
+mod gemm_l1_bench {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn timeit(f: &mut impl FnMut()) -> Duration {
+        let t = Instant::now();
+        f();
+        t.elapsed()
+    }
+    fn median(mut v: Vec<Duration>) -> Duration {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "perf probe: cargo test --release --lib gemm_l1_bench -- --ignored --nocapture"]
+    fn bench_gemm_l1_variants() {
+        let cfgs: Vec<(&str, KernelCfg)> = vec![
+            // **改动前行为**（chunk 主序）——真正的 baseline；`KernelCfg::default()` 是候选采纳配置。
+            ("legacy(chunk_outer)", KernelCfg::legacy()),
+            ("adopted(strip_outer)", KernelCfg::default()),
+            (
+                "strip_outer",
+                KernelCfg {
+                    strip_outer: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+prefetch",
+                KernelCfg {
+                    strip_outer: true,
+                    prefetch: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+l1=64K",
+                KernelCfg {
+                    strip_outer: true,
+                    l1_budget: 64 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+l1=64K+prefetch",
+                KernelCfg {
+                    strip_outer: true,
+                    l1_budget: 64 * 1024,
+                    prefetch: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+panel3M",
+                KernelCfg {
+                    strip_outer: true,
+                    panel_bytes: 3 * 1024 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+l1=64K+panel3M",
+                KernelCfg {
+                    strip_outer: true,
+                    l1_budget: 64 * 1024,
+                    panel_bytes: 3 * 1024 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "strip_outer+cbuf+prefetch",
+                KernelCfg {
+                    strip_outer: true,
+                    c_strip_buf: true,
+                    prefetch: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        // `GEMM_CFG=<cfg 名>`：只跑该组合 + 1536³（供 `perf stat` 前后对照用；默认跑全部组合）。
+        let only = std::env::var("GEMM_CFG").ok();
+        let cfgs: Vec<(&str, KernelCfg)> = match &only {
+            Some(sel) => cfgs.into_iter().filter(|(n, _)| n == sel).collect(),
+            None => cfgs,
+        };
+        let shapes: Vec<(usize, usize, usize)> = if only.is_some() {
+            vec![(1536, 1536, 1536)]
+        } else {
+            vec![(1024, 1024, 1024), (1536, 1536, 1536)]
+        };
+        for (m, k, n) in shapes {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| (((i * 37 + 11) % 101) as f32) * 0.01 - 0.5)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| (((i * 53 + 7) % 97) as f32) * 0.01 - 0.5)
+                .collect();
+            let gflops = |ms: f64| 2.0 * (m * k * n) as f64 / (ms * 1e-3) * 1e-9;
+            // `perf stat` 专用：只跑选中的那个组合（8 轮丢首轮），不混入 base 臂/逐位参照。
+            if let Some(sel) = &only {
+                let (name, cfg) = cfgs[0];
+                assert_eq!(name, sel, "GEMM_CFG 名字不匹配");
+                let mut c = vec![0f32; m * n];
+                let mut tv = Vec::new();
+                for _ in 0..8 {
+                    let t = timeit(&mut || {
+                        matmul_f32_packed_at(m, k, n, &a, &b, &mut c, Epi::Plain, cfg)
+                    });
+                    tv.push(t);
+                }
+                std::hint::black_box(c[0]);
+                tv.remove(0);
+                let mv = median(tv).as_secs_f64() * 1e3;
+                println!("| {name} | {mv:.2} | {:.2} | (perf 模式) | — |", gflops(mv));
+                continue;
+            }
+            let mut c_ref = vec![0f32; m * n];
+            matmul_f32_packed_at(
+                m,
+                k,
+                n,
+                &a,
+                &b,
+                &mut c_ref,
+                Epi::Plain,
+                KernelCfg::default(),
+            );
+            let gflops = |ms: f64| 2.0 * (m * k * n) as f64 / (ms * 1e-3) * 1e-9;
+            println!("\n== {m}×{k}×{n}（1t 打包内核，base 为逐位参照）==");
+            println!("| cfg | ms(med) | GFLOP/s | vs base | bitwise |");
+            println!("|---|---|---|---|---|");
+            for (name, cfg) in &cfgs {
+                let mut c_var = vec![0f32; m * n];
+                matmul_f32_packed_at(m, k, n, &a, &b, &mut c_var, Epi::Plain, *cfg);
+                let bitwise = c_var
+                    .iter()
+                    .zip(&c_ref)
+                    .all(|(x, y)| x.to_bits() == y.to_bits());
+                let mut c_base = vec![0f32; m * n];
+                let (mut tv, mut tb) = (Vec::new(), Vec::new());
+                for r in 0..5 {
+                    let (t1, t2) = if r % 2 == 0 {
+                        let t1 = timeit(&mut || {
+                            matmul_f32_packed_at(m, k, n, &a, &b, &mut c_var, Epi::Plain, *cfg)
+                        });
+                        let t2 = timeit(&mut || {
+                            matmul_f32_packed_at(
+                                m,
+                                k,
+                                n,
+                                &a,
+                                &b,
+                                &mut c_base,
+                                Epi::Plain,
+                                KernelCfg::default(),
+                            )
+                        });
+                        (t1, t2)
+                    } else {
+                        let t2 = timeit(&mut || {
+                            matmul_f32_packed_at(
+                                m,
+                                k,
+                                n,
+                                &a,
+                                &b,
+                                &mut c_base,
+                                Epi::Plain,
+                                KernelCfg::default(),
+                            )
+                        });
+                        let t1 = timeit(&mut || {
+                            matmul_f32_packed_at(m, k, n, &a, &b, &mut c_var, Epi::Plain, *cfg)
+                        });
+                        (t1, t2)
+                    };
+                    tv.push(t1);
+                    tb.push(t2);
+                }
+                std::hint::black_box(c_var[0]);
+                std::hint::black_box(c_base[0]);
+                tv.remove(0);
+                tb.remove(0);
+                let mv = median(tv).as_secs_f64() * 1e3;
+                let mb = median(tb).as_secs_f64() * 1e3;
+                println!(
+                    "| {name} | {mv:.2} | {:.2} | {:+.1}% | {bitwise} |",
+                    gflops(mv),
+                    (mb / mv - 1.0) * 100.0
+                );
+            }
+            // 诊断：整条 `matmul_f32`（C ABI 走的同一条）vs 直接打包内核。
+            println!(
+                "- 诊断：`pool::threads()` = {}（>1 且 work≥32M 时 `matmul_f32` 会走并行）",
+                crate::pool::global().threads()
+            );
+            {
+                let mut cf = vec![0f32; m * n];
+                let mut tv = Vec::new();
+                let mut tb = Vec::new();
+                for r in 0..5 {
+                    let (t1, t2) = if r % 2 == 0 {
+                        let t1 = timeit(&mut || matmul_f32(m, k, n, &a, &b, &mut cf));
+                        let t2 = timeit(&mut || {
+                            matmul_f32_packed_at(
+                                m,
+                                k,
+                                n,
+                                &a,
+                                &b,
+                                &mut cf,
+                                Epi::Plain,
+                                KernelCfg::default(),
+                            )
+                        });
+                        (t1, t2)
+                    } else {
+                        let t2 = timeit(&mut || {
+                            matmul_f32_packed_at(
+                                m,
+                                k,
+                                n,
+                                &a,
+                                &b,
+                                &mut cf,
+                                Epi::Plain,
+                                KernelCfg::default(),
+                            )
+                        });
+                        let t1 = timeit(&mut || matmul_f32(m, k, n, &a, &b, &mut cf));
+                        (t1, t2)
+                    };
+                    tv.push(t1);
+                    tb.push(t2);
+                }
+                tv.remove(0);
+                tb.remove(0);
+                let mf = median(tv).as_secs_f64() * 1e3;
+                let mk = median(tb).as_secs_f64() * 1e3;
+                println!(
+                    "- 全派发 {mf:.2} ms（{:.2} GFLOP/s） / 内核 {mk:.2} ms（{:.2} GFLOP/s） ⇒ 派发+并行层 {:+.1}%",
+                    gflops(mf),
+                    gflops(mk),
+                    (mf / mk - 1.0) * 100.0
+                );
+            }
         }
     }
 }
