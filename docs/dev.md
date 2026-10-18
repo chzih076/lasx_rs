@@ -7179,6 +7179,21 @@ C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实
 - **流程教训（Lead 侧，已记 #66）**：批1 合入后 CI 红在 **nightly rustdoc**（删方法后残留 intra-doc link），
   而我在本地用 **stable `cargo doc` 的缓存产物**得到"假通过" ⇒ **验证必须用与 CI 相同的命令（nightly）+ 新鲜构建**。
 
+**P1 批2 后端适配（`lasx_rs` `fb90c4b`）：11 pattern、删几何 5 旧 override**
+- `supports_plan` 扩到 **11 kind 全 true**；`exec_fused_plan` 5 个几何臂映射 `api::*_into`（mat3 走 Rust 层 helper）+ 校验（`n==0 ⇒ Ok`、全部输出等长、mat3 9 条 `m`）；`unitize3` 零向量 LASX=0 / portable 计划解释=NaN（保留）；
+- **删 5 个几何旧 override**；`Capability::FusedGeometry` 改**不报**（位语义"5 方法全 override"已不成立，能力由 `supports_plan` 承载）；
+- **A/B（A=Plan，B=直接 api；3 次复跑；loadavg 7.6–9.3）**：9/11 中位落在 **0.98–1.12**；**Mat3 三次一致 0.94–0.96（未达 0.98）**、Norm3 一次 0.913（另次 1.041 ⇒ 噪声）；
+  两臂**同一内核、逐位相同**；Mat3 偏低**未完全归因**（候选：两臂写不同输出缓冲 ⇒ 地址/对齐/缓存别名；借用检查下无法复用同一缓冲），**如实记、不宣称全部 ≥0.98**。
+- 删除了已无对照臂的 `geomf64_fused_ab.rs`（几何 A/B 由 `plan_ab` 承接）。
+
+**P1 批3（`simd_dsl` `fd37e6b`）：量化 4 → Plan，删 4 个具名方法（`Backend` 66 → 62）**
+- payload：4 变体**自带 i8 输入/输出与 `&mut i32`**（`FusedIo` 继续零改动；`DotI8` 用 `&mut i32` 承接返回值）；代价（plan 值变大）已记录；
+- 解释器 4 臂**逐行照抄旧默认**（ties-even+clamp；dot/gemv **i64 累加+末端饱和**）⇒ **全部逐位**；边界 ±0.5/±1.5/±2.5/NaN/±inf/饱和端点 + 8 用例全过；
+- `Capability::Quant` **保留变体**但语义改为"由 `supports_plan` 探测"（平滑过渡，不制造无谓破坏；`#[non_exhaustive]` 内 match 需穷尽）；
+- **9 处 intra-doc 破链已改**并本地跑 CI 同款 nightly rustdoc 通过；`Backend` **66→62**；62 个方法累计 **9 个具名融合方法**迁 Plan 并真删；
+- 门禁：379 tests、clippy、nightly rustdoc、namecheck（读表）/docrefcheck/opcheck/layercheck/covercheck/portcheck、`gen --check` 全绿。
+
+
 
 
 
