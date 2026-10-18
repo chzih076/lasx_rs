@@ -6968,7 +6968,21 @@ A/B（A=portable，B=override；6 对丢首对中位；loadavg 7.22/6.26/5.36）
 **等价类**：整数路径**逐位**；测试含 `n=0/1/7/64/1024` vs i64 参照逐位、**饱和用例**（`k=200000` 全 `127·127` ⇒ `i32::MAX`
 （i64 原始和 3225800000 > MAX）、全 `127·(-128)` ⇒ `i32::MIN`）、`gemv` `k=0`/`j=0`/长度错边界。
 **坑（值得记）**：**饱和必须用 i64 累加**——用 `i32::saturating_add` 逐项饱和会**与累加顺序相关**，那就不是契约级承诺。
-**LASX override**：待后端侧实现后补测（`Capability::Quant` 只在 4 个全接上时报 true）。
+**LASX override（已落地，`77b5640` 合并于 `0f9bdf7`）**：`src/ops/quant_i8.rs`（`xvfdiv_s` → 浮点钳位 → `xvftintrne_w_s`（RN-even = ties-even）→ NaN 掩码 → 逐 lane 转 i8；
+注释论证并单测钉住**"先浮点钳位再取整 ≡ 先取整再钳位"**（端点为整数、取整单调幂等；NaN 不能靠 `fmax/fmin`——maxNum 语义会把它变 −128））、
+`src/ops/dot_i8.rs`（拆出 `dot_i8_i64` 精确和 + `dot_i8_saturating` **末端一次饱和**，N3 的 FFI 截断入口语义保持不变）、
+`src/ops/gemv_i8.rs`（逐行复用饱和 dot，**不是**中途 `saturating_add`）。
+**A/B（A=portable，B=override；同进程交替 6 对丢首对中位；threads=12；loadavg 6.19）**：
+| 用例 | A ms | B ms | 加速比 | 等价 |
+|---|---|---|---|---|
+| quantize_i8_rows_f32（1M） | 4.412 | 0.986 | **4.47×** | **逐位** |
+| dot_i8（1M） | 0.314 | 0.138 | **2.27×** | **逐位**（整数） |
+| gemv_i8（1024×1024） | 0.328 | 0.107 | **3.06×** | **逐位**（整数） |
+
+三项 ≥1.10 ⇒ **全部保留**。**`dequantize_i8_rows_f32` 如实不接**：LASX 拓宽指令是 **128-bit lane 语义**
+（`xvsllwil_h_b` 取每半区低 8 字节，链到 w 后 lane 序为 `[b0..b3,b16..b19]`），拼连续 8 字节块需 4 次 unaligned load + `xvpermi_q`
+（或标量 scatter），而 portable 默认已是 1 乘/元素 ⇒ **收益不足**；探针与原因写进模块注释。
+**`Capability::Quant` 仍报 false**（只低估）：位语义=4 方法全有专用实现，3/4 不报。
 
 ## 7.41 P2-6：大尺寸 GEMM 追 OpenBLAS —— 基线可复现；**三个方向实测均未达 10%，零代码改动**
 
