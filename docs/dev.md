@@ -7308,10 +7308,10 @@ LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 fal
 | **I5** | **API 面快照门禁** `apicheck.sh` + 基线（**463 条**）+ 自测 | `b220241`→`a7912ad` | 自测 6 类（含"同文件同名删一个"防假绿）；CI 步骤绿 |
 | 附加 | CI 增 `Capability consumer guard` / `API surface snapshot guard` 两步 | `simd d4d2dd0` | 本地三脚本绿；CI 随后验证 |
 
-**未做（如实留在审计 §7/§9）**：**I6** perceive 家族 `analysis` feature 门控 / rewrite 判断下沉 / reference 门控（breaking 面积大，需单独决策）；
+**未做（如实留在审计报告的"改进优先级/未做与风险"章节）**：**I6** perceive 家族 `analysis` feature 门控 / rewrite 判断下沉 / reference 门控（breaking 面积大，需单独决策）；
 **I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）；门禁盲区补测（namecheck/opcheck 负例自测）。
-**过程记录**：CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障（非代码问题，已记审计 §10）。
-**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`；`lasx_rs` 本文件 + `AGENTS §38`（违规 #71/#72）。
+**过程记录**：CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障（非代码问题，已记审计报告的改进实施记录）。
+**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71/#72）。
 
 
 
