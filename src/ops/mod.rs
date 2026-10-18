@@ -84,6 +84,11 @@ pub mod gelu_quick;
 pub mod gemv_i8;
 pub mod j2_accel_batch;
 pub mod layer_norm;
+/// **P0-2 单趟 map+行和**（`Backend::map_rows_sum_f32` 的 LASX 向量实现）。
+/// 唯一调用方是 `src/dsl_backend.rs`（同 feature 门控）⇒ 挂在 `dsl-backend` 下，避免默认构建
+/// 编成"无人使用的模块"（AGENTS.md #49 的 `dead_code` 教训）。
+#[cfg(feature = "dsl-backend")]
+pub mod map_rows_sum;
 pub mod mat3_mul_vec3_batch;
 pub mod matmul;
 /// **P5-b：NT-GEMM 内核**（`out[i*n+j] = Σ_t a[i*k+t]·b[j*k+t]`；`b` 行主序 ⇒ **不需要物化转置**）。
