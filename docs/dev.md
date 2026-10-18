@@ -7288,6 +7288,31 @@ LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 fal
 **Commits**：`simd_dsl` `d5c8356`/`f74ec2f`/`329aff9`（+`8bb5c97`/`4dfc356` 文档与生成器收尾）；
 `lasx_rs` `bb574c6`（落地）、`94a8182`（违规记录）。
 
+## 7.48 抽象层系统审计 + 首轮改进（I1–I5，含新增三步门禁）
+
+**审计**（完整报告：`simd_dsl/docs/abstraction_audit.md`；只读，三片并行 + Lead 逐条复核）：
+- **分层/依赖干净**：代码级 `use crate::` 实测无逆向边、无越层（doc 注释里的跨层引用不计）；但 criteria/engine/kernels/reference **整体 `pub mod`** 暴露（对外 76/129/63/6 项），下游（lasx/ops_dsl）已实际依赖内部路径 ⇒ 暂不能 crate-private；
+- **契约面**：`Backend` 62 = **必需 2 + 默认 60**；`#[non_exhaustive]` **26 处**（38 个公开 enum 的 68%）、`#[must_use]` **仅 1**；`Capability` 12 变体里 **9 个在 crate 内无消费者**（只被后端申报/测试断言）；
+- **自动化残留**：`primitives.tsv` 63 行 / `patterns.tsv` 17 行；validate `match`（可自动、缺"校验规格列"）、plan payload/解释臂（中）、scalar 参照（低）仍手写；
+- **冗余**：校验 helper **三套**（contract 2 + plan_validate 2 + kernels 私有 2）；`engine` 的 `perceive_*` **7 模块 / 2594 行（52%）无外部可达入口**；`reference` 561 行仅测试/对照用；ops_dsl 直调 backend 83 处（多数合理，f64 元素宏缺口 31 处）；
+- **测试/门禁**：296（219 集成 + 77 内联）；perceive 家族 56 pub 无集成测试；namecheck/opcheck **无自测**、抓不到 API 面膨胀/死 pub/跨文件重复；本地 vs CI 有 nightly/`--workspace` 差异（历史红点 #39/#41/#66）；
+- **审计勘误（如实）**：成员报告 4 处与实测不符（`primitives.tsv` 76→**63**、`patterns.tsv` 27→**17**、`non_exhaustive` 8→**26**、perceive 9/3582→**7/2594**），已由 Lead 复核纠正并写入审计 §8。
+
+**本轮已落地改进（全部有自测/CI 证据）**：
+| # | 改进 | 提交 | 证据 |
+|---|---|---|---|
+| **I1** | CI 补 conformance 档（此前 harness 不在 CI，会腐烂） | `simd fc5e18b` | CI 两步 `Test release (conformance harness)`/`Clippy conformance harness` 绿 |
+| **I2** | 文档漂移修复（指南说 harness"待合入"、行数过时；structure 无 conformance） | `f340983` | "待合入" 0 命中；structure conformance 11 处；docrefcheck OK |
+| **I3** | **能力位消费门禁** `capabilitycheck.sh` + 自测 + allowlist | `f04cafe`→`475239f` | 12 变体 = 消费 4 + 豁免 8；自测 **9/0**；CI 步骤绿 |
+| **I4** | contract 内 4 个长度/溢出 helper → `contract::guard`（2 原语 + 2 适配器） | `444a7e4`→`70d9464` | 383 tests 绿、clippy/nightly rustdoc 绿；独立校验 4→2 |
+| **I5** | **API 面快照门禁** `apicheck.sh` + 基线（**463 条**）+ 自测 | `b220241`→`a7912ad` | 自测 6 类（含"同文件同名删一个"防假绿）；CI 步骤绿 |
+| 附加 | CI 增 `Capability consumer guard` / `API surface snapshot guard` 两步 | `simd d4d2dd0` | 本地三脚本绿；CI 随后验证 |
+
+**未做（如实留在审计 §7/§9）**：**I6** perceive 家族 `analysis` feature 门控 / rewrite 判断下沉 / reference 门控（breaking 面积大，需单独决策）；
+**I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）；门禁盲区补测（namecheck/opcheck 负例自测）。
+**过程记录**：CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障（非代码问题，已记审计 §10）。
+**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`；`lasx_rs` 本文件 + `AGENTS §38`（违规 #71/#72）。
+
 
 
 
