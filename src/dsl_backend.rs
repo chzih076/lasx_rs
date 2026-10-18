@@ -56,7 +56,7 @@
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
-    PackedB, PrecisionClaim, ScalarKind, TernaryOp, UnaryOp,
+    PackedB, PrecisionClaim, ReduceMapOp, ScalarKind, TernaryOp, UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -897,6 +897,62 @@ impl Backend for LasxBackend {
     ///   已 override 到 `ops::f64_map`（LASX 4 f64/lane；与 `kernels::scalar` **逐位**，
     ///   测试 `f64_map_is_bitwise_vs_scalar`）。
     ///
+    // ============ P0-2：单趟 map + 行和（`map_rows_sum_f32`）============
+    //
+    // 契约语义：`out_mapped = f(x, shift[r])`、`out_rowsum[r] = Σ_c out_mapped`（**一次扫描**）。
+    // **等价类：容差**（契约文档自己也这么写）：映射值用 LASX `exp_vec`（与 `softmax_rows` 同串），
+    // 与 portable 的 libm `exp` 非逐位；行和是 per-lane 累加 + 固定次序水平求和（portable 是单累加器）。
+    // 实测界见 `examples/map_rowsum_ab.rs`；**A/B <10% 就不保留此 override**（届时删掉本段）。
+    fn map_rows_sum_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        shift: &[f32],
+        map: ReduceMapOp,
+        out_mapped: &mut [f32],
+        out_rowsum: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "map_rows_sum_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if out_mapped.len() != total {
+            return Err(len_err(op, "out_mapped", total, out_mapped.len()));
+        }
+        if out_rowsum.len() != rows {
+            return Err(len_err(op, "out_rowsum", rows, out_rowsum.len()));
+        }
+        match map {
+            ReduceMapOp::Exp => {
+                if !shift.is_empty() {
+                    return Err(len_err(op, "shift（Exp 不接受位移）", 0, shift.len()));
+                }
+            }
+            ReduceMapOp::ExpShiftedRow => {
+                if shift.len() != rows {
+                    return Err(len_err(op, "shift", rows, shift.len()));
+                }
+            }
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out_mapped.as_ptr()),
+            "{op}: out_mapped 不得与 x 重叠（契约）"
+        );
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out_rowsum.as_ptr()),
+            "{op}: out_rowsum 不得与 x 重叠（契约）"
+        );
+        crate::ops::map_rows_sum::map_rows_sum_f32(
+            x, rows, cols, shift, map, out_mapped, out_rowsum,
+        );
+        Ok(())
+    }
+
     /// 其余（归约/超越/多线程/复数组合步）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     fn supports(&self, cap: Capability) -> bool {
