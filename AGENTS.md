@@ -632,3 +632,15 @@ heredoc 占位"）。**教训重复第 13 次那条**：需要占位就用 shell
   `Backend` **75→71**、逐位/容差证据齐全、调用方同步在同一提交、**删方法未手改任何白名单/文档行**——
   这正是自动化表带来的收益；并主动上报"哪两个方法按约定保留为薄委托"）。
 
+## 34. 第 66 条（**验证纪律**，不是黑名单违规；P1 批1 合入，主代理侧）
+
+- **事实**：批1 删除 4 个具名方法后，`simd_dsl` 提交 `9af59f7` **CI 红在 nightly rustdoc**：
+  文档里残留指向已删方法的 intra-doc link（`Backend::{rms_norm_rows_f32,...}`）⇒ `cargo +nightly doc -D warnings` 破链。
+  修于 `bc7197d`（改成链到 `FusedPlan::*`/文字）。
+- **根因**：我本地跑的是 **stable `cargo doc --workspace`**，且**命中了缓存产物**（源码改动未触发重编文档）⇒ 得到"假通过"；
+  而 CI 用 `cargo +nightly doc` 且是新鲜构建。**同一类"验证对象 ≠ 实际产物"**（#39/#41/#43-b 同族）。
+- **判据（写进习惯）**：**rustdoc 门禁必须用与 CI 完全相同的命令**（`RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --workspace`），
+  且在**源码有改动**后跑；stable/cached 的"OK"**没有证明力**。同理：其他门禁若本地与 CI 命令不同，一律以 CI 命令为准。
+- **影响**：一个红 run（已前滚修复，未 amend/强推）；其余门禁本地/CI 一致。**记录不加辩解。**
+
+

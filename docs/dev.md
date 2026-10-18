@@ -7160,6 +7160,26 @@ C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实
 - 门禁：62 test binaries 全过、clippy/rustdoc/docrefcheck/opcheck/layercheck/covercheck/portcheck 全绿。
 - **未假删说明**：无（本轮 4 个方法全部真删；`axpy`/`softmax` 的保留是前一批的显式约定）。
 
+**P1 批1 后端适配（`lasx_rs` `fa120ac`）：6 pattern `exec_fused_plan` + 删 4 旧 override**
+- `supports_plan` 扩到 **6 kind 全 true**（portable 6 个全 false，A/B 打印证实）；`exec_fused_plan` 6 臂：
+  `Axpy→api::axpy`、`SoftmaxRows→api::softmax_rows_into`、`RmsNormRows→api::rms_norm_into`、`LayerNormRows→api::layer_norm_into`、
+  `GeluQuick→api::gelu_quick_into`、`RopeApply→api::rope_into(RopeMode::NeoX)`；**删除 4 个旧 override**；
+  校验与契约默认解释器同口径（`rows×cols` 溢出 ⇒ `ShapeOverflow`、长度不符 ⇒ `LengthMismatch`、空 ⇒ `Ok`、Rope 的 `n_dims`/`cos`/`sin`）。
+- **A/B（A=Plan 路，B=直接 api；同进程 6 对丢首对中位；3 次复跑；loadavg 7.8–9.3）**：6 条中位 **≈1.0（0.99–1.05）**，
+  但单次 pair 有 ±10% 噪声（0.913/0.939/0.955 单点）⇒ **不宣称"每条硬 ≥0.98"，给原始数字**；三路（Plan/命名/api）**逐位等价**（axpy/softmax/rms/layer/gelu/rope）；
+  vs portable 差：2.38e-7 / 3.96e-9 / 3.58e-7 / 5.01e-6 / **相对 2.07e-2（gelu 文档界 5.26e-3 是相对值，断言必须用相对）** / 2.38e-7。
+- **坑**：`FusedIo` 加 `cos`/`sin` 后所有字面量要补（15 处）；Axpy 就地累加的数值差要在计时循环**之前**取（计时会反复累加 ⇒ 假差）；
+  删方法后必须同步示例/测试调用方（`fused_ab.rs` 4 组），否则 feature 档编译红。
+
+**P1 批2（`simd_dsl` `b89a32f`）：几何 5 → Plan，删 5 个具名方法（`Backend` 71 → 66）**
+- **payload 决定**：`FusedPlan` 改为 **`FusedPlan<'a>`（非 Copy）**，5 个几何变体**自带 f64 缓冲**；**`FusedIo` 零改动** ⇒ 既有 f32 调用点无一行改动（代价：plan 值较大、按值传，已写进枚举文档）；
+- 解释器 5 臂**逐行照抄删除前默认序列**（6/6/9/9/15 趟；复用 `fused_geo_len`/`mat3_row_f64`）⇒ 等价类不升级；`unitize3` 零向量：解释器 NaN、LASX override 仍 0（**"路径各自语义"**保留，`*_auto` 文档 + 测试钉住）；
+- **删除** 5 个方法 + tsv 5 行（生成器自动同步白名单/文档，**0 处手改**）；调用方（`ops_dsl::geometry` 的 5 个 `*_auto`、`geometry_auto` mock、`geometry_fused_contract`）同步改 Plan 面（测试内糖明确非生产壳）；
+- 验收：`tests/geometry_fused_contract.rs` 4/4 经 Plan 路径全过（逐位项 `to_bits` 全等、容差项 ≤1 ulp 界不变）；`Backend` **71→66**；62 test binaries；本地 nightly rustdoc + 全门禁绿。
+- **流程教训（Lead 侧，已记 #66）**：批1 合入后 CI 红在 **nightly rustdoc**（删方法后残留 intra-doc link），
+  而我在本地用 **stable `cargo doc` 的缓存产物**得到"假通过" ⇒ **验证必须用与 CI 相同的命令（nightly）+ 新鲜构建**。
+
+
 
 
 
