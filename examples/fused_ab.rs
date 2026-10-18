@@ -13,10 +13,92 @@ use std::time::{Duration, Instant};
 
 use lasx_rs::api;
 use lasx_rs::dsl_backend::LasxBackend;
-use simd_dsl::Backend;
+use simd_dsl::{Backend, BackendError, FusedIo, FusedPlan};
 
 const ROUNDS: usize = 6;
 const EPS: f32 = 1e-5;
+
+// **P1 批1（task-66）起**：`rms_norm_rows_f32`/`layer_norm_rows_f32`/`gelu_quick_f32`/
+// `rope_apply_f32` 四个**具名方法已从契约删除** ⇒ 本示例改用 Plan 入口（同一 LASX 内核，
+// 数值逐位不变）。保留 `check()` 逐位对照，确保持久等价。
+fn dsl_rms(
+    be: &LasxBackend,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> Result<(), BackendError> {
+    be.exec_fused_plan(
+        FusedPlan::RmsNormRows {
+            rows,
+            cols,
+            eps: EPS,
+        },
+        FusedIo {
+            x,
+            y: &mut [],
+            out,
+            cos: &[],
+            sin: &[],
+        },
+    )
+}
+fn dsl_layer(
+    be: &LasxBackend,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> Result<(), BackendError> {
+    be.exec_fused_plan(
+        FusedPlan::LayerNormRows {
+            rows,
+            cols,
+            eps: EPS,
+        },
+        FusedIo {
+            x,
+            y: &mut [],
+            out,
+            cos: &[],
+            sin: &[],
+        },
+    )
+}
+fn dsl_gelu(be: &LasxBackend, x: &[f32], out: &mut [f32]) -> Result<(), BackendError> {
+    be.exec_fused_plan(
+        FusedPlan::GeluQuick,
+        FusedIo {
+            x,
+            y: &mut [],
+            out,
+            cos: &[],
+            sin: &[],
+        },
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn dsl_rope(
+    be: &LasxBackend,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    n_dims: usize,
+    cos: &[f32],
+    sin: &[f32],
+    out: &mut [f32],
+) -> Result<(), BackendError> {
+    be.exec_fused_plan(
+        FusedPlan::RopeApply { rows, cols, n_dims },
+        FusedIo {
+            x,
+            y: &mut [],
+            out,
+            cos,
+            sin,
+        },
+    )
+}
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
@@ -117,7 +199,7 @@ fn main() {
         let x = sample(n);
         let (mut ao, mut bo) = (vec![0.0f32; n], vec![0.0f32; n]);
         api::rms_norm_into(&x, None, rows, cols, EPS, &mut ao).unwrap();
-        be.rms_norm_rows_f32(&x, rows, cols, EPS, &mut bo).unwrap();
+        dsl_rms(&be, &x, rows, cols, &mut bo).unwrap();
         check("rms_norm", &ao, &bo);
         let (a, b) = ab(
             || {
@@ -125,7 +207,7 @@ fn main() {
                 black_box(&ao);
             },
             || {
-                be.rms_norm_rows_f32(&x, rows, cols, EPS, &mut bo).unwrap();
+                dsl_rms(&be, &x, rows, cols, &mut bo).unwrap();
                 black_box(&bo);
             },
         );
@@ -138,8 +220,7 @@ fn main() {
         let x = sample(n);
         let (mut ao, mut bo) = (vec![0.0f32; n], vec![0.0f32; n]);
         api::layer_norm_into(&x, None, None, rows, cols, EPS, &mut ao).unwrap();
-        be.layer_norm_rows_f32(&x, rows, cols, EPS, &mut bo)
-            .unwrap();
+        dsl_layer(&be, &x, rows, cols, &mut bo).unwrap();
         check("layer_norm", &ao, &bo);
         let (a, b) = ab(
             || {
@@ -147,8 +228,7 @@ fn main() {
                 black_box(&ao);
             },
             || {
-                be.layer_norm_rows_f32(&x, rows, cols, EPS, &mut bo)
-                    .unwrap();
+                dsl_layer(&be, &x, rows, cols, &mut bo).unwrap();
                 black_box(&bo);
             },
         );
@@ -160,7 +240,7 @@ fn main() {
         let x = sample(n);
         let (mut ao, mut bo) = (vec![0.0f32; n], vec![0.0f32; n]);
         api::gelu_quick_into(&x, &mut ao).unwrap();
-        be.gelu_quick_f32(&x, &mut bo).unwrap();
+        dsl_gelu(&be, &x, &mut bo).unwrap();
         check("gelu_quick", &ao, &bo);
         let (a, b) = ab(
             || {
@@ -168,7 +248,7 @@ fn main() {
                 black_box(&ao);
             },
             || {
-                be.gelu_quick_f32(&x, &mut bo).unwrap();
+                dsl_gelu(&be, &x, &mut bo).unwrap();
                 black_box(&bo);
             },
         );
@@ -215,8 +295,7 @@ fn main() {
             &mut ao,
         )
         .unwrap();
-        be.rope_apply_f32(&x, rows, cols, n_dims, &cos, &sin, &mut bo)
-            .unwrap();
+        dsl_rope(&be, &x, rows, cols, n_dims, &cos, &sin, &mut bo).unwrap();
         check("rope", &ao, &bo);
         let (a, b) = ab(
             || {
@@ -234,8 +313,7 @@ fn main() {
                 black_box(&ao);
             },
             || {
-                be.rope_apply_f32(&x, rows, cols, n_dims, &cos, &sin, &mut bo)
-                    .unwrap();
+                dsl_rope(&be, &x, rows, cols, n_dims, &cos, &sin, &mut bo).unwrap();
                 black_box(&bo);
             },
         );
