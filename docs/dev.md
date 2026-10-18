@@ -6896,6 +6896,25 @@ B 臂 `*_auto` 复用调用方缓冲**（暂存参数在融合分支被忽略）
 **如实边界**：**重叠调用形态未测**（安全 Rust 借用检查器拒绝构造 `&[f32]` 与 `&mut [f32]` 指向同一块内存；本仓不用 `unsafe` 造别名），
 守它的是 `assert_no_alias` 的谓词单测（`#[should_panic]`，debug 档）。
 
+## 7.37 P0-2：`map_rows_sum_f32` 单趟融合归约 + softmax **5→3 趟（1.328–1.464×）**
+
+**契约**（`simd_dsl` `8845f87`；`Backend` 69 方法）：`ReduceMapOp { Exp, ExpShiftedRow }`（**值枚举**，非闭包——
+为了 `dyn Backend` 可用 + LASX 可精确 override + 可穷尽匹配）+ `map_rows_sum_f32(x, rows, cols, shift, map, out_mapped, out_rowsum)`：
+**一次物理扫描**同时写映射值并累加行和。portable 默认=`kernels::scalar` 逐元素+行累加（**不调任何后端融合核**）；
+守卫：`Exp` 传非空 `shift` ⇒ `Err`、`ExpShiftedRow` 的 `shift.len()!=rows` ⇒ `Err`、长度错 ⇒ `Err`、`n=0` ⇒ `Ok`、输出与输入不得重叠。
+**趟数**：`softmax_rows_f32` **5 趟 → 3 趟**（行 max → 单趟 `map_rows_sum{ExpShiftedRow}` → 行级 `1/Σ` + 乘）。
+**A/B（同进程交替、5 对丢首对中位）**：
+| 轮次 | loadavg | 新 3 趟 | 旧 5 趟 | 倍率 |
+|---|---|---|---|---|
+| 首测（64×512） | 7.33/5.91/3.51 | 0.2925 ms | 0.3885 ms | **1.328×** |
+| 复跑（提交内容上） | 6.60/7.21/5.09 | 0.2539 ms | 0.3718 ms | **1.464×**（逐对 1.34–1.51×） |
+
+⇒ **≥10% 采纳**。**等价类未升级**：映射值**逐位**（`Exp` vs `map_unary(Exp)` 位差 0；`ExpShiftedRow` vs `Sub+exp` 位差 0）；
+行和是**容差类**（本数据实测 `max abs/rel = 0e0` 属巧合，文档按"容差 + 实测界"写）；softmax vs 标量参照 `max abs 9.31e-10`（仍 ≤1e-6 界）。
+**关键教训**：上一轮"逻辑趟数减少"全假——`reduce_rows_map_f32` 是复合操作（**2 次物理扫描**）；
+这次能赢的关键是**真的少一次物理扫描**（单趟同时写两个输出），不是"少一个逻辑步骤"。
+**LASX override**（`map_rows_sum_f32` 单趟 exp+行和）：由后端侧实现后补测（≥10% 才保留 override）。
+
 ## 7.38 P0-3：行归约/归一分派推广 —— 行归一化 **3–10×**；列归约仅 **≥67M** 有收益
 
 **做法**（`lasx_rs` `3054591` 合并；`src/parallel.rs` 新增 5 个切分层入口，接收显式 `&WorkerPool` ⇒ 同进程 1t vs auto 可对照）：
