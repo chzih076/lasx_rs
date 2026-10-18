@@ -6848,7 +6848,20 @@ override 保持 LASX 内核语义（零向量 `(0,0,0)`）⇒ **"能力探测路
 `mat3` 多一层 15 项长度校验），**不调阈值、不换内核**。`ops_dsl` 侧 `*_auto` 入口（`0fd6d66`）：`supports` 真走 1 趟融合、
 否则组合版（组合版保留为跨后端源实现）；auto 路径 A/B 另测（见下）。
 
-**auto 路径 A/B（`examples/geomf64_auto_ab.rs`，LASX `supports(FusedGeometry)=true`）**：待测量补入（不预填数字）。
+**auto 路径 A/B（`examples/geomf64_auto_ab.rs`；基线 `cd090eb`；n=1M；threads=12；loadavg 4.94/4.96/4.77；6 对丢首对中位；5/5 逐位）**：
+| 算子 | api ms | auto ms | api/auto |
+|---|---|---|---|
+| vec3_add_scaled_auto | 16.802 | 12.990 | **1.293×** ✅ |
+| norm3_batch_auto | 5.162 | 4.329 | **1.192×** ✅ |
+| unitize3_batch_auto | 17.199 | 10.674 | **1.611×** ✅ |
+| cross3_batch_auto | 17.886 | 13.609 | **1.314×** ✅ |
+| mat3_mul_vec3_batch_auto | 29.454 | 24.738 | **1.191×** ✅ |
+
+⇒ **5/5 ≥0.98**（运行时 `cap: FusedGeometry=true` ⇒ auto 走 1 趟融合分支）。**归因（别误读成"组合版更快"）**：
+两臂内部是**同一个 LASX 内核**（结果逐位相同）；比值 >1 来自 **A 臂 `api::*_batch` 每次调用分配 1–3 个 `AlignedVec`、
+B 臂 `*_auto` 复用调用方缓冲**（暂存参数在融合分支被忽略）⇒ 这是"**免分配入口 vs 分配版入口**"的差，**不是算法差异**。
+若看"同分配语义"对照，见上面的 `geomf64_fused_ab`（3/5 ≥0.98，vec3 0.972 / mat3 0.953 = 薄转发 + 15 项长度校验）。
+**零向量**（不参与比值）：auto(融合)=`(0,0,0)`（LASX 内核语义）；组合版=`(NaN,NaN,NaN)`（路径各自语义，override 不打补丁）。
 
 ## 7.35 任务2（引擎 KPI 续）：softmax 三案 **全部 <1.10 不采纳**；axpy 单趟因契约禁止别名 **只记提案**
 
