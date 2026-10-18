@@ -120,3 +120,9 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "geomf64_auto_ab"
 required-features = ["dsl-backend"]
+
+# `row_par_ab`（路线图 P0-3）：**行归约/归一化自动并行**的 A/B——同进程 `WorkerPool::new(1)` vs
+# `WorkerPool::auto()`（切分层接收显式池，绕开 `pool::global()` 单例）；先逐位等价再谈 ≥10% 采纳。
+[[example]]
+name = "row_par_ab"
+required-features = ["dsl-backend"]

@@ -719,10 +719,194 @@ pub fn rk4_j2_step_batch(
     Ok(())
 }
 
+// ============================================================================
+// 路线图 P0-3：**行归约 / 归一化的自动并行**（行块切分，结果与单线程**逐位一致**）
+//
+// 切分原则（与 GEMM 同思路，但更简单）：每个输出元素只依赖**一行**或**一列**内部的数据，
+// 因此按行块（归一化）或列块（列归约）切分**不改变任何元素的累加次序** ⇒ `to_bits` 相等
+// （`examples/row_par_ab.rs` 用两个池同进程逐位对照 + 计时）。
+//
+// 阈值在 `src/ops/*.rs` 的自动分派包装里（小规模回退 1t）；这里的函数**只负责切分**，
+// 不判断规模 ⇒ 调用方（含 A/B 示例）可以用 `WorkerPool::new(1)` 与 `WorkerPool::auto()`
+// 在同一进程里对照，不受 `pool::global()` 单例限制。
+// ============================================================================
+
+/// 列和并行版：按**列块**切（每列独立、按行序累加 ⇒ **逐位**）。`x` 只读、`out` 长度 `cols`。
+// `dsl_map` 本身挂在 `dsl-backend` feature 下（§7 的 feature 门控）⇒ 这里同门控。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_sum_cols(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    // 闭包第二参是**块行数**（不是结束下标）——`pool` 的约定与 `_start, rows` 一致。
+    pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
+        crate::ops::dsl_map::reduce_sum_cols_range(x, rows, cols, c0, c0 + clen, o);
+    });
+}
+
+/// 带权列和并行版（按列块切；**逐位**，同 `reduce_sum_cols`）。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_weighted_sum_cols(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    // 同 `reduce_sum_cols`：闭包第二参是块行数。
+    pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
+        crate::ops::dsl_map::reduce_weighted_sum_cols_range(x, w, rows, cols, c0, c0 + clen, o);
+    });
+}
+
+/// 行 softmax 并行版：按**行块**切（行内统计量不变 ⇒ **逐位**）。
+pub fn softmax_rows(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    mask: &[f32],
+    scale: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // 闭包第二参是**块行数**；`o` 是本块的行主序切片（长度 rlen·cols）。
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, cols)], |r0, rlen, [o]| {
+        let r1 = r0 + rlen;
+        let m = if mask.is_empty() {
+            &mask[..0]
+        } else {
+            &mask[r0 * cols..r1 * cols]
+        };
+        crate::ops::softmax_rows::softmax_rows_single(
+            &x[r0 * cols..r1 * cols],
+            m,
+            scale,
+            rlen,
+            cols,
+            o,
+        );
+    });
+}
+
+/// 行 RMSNorm 并行版：按**行块**切（**逐位**）。
+pub fn rms_norm(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    w: &[f32],
+    eps: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // 闭包第二参是**块行数**（同 `softmax_rows`）。
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, cols)], |r0, rlen, [o]| {
+        crate::ops::rms_norm::rms_norm_single(
+            &x[r0 * cols..(r0 + rlen) * cols],
+            w,
+            eps,
+            rlen,
+            cols,
+            o,
+        );
+    });
+}
+
+/// 行 LayerNorm 并行版：按**行块**切（**逐位**）。
+// 参数 = 池 + `layer_norm` 合同本身那 7 个（x/w/b/eps/rows/cols/out）⇒ 拆结构体只会多造临时对象。
+#[allow(clippy::too_many_arguments)]
+pub fn layer_norm(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    eps: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // 闭包第二参是**块行数**（同 `softmax_rows`）。
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, cols)], |r0, rlen, [o]| {
+        crate::ops::layer_norm::layer_norm_single(
+            &x[r0 * cols..(r0 + rlen) * cols],
+            w,
+            b,
+            eps,
+            rlen,
+            cols,
+            o,
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aligned::AlignedVec;
+
+    /// **P0-3**：行归约/归一化的并行切分必须与单线程**逐位一致**（切分不改变累加次序）。
+    ///
+    /// 用 `WorkerPool::new(1)` 与 `WorkerPool::auto()` 同进程对照（不依赖 `pool::global()` 单例）。
+    #[test]
+    fn test_row_reductions_and_norms_parallel_bit_for_bit() {
+        let p1 = crate::pool::WorkerPool::new(1);
+        let pn = crate::pool::WorkerPool::auto();
+        let (rows, cols) = (7usize, 40usize); // 非 8 倍数、行数少（覆盖尾列/尾块）
+        let n = rows * cols;
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+            .collect();
+        let w: Vec<f32> = (0..cols).map(|i| (i as f32) - 3.5).collect();
+        let b: Vec<f32> = (0..cols).map(|i| 1.25 - i as f32).collect();
+
+        // 行归一化：按行块切
+        let (mut o1, mut on) = (vec![0.0f32; n], vec![0.0f32; n]);
+        softmax_rows(&p1, &x, &[], 1.0, rows, cols, &mut o1);
+        softmax_rows(&pn, &x, &[], 1.0, rows, cols, &mut on);
+        assert_eq!(bits(&o1), bits(&on), "softmax_rows 并行不逐位");
+        rms_norm(&p1, &x, &w, 1e-5, rows, cols, &mut o1);
+        rms_norm(&pn, &x, &w, 1e-5, rows, cols, &mut on);
+        assert_eq!(bits(&o1), bits(&on), "rms_norm 并行不逐位");
+        layer_norm(&p1, &x, &w, &b, 1e-5, rows, cols, &mut o1);
+        layer_norm(&pn, &x, &w, &b, 1e-5, rows, cols, &mut on);
+        assert_eq!(bits(&o1), bits(&on), "layer_norm 并行不逐位");
+
+        // 列归约：按列块切（helpers 挂在 dsl-backend feature 下）
+        #[cfg(feature = "dsl-backend")]
+        {
+            let (mut c1, mut cn) = (vec![0.0f32; cols], vec![0.0f32; cols]);
+            reduce_sum_cols(&p1, &x, rows, cols, &mut c1);
+            reduce_sum_cols(&pn, &x, rows, cols, &mut cn);
+            assert_eq!(bits(&c1), bits(&cn), "reduce_sum_cols 并行不逐位");
+            let wshort = &w[..rows];
+            reduce_weighted_sum_cols(&p1, &x, wshort, rows, cols, &mut c1);
+            reduce_weighted_sum_cols(&pn, &x, wshort, rows, cols, &mut cn);
+            assert_eq!(bits(&c1), bits(&cn), "reduce_weighted_sum_cols 并行不逐位");
+        }
+    }
+
+    /// `Vec<f32>` 的位模式（逐位断言用）。
+    fn bits(s: &[f32]) -> Vec<u32> {
+        s.iter().map(|v| v.to_bits()).collect()
+    }
 
     /// 池化矩阵乘必须与单线程**逐位一致**。形状要同时覆盖三条分支：
     /// 小形状（走 `lasx_matmul` 的流式/列块路径）、`m < SHARED_PACK_MIN_M` 的回退、
