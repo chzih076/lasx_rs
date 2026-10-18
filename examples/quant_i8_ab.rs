@@ -15,10 +15,37 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use lasx_rs::dsl_backend::LasxBackend;
-use simd_dsl::Backend;
 use simd_dsl::kernels::scalar;
+use simd_dsl::{Backend, FusedIo, FusedPlan};
 
 const ROUNDS: usize = 6;
+
+/// **批3 起**：4 个量化具名方法已删除 ⇒ 本示例 A/B 走 `exec_fused_plan`（Plan 路）；
+/// B 臂仍是 portable 标量默认（`kernels::scalar`）⇒ 质量口径不变（逐位/整数相等）。
+fn empty_io() -> FusedIo<'static> {
+    FusedIo {
+        x: &[],
+        y: &mut [],
+        out: &mut [],
+        cos: &[],
+        sin: &[],
+    }
+}
+fn quantize_plan<'a>(
+    rows: usize,
+    cols: usize,
+    x: &'a [f32],
+    scale: &'a [f32],
+    out: &'a mut [i8],
+) -> FusedPlan<'a> {
+    FusedPlan::QuantizeI8Rows {
+        rows,
+        cols,
+        x,
+        scale,
+        out,
+    }
+}
 
 fn timeit(f: &mut impl FnMut()) -> Duration {
     let t = Instant::now();
@@ -80,7 +107,7 @@ fn main() {
         let mut qa = vec![0i8; total];
         let mut qb = vec![0i8; total];
         scalar::quantize_i8_rows_f32(&x, rows, cols, &scale, &mut qa).unwrap();
-        be.quantize_i8_rows_f32(&x, rows, cols, &scale, &mut qb)
+        be.exec_fused_plan(quantize_plan(rows, cols, &x, &scale, &mut qb), empty_io())
             .unwrap();
         let eq = if qa == qb {
             "**逐位**"
@@ -93,7 +120,7 @@ fn main() {
                 black_box(qa[0]);
             },
             || {
-                be.quantize_i8_rows_f32(&x, rows, cols, &scale, &mut qb)
+                be.exec_fused_plan(quantize_plan(rows, cols, &x, &scale, &mut qb), empty_io())
                     .unwrap();
                 black_box(qb[0]);
             },
@@ -111,7 +138,16 @@ fn main() {
             .map(|i| ((i * 97 % 241) as i32 - 120) as i8)
             .collect();
         let want = scalar::dot_i8(&a, &b).unwrap();
-        let got = be.dot_i8(&a, &b).unwrap();
+        let mut got = 0i32;
+        be.exec_fused_plan(
+            FusedPlan::DotI8 {
+                a: &a,
+                b: &b,
+                out: &mut got,
+            },
+            empty_io(),
+        )
+        .unwrap();
         let eq = if want == got {
             "**逐位**（整数）"
         } else {
@@ -122,7 +158,17 @@ fn main() {
                 black_box(scalar::dot_i8(&a, &b).unwrap());
             },
             || {
-                black_box(be.dot_i8(&a, &b).unwrap());
+                let mut got = 0i32;
+                be.exec_fused_plan(
+                    FusedPlan::DotI8 {
+                        a: &a,
+                        b: &b,
+                        out: &mut got,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(got);
             },
         );
         row("dot_i8（1M）", ta, tb, eq);
@@ -140,7 +186,17 @@ fn main() {
         let mut outa = vec![0i32; j];
         let mut outb = vec![0i32; j];
         scalar::gemv_i8(j, k, &a, &x, &mut outa).unwrap();
-        be.gemv_i8(j, k, &a, &x, &mut outb).unwrap();
+        be.exec_fused_plan(
+            FusedPlan::GemvI8 {
+                j,
+                k,
+                a: &a,
+                x: &x,
+                out: &mut outb,
+            },
+            empty_io(),
+        )
+        .unwrap();
         let eq = if outa == outb {
             "**逐位**（整数）"
         } else {
@@ -152,7 +208,17 @@ fn main() {
                 black_box(outa[0]);
             },
             || {
-                be.gemv_i8(j, k, &a, &x, &mut outb).unwrap();
+                be.exec_fused_plan(
+                    FusedPlan::GemvI8 {
+                        j,
+                        k,
+                        a: &a,
+                        x: &x,
+                        out: &mut outb,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
                 black_box(outb[0]);
             },
         );

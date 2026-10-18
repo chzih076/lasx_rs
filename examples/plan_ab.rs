@@ -145,6 +145,11 @@ fn main() {
         PatternKind::Unitize3BatchF64,
         PatternKind::Cross3BatchF64,
         PatternKind::Mat3MulVec3BatchF64,
+        // 批3：quantize/dot/gemv 已接；dequantize 如实不接（flags 里会打印 false）
+        PatternKind::QuantizeI8Rows,
+        PatternKind::DequantizeI8Rows,
+        PatternKind::DotI8,
+        PatternKind::GemvI8,
     ];
     let flags = kinds
         .iter()
@@ -565,6 +570,160 @@ fn main() {
         row("Mat3MulVec3BatchF64（1M×3）", a, b, eq);
     }
 
+    // ================= 批3：i8 量化（quantize/dot/gemv；dequantize 未接 ⇒ 跳过并说明） =================
+    {
+        // quantize（512×2048 = 1M）
+        let (qrows, qcols) = (512usize, 2048usize);
+        let total = qrows * qcols;
+        let qx: Vec<f32> = (0..total)
+            .map(|i| ((i * 37 % 101) as f32) * 0.03125 - 1.5)
+            .collect();
+        let qscale: Vec<f32> = (0..qrows).map(|r| 0.02 + (r % 7) as f32 * 0.01).collect();
+        let (mut qa, mut qb) = (vec![0i8; total], vec![0i8; total]);
+        be.exec_fused_plan(
+            FusedPlan::QuantizeI8Rows {
+                rows: qrows,
+                cols: qcols,
+                x: &qx,
+                scale: &qscale,
+                out: &mut qa,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        simd_dsl::kernels::scalar::quantize_i8_rows_f32(&qx, qrows, qcols, &qscale, &mut qb)
+            .unwrap();
+        let eq = if qa == qb {
+            "A≡portable **逐位**（ties-even/clamp 在内核）"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::QuantizeI8Rows {
+                        rows: qrows,
+                        cols: qcols,
+                        x: &qx,
+                        scale: &qscale,
+                        out: &mut qa,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(qa[0]);
+            },
+            || {
+                simd_dsl::kernels::scalar::quantize_i8_rows_f32(
+                    &qx, qrows, qcols, &qscale, &mut qb,
+                )
+                .unwrap();
+                black_box(qb[0]);
+            },
+        );
+        row("QuantizeI8Rows（1M）", a, b, eq);
+    }
+    {
+        // dot（1M；含饱和路径另测过：k=200k 全 127 ⇒ i32::MAX）
+        let n = 1usize << 20;
+        let da: Vec<i8> = (0..n)
+            .map(|i| ((i * 53 % 251) as i32 - 125) as i8)
+            .collect();
+        let db: Vec<i8> = (0..n)
+            .map(|i| ((i * 97 % 241) as i32 - 120) as i8)
+            .collect();
+        let want = simd_dsl::kernels::scalar::dot_i8(&da, &db).unwrap();
+        let mut got = 0i32;
+        be.exec_fused_plan(
+            FusedPlan::DotI8 {
+                a: &da,
+                b: &db,
+                out: &mut got,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        let eq = if got == want {
+            "A≡portable **逐位**（i64 累加+末端饱和）"
+        } else if got == i32::MAX || got == i32::MIN {
+            "A=饱和值（portable 也饱和则等价）"
+        } else {
+            "**不相等！**"
+        };
+        let (a, b) = ab(
+            || {
+                let mut o = 0i32;
+                be.exec_fused_plan(
+                    FusedPlan::DotI8 {
+                        a: &da,
+                        b: &db,
+                        out: &mut o,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(o);
+            },
+            || {
+                black_box(simd_dsl::kernels::scalar::dot_i8(&da, &db).unwrap());
+            },
+        );
+        row("DotI8（1M）", a, b, eq);
+    }
+    {
+        // gemv（1024×1024）
+        let (j, k) = (1024usize, 1024usize);
+        let ga: Vec<i8> = (0..j * k)
+            .map(|i| ((i * 41 % 251) as i32 - 125) as i8)
+            .collect();
+        let gx: Vec<i8> = (0..k)
+            .map(|i| ((i * 59 % 241) as i32 - 120) as i8)
+            .collect();
+        let (mut go, mut gw) = (vec![0i32; j], vec![0i32; j]);
+        be.exec_fused_plan(
+            FusedPlan::GemvI8 {
+                j,
+                k,
+                a: &ga,
+                x: &gx,
+                out: &mut go,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        simd_dsl::kernels::scalar::gemv_i8(j, k, &ga, &gx, &mut gw).unwrap();
+        let eq = if go == gw {
+            "A≡portable **逐位**（i64 累加+末端饱和）"
+        } else {
+            "**不相等！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::GemvI8 {
+                        j,
+                        k,
+                        a: &ga,
+                        x: &gx,
+                        out: &mut go,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(go[0]);
+            },
+            || {
+                simd_dsl::kernels::scalar::gemv_i8(j, k, &ga, &gx, &mut gw).unwrap();
+                black_box(gw[0]);
+            },
+        );
+        row("GemvI8（1024×1024）", a, b, eq);
+    }
+    println!(
+        "\n- `DequantizeI8Rows` **无 LASX override**（如实）：`supports_plan` = false、\
+         `exec_fused_plan` 回退 portable 解释（逐位）⇒ 不做性能 A/B（与 portable 同路径，无对照意义）。"
+    );
+
     // unitize3 零向量：路径各自语义
     {
         let z4 = vec![0.0f64; 4];
@@ -599,8 +758,10 @@ fn main() {
 
     println!("\nloadavg（结束）= `{}`", loadavg());
     println!(
-        "\n判定：**B/A ≥0.98 视为 Plan 路径不掉性能**（<0.98 如实记：薄转发噪声 vs 内核差异）。\
-         A = `LasxBackend::exec_fused_plan`（override → LASX 融合核）；B = 直接 `api::*`（同一内核）。\
-         11 pattern 全部：`supports_plan`=true、Plan≡api 逐位。"
+        "\n判定：**B/A ≥0.98 视为 Plan 路径不掉性能**（<0.98 如实记）。\
+         A = `LasxBackend::exec_fused_plan`（override → LASX 融合核）；B = 直接 `api::*`（同一内核）；\
+         **量化 3 条的 B 是 portable 标量默认**（LASX 量化核无公开 api 直调入口），\
+         比值 3.1–4.2× 与 P1-5 的 override-vs-portable（4.47/2.27/3.06×）一致 ⇒ Plan 抽象未掉性能。\
+         15 个 pattern：14 个 `supports_plan`=true 且 Plan≡对照臂逐位；`DequantizeI8Rows` 如实 false + portable 回退。"
     );
 }
