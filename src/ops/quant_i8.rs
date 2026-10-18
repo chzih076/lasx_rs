@@ -210,6 +210,79 @@ pub(crate) fn dequantize_i8_per_row(
     }
 }
 
+// ===== P1-5：`Backend` 量化族 4 方法的 LASX 内核（与上面 N3 的 per-tensor/per-row 生产端并存）=====
+//
+// 契约写法（`simd_dsl` rev `6d3e41a`）：这四个方法**不是** N3 的"对称量化生产端"——
+// `quantize_i8_rows_f32` 是 **每行给定 scale**（不是从 amax 反推）、**用除法**（`x / scale`）、
+// **先 ties-even 再 clamp 到 [-128, 127]**、`NaN ⇒ 0`、`±inf ⇒ ±端点`。
+// 因此不能复用 `quantize_i8_per_row`（那条是 `x·(1/scale)`、不夹取、NaN 不在契约内）。
+
+/// **P1-5 契约**：`quantize_i8_rows_f32` 的 LASX 实现（每行一个 `scale`）。
+///
+/// **语义（与 `kernels::scalar` 逐位）**：`q = clamp(ties_even(x / scale[r]), -128, 127)`；
+/// `NaN ⇒ 0`；`+inf ⇒ 127`；`-inf ⇒ -128`。
+///
+/// **为什么"先浮点钳位再转换"与"先取整再钳位"等价**：钳位端点是整数且函数单调，
+/// 取整对整数端点幂等 ⇒ 两者对所有有限值/±inf 同结果（`NaN` 单独处理，见下）。
+/// **向量路径**：`xvfdiv_s` → `xvfmin_s(xvfmax_s(·, -128), 127)` → `xvftintrne_w_s`（RN-even，
+/// 即 ties-even）→ `ceq(v,v)` 掩码把 NaN lane 按位清零（LoongArch `fmax/fmin` 的 NaN 语义
+/// 会把 NaN 变成 -128，**不能**用它替代掩码）。i32 → i8 无打包指令（stdarch 未暴露 pack）⇒
+/// 标量逐 lane 转换（已钳位 ⇒ 无溢出，1 次标量转换/元素）。
+///
+/// # 等价类
+/// **逐元素位模式确定**（同一 `(x, scale)` ⇒ 同一 `i8`），不是浮点容差类。
+///
+/// # Safety
+/// 调用方保证 `x.len() >= rows*cols`、`out.len() >= rows*cols`、`scale.len() >= rows`。
+#[cfg(feature = "dsl-backend")]
+pub(crate) unsafe fn quantize_i8_rows_contract(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    scale: &[f32],
+    out: &mut [i8],
+) {
+    let lo = splat(-128.0);
+    let hi = splat(127.0);
+    for (r, &s) in scale.iter().take(rows).enumerate() {
+        let vb = splat(s);
+        let base = r * cols;
+        let mut c = 0;
+        while c + 8 <= cols {
+            // SAFETY: `c + 8 <= cols` ⇒ 8 个 f32 可读、8 个 i8 可写。
+            unsafe {
+                let px = x.as_ptr().add(base + c);
+                let po = out.as_mut_ptr().add(base + c);
+                let vx = lasx::load_f32x8(px);
+                let vq = lasx_xvfdiv_s(vx, vb);
+                // 钳位（与"先取整再钳位"等价；±inf 自然落到端点）
+                let vcl = lasx_xvfmin_s(lasx_xvfmax_s(vq, lo), hi);
+                let qi = lasx_xvftintrne_w_s(vcl);
+                // NaN ⇒ 0：`ceq(v,v)` 对 NaN lane 为 0（非 NaN 全 1）⇒ 按位与清零
+                let mask = lasx_xvfcmp_ceq_s(vq, vq);
+                let fixed = lasx_xvand_v(qi, mask);
+                let lanes: [i32; 8] = std::mem::transmute(fixed);
+                for (k, q) in lanes.iter().enumerate() {
+                    *po.add(k) = *q as i8;
+                }
+            }
+            c += 8;
+        }
+        // 尾部：与 scalar 参照同式（逐位一致）
+        for c in c..cols {
+            let v = x[base + c] / scale[r];
+            let q = if v.is_nan() { 0.0 } else { v.round_ties_even() };
+            out[base + c] = q.clamp(-128.0, 127.0) as i8;
+        }
+    }
+}
+
+// **P1-5 未接 `dequantize_i8_rows_f32`**（如实记）：LASX 的拓宽类指令是 **128-bit lane 语义**——
+// `xvsllwil_h_b` 取的是**每个 128 位半区**的低 8 字节，链到 `w` 后 lane 顺序是
+// `[b0,b1,b2,b3,b16,b17,b18,b19]`（实测，见 P1-5 探针）；要做成**连续 8 字节块**需要
+// 4 次 unaligned load + `xvpermi_q` 合并（或标量 scatter），收益不足（该路径 portable 默认
+// 已是"1 次乘法/元素"的简单循环）⇒ 本批**不 override**，`Capability::Quant` 因此**不置真**。
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +497,95 @@ mod tests {
                 let i = r * cols + j;
                 assert_eq!(out[i].to_bits(), ((qr[i] as f32) * s).to_bits());
             }
+        }
+    }
+
+    // ===== P1-5 契约函数（每行给定 scale）的逐位验收 =====
+
+    /// P1-5 契约的独立参考实现（照契约写：除法 → ties-even → clamp；NaN ⇒ 0）。
+    #[cfg(feature = "dsl-backend")]
+    fn ref_quantize(x: &[f32], rows: usize, cols: usize, scale: &[f32]) -> Vec<i8> {
+        let mut out = vec![0i8; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let v = x[r * cols + c] / scale[r];
+                let q = if v.is_nan() { 0.0 } else { v.round_ties_even() };
+                out[r * cols + c] = q.clamp(-128.0, 127.0) as i8;
+            }
+        }
+        out
+    }
+
+    /// **边界样本**（±0.5/±1.5/±2.5/127.5/128.5/-128.5/-129.5/NaN/±inf/极小值）× 多 scale：
+    /// 与契约参考**逐位一致**（含 scale=0/负/inf 的 IEEE 除法语义）。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn contract_quantize_matches_reference_on_boundaries() {
+        let x: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            127.5,
+            -127.5,
+            128.5,
+            -128.5,
+            129.5,
+            -129.5,
+            1e30,
+            -1e30,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.49999,
+            -0.50001,
+            1.0,
+            -1.0,
+            127.0,
+            -128.0,
+        ];
+        let rows = 1usize;
+        let cols = x.len();
+        for &s in &[
+            1.0f32,
+            0.5,
+            0.1,
+            3.0,
+            -1.0,
+            0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            let scale = [s];
+            let mut got = vec![0i8; cols];
+            // SAFETY: 长度由构造保证。
+            unsafe { quantize_i8_rows_contract(&x, rows, cols, &scale, &mut got) };
+            let want = ref_quantize(&x, rows, cols, &scale);
+            assert_eq!(got, want, "scale={s}: contract quantize 与参考不逐位");
+        }
+    }
+
+    /// 多行 + 非 8 倍数 `cols`（覆盖尾部标量）× 每行不同 scale：逐位。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn contract_quantize_matches_reference_for_ragged_rows() {
+        for &(rows, cols) in &[(3usize, 21usize), (4, 32), (5, 33), (2, 1), (1, 8)] {
+            let x: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 37 % 101) as f32) * 0.125 - 6.0)
+                .collect();
+            let scale: Vec<f32> = (0..rows).map(|r| 0.1 + r as f32 * 0.25).collect();
+            let mut got = vec![0i8; rows * cols];
+            // SAFETY: 长度由构造保证。
+            unsafe { quantize_i8_rows_contract(&x, rows, cols, &scale, &mut got) };
+            assert_eq!(
+                got,
+                ref_quantize(&x, rows, cols, &scale),
+                "{rows}×{cols} 不逐位"
+            );
         }
     }
 }
