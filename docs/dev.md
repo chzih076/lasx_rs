@@ -6826,7 +6826,49 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 * **未迁移（8 个，`NotMigrated`，理由入模块头）**：`quat_*`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch`
   —— f64 SoA 交叉索引 + 领域融合语义，建议做领域库而非塞 `Backend`。
 
-**数字家**：本文件（`simd_dsl` docs 只引不抄）。
+## 7.34 任务1：f64 几何 5 融合原语进契约 + LASX override（fused A/B **3/5 ≥0.98**）
+
+**契约（`simd_dsl` `1507da3` / 现 rev `0fd6d66`；`Backend` 62 → 67）**：`vec3_add_scaled_f64` / `norm3_batch_f64` /
+`unitize3_batch_f64` / `cross3_batch_f64` / `mat3_mul_vec3_batch_f64`（`m:[&[f64];9]` 9 条逐元素数组）
++ `Capability::FusedGeometry`；**portable 默认=现有组合版、逐位**（默认实现逐行照抄 `ops_dsl::geometry` 组合序列，6/6/9/9/15 趟），
+portable **不自称**能力位。零向量：默认 `NaN`（组合语义）。
+**LASX override（`a62a48c`）**：前 4 直接映射 `api::*_into`；`mat3` 新增 **Rust 层 `mat3_mul_vec3_batch_into`**
+（内部逐元素核、免分配、**无新 C 导出 ⇒ `nm -D` 98**）；`supports(FusedGeometry)` **5 全接才 true**；
+override 保持 LASX 内核语义（零向量 `(0,0,0)`）⇒ **"能力探测路径各自语义"已文档化 + 测试分别断言**。
+**fused A/B（`examples/geomf64_fused_ab.rs`；threads=12；loadavg 6.30/5.63/3.93；n=1M；6 对丢首对中位；5/5 逐位）**：
+| 算子 | api ms | DSL ms | api/dsl |
+|---|---|---|---|
+| vec3_add_scaled_f64 | 10.985 | 11.297 | 0.972× ❌ |
+| norm3_batch_f64 | 4.398 | 4.148 | **1.060×** ✅ |
+| unitize3_batch_f64 | 10.092 | 10.249 | **0.985×** ✅ |
+| cross3_batch_f64 | 14.069 | 12.669 | **1.110×** ✅ |
+| mat3_mul_vec3_batch_f64 | 20.925 | 21.958 | 0.953× ❌ |
+
+⇒ **3/5 ≥0.98（0.22–0.43× → 0.95–1.11×）**；两项 <0.98 是**薄转发 + 参数校验开销**（内部同一内核、结果逐位；
+`mat3` 多一层 15 项长度校验），**不调阈值、不换内核**。`ops_dsl` 侧 `*_auto` 入口（`0fd6d66`）：`supports` 真走 1 趟融合、
+否则组合版（组合版保留为跨后端源实现）；auto 路径 A/B 另测（见下）。
+
+**auto 路径 A/B（`examples/geomf64_auto_ab.rs`，LASX `supports(FusedGeometry)=true`）**：待测量补入（不预填数字）。
+
+## 7.35 任务2（引擎 KPI 续）：softmax 三案 **全部 <1.10 不采纳**；axpy 单趟因契约禁止别名 **只记提案**
+
+**softmax 两趟再试（`simd_dsl` `9e34439`；同进程 A/B 新组合 vs 现 5 趟；64×512；≥5 对丢首对中位；loadavg 6.49/5.58/3.84，复跑 6.86/7.25/5.28）**：
+| 候选 | 拆法 | 实测（两次） | 结论 |
+|---|---|---|---|
+| A | `{Max,Raw,Sub}` + exp + `{Sum,Inv,Mul}` | 0.977× / 0.988× | **不采纳** |
+| B | 2 块缓冲（p1 写 out、exp 写 ex、p3 回写） | 0.999× / 1.000× | **不采纳** |
+| C | B + 行块（工作集 ~256 KiB） | 0.999× / 0.999× | **不采纳** |
+
+**归因（实测，不是猜测）**：`reduce_rows_map_f32` 内部 = 归约 + map **两次物理扫描** + 多累加器 ⇒ 一次调用 ≈ 2 物理趟；
+"3 逻辑趟"实际 ≈ 5 物理趟 ⇒ 省下的 pass 被内部重扫吃掉；`exp` 必须落在两次行归约之间 ⇒ 真 2 趟需要
+"**边 map 边累加**"的融合归约，**现有契约没有**（候选 A 的设想不可表达）。候选 B 只省缓冲（内存收益），**不是时间收益**。
+等价类：三案 vs 旧 5 趟 `max abs = 9.31e-10`（同容差界，未升级）。
+**axpy 单趟**：先验证后断言——`kernels::scalar` 的 `map_affine_f32`/`map_binary_f32` 用 `assert_no_alias`（`debug_assert` 基地址比较）
+**契约明确禁止输出别名输入** ⇒ **不实现**（保留 3 趟、逐位不变）；**提案**：新增 `axpy_inplace_f32(y:&mut, x, alpha)` 或
+按 op 分类放宽别名规则（"纯逐元素、读前写后"），等价类仍**逐位**；影响面：契约文档 + 所有后端 override 复核 + `assert_no_alias` 分类放行；
+收益上限 3→1 趟（**未测**，本轮不实现）。
+**教训**：① **"逻辑趟数"不是性能指标**——复合原语（`reduce_rows_map` = 2 次物理扫描）拼"更少趟"可能更慢，必须实测；
+② **省缓冲 ≠ 省时间**；③ `assert_no_alias` 是 `debug_assert` ⇒ **release 下"跑通了"不能当作别名合法的证据**。
 
 **数字家**：本文件（`simd_dsl` docs 只引不抄）。
 
