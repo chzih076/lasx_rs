@@ -1170,71 +1170,6 @@ impl Backend for LasxBackend {
         })
     }
 
-    fn rms_norm_rows_f32(
-        &self,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
-        crate::api::rms_norm_into(x, None, rows, cols, eps, out).map_err(|_| {
-            BackendError::Unsupported {
-                op: "rms_norm_rows_f32",
-                cap: Capability::FusedNorms,
-            }
-        })
-    }
-
-    fn layer_norm_rows_f32(
-        &self,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
-        crate::api::layer_norm_into(x, None, None, rows, cols, eps, out).map_err(|_| {
-            BackendError::Unsupported {
-                op: "layer_norm_rows_f32",
-                cap: Capability::FusedNorms,
-            }
-        })
-    }
-
-    fn gelu_quick_f32(&self, x: &[f32], out: &mut [f32]) -> Result<(), BackendError> {
-        crate::api::gelu_quick_into(x, out).map_err(|_| BackendError::Unsupported {
-            op: "gelu_quick_f32",
-            cap: Capability::FusedElementwise,
-        })
-    }
-
-    fn rope_apply_f32(
-        &self,
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        n_dims: usize,
-        cos: &[f32],
-        sin: &[f32],
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
-        crate::api::rope_into(
-            x,
-            cos,
-            sin,
-            rows,
-            cols,
-            n_dims,
-            crate::api::RopeMode::NeoX,
-            out,
-        )
-        .map_err(|_| BackendError::Unsupported {
-            op: "rope_apply_f32",
-            cap: Capability::FusedElementwise,
-        })
-    }
-
     fn axpy_f32(&self, y: &mut [f32], x: &[f32], alpha: f32) -> Result<(), BackendError> {
         debug_assert_ne!(x.as_ptr(), y.as_ptr(), "axpy_f32：x/y 不得重叠");
         crate::api::axpy(alpha, x, y).map_err(|_| BackendError::Unsupported {
@@ -1243,24 +1178,56 @@ impl Backend for LasxBackend {
         })
     }
 
-    // ============ P3 Plan 试点：`supports_plan` / `exec_fused_plan`（task-63）============
+    // ============ P3 Plan：`supports_plan` / `exec_fused_plan`（task-63 + P1 批1 task-66）============
     //
-    // **语义映射（契约 `daa9419` 定死，不是猜）**：
-    // * `FusedPlan::Axpy { alpha }` = `y := alpha·x + y`（**就地**；用 `FusedIo::x` 只读、
-    //   `FusedIo::y` 输出；`FusedIo::out` 必须为空）——与 `axpy_inplace_f32`/`axpy_f32` 同义；
-    // * `FusedPlan::SoftmaxRows { rows, cols }` = `[rows, cols]` 行 softmax（用 `FusedIo::x` 只读、
-    //   `FusedIo::out` 输出；`FusedIo::y` 必须为空）——与 `softmax_rows_f32` 同义。
-    // **本后端映射**：Axpy → `api::axpy`（LASX 就地内核）；SoftmaxRows → `api::softmax_rows_into`
-    // （LASX 1 趟融合核）。**长度/形状校验与具名方法同口径**（错 ⇒ `LengthMismatch`/`ShapeOverflow`）。
-    // 数值：Plan 路 ≡ 本后端具名方法 **逐位**（同一内核）；与 portable 计划解释比 = 既有容差类
-    // （axpy 8.27e-8 / softmax 2.79e-9，见上方融合原语注释）。
+    // **语义映射（契约 `9af59f7` 定死，不是猜；先读 backend.rs + tests/fused_plan.rs）**：
+    // * `Axpy { alpha }`：`y := alpha·x + y`（就地；`io.x` 只读、`io.y` 输出；`y.len()==x.len()`）；
+    // * `SoftmaxRows { rows, cols }`：行 softmax（`io.x`/`io.out`，`len==rows·cols`）；
+    // * `RmsNormRows { rows, cols, eps }`：`out = x/√(mean(x²)+eps)`（`io.x`/`io.out`）；
+    // * `LayerNormRows { rows, cols, eps }`：`out = (x−mean)/√(var+eps)`（`io.x`/`io.out`）；
+    // * `GeluQuick`：GELU tanh 近似（等长 `io.x`/`io.out`）；
+    // * `RopeApply { rows, cols, n_dims }`：半旋转（`io.x`/`io.cos`/`io.sin`/`io.out`；
+    //   `cos`/`sin` 长度 = `rows·(n_dims/2)`、`n_dims` 偶数且 ≤ cols）。
+    // **本后端映射**（全部走 LASX 融合核）：Axpy → `api::axpy`；SoftmaxRows → `api::softmax_rows_into`；
+    // RmsNormRows → `api::rms_norm_into`；LayerNormRows → `api::layer_norm_into`；
+    // GeluQuick → `api::gelu_quick_into`；RopeApply → `api::rope_into(RopeMode::NeoX)`。
+    // **长度/形状校验与契约默认解释器同口径**（错 ⇒ `LengthMismatch`/`ShapeOverflow`，空 ⇒ `Ok`）。
+    // 数值：Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；与 portable 计划解释比 = 既有容差类
+    // （softmax 2.79e-9、rms 1.83e-7、layer 2.08e-7、gelu 5.26e-3、rope 6.92e-8、axpy 8.27e-8）。
 
     fn supports_plan(&self, kind: PatternKind) -> bool {
-        // 两个 kind 都已接融合核 => 都报 true（按 PatternKind 粒度、只低估）。
-        matches!(kind, PatternKind::Axpy | PatternKind::SoftmaxRows)
+        // 6 个 kind 都已接 LASX 融合核 ⇒ 全报 true（按 PatternKind 粒度、只低估）。
+        matches!(
+            kind,
+            PatternKind::Axpy
+                | PatternKind::SoftmaxRows
+                | PatternKind::RmsNormRows
+                | PatternKind::LayerNormRows
+                | PatternKind::GeluQuick
+                | PatternKind::RopeApply
+        )
     }
 
     fn exec_fused_plan(&self, plan: FusedPlan, io: FusedIo<'_>) -> Result<(), BackendError> {
+        /// 行 pattern 的公共校验：`rows×cols` 不溢出、`x`/`out` 等长（与 `fused_rows_len` 同口径）。
+        fn rows_plan_len(
+            op: &'static str,
+            rows: usize,
+            cols: usize,
+            x: &[f32],
+            out: &[f32],
+        ) -> Result<usize, BackendError> {
+            let n = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+                op,
+                what: "rows×cols",
+            })?;
+            for (what, got) in [("x", x.len()), ("out", out.len())] {
+                if got != n {
+                    return Err(len_err(op, what, n, got));
+                }
+            }
+            Ok(n)
+        }
         match plan {
             FusedPlan::Axpy { alpha } => {
                 // Plan 语义：y := alpha·x + y（就地）；`out` 不参与（契约为空）。
@@ -1287,16 +1254,7 @@ impl Backend for LasxBackend {
             }
             FusedPlan::SoftmaxRows { rows, cols } => {
                 let op = "exec_fused_plan(SoftmaxRows)";
-                let n = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-                    op,
-                    what: "rows×cols",
-                })?;
-                if io.x.len() != n {
-                    return Err(len_err(op, "x", n, io.x.len()));
-                }
-                if io.out.len() != n {
-                    return Err(len_err(op, "out", n, io.out.len()));
-                }
+                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
                 if n == 0 {
                     return Ok(());
                 }
@@ -1305,6 +1263,88 @@ impl Backend for LasxBackend {
                         op,
                         cap: Capability::FusedNorms,
                     }
+                })
+            }
+            FusedPlan::RmsNormRows { rows, cols, eps } => {
+                let op = "exec_fused_plan(RmsNormRows)";
+                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::rms_norm_into(io.x, None, rows, cols, eps, io.out).map_err(|_| {
+                    BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedNorms,
+                    }
+                })
+            }
+            FusedPlan::LayerNormRows { rows, cols, eps } => {
+                let op = "exec_fused_plan(LayerNormRows)";
+                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::layer_norm_into(io.x, None, None, rows, cols, eps, io.out).map_err(
+                    |_| BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedNorms,
+                    },
+                )
+            }
+            FusedPlan::GeluQuick => {
+                let op = "exec_fused_plan(GeluQuick)";
+                if io.out.len() != io.x.len() {
+                    return Err(len_err(op, "out", io.x.len(), io.out.len()));
+                }
+                if io.x.is_empty() {
+                    return Ok(());
+                }
+                crate::api::gelu_quick_into(io.x, io.out).map_err(|_| BackendError::Unsupported {
+                    op,
+                    cap: Capability::FusedElementwise,
+                })
+            }
+            FusedPlan::RopeApply { rows, cols, n_dims } => {
+                let op = "exec_fused_plan(RopeApply)";
+                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+                    op,
+                    what: "rows×cols",
+                })?;
+                if !n_dims.is_multiple_of(2) || n_dims > cols {
+                    return Err(BackendError::LengthMismatch {
+                        op,
+                        what: "n_dims（偶数且 ≤ cols）",
+                        expected: cols,
+                        got: n_dims,
+                    });
+                }
+                for (what, got) in [("x", io.x.len()), ("out", io.out.len())] {
+                    if got != total {
+                        return Err(len_err(op, what, total, got));
+                    }
+                }
+                let tbl = rows * (n_dims / 2); // 行数×半维；与契约默认体同口径
+                for (what, got) in [("cos", io.cos.len()), ("sin", io.sin.len())] {
+                    if got != tbl {
+                        return Err(len_err(op, what, tbl, got));
+                    }
+                }
+                if total == 0 {
+                    return Ok(());
+                }
+                crate::api::rope_into(
+                    io.x,
+                    io.cos,
+                    io.sin,
+                    rows,
+                    cols,
+                    n_dims,
+                    crate::api::RopeMode::NeoX,
+                    io.out,
+                )
+                .map_err(|_| BackendError::Unsupported {
+                    op,
+                    cap: Capability::FusedElementwise,
                 })
             }
         }
@@ -2133,138 +2173,285 @@ mod tests {
         );
     }
 
-    /// **P3 Plan 试点（task-63）**：`supports_plan` / `exec_fused_plan` 的语义映射与数值——
-    /// Plan 路 ≡ 本后端具名方法 ≡ 直接 `api::*`（**逐位**）；
-    /// vs portable 计划解释 = 既有容差类（axpy FMA 8.27e-8 / softmax 2.79e-9 相对）；
-    /// portable 后端 `supports_plan` 仍 false（两个 kind）；长度错 ⇒ `Err`。
+    /// **P3 Plan（task-63）→ P1 批1（task-66）**：6 个 kind 的语义映射与数值——
+    /// Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 = 既有容差类；
+    /// portable 后端 `supports_plan` 全 false；长度/形状错 ⇒ `Err`（不 panic）。
     #[test]
     fn plan_overrides_map_to_fused_kernels_and_stay_bitwise() {
         use simd_dsl::{FusedIo, FusedPlan, PatternKind, ScalarBackend};
         let be = LasxBackend;
-
-        // ① 能力位：按 PatternKind 粒度、只低估——本后端两个 kind 都接；portable 两个都 false
-        assert!(be.supports_plan(PatternKind::Axpy));
-        assert!(be.supports_plan(PatternKind::SoftmaxRows));
-        assert!(!ScalarBackend.supports_plan(PatternKind::Axpy));
-        assert!(!ScalarBackend.supports_plan(PatternKind::SoftmaxRows));
+        let kinds = [
+            PatternKind::Axpy,
+            PatternKind::SoftmaxRows,
+            PatternKind::RmsNormRows,
+            PatternKind::LayerNormRows,
+            PatternKind::GeluQuick,
+            PatternKind::RopeApply,
+        ];
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端 6 个都接；portable 6 个都 false
+        for k in kinds {
+            assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
+            assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
+        }
+        /// 空 `FusedIo` 构造（`cos`/`sin` 只 RopeApply 用）。
+        fn io<'a>(x: &'a [f32], y: &'a mut [f32], out: &'a mut [f32]) -> FusedIo<'a> {
+            FusedIo {
+                x,
+                y,
+                out,
+                cos: &[],
+                sin: &[],
+            }
+        }
+        let max_d = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+        };
 
         // ② Axpy：Plan 路 ≡ 命名方法 ≡ 直接 api（逐位）
         let n = 257usize;
         let x: Vec<f32> = (0..n).map(|i| (i % 37) as f32 * 0.125 - 2.0).collect();
         let base: Vec<f32> = (0..n).map(|i| (i % 53) as f32 * 0.0625 + 1.0).collect();
+        let alpha = 0.375f32;
         let mut y_plan = base.clone();
-        be.exec_fused_plan(
-            FusedPlan::Axpy { alpha: 0.375 },
-            FusedIo {
-                x: &x,
-                y: &mut y_plan,
-                out: &mut [],
-            },
-        )
-        .unwrap();
+        be.exec_fused_plan(FusedPlan::Axpy { alpha }, io(&x, &mut y_plan, &mut []))
+            .unwrap();
         let mut y_named = base.clone();
-        be.axpy_f32(&mut y_named, &x, 0.375).unwrap();
+        be.axpy_f32(&mut y_named, &x, alpha).unwrap();
         let mut y_api = base.clone();
-        crate::api::axpy(0.375, &x, &mut y_api).unwrap();
+        crate::api::axpy(alpha, &x, &mut y_api).unwrap();
         for (a, b) in y_plan.iter().zip(&y_named) {
             assert_eq!(a.to_bits(), b.to_bits(), "Axpy：Plan 路与命名方法不逐位");
         }
         for (a, b) in y_plan.iter().zip(&y_api) {
             assert_eq!(a.to_bits(), b.to_bits(), "Axpy：Plan 路与直接 api 不逐位");
         }
-        // vs portable 计划解释（容差类：LASX 就地内核用 FMA）
         let mut y_port = base.clone();
         ScalarBackend
-            .exec_fused_plan(
-                FusedPlan::Axpy { alpha: 0.375 },
-                FusedIo {
-                    x: &x,
-                    y: &mut y_port,
-                    out: &mut [],
-                },
-            )
+            .exec_fused_plan(FusedPlan::Axpy { alpha }, io(&x, &mut y_port, &mut []))
             .unwrap();
-        let d_axpy = y_plan
-            .iter()
-            .zip(&y_port)
-            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        eprintln!("Plan Axpy：LASX vs portable 计划解释 max|d| = {d_axpy:.3e}");
+        eprintln!(
+            "Plan Axpy：LASX vs portable 计划解释 max|d| = {:.3e}",
+            max_d(&y_plan, &y_port)
+        );
 
-        // ③ SoftmaxRows：Plan 路 ≡ 命名方法（逐位）；vs portable 计划解释容差
+        // ③ 行 pattern：Softmax / RmsNorm / LayerNorm —— Plan 路 ≡ 直接 api（逐位）
         let (rows, cols) = (16usize, 129usize);
         let m = rows * cols;
         let xs: Vec<f32> = (0..m).map(|i| (i % 71) as f32 * 0.05 - 1.8).collect();
-        let mut out_plan = vec![0.0f32; m];
-        be.exec_fused_plan(
-            FusedPlan::SoftmaxRows { rows, cols },
-            FusedIo {
-                x: &xs,
-                y: &mut [],
-                out: &mut out_plan,
-            },
-        )
-        .unwrap();
-        let mut out_named = vec![0.0f32; m];
-        be.softmax_rows_f32(&xs, rows, cols, &mut out_named)
+        let eps = 1e-5f32;
+        for (name, plan) in [
+            ("SoftmaxRows", FusedPlan::SoftmaxRows { rows, cols }),
+            ("RmsNormRows", FusedPlan::RmsNormRows { rows, cols, eps }),
+            (
+                "LayerNormRows",
+                FusedPlan::LayerNormRows { rows, cols, eps },
+            ),
+        ] {
+            let mut out_plan = vec![0.0f32; m];
+            be.exec_fused_plan(plan, io(&xs, &mut [], &mut out_plan))
+                .unwrap();
+            let mut out_api = vec![0.0f32; m];
+            match plan {
+                FusedPlan::SoftmaxRows { .. } => {
+                    crate::api::softmax_rows_into(&xs, None, rows, cols, 1.0, &mut out_api).unwrap()
+                }
+                FusedPlan::RmsNormRows { .. } => {
+                    crate::api::rms_norm_into(&xs, None, rows, cols, eps, &mut out_api).unwrap()
+                }
+                _ => crate::api::layer_norm_into(&xs, None, None, rows, cols, eps, &mut out_api)
+                    .unwrap(),
+            }
+            for (a, b) in out_plan.iter().zip(&out_api) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}：Plan 路与直接 api 不逐位");
+            }
+            let mut out_port = vec![0.0f32; m];
+            ScalarBackend
+                .exec_fused_plan(plan, io(&xs, &mut [], &mut out_port))
+                .unwrap();
+            let d = max_d(&out_plan, &out_port);
+            eprintln!("Plan {name}：LASX vs portable 计划解释 max|d| = {d:.3e}");
+            assert!(d <= 1e-5, "{name} 计划路与 portable 超界 {d:e}");
+        }
+
+        // ④ GeluQuick：Plan 路 ≡ 直接 api（逐位）；vs portable = 既有容差类（文档界 5.26e-3）
+        let xg: Vec<f32> = (0..257).map(|i| (i % 43) as f32 * 0.125 - 2.5).collect();
+        let mut g_plan = vec![0.0f32; xg.len()];
+        be.exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_plan))
             .unwrap();
-        for (a, b) in out_plan.iter().zip(&out_named) {
+        let mut g_api = vec![0.0f32; xg.len()];
+        crate::api::gelu_quick_into(&xg, &mut g_api).unwrap();
+        for (a, b) in g_plan.iter().zip(&g_api) {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "SoftmaxRows：Plan 路与命名方法不逐位"
+                "GeluQuick：Plan 路与直接 api 不逐位"
             );
         }
-        let mut out_port = vec![0.0f32; m];
+        let mut g_port = vec![0.0f32; xg.len()];
+        ScalarBackend
+            .exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_port))
+            .unwrap();
+        let d_gelu = max_d(&g_plan, &g_port);
+        // 文档界 5.26e-3 是**相对峰值**；这里按相对值断言（绝对差随输入幅值放大，不能用绝对界）。
+        let peak = g_plan.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-12);
+        let rel_gelu = d_gelu / peak;
+        eprintln!(
+            "Plan GeluQuick：LASX vs portable 计划解释 max|d| = {d_gelu:.3e}（相对 {rel_gelu:.3e}）"
+        );
+        assert!(
+            rel_gelu <= 1.2e-2,
+            "GeluQuick 计划路与 portable 相对超界 {rel_gelu:e}（文档界 5.26e-3）"
+        );
+
+        // ⑤ RopeApply：Plan 路 ≡ 直接 api（RopeMode::NeoX）逐位；vs portable 容差
+        let (rows, cols, n_dims) = (8usize, 64usize, 32usize);
+        let total = rows * cols;
+        let half = n_dims / 2;
+        let cos: Vec<f32> = (0..rows * half)
+            .map(|i| ((i * 7 % 41) as f32 * 0.03).cos())
+            .collect();
+        let sin: Vec<f32> = (0..rows * half)
+            .map(|i| ((i * 7 % 41) as f32 * 0.03).sin())
+            .collect();
+        let xr: Vec<f32> = (0..total).map(|i| (i % 61) as f32 * 0.1 - 3.0).collect();
+        let rope = FusedPlan::RopeApply { rows, cols, n_dims };
+        let mut r_plan = vec![0.0f32; total];
+        be.exec_fused_plan(
+            rope,
+            FusedIo {
+                x: &xr,
+                y: &mut [],
+                out: &mut r_plan,
+                cos: &cos,
+                sin: &sin,
+            },
+        )
+        .unwrap();
+        let mut r_api = vec![0.0f32; total];
+        crate::api::rope_into(
+            &xr,
+            &cos,
+            &sin,
+            rows,
+            cols,
+            n_dims,
+            crate::api::RopeMode::NeoX,
+            &mut r_api,
+        )
+        .unwrap();
+        for (a, b) in r_plan.iter().zip(&r_api) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "RopeApply：Plan 路与直接 api 不逐位"
+            );
+        }
+        let mut r_port = vec![0.0f32; total];
         ScalarBackend
             .exec_fused_plan(
-                FusedPlan::SoftmaxRows { rows, cols },
+                rope,
                 FusedIo {
-                    x: &xs,
+                    x: &xr,
                     y: &mut [],
-                    out: &mut out_port,
+                    out: &mut r_port,
+                    cos: &cos,
+                    sin: &sin,
                 },
             )
             .unwrap();
-        let d_sm = out_plan
-            .iter()
-            .zip(&out_port)
-            .fold(0.0f32, |mx, (a, b)| mx.max((a - b).abs()));
-        eprintln!("Plan SoftmaxRows：LASX vs portable 计划解释 max|d| = {d_sm:.3e}");
-        assert!(d_sm <= 1e-5, "SoftmaxRows 计划路与 portable 超界 {d_sm:e}");
+        let d_rope = max_d(&r_plan, &r_port);
+        eprintln!("Plan RopeApply：LASX vs portable 计划解释 max|d| = {d_rope:.3e}");
+        assert!(
+            d_rope <= 1e-5,
+            "RopeApply 计划路与 portable 超界 {d_rope:e}"
+        );
 
-        // ④ 形状/长度错 ⇒ Err（不 panic）
+        // ⑥ 形状/长度错 ⇒ Err（不 panic）
         assert!(matches!(
             be.exec_fused_plan(
                 FusedPlan::Axpy { alpha: 1.0 },
-                FusedIo {
-                    x: &[1.0, 2.0, 3.0],
-                    y: &mut [0.0; 2],
-                    out: &mut [],
-                },
+                io(&[1.0, 2.0, 3.0], &mut [0.0; 2], &mut []),
             ),
             Err(BackendError::LengthMismatch { .. })
         ));
         assert!(matches!(
             be.exec_fused_plan(
                 FusedPlan::SoftmaxRows { rows: 2, cols: 3 },
-                FusedIo {
-                    x: &[1.0, 2.0],
-                    y: &mut [],
-                    out: &mut [0.0; 6],
-                },
+                io(&[1.0, 2.0], &mut [], &mut [0.0; 6]),
             ),
             Err(BackendError::LengthMismatch { .. })
         ));
         assert!(matches!(
             be.exec_fused_plan(
-                FusedPlan::SoftmaxRows { rows: 2, cols: 3 },
+                FusedPlan::RmsNormRows {
+                    rows: 2,
+                    cols: 3,
+                    eps: 1e-5
+                },
+                io(&[1.0; 6], &mut [], &mut [0.0; 5]),
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            be.exec_fused_plan(FusedPlan::GeluQuick, io(&[1.0; 4], &mut [], &mut [0.0; 3])),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        // Rope：n_dims 奇数 / n_dims > cols / cos 长度错
+        for bad in [
+            FusedPlan::RopeApply {
+                rows: 2,
+                cols: 8,
+                n_dims: 3,
+            },
+            FusedPlan::RopeApply {
+                rows: 2,
+                cols: 8,
+                n_dims: 10,
+            },
+        ] {
+            assert!(matches!(
+                be.exec_fused_plan(
+                    bad,
+                    FusedIo {
+                        x: &[1.0; 16],
+                        y: &mut [],
+                        out: &mut [0.0; 16],
+                        cos: &[1.0],
+                        sin: &[1.0],
+                    },
+                ),
+                Err(BackendError::LengthMismatch { .. })
+            ));
+        }
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::RopeApply {
+                    rows: 2,
+                    cols: 8,
+                    n_dims: 4
+                },
                 FusedIo {
-                    x: &[1.0; 6],
+                    x: &[1.0; 16],
                     y: &mut [],
-                    out: &mut [0.0; 5],
+                    out: &mut [0.0; 16],
+                    cos: &[1.0; 3],
+                    sin: &[1.0; 4],
                 },
             ),
             Err(BackendError::LengthMismatch { .. })
+        ));
+        // 溢出：rows×cols 超过 usize
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::SoftmaxRows {
+                    rows: usize::MAX / 2 + 1,
+                    cols: 3
+                },
+                io(&[], &mut [], &mut []),
+            ),
+            Err(BackendError::ShapeOverflow { .. })
         ));
     }
 }
