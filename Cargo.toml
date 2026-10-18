@@ -112,3 +112,11 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "geomf64_fused_ab"
 required-features = ["dsl-backend"]
+
+# `geomf64_auto_ab`（阶段4 收尾，任务1 验收）：**f64 几何五入口 auto 路径 A/B**——
+# A = `api::{norm3_batch, vec3_add_scaled_batch, unitize3_batch, cross3_batch, mat3_mul_vec3_batch}`；
+# B = `ops_dsl::geometry::*_auto(&LasxBackend, …)`（`supports(FusedGeometry)` 真 ⇒ 1 趟融合分支）。
+# 同进程交替 6 对丢首对中位；零向量单列（融合 0 / 组合 NaN），不参与比值。
+[[example]]
+name = "geomf64_auto_ab"
+required-features = ["dsl-backend"]
