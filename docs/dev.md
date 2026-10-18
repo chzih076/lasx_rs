@@ -7193,6 +7193,28 @@ C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实
 - **9 处 intra-doc 破链已改**并本地跑 CI 同款 nightly rustdoc 通过；`Backend` **66→62**；62 个方法累计 **9 个具名融合方法**迁 Plan 并真删；
 - 门禁：379 tests、clippy、nightly rustdoc、namecheck（读表）/docrefcheck/opcheck/layercheck/covercheck/portcheck、`gen --check` 全绿。
 
+**P1 批3 后端适配（`lasx_rs` `1551df1`）：14 pattern、`Dequantize` 如实 false + portable 回退**
+- **按代码事实删 3 个旧 override**（`quantize`/`dot`/`gemv`）——`dequantize_i8_rows_f32` **从 P1-5 起就没有 override**（第 61 条那轮已如实不接），**任务写"删 4 个"是笔误，代码事实是 3 个**，如实记；
+- `supports_plan`：**14 kind true**（批1 6 + 批2 5 + quantize/dot/gemv），**`DequantizeI8Rows` 明确 false**（不虚报）+ `exec_fused_plan` 该臂**回退 portable 解释**（与契约默认逐位）；
+- `Capability::Quant` 在 `supports` 里**不报**（语义已由 plan 承载）；
+- **A/B**（A=Plan；量化无公开 `api::` 直调 ⇒ B=portable 默认；同进程 6 对丢首对中位；2 次复跑）：quantize **4.040×/4.198×**、dot **3.226×/3.216×**、gemv **3.154×/3.262×**；**A≡portable 逐位**（ties-even/clamp；i64+末端饱和）；与 P1-5 的 override 比值（4.47/2.27/3.06×）一致 ⇒ **Plan 抽象未掉性能**；dequantize 同路径无对照意义 ⇒ 不做性能 A/B（如实）。
+
+## 7.46 P2：pattern 层表驱动自动化 —— **新增 pattern 的手改：6 处 → 「表 1 行 + 变体 + 解释臂」**
+
+**单源真相**：`src/contract/patterns.tsv`（16 行；`kind / FusedPlan 变体 / form / portable 解释入口 / 职责`）。
+`scripts/gen_patterns.sh` 生成：`src/contract/patterns_gen.rs`（`PatternKind` 枚举、`ALL`、`name()`、`doc()`、`FusedPlan::kind()`——**手写枚举已删除**）、`docs/patterns.md`（总表）。
+`namecheck` 接入 `gen_patterns.sh --check` 防漂移；`tests/patterns_table.rs` 断言 **表 ↔ 枚举 ↔ `ALL` ↔ `exec_fused_plan` dispatch 臂 ↔ `kind()`** 五方一致（表加了行但没实现 ⇒ 测试红）。
+**真 pattern 演示（`Norm2BatchF64 = √(x²+y²)`，非桩）**：`to_bits` 与手算参照逐位（`5/√5/√8/5` 四例）、`n=0 ⇒ Ok`；**手改 diff = 22 行**，其中**"表相关" = 1 行**（`patterns.tsv`），其余为 `FusedPlan` payload 变体 7 行 + 解释臂 14 行。
+**before → after**：新增 pattern 此前需手改 **6 处**（`PatternKind` 变体 + `ALL` + `name` + `doc` + `kind()` 映射 + 文档行 + 一致性测试）⇒ 现在 **0 处**（全部生成）；手改只剩"表 1 行 + payload 变体 + 解释臂"。
+**诚实边界（已写进 `structure.md` 第 3.1.4 节与 `docs/patterns.md`）**：payload 字段形态与解释体（数学）**无法从表生成**（异构 payload + 语义判断）；后端 override（LASX 内核）仍手写，生成器不产出内核代码。
+**门禁**：63 个测试目标全过（含 `patterns_table` 2 个）、clippy、**nightly rustdoc**、双 `--check`（patterns + primitives）、namecheck/docrefcheck/opcheck/layercheck/covercheck/portcheck 全绿。
+
+**P1 总账（三批 + 三批后端适配，全部落地并真删）**：`Backend` 公开方法 **73 → 75 → 62**（原始 73；Plan 试点新增 `supports_plan`/`exec_fused_plan` 2 个入口 ⇒ 75；三批共删 **13 个**具名方法 ⇒ **62**）。
+**13 个具名融合方法** = rms/layer/gelu/rope（4）+ 几何 5 + 量化 4，全部迁入 `FusedPlan` 并**删除**；
+`axpy_f32`/`softmax_rows_f32` 按试点约定**保留为薄委托**（未假删、已说明）；`ops_dsl` 调用方全部改 Plan 面；
+LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 false + portable 回退）。
+
+
 
 
 
