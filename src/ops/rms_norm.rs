@@ -49,13 +49,38 @@ fn hsum(v: lasx::F32x8) -> f32 {
     ((buf[0] + buf[1]) + (buf[2] + buf[3])) + ((buf[4] + buf[5]) + (buf[6] + buf[7]))
 }
 
-/// 行内 RMSNorm（LASX）。
+/// 行内 RMSNorm（LASX）；P0-3 起含**自动并行分派**（行块切分，**逐位**不变）。
 ///
-/// `x`/`out` 是 `rows × cols` 行主序；`w` 是**按列**的权重（长度 `cols`，空切片表示无权重）。
+/// `work = rows·cols ≥ PAR_MIN_ROWS_ELEMS` 且池线程 > 1 ⇒ [`crate::parallel::rms_norm`]；
+/// 否则单线程主体 [`rms_norm_single`]（阈值以下不许变慢）。
 ///
 /// # Panics
 /// 调用方（`ffi`/`api`）已保证长度一致、`cols > 0`；这里只做 debug 断言。
 pub(crate) fn rms_norm(x: &[f32], w: &[f32], eps: f32, rows: usize, cols: usize, out: &mut [f32]) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_ROWS_ELEMS && pool.threads() > 1 && cols > 0 {
+        crate::parallel::rms_norm(pool, x, w, eps, rows, cols, out);
+        return;
+    }
+    rms_norm_single(x, w, eps, rows, cols, out);
+}
+
+/// 行 RMSNorm 的自动并行阈值（元素数；按 `examples/row_par_ab.rs` 校准）。
+///
+/// 实测（12 线程、loadavg≈1.3）：8K 2.9×、16K 1.45×、32K 5.3×、786K 9.1×、67M 2.2×
+/// ⇒ 取 8K（更小规模回退 1t，避免唤醒开销）。
+pub(crate) const PAR_MIN_ROWS_ELEMS: u128 = 1 << 13; // 8K 元素
+
+/// 单线程主体（原实现，逐行未改）。
+pub(crate) fn rms_norm_single(
+    x: &[f32],
+    w: &[f32],
+    eps: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(x.len(), rows * cols);
     debug_assert_eq!(out.len(), rows * cols);
     debug_assert!(w.is_empty() || w.len() == cols);

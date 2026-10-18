@@ -55,14 +55,39 @@ fn hsum(v: lasx::F32x8) -> f32 {
     ((buf[0] + buf[1]) + (buf[2] + buf[3])) + ((buf[4] + buf[5]) + (buf[6] + buf[7]))
 }
 
-/// 行内 LayerNorm（LASX）。
+/// 行内 LayerNorm（LASX）；P0-3 起含**自动并行分派**（行块切分，**逐位**不变）。
 ///
-/// `x`/`out` 是 `rows × cols` 行主序；`w`/`b` 是**按列**的权重与偏置（长度 `cols`，
-/// 空切片表示无）。`eps` 由调用方保证为正（`api`/`ffi` 层校验）。
+/// `work = rows·cols ≥ PAR_MIN_ROWS_ELEMS` 且池线程 > 1 ⇒ [`crate::parallel::layer_norm`]；
+/// 否则单线程主体 [`layer_norm_single`]（阈值以下不许变慢）。
 ///
 /// # Panics
 /// 调用方（`ffi`/`api`）已保证长度一致、`cols > 0`；这里只做 debug 断言。
 pub(crate) fn layer_norm(
+    x: &[f32],
+    w: &[f32],
+    b: &[f32],
+    eps: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_ROWS_ELEMS && pool.threads() > 1 && cols > 0 {
+        crate::parallel::layer_norm(pool, x, w, b, eps, rows, cols, out);
+        return;
+    }
+    layer_norm_single(x, w, b, eps, rows, cols, out);
+}
+
+/// 行 LayerNorm 的自动并行阈值（元素数；按 `examples/row_par_ab.rs` 校准）。
+///
+/// 实测（12 线程、loadavg≈1.3）：8K 3.9×、32K 7.7×、786K **10.2×**、4.2M 3.7×、67M 2.8×
+/// ⇒ 取 8K（更小规模回退 1t，避免唤醒开销）。
+pub(crate) const PAR_MIN_ROWS_ELEMS: u128 = 1 << 13; // 8K 元素
+
+/// 单线程主体（原实现，逐行未改）。
+pub(crate) fn layer_norm_single(
     x: &[f32],
     w: &[f32],
     b: &[f32],

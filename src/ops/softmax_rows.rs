@@ -81,13 +81,43 @@ fn tail_vector(x_row: &[f32], mask_row: &[f32], j0: usize, cols: usize, scale: f
     unsafe { lasx::load_f32x8(buf.as_ptr()) }
 }
 
-/// 行内 softmax（LASX）。
+/// 行内 softmax（LASX）；P0-3 起含**自动并行分派**（行块切分，**逐位**不变）。
 ///
-/// `x`/`mask`/`out` 都是 `rows × cols` 行主序；`mask` 空切片表示无 mask。
+/// `work = rows·cols ≥ PAR_MIN_ROWS_ELEMS` 且池线程 > 1 ⇒ [`crate::parallel::softmax_rows`]
+/// （按行块切；每行内统计量/累加次序不变 ⇒ `to_bits` 相等）；否则走单线程主体
+/// [`softmax_rows_single`]（阈值以下**不许变慢**）。
+///
+/// # Panics
+/// 调用方（`ffi`/`api`）已保证长度一致；`cols == 0` 是合法空操作（见下）。
+pub(crate) fn softmax_rows(
+    x: &[f32],
+    mask: &[f32],
+    scale: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_ROWS_ELEMS && pool.threads() > 1 && cols > 0 {
+        crate::parallel::softmax_rows(pool, x, mask, scale, rows, cols, out);
+        return;
+    }
+    softmax_rows_single(x, mask, scale, rows, cols, out);
+}
+
+/// 行 softmax 的自动并行阈值（元素数；按 `examples/row_par_ab.rs` 校准）。
+///
+/// 实测（12 线程、loadavg≈1.3）：**8K 元素 4.5×**、32K 6.7×、786K 6.9×、4.2M 4.0×、67M 3.7×
+/// ⇒ 行切分收益在**很小**的规模就出现（单行 SIMD 计算量低、并行几乎免费），阈值取 8K；
+/// 更小的规模回退 1t（避免唤醒开销）。
+pub(crate) const PAR_MIN_ROWS_ELEMS: u128 = 1 << 13; // 8K 元素
+
+/// 单线程主体（原实现，逐行未改）。
 ///
 /// # Panics
 /// 调用方（`ffi`/`api`）已保证长度一致、`cols > 0`；这里只做 debug 断言。
-pub(crate) fn softmax_rows(
+pub(crate) fn softmax_rows_single(
     x: &[f32],
     mask: &[f32],
     scale: f32,

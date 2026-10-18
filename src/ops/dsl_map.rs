@@ -132,37 +132,70 @@ pub(crate) fn map_affine(a: f32, b: f32, x: &[f32], out: &mut [f32]) {
     }
 }
 
-/// `out[c] = Σ_r x[r·cols + c]`（**每列一条 lane、按行序累加** ⇒ 与标量参照逐位）。
+/// **列和**：`out[c] = Σ_r x[r·cols + c]`（**每列一条 lane、按行序累加** ⇒ 与标量参照逐位）。
+///
+/// P0-3 起含**自动并行分派**：`work = rows·cols ≥ PAR_MIN_REDUCE_ELEMS` 且池线程 > 1 时按
+/// **列块**切（每列独立、行序不变 ⇒ **逐位**，见 [`crate::parallel::reduce_sum_cols`]）；
+/// 小规模回退单线程（阈值以下**不许变慢**）。
 ///
 /// # Safety
 /// 调用方保证 `x.len() == rows·cols`、`out.len() == cols`、`out` 不与 `x` 重叠。
 #[inline]
 pub(crate) fn reduce_sum_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
-    let mut c = 0;
-    while c + 8 <= cols {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_REDUCE_ELEMS && pool.threads() > 1 && cols >= 8 {
+        crate::parallel::reduce_sum_cols(pool, x, rows, cols, out);
+        return;
+    }
+    reduce_sum_cols_range(x, rows, cols, 0, cols, out);
+}
+
+/// 自动并行阈值（元素数；与 GEMM 的 `PAR_MIN_WORK` 同思路，按 `examples/row_par_ab.rs` 校准）。
+///
+/// 实测（12 线程、loadavg≈1.3）：33.5M 元素 **1.007×（中性、无退化）**，67M **4.04×/5.17×**；
+/// 4.2M 及以下 0.98–1.04×（无效）⇒ 阈值取 33.5M：**33.5M 以下回退 1t（不许变慢）**，
+/// 大矩阵（列足够多）才并行。
+pub(crate) const PAR_MIN_REDUCE_ELEMS: u128 = 1 << 25; // 33.5M 元素
+
+/// 列和的**列区间**版本：只算列 `[c0, c1)`，写入 `out_chunk`（长度 `c1-c0`）。
+///
+/// 每列仍按行序累加 ⇒ 与整段调用**逐位一致**（并行切分的基础）。
+pub(crate) fn reduce_sum_cols_range(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    c0: usize,
+    c1: usize,
+    out_chunk: &mut [f32],
+) {
+    let mut c = c0;
+    while c + 8 <= c1 {
         let mut acc = lasx::zero_f32x8();
         for r in 0..rows {
             let off = r * cols + c;
-            // SAFETY: `c + 8 <= cols` 且 `r < rows` ⇒ `off + 8 <= rows*cols`，落在 `x` 内。
+            // SAFETY: `c + 8 <= c1 <= cols` 且 `r < rows` ⇒ `off + 8 <= rows*cols`，落在 `x` 内。
             unsafe {
                 acc = lasx_xvfadd_s(acc, lasx::load_f32x8(x.as_ptr().add(off)));
             }
         }
-        // SAFETY: `c + 8 <= cols == out.len()`。
-        unsafe { lasx::store_f32x8(out.as_mut_ptr().add(c), acc) };
+        // SAFETY: `c + 8 <= c1`，`out_chunk` 长度 `c1-c0` ⇒ 落在其中。
+        unsafe { lasx::store_f32x8(out_chunk.as_mut_ptr().add(c - c0), acc) };
         c += 8;
     }
     // 尾部列：与参照同形（f32 单累加器、按行序）
-    for cc in c..cols {
+    for cc in c..c1 {
         let mut acc = 0.0f32;
         for r in 0..rows {
             acc += x[r * cols + cc];
         }
-        out[cc] = acc;
+        out_chunk[cc - c0] = acc;
     }
 }
 
 /// `out[c] = Σ_r x[r·cols + c]·w[r]`（`out + (x·w)`：**先乘后加**，与标量参照逐位）。
+///
+/// P0-3 起含**自动并行分派**（同 [`reduce_sum_cols`]：按列块切，每列行序不变 ⇒ **逐位**）。
 ///
 /// # Safety
 /// 调用方保证 `x.len() == rows·cols`、`w.len() >= rows`、`out.len() == cols`、`out` 不与 `x` 重叠。
@@ -174,28 +207,47 @@ pub(crate) fn reduce_weighted_sum_cols(
     cols: usize,
     out: &mut [f32],
 ) {
-    let mut c = 0;
-    while c + 8 <= cols {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_REDUCE_ELEMS && pool.threads() > 1 && cols >= 8 {
+        crate::parallel::reduce_weighted_sum_cols(pool, x, w, rows, cols, out);
+        return;
+    }
+    reduce_weighted_sum_cols_range(x, w, rows, cols, 0, cols, out);
+}
+
+/// 带权列和的**列区间**版本（逐位切分基础）。
+pub(crate) fn reduce_weighted_sum_cols_range(
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    c0: usize,
+    c1: usize,
+    out_chunk: &mut [f32],
+) {
+    let mut c = c0;
+    while c + 8 <= c1 {
         let mut acc = lasx::zero_f32x8();
         for (r, wv) in w.iter().enumerate().take(rows) {
             let off = r * cols + c;
-            // SAFETY: 同 `reduce_sum_cols`；`*wv` 是标量广播。
+            // SAFETY: 同 `reduce_sum_cols_range`；`*wv` 是标量广播。
             unsafe {
                 let v = lasx::load_f32x8(x.as_ptr().add(off));
                 // **R19-G：FMA**（`v·w + acc`）——省一条指令；舍入与"先乘后加"不同 ⇒ **容差类**。
                 acc = lasx_xvfmadd_s(v, lasx::splat_f32(*wv), acc);
             }
         }
-        // SAFETY: `c + 8 <= cols == out.len()`。
-        unsafe { lasx::store_f32x8(out.as_mut_ptr().add(c), acc) };
+        // SAFETY: `c + 8 <= c1`，`out_chunk` 长度 `c1-c0`。
+        unsafe { lasx::store_f32x8(out_chunk.as_mut_ptr().add(c - c0), acc) };
         c += 8;
     }
-    for cc in c..cols {
+    for cc in c..c1 {
         let mut acc = 0.0f32;
         for (r, wv) in w.iter().enumerate().take(rows) {
             acc = x[r * cols + cc].mul_add(*wv, acc);
         }
-        out[cc] = acc;
+        out_chunk[cc - c0] = acc;
     }
 }
 
