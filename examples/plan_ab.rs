@@ -1,13 +1,15 @@
-//! **P1 批1 后端 A/B（task-66）**：`FusedPlan` 路径 vs 直接 `api::*`（6 个 kind）。
+//! **P1 批1+批2 后端 A/B（task-66 / task-69）**：`FusedPlan` 路径 vs 直接 `api::*`（**11 个 kind**）。
 //!
 //! 臂：
 //! * **A = Plan 路**：`LasxBackend::exec_fused_plan(FusedPlan::…)`（本仓 override → LASX 融合核）；
-//! * **B = 对比臂**：能直调的 `api::*`（`axpy`/`softmax_rows_into`/`rms_norm_into`/`layer_norm_into`/
-//!   `gelu_quick_into`/`rope_into(RopeMode::NeoX)`）；`Axpy`/`SoftmaxRows` 另有具名方法
-//!   （`axpy_f32`/`softmax_rows_f32`，薄委托同内核）一并对照；
-//! * **C = portable 计划解释**（`ScalarBackend::exec_fused_plan`）：只做数值参照（慢，不进性能比）。
+//! * **B = 直接 api**：`api::axpy`/`softmax_rows_into`/`rms_norm_into`/`layer_norm_into`/
+//!   `gelu_quick_into`/`rope_into(RopeMode::NeoX)`；几何 5 走 `api::*_batch_into`；
+//! * Axpy/SoftmaxRows 另有具名方法（`axpy_f32`/`softmax_rows_f32`）一并做数值核对。
 //!
-//! 判据：**A ≡ B 逐位**（同一内核）；A vs C = 既有容差类；性能 **B/A ≥0.98**（Plan 路径不掉性能）。
+//! 判据：**A ≡ B 逐位**（同一内核）；性能 **B/A ≥0.98**（Plan 路径不掉性能）。
+//! `unitize3` 零向量单列：**Plan(LASX) = 0 / portable 计划解释 = NaN**（路径各自语义）。
+//!
+//! 注：`FusedPlan` 自批2 起**不是 `Copy`**（几何变体自带 f64 缓冲）⇒ 每次用现构造。
 //!
 //! 用法（`--release`）：
 //! ```text
@@ -61,37 +63,71 @@ fn sample(n: usize, seed: usize) -> Vec<f32> {
         .map(|i| (((i * 37 + seed) % 101) as f32) * 0.05 - 2.5)
         .collect()
 }
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+fn gsample(n: usize, seed: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| (((i * 37 + seed) % 101) as f64) * 0.05 - 2.5)
+        .collect()
 }
 fn bits_eq(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
-fn row(name: &str, a: f64, b: f64, eq: &str, dport: f32) {
-    println!(
-        "| {name} | {a:.3} | {b:.3} | {:.3}× | {eq}（vs portable 计划 max|d|={dport:.2e}） |",
-        b / a
-    );
+fn f64_bits_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+fn row(name: &str, a: f64, b: f64, eq: &str) {
+    println!("| {name} | {a:.3} | {b:.3} | {:.3}× | {eq} |", b / a);
 }
 
-/// 空 `FusedIo`（只有 RopeApply 用 `cos`/`sin`）。
-fn io<'a>(x: &'a [f32], y: &'a mut [f32], out: &'a mut [f32]) -> FusedIo<'a> {
+/// 空 `FusedIo`（几何 pattern 用这个）。
+fn empty_io() -> FusedIo<'static> {
+    FusedIo {
+        x: &[],
+        y: &mut [],
+        out: &mut [],
+        cos: &[],
+        sin: &[],
+    }
+}
+fn f32_io<'a>(x: &'a [f32], out: &'a mut [f32]) -> FusedIo<'a> {
     FusedIo {
         x,
-        y,
+        y: &mut [],
         out,
         cos: &[],
         sin: &[],
     }
 }
+/// 行/逐元素 f32 pattern 的现构造（`FusedPlan` 非 Copy）。
+fn mk_f32_plan(
+    name: &str,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    alpha: f32,
+    n_dims: usize,
+) -> FusedPlan<'static> {
+    match name {
+        "Axpy" => FusedPlan::Axpy { alpha },
+        "SoftmaxRows" => FusedPlan::SoftmaxRows { rows, cols },
+        "RmsNormRows" => FusedPlan::RmsNormRows { rows, cols, eps },
+        "LayerNormRows" => FusedPlan::LayerNormRows { rows, cols, eps },
+        "GeluQuick" => FusedPlan::GeluQuick,
+        _ => FusedPlan::RopeApply { rows, cols, n_dims },
+    }
+}
+/// f64 几何 plan 的现构造。
+fn vec3_plan<'a>(
+    s: f64,
+    a: [&'a [f64]; 3],
+    b: [&'a [f64]; 3],
+    o: [&'a mut [f64]; 3],
+) -> FusedPlan<'a> {
+    FusedPlan::Vec3AddScaledF64 { s, a, b, o }
+}
 
 fn main() {
     let be = LasxBackend;
-    println!(
-        "# P1 批1 后端 A/B：`exec_fused_plan`（6 kind）vs 直接 `api::*`（后端 = LasxBackend）"
-    );
+    println!("# Plan 后端 A/B：`exec_fused_plan`（11 kind）vs 直接 `api::*`（后端 = LasxBackend）");
     println!(
         "- threads = {}；loadavg = `{}`（同进程交替 {ROUNDS} 对丢首对取中位）",
         lasx_rs::pool::global().threads(),
@@ -104,6 +140,11 @@ fn main() {
         PatternKind::LayerNormRows,
         PatternKind::GeluQuick,
         PatternKind::RopeApply,
+        PatternKind::Vec3AddScaledF64,
+        PatternKind::Norm3BatchF64,
+        PatternKind::Unitize3BatchF64,
+        PatternKind::Cross3BatchF64,
+        PatternKind::Mat3MulVec3BatchF64,
     ];
     let flags = kinds
         .iter()
@@ -111,10 +152,10 @@ fn main() {
         .collect::<Vec<_>>()
         .join(" ");
     println!("- `supports_plan`（LASX）：{flags}；portable 全 false（如实）");
-    println!("| 用例 | A=Plan ms | B=对比臂 ms | B/A | 等价类 |");
+    println!("| 用例 | A=Plan ms | B=直接 api ms | B/A | 等价类 |");
     println!("|---|---|---|---|---|");
 
-    // ---- Axpy ----
+    // ================= f32：Axpy / Softmax / Rms / Layer / Gelu / Rope =================
     {
         let n = 1usize << 20;
         let x = sample(n, 3);
@@ -123,25 +164,37 @@ fn main() {
         let mut ya = base.clone();
         let mut yb = base.clone();
         let mut yn = base.clone();
-        let mut yd = base.clone();
-        be.exec_fused_plan(FusedPlan::Axpy { alpha }, io(&x, &mut ya, &mut []))
-            .unwrap();
+        be.exec_fused_plan(
+            mk_f32_plan("Axpy", 0, 0, 0.0, alpha, 0),
+            FusedIo {
+                x: &x,
+                y: &mut ya,
+                out: &mut [],
+                cos: &[],
+                sin: &[],
+            },
+        )
+        .unwrap();
         lasx_rs::api::axpy(alpha, &x, &mut yb).unwrap();
         be.axpy_f32(&mut yn, &x, alpha).unwrap();
-        ScalarBackend
-            .exec_fused_plan(FusedPlan::Axpy { alpha }, io(&x, &mut yd, &mut []))
-            .unwrap();
         let eq = if bits_eq(&ya, &yb) && bits_eq(&ya, &yn) {
             "A≡api≡命名方法 **逐位**"
         } else {
             "**不逐位！**"
         };
-        // **在计时前**取数值差：Axpy 是**就地累加**，计时循环会反复把 ya/yb 再累加，事后比会产生假差。
-        let dport = max_abs_diff(&ya, &yd);
         let (a, b) = ab(
             || {
-                be.exec_fused_plan(FusedPlan::Axpy { alpha }, io(&x, &mut ya, &mut []))
-                    .unwrap();
+                be.exec_fused_plan(
+                    mk_f32_plan("Axpy", 0, 0, 0.0, alpha, 0),
+                    FusedIo {
+                        x: &x,
+                        y: &mut ya,
+                        out: &mut [],
+                        cos: &[],
+                        sin: &[],
+                    },
+                )
+                .unwrap();
                 black_box(ya[0]);
             },
             || {
@@ -149,115 +202,82 @@ fn main() {
                 black_box(yb[0]);
             },
         );
-        row("Axpy（1M）", a, b, eq, dport);
+        row("Axpy（1M）", a, b, eq);
     }
 
-    // ---- 行 pattern：Softmax / RmsNorm / LayerNorm ----
     let (rows, cols) = (512usize, 2048usize);
     let n = rows * cols;
     let xs = sample(n, 5);
     let eps = 1e-5f32;
-    {
-        let plan = FusedPlan::SoftmaxRows { rows, cols };
-        let mut oa = vec![0.0f32; n];
-        let mut ob = vec![0.0f32; n];
-        let mut od = vec![0.0f32; n];
-        be.exec_fused_plan(plan, io(&xs, &mut [], &mut oa)).unwrap();
-        lasx_rs::api::softmax_rows_into(&xs, None, rows, cols, 1.0, &mut ob).unwrap();
-        ScalarBackend
-            .exec_fused_plan(plan, io(&xs, &mut [], &mut od))
+    let mut of_a = vec![0.0f32; n];
+    let mut of_b = vec![0.0f32; n];
+    macro_rules! f32_row {
+        ($name:literal, $api:expr) => {{
+            be.exec_fused_plan(
+                mk_f32_plan($name, rows, cols, eps, 0.0, 0),
+                f32_io(&xs, &mut of_a),
+            )
             .unwrap();
-        let eq = if bits_eq(&oa, &ob) {
-            "A≡api **逐位**"
-        } else {
-            "**不逐位！**"
-        };
-        let (a, b) = ab(
-            || {
-                be.exec_fused_plan(plan, io(&xs, &mut [], &mut oa)).unwrap();
-                black_box(oa[0]);
-            },
-            || {
-                lasx_rs::api::softmax_rows_into(&xs, None, rows, cols, 1.0, &mut ob).unwrap();
-                black_box(ob[0]);
-            },
-        );
-        row("SoftmaxRows（512×2048）", a, b, eq, max_abs_diff(&oa, &od));
+            $api(&xs, &mut of_b);
+            let eq = if bits_eq(&of_a, &of_b) {
+                "A≡api **逐位**"
+            } else {
+                "**不逐位！**"
+            };
+            let (a, b) = ab(
+                || {
+                    be.exec_fused_plan(
+                        mk_f32_plan($name, rows, cols, eps, 0.0, 0),
+                        f32_io(&xs, &mut of_a),
+                    )
+                    .unwrap();
+                    black_box(of_a[0]);
+                },
+                || {
+                    $api(&xs, &mut of_b);
+                    black_box(of_b[0]);
+                },
+            );
+            row($name, a, b, eq);
+        }};
     }
-    for (name, plan) in [
-        ("RmsNormRows", FusedPlan::RmsNormRows { rows, cols, eps }),
-        (
-            "LayerNormRows",
-            FusedPlan::LayerNormRows { rows, cols, eps },
-        ),
-    ] {
-        let mut oa = vec![0.0f32; n];
-        let mut ob = vec![0.0f32; n];
-        let mut od = vec![0.0f32; n];
-        be.exec_fused_plan(plan, io(&xs, &mut [], &mut oa)).unwrap();
-        match plan {
-            FusedPlan::RmsNormRows { .. } => {
-                lasx_rs::api::rms_norm_into(&xs, None, rows, cols, eps, &mut ob).unwrap()
-            }
-            _ => lasx_rs::api::layer_norm_into(&xs, None, None, rows, cols, eps, &mut ob).unwrap(),
-        }
-        ScalarBackend
-            .exec_fused_plan(plan, io(&xs, &mut [], &mut od))
-            .unwrap();
-        let eq = if bits_eq(&oa, &ob) {
-            "A≡api **逐位**"
-        } else {
-            "**不逐位！**"
-        };
-        let (a, b) = ab(
-            || {
-                be.exec_fused_plan(plan, io(&xs, &mut [], &mut oa)).unwrap();
-                black_box(oa[0]);
-            },
-            || match plan {
-                FusedPlan::RmsNormRows { .. } => {
-                    lasx_rs::api::rms_norm_into(&xs, None, rows, cols, eps, &mut ob).unwrap()
-                }
-                _ => lasx_rs::api::layer_norm_into(&xs, None, None, rows, cols, eps, &mut ob)
-                    .unwrap(),
-            },
-        );
-        row(name, a, b, eq, max_abs_diff(&oa, &od));
-    }
+    f32_row!("SoftmaxRows", |x: &[f32], o: &mut [f32]| {
+        lasx_rs::api::softmax_rows_into(x, None, rows, cols, 1.0, o).unwrap()
+    });
+    f32_row!("RmsNormRows", |x: &[f32], o: &mut [f32]| {
+        lasx_rs::api::rms_norm_into(x, None, rows, cols, eps, o).unwrap()
+    });
+    f32_row!("LayerNormRows", |x: &[f32], o: &mut [f32]| {
+        lasx_rs::api::layer_norm_into(x, None, None, rows, cols, eps, o).unwrap()
+    });
 
-    // ---- GeluQuick ----
+    // GeluQuick（等长）
     {
         let xg = sample(1usize << 20, 7);
         let m = xg.len();
-        let mut oa = vec![0.0f32; m];
-        let mut ob = vec![0.0f32; m];
-        let mut od = vec![0.0f32; m];
-        be.exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut oa))
+        let (mut ga, mut gb) = (vec![0.0f32; m], vec![0.0f32; m]);
+        be.exec_fused_plan(FusedPlan::GeluQuick, f32_io(&xg, &mut ga))
             .unwrap();
-        lasx_rs::api::gelu_quick_into(&xg, &mut ob).unwrap();
-        ScalarBackend
-            .exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut od))
-            .unwrap();
-        let eq = if bits_eq(&oa, &ob) {
+        lasx_rs::api::gelu_quick_into(&xg, &mut gb).unwrap();
+        let eq = if bits_eq(&ga, &gb) {
             "A≡api **逐位**"
         } else {
             "**不逐位！**"
         };
         let (a, b) = ab(
             || {
-                be.exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut oa))
+                be.exec_fused_plan(FusedPlan::GeluQuick, f32_io(&xg, &mut ga))
                     .unwrap();
-                black_box(oa[0]);
+                black_box(ga[0]);
             },
             || {
-                lasx_rs::api::gelu_quick_into(&xg, &mut ob).unwrap();
-                black_box(ob[0]);
+                lasx_rs::api::gelu_quick_into(&xg, &mut gb).unwrap();
+                black_box(gb[0]);
             },
         );
-        row("GeluQuick（1M）", a, b, eq, max_abs_diff(&oa, &od));
+        row("GeluQuick（1M）", a, b, eq);
     }
-
-    // ---- RopeApply ----
+    // RopeApply
     {
         let (rr, cc, nd) = (1024usize, 128usize, 64usize);
         let total = rr * cc;
@@ -269,20 +289,13 @@ fn main() {
             .map(|i| ((i * 7 % 41) as f32 * 0.03).sin())
             .collect();
         let xr = sample(total, 9);
-        let plan = FusedPlan::RopeApply {
-            rows: rr,
-            cols: cc,
-            n_dims: nd,
-        };
-        let mut oa = vec![0.0f32; total];
-        let mut ob = vec![0.0f32; total];
-        let mut od = vec![0.0f32; total];
+        let (mut ra, mut rb) = (vec![0.0f32; total], vec![0.0f32; total]);
         be.exec_fused_plan(
-            plan,
+            mk_f32_plan("RopeApply", rr, cc, 0.0, 0.0, nd),
             FusedIo {
                 x: &xr,
                 y: &mut [],
-                out: &mut oa,
+                out: &mut ra,
                 cos: &cos,
                 sin: &sin,
             },
@@ -296,22 +309,10 @@ fn main() {
             cc,
             nd,
             lasx_rs::api::RopeMode::NeoX,
-            &mut ob,
+            &mut rb,
         )
         .unwrap();
-        ScalarBackend
-            .exec_fused_plan(
-                plan,
-                FusedIo {
-                    x: &xr,
-                    y: &mut [],
-                    out: &mut od,
-                    cos: &cos,
-                    sin: &sin,
-                },
-            )
-            .unwrap();
-        let eq = if bits_eq(&oa, &ob) {
+        let eq = if bits_eq(&ra, &rb) {
             "A≡api **逐位**"
         } else {
             "**不逐位！**"
@@ -319,17 +320,17 @@ fn main() {
         let (a, b) = ab(
             || {
                 be.exec_fused_plan(
-                    plan,
+                    mk_f32_plan("RopeApply", rr, cc, 0.0, 0.0, nd),
                     FusedIo {
                         x: &xr,
                         y: &mut [],
-                        out: &mut oa,
+                        out: &mut ra,
                         cos: &cos,
                         sin: &sin,
                     },
                 )
                 .unwrap();
-                black_box(oa[0]);
+                black_box(ra[0]);
             },
             || {
                 lasx_rs::api::rope_into(
@@ -340,26 +341,266 @@ fn main() {
                     cc,
                     nd,
                     lasx_rs::api::RopeMode::NeoX,
-                    &mut ob,
+                    &mut rb,
                 )
                 .unwrap();
-                black_box(ob[0]);
+                black_box(rb[0]);
             },
         );
-        row(
-            "RopeApply（1024×128, n_dims=64）",
-            a,
-            b,
-            eq,
-            max_abs_diff(&oa, &od),
+        row("RopeApply（1024×128,n_dims=64）", a, b, eq);
+    }
+
+    // ================= 批2：f64 几何 5 pattern =================
+    let gn = 1usize << 20;
+    let (ax, ay, az) = (gsample(gn, 1), gsample(gn, 2), gsample(gn, 3));
+    let (bx, by, bz) = (gsample(gn, 4), gsample(gn, 5), gsample(gn, 6));
+
+    // Vec3AddScaled
+    {
+        let (mut pa, mut pa1, mut pa2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut pb, mut pb1, mut pb2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            vec3_plan(
+                1.25,
+                [&ax, &ay, &az],
+                [&bx, &by, &bz],
+                [&mut pa[..], &mut pa1[..], &mut pa2[..]],
+            ),
+            empty_io(),
+        )
+        .unwrap();
+        lasx_rs::api::vec3_add_scaled_batch_into(
+            &ax, &ay, &az, &bx, &by, &bz, 1.25, &mut pb, &mut pb1, &mut pb2,
+        )
+        .unwrap();
+        let eq = if f64_bits_eq(&pa, &pb) && f64_bits_eq(&pa1, &pb1) && f64_bits_eq(&pa2, &pb2) {
+            "A≡api **逐位**"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    vec3_plan(
+                        1.25,
+                        [&ax, &ay, &az],
+                        [&bx, &by, &bz],
+                        [&mut pa[..], &mut pa1[..], &mut pa2[..]],
+                    ),
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(pa[0]);
+            },
+            || {
+                lasx_rs::api::vec3_add_scaled_batch_into(
+                    &ax, &ay, &az, &bx, &by, &bz, 1.25, &mut pb, &mut pb1, &mut pb2,
+                )
+                .unwrap();
+                black_box(pb[0]);
+            },
+        );
+        row("Vec3AddScaledF64（1M×3）", a, b, eq);
+    }
+    // Norm3
+    {
+        let (mut na, mut nb) = (vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Norm3BatchF64 {
+                xyz: [&ax, &ay, &az],
+                out: &mut na,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        lasx_rs::api::norm3_batch_into(&ax, &ay, &az, &mut nb).unwrap();
+        let eq = if f64_bits_eq(&na, &nb) {
+            "A≡api **逐位**"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::Norm3BatchF64 {
+                        xyz: [&ax, &ay, &az],
+                        out: &mut na,
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(na[0]);
+            },
+            || {
+                lasx_rs::api::norm3_batch_into(&ax, &ay, &az, &mut nb).unwrap();
+                black_box(nb[0]);
+            },
+        );
+        row("Norm3BatchF64（1M）", a, b, eq);
+    }
+    // Unitize3（非零）
+    {
+        let (mut ua, mut ua1, mut ua2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut ub, mut ub1, mut ub2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Unitize3BatchF64 {
+                xyz: [&ax, &ay, &az],
+                o: [&mut ua[..], &mut ua1[..], &mut ua2[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        lasx_rs::api::unitize3_batch_into(&ax, &ay, &az, &mut ub, &mut ub1, &mut ub2).unwrap();
+        let eq = if f64_bits_eq(&ua, &ub) && f64_bits_eq(&ua1, &ub1) && f64_bits_eq(&ua2, &ub2) {
+            "A≡api **逐位**"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::Unitize3BatchF64 {
+                        xyz: [&ax, &ay, &az],
+                        o: [&mut ua[..], &mut ua1[..], &mut ua2[..]],
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(ua[0]);
+            },
+            || {
+                lasx_rs::api::unitize3_batch_into(&ax, &ay, &az, &mut ub, &mut ub1, &mut ub2)
+                    .unwrap();
+                black_box(ub[0]);
+            },
+        );
+        row("Unitize3BatchF64（1M，非零）", a, b, eq);
+    }
+    // Cross3
+    {
+        let (mut ca, mut ca1, mut ca2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut cb, mut cb1, mut cb2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Cross3BatchF64 {
+                a: [&ax, &ay, &az],
+                b: [&bx, &by, &bz],
+                o: [&mut ca[..], &mut ca1[..], &mut ca2[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        lasx_rs::api::cross3_batch_into(&ax, &ay, &az, &bx, &by, &bz, &mut cb, &mut cb1, &mut cb2)
+            .unwrap();
+        let eq = if f64_bits_eq(&ca, &cb) && f64_bits_eq(&ca1, &cb1) && f64_bits_eq(&ca2, &cb2) {
+            "A≡api **逐位**"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::Cross3BatchF64 {
+                        a: [&ax, &ay, &az],
+                        b: [&bx, &by, &bz],
+                        o: [&mut ca[..], &mut ca1[..], &mut ca2[..]],
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(ca[0]);
+            },
+            || {
+                lasx_rs::api::cross3_batch_into(
+                    &ax, &ay, &az, &bx, &by, &bz, &mut cb, &mut cb1, &mut cb2,
+                )
+                .unwrap();
+                black_box(cb[0]);
+            },
+        );
+        row("Cross3BatchF64（1M×3）", a, b, eq);
+    }
+    // Mat3MulVec3
+    {
+        let gm: Vec<Vec<f64>> = (0..9).map(|k| gsample(gn, 10 + k)).collect();
+        let gmr: [&[f64]; 9] = std::array::from_fn(|k| gm[k].as_slice());
+        let (mut ma, mut ma1, mut ma2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut mb, mut mb1, mut mb2) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Mat3MulVec3BatchF64 {
+                m: gmr,
+                v: [&ax, &ay, &az],
+                o: [&mut ma[..], &mut ma1[..], &mut ma2[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        lasx_rs::api::mat3_mul_vec3_batch_into(gmr, &ax, &ay, &az, &mut mb, &mut mb1, &mut mb2)
+            .unwrap();
+        let eq = if f64_bits_eq(&ma, &mb) && f64_bits_eq(&ma1, &mb1) && f64_bits_eq(&ma2, &mb2) {
+            "A≡api **逐位**"
+        } else {
+            "**不逐位！**"
+        };
+        let (a, b) = ab(
+            || {
+                be.exec_fused_plan(
+                    FusedPlan::Mat3MulVec3BatchF64 {
+                        m: gmr,
+                        v: [&ax, &ay, &az],
+                        o: [&mut ma[..], &mut ma1[..], &mut ma2[..]],
+                    },
+                    empty_io(),
+                )
+                .unwrap();
+                black_box(ma[0]);
+            },
+            || {
+                lasx_rs::api::mat3_mul_vec3_batch_into(
+                    gmr, &ax, &ay, &az, &mut mb, &mut mb1, &mut mb2,
+                )
+                .unwrap();
+                black_box(mb[0]);
+            },
+        );
+        row("Mat3MulVec3BatchF64（1M×3）", a, b, eq);
+    }
+
+    // unitize3 零向量：路径各自语义
+    {
+        let z4 = vec![0.0f64; 4];
+        let (mut za, mut zb, mut zc) = (vec![f64::NAN; 4], vec![f64::NAN; 4], vec![f64::NAN; 4]);
+        be.exec_fused_plan(
+            FusedPlan::Unitize3BatchF64 {
+                xyz: [&z4, &z4, &z4],
+                o: [&mut za[..], &mut zb[..], &mut zc[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        let lasx_zero = za.iter().all(|v| v.to_bits() == 0.0f64.to_bits())
+            && zb.iter().all(|v| v.to_bits() == 0.0f64.to_bits())
+            && zc.iter().all(|v| v.to_bits() == 0.0f64.to_bits());
+        let (mut pa, mut pb, mut pc) = (vec![0.0f64; 4], vec![0.0f64; 4], vec![0.0f64; 4]);
+        ScalarBackend
+            .exec_fused_plan(
+                FusedPlan::Unitize3BatchF64 {
+                    xyz: [&z4, &z4, &z4],
+                    o: [&mut pa[..], &mut pb[..], &mut pc[..]],
+                },
+                empty_io(),
+            )
+            .unwrap();
+        let port_nan = pa.iter().all(|v| v.is_nan()) && pb.iter().all(|v| v.is_nan());
+        println!(
+            "\n- unitize3 零向量：Plan(LASX) = 0？**{lasx_zero}**；portable 计划解释 = NaN？**{port_nan}**\
+             （路径各自语义，调用方按 `supports_plan` 选择）"
         );
     }
 
     println!("\nloadavg（结束）= `{}`", loadavg());
     println!(
         "\n判定：**B/A ≥0.98 视为 Plan 路径不掉性能**（<0.98 如实记：薄转发噪声 vs 内核差异）。\
-         Plan = `LasxBackend::exec_fused_plan`（override → LASX 融合核）；B = 直接 `api::*`（同一内核）。\
-         `Axpy`/`SoftmaxRows` 的具名方法（`axpy_f32`/`softmax_rows_f32`）仍在 trait 里（薄委托）；\
-         其余 4 个具名方法已按批1 删除（只剩 Plan 入口）。"
+         A = `LasxBackend::exec_fused_plan`（override → LASX 融合核）；B = 直接 `api::*`（同一内核）。\
+         11 pattern 全部：`supports_plan`=true、Plan≡api 逐位。"
     );
 }

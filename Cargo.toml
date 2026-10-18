@@ -37,11 +37,11 @@ lasx_rs_macros = { path = "macros", version = "0.1.0" }
 # （`git ls-remote <panel>` 取实值），否则本仓看到的是**旧快照**——③b-3b 就是因为 rev 钉在 `fc57fc7`
 # 而误判"`IdiomaticBackend` 未导出"（实际 `521e837` 已 `pub use idiomatic::IdiomaticBackend;`）。
 # 改完必须 `cargo update -p simd_dsl` 让 `Cargo.lock` 跟上。
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "9af59f772c91927adf72a66a13375d672b8267a8", optional = true }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "b89a32f49f5658417f36e039394e642a14609b7d", optional = true }
 # **可选**：`ops_dsl`（算子库，含谱检测整帧 `detect`）——**只给"帧级 A/B"示例用**。
 # 依赖方向仍向下：`lasx_rs → ops_dsl → simd_dsl`；与 `simd_dsl` 同一个 rev（同一 git 仓的 workspace 成员）。
 # 仅在本 feature 下解析 ⇒ 默认构建不受影响（同上：一移动就 bump、并 `cargo update -p ops_dsl`）。
-ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "9af59f772c91927adf72a66a13375d672b8267a8", optional = true }
+ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "b89a32f49f5658417f36e039394e642a14609b7d", optional = true }
 
 [features]
 # 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
@@ -106,16 +106,13 @@ required-features = ["dsl-backend"]
 name = "geomf64_ab"
 required-features = ["dsl-backend"]
 
-# `geomf64_fused_ab`（阶段4 收尾 / task-49）：**f64 几何五入口 fused A/B**——
-# A = `api::*_into`（LASX 向量核），B = `Backend::*_f64`（LasxBackend override；`supports(FusedGeometry)`
-# 仅在五个方法全接上后为真）。同进程交替 6 对丢首对中位；零向量语义差异单列（LASX=0 vs 合同默认=NaN）。
-[[example]]
-name = "geomf64_fused_ab"
-required-features = ["dsl-backend"]
+# `geomf64_fused_ab` **已随批2 删除**：5 个几何具名方法（`Backend::*_f64`）在 `b89a32f` 被
+# `FusedPlan` 取代 ⇒ 原「trait override vs api」装置不再有对照臂；几何 A/B 现由 `plan_ab`
+# 的 5 条 Plan 行承接（Plan vs 直接 api）。
 
 # `geomf64_auto_ab`（阶段4 收尾，任务1 验收）：**f64 几何五入口 auto 路径 A/B**——
 # A = `api::{norm3_batch, vec3_add_scaled_batch, unitize3_batch, cross3_batch, mat3_mul_vec3_batch}`；
-# B = `ops_dsl::geometry::*_auto(&LasxBackend, …)`（`supports(FusedGeometry)` 真 ⇒ 1 趟融合分支）。
+# B = `ops_dsl::geometry::*_auto(&LasxBackend, …)`（`supports_plan(…F64)` 真 ⇒ 1 趟融合分支）。
 # 同进程交替 6 对丢首对中位；零向量单列（融合 0 / 组合 NaN），不参与比值。
 [[example]]
 name = "geomf64_auto_ab"

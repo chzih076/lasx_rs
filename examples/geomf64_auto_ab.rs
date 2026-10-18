@@ -79,9 +79,15 @@ fn main() {
     let be = LasxBackend;
     println!("f64 几何 auto A/B（api 原实现 vs ops_dsl::*_auto；{ROUNDS} 对丢首对取中位）");
     println!("threads = {}", lasx_rs::pool::global().threads());
+    // **批2 起**：几何融合能力改由 `supports_plan` 的 5 个 kind 承载（`FusedGeometry` 位不再报，
+    // 因为 5 个具名方法已被 `FusedPlan` 取代）⇒ 这里按 Plan 能力打印。
     println!(
-        "cap: FusedGeometry={}  ← true ⇒ auto 走 1 趟融合分支",
-        be.supports(simd_dsl::Capability::FusedGeometry)
+        "cap: Plan={{vec3={}, norm3={}, unitize3={}, cross3={}, mat3={}}}  ← true ⇒ auto 走 1 趟融合分支",
+        be.supports_plan(simd_dsl::PatternKind::Vec3AddScaledF64),
+        be.supports_plan(simd_dsl::PatternKind::Norm3BatchF64),
+        be.supports_plan(simd_dsl::PatternKind::Unitize3BatchF64),
+        be.supports_plan(simd_dsl::PatternKind::Cross3BatchF64),
+        be.supports_plan(simd_dsl::PatternKind::Mat3MulVec3BatchF64),
     );
     println!("loadavg(开始) = {}", loadavg());
     println!("| 算子 | n | api ms | auto ms | 比值 api/auto |");
