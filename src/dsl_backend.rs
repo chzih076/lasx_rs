@@ -794,15 +794,111 @@ impl Backend for LasxBackend {
     /// 其余（逐元素/归约/超越/多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     fn supports(&self, cap: Capability) -> bool {
-        // 阶段4：`FusedNorms` / `FusedElementwise` **只报真**——6 个融合方法**全部**在本文件
-        // override 到 LASX 内核后才报 `true`（只报确实覆盖的族）。
+        // 阶段4：`FusedNorms` / `FusedElementwise` / `FusedGeometry` **只报真**——
+        // 对应方法**全部**在本文件 override 到 LASX 内核后才报 `true`（只报确实覆盖的族）。
         matches!(
             cap,
             Capability::Packing
                 | Capability::MatmulF64
                 | Capability::FusedNorms
                 | Capability::FusedElementwise
+                | Capability::FusedGeometry
         )
+    }
+
+    // ============ 阶段4 收尾：f64 几何五入口（`FusedGeometry`）============
+    //
+    // 映射：全部走 `api::*_into`（LASX 向量核，免分配）。**零向量语义差异（路径各自语义）**：
+    // LASX `unitize3` 对零向量给 `0`；合同默认（组合版）给 `NaN` —— override **不额外打补丁**，
+    // 保持内核语义；调用方要 NaNs 档就用组合版（能力探测为假时）。
+
+    fn vec3_add_scaled_f64(
+        &self,
+        ax: &[f64],
+        ay: &[f64],
+        az: &[f64],
+        bx: &[f64],
+        by: &[f64],
+        bz: &[f64],
+        s: f64,
+        ox: &mut [f64],
+        oy: &mut [f64],
+        oz: &mut [f64],
+    ) -> Result<(), BackendError> {
+        crate::api::vec3_add_scaled_batch_into(ax, ay, az, bx, by, bz, s, ox, oy, oz).map_err(
+            |_| BackendError::Unsupported {
+                op: "vec3_add_scaled_f64",
+                cap: Capability::FusedGeometry,
+            },
+        )
+    }
+
+    fn norm3_batch_f64(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        crate::api::norm3_batch_into(x, y, z, out).map_err(|_| BackendError::Unsupported {
+            op: "norm3_batch_f64",
+            cap: Capability::FusedGeometry,
+        })
+    }
+
+    fn unitize3_batch_f64(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        ox: &mut [f64],
+        oy: &mut [f64],
+        oz: &mut [f64],
+    ) -> Result<(), BackendError> {
+        crate::api::unitize3_batch_into(x, y, z, ox, oy, oz).map_err(|_| {
+            BackendError::Unsupported {
+                op: "unitize3_batch_f64",
+                cap: Capability::FusedGeometry,
+            }
+        })
+    }
+
+    fn cross3_batch_f64(
+        &self,
+        ax: &[f64],
+        ay: &[f64],
+        az: &[f64],
+        bx: &[f64],
+        by: &[f64],
+        bz: &[f64],
+        ox: &mut [f64],
+        oy: &mut [f64],
+        oz: &mut [f64],
+    ) -> Result<(), BackendError> {
+        crate::api::cross3_batch_into(ax, ay, az, bx, by, bz, ox, oy, oz).map_err(|_| {
+            BackendError::Unsupported {
+                op: "cross3_batch_f64",
+                cap: Capability::FusedGeometry,
+            }
+        })
+    }
+
+    fn mat3_mul_vec3_batch_f64(
+        &self,
+        m: [&[f64]; 9],
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        ox: &mut [f64],
+        oy: &mut [f64],
+        oz: &mut [f64],
+    ) -> Result<(), BackendError> {
+        crate::api::mat3_mul_vec3_batch_into(m, x, y, z, ox, oy, oz).map_err(|_| {
+            BackendError::Unsupported {
+                op: "mat3_mul_vec3_batch_f64",
+                cap: Capability::FusedGeometry,
+            }
+        })
     }
 
     // ============ 阶段4：融合原语**加速选项**（源实现仍是 portable 组合版）============

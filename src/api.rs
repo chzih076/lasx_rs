@@ -1629,6 +1629,47 @@ pub fn mat3_mul_vec3_batch(
     Ok([ox, oy, oz])
 }
 
+/// [`mat3_mul_vec3_batch`] 的**免分配**版本：输出写进调用方缓冲（`ox`/`oy`/`oz`）。
+///
+/// 输入布局与 [`mat3_mul_vec3_batch`] **完全一致**（`m` = 9 条逐元素数组，行主序 `m[3r+c]`）。
+/// **不新增 C 导出**（纯 Rust 层入口，`nm -D` 不变）；给 `Backend::mat3_mul_vec3_batch_f64` 的
+/// LASX override 用（DSL 侧不允许分配）。
+///
+/// # Errors
+/// 15 条数组（`m` 的 9 条 + `x`/`y`/`z` + 3 条输出）长度不一致时返回 [`Error::Shape`]。
+#[allow(clippy::too_many_arguments)]
+pub fn mat3_mul_vec3_batch_into(
+    m: [&[f64]; 9],
+    x: &[f64],
+    y: &[f64],
+    z: &[f64],
+    ox: &mut [f64],
+    oy: &mut [f64],
+    oz: &mut [f64],
+) -> Result<()> {
+    let names: [&'static str; 15] = [
+        "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "x", "y", "z", "ox", "oy", "oz",
+    ];
+    let mut lens = [("", 0usize); 15];
+    for (k, name) in names.iter().enumerate() {
+        lens[k] = (
+            name,
+            match k {
+                0..=8 => m[k].len(),
+                9 => x.len(),
+                10 => y.len(),
+                11 => z.len(),
+                12 => ox.len(),
+                13 => oy.len(),
+                _ => oz.len(),
+            },
+        );
+    }
+    expect_same_len("mat3_mul_vec3_batch_into", &lens)?;
+    crate::ops::mat3_mul_vec3_batch::mat3_mul_vec3_batch(m, x, y, z, ox, oy, oz);
+    Ok(())
+}
+
 /// 批量单位化四元数（标量在前），返回 `[qw, qx, qy, qz]`。
 ///
 /// `|q| < 1e-15` 的样本输出单位四元数 `(1,0,0,0)`。
