@@ -1041,8 +1041,9 @@ impl Backend for LasxBackend {
     /// （LASX 拓宽指令的 128-bit lane 语义使连续 i8 块需要额外的多次 load + 重排，收益不足，
     /// 见上面注释）⇒ 该位语义是"4 个全有专用实现"，**只接 3 个就不报**（只低估）。
     fn supports(&self, cap: Capability) -> bool {
-        // 阶段4：`FusedNorms` / `FusedElementwise` / `FusedGeometry` **只报真**——
-        // 对应方法**全部**在本文件 override 到 LASX 内核后才报 `true`（只报确实覆盖的族）。
+        // 阶段4：`FusedNorms` / `FusedElementwise` **只报真**——对应方法全部 override 到 LASX 内核才报。
+        // **`FusedGeometry` 自 P1 批2 起不报**：5 个具名方法已被 `FusedPlan` 取代（批2 删除），
+        // 该位语义（"5 方法全 override"）不再成立；几何融合能力由 `supports_plan` 的 5 个 kind 承载。
         matches!(
             cap,
             Capability::Packing
@@ -1050,104 +1051,19 @@ impl Backend for LasxBackend {
                 | Capability::F64Elementwise
                 | Capability::FusedNorms
                 | Capability::FusedElementwise
-                | Capability::FusedGeometry
         )
     }
 
-    // ============ 阶段4 收尾：f64 几何五入口（`FusedGeometry`）============
+    // ============ 阶段4 收尾：f64 几何五入口（`FusedGeometry`）→ **P1 批2 起迁入 `exec_fused_plan`** ============
     //
-    // 映射：全部走 `api::*_into`（LASX 向量核，免分配）。**零向量语义差异（路径各自语义）**：
-    // LASX `unitize3` 对零向量给 `0`；合同默认（组合版）给 `NaN` —— override **不额外打补丁**，
-    // 保持内核语义；调用方要 NaNs 档就用组合版（能力探测为假时）。
-
-    fn vec3_add_scaled_f64(
-        &self,
-        ax: &[f64],
-        ay: &[f64],
-        az: &[f64],
-        bx: &[f64],
-        by: &[f64],
-        bz: &[f64],
-        s: f64,
-        ox: &mut [f64],
-        oy: &mut [f64],
-        oz: &mut [f64],
-    ) -> Result<(), BackendError> {
-        crate::api::vec3_add_scaled_batch_into(ax, ay, az, bx, by, bz, s, ox, oy, oz).map_err(
-            |_| BackendError::Unsupported {
-                op: "vec3_add_scaled_f64",
-                cap: Capability::FusedGeometry,
-            },
-        )
-    }
-
-    fn norm3_batch_f64(
-        &self,
-        x: &[f64],
-        y: &[f64],
-        z: &[f64],
-        out: &mut [f64],
-    ) -> Result<(), BackendError> {
-        crate::api::norm3_batch_into(x, y, z, out).map_err(|_| BackendError::Unsupported {
-            op: "norm3_batch_f64",
-            cap: Capability::FusedGeometry,
-        })
-    }
-
-    fn unitize3_batch_f64(
-        &self,
-        x: &[f64],
-        y: &[f64],
-        z: &[f64],
-        ox: &mut [f64],
-        oy: &mut [f64],
-        oz: &mut [f64],
-    ) -> Result<(), BackendError> {
-        crate::api::unitize3_batch_into(x, y, z, ox, oy, oz).map_err(|_| {
-            BackendError::Unsupported {
-                op: "unitize3_batch_f64",
-                cap: Capability::FusedGeometry,
-            }
-        })
-    }
-
-    fn cross3_batch_f64(
-        &self,
-        ax: &[f64],
-        ay: &[f64],
-        az: &[f64],
-        bx: &[f64],
-        by: &[f64],
-        bz: &[f64],
-        ox: &mut [f64],
-        oy: &mut [f64],
-        oz: &mut [f64],
-    ) -> Result<(), BackendError> {
-        crate::api::cross3_batch_into(ax, ay, az, bx, by, bz, ox, oy, oz).map_err(|_| {
-            BackendError::Unsupported {
-                op: "cross3_batch_f64",
-                cap: Capability::FusedGeometry,
-            }
-        })
-    }
-
-    fn mat3_mul_vec3_batch_f64(
-        &self,
-        m: [&[f64]; 9],
-        x: &[f64],
-        y: &[f64],
-        z: &[f64],
-        ox: &mut [f64],
-        oy: &mut [f64],
-        oz: &mut [f64],
-    ) -> Result<(), BackendError> {
-        crate::api::mat3_mul_vec3_batch_into(m, x, y, z, ox, oy, oz).map_err(|_| {
-            BackendError::Unsupported {
-                op: "mat3_mul_vec3_batch_f64",
-                cap: Capability::FusedGeometry,
-            }
-        })
-    }
+    // b89a32f 删除了 `vec3_add_scaled_f64` / `norm3_batch_f64` / `unitize3_batch_f64` /
+    // `cross3_batch_f64` / `mat3_mul_vec3_batch_f64` 五个具名方法（`Backend` 71→66）；
+    // 它们的 PLAN overrides 全部走 `api::*_into`（LASX 向量核，免分配）：
+    // `FusedPlan::{Vec3AddScaledF64, Norm3BatchF64, Unitize3BatchF64, Cross3BatchF64, Mat3MulVec3BatchF64}`。
+    // **零向量语义差异（路径各自语义）**：LASX `unitize3` 对零向量给 `0`；契约默认（组合版）给 `NaN` ——
+    // PLAN override **不额外打补丁**、保持内核语义；调用方要 `NaN` 档就用 portable 计划解释。
+    // ⇒ `Capability::FusedGeometry`（语义 = "5 个具名方法全 override"）在本后端**不再报 true**
+    //   （方法已不存在；能力改由 `supports_plan` 的 5 个 `PatternKind` 承载）。
 
     // ============ 阶段4：融合原语**加速选项**（源实现仍是 portable 组合版）============
     //
@@ -1196,7 +1112,8 @@ impl Backend for LasxBackend {
     // （softmax 2.79e-9、rms 1.83e-7、layer 2.08e-7、gelu 5.26e-3、rope 6.92e-8、axpy 8.27e-8）。
 
     fn supports_plan(&self, kind: PatternKind) -> bool {
-        // 6 个 kind 都已接 LASX 融合核 ⇒ 全报 true（按 PatternKind 粒度、只低估）。
+        // **11 个 kind 全报 true**：批1 的 6 个（f32 融合原语）+ 批2 的 5 个 f64 几何
+        // 都已接 LASX 融合核（按 PatternKind 粒度、只低估）。
         matches!(
             kind,
             PatternKind::Axpy
@@ -1205,10 +1122,15 @@ impl Backend for LasxBackend {
                 | PatternKind::LayerNormRows
                 | PatternKind::GeluQuick
                 | PatternKind::RopeApply
+                | PatternKind::Vec3AddScaledF64
+                | PatternKind::Norm3BatchF64
+                | PatternKind::Unitize3BatchF64
+                | PatternKind::Cross3BatchF64
+                | PatternKind::Mat3MulVec3BatchF64
         )
     }
 
-    fn exec_fused_plan(&self, plan: FusedPlan, io: FusedIo<'_>) -> Result<(), BackendError> {
+    fn exec_fused_plan(&self, plan: FusedPlan<'_>, io: FusedIo<'_>) -> Result<(), BackendError> {
         /// 行 pattern 的公共校验：`rows×cols` 不溢出、`x`/`out` 等长（与 `fused_rows_len` 同口径）。
         fn rows_plan_len(
             op: &'static str,
@@ -1345,6 +1267,151 @@ impl Backend for LasxBackend {
                 .map_err(|_| BackendError::Unsupported {
                     op,
                     cap: Capability::FusedElementwise,
+                })
+            }
+            // ---- P1 批2（task-69）：f64 几何 5 pattern。缓冲在 plan 值里（`FusedPlan<'a>`），
+            //      `io` 不参与（契约：几何 pattern 传空 `FusedIo`）。校验与契约 `fused_geo_len` 同口径：
+            //      n = 第一个输入的长度，其余（含所有输出）必须等长；n==0 ⇒ Ok。
+            //      映射：全部 → `api::*_into`（LASX 向量核，免分配）。
+            //      **零向量**：Unitize3 走 LASX 内核 ⇒ `0`（契约默认解释 = 组合版 `0/0 = NaN`，
+            //      "路径各自语义"由调用方按 `supports_plan` 选择）。
+            FusedPlan::Vec3AddScaledF64 { s, a, b, o } => {
+                let op = "exec_fused_plan(Vec3AddScaledF64)";
+                let [ax, ay, az] = a;
+                let [bx, by, bz] = b;
+                let [ox, oy, oz] = o;
+                let n = ax.len();
+                for (what, got) in [
+                    ("ay", ay.len()),
+                    ("az", az.len()),
+                    ("bx", bx.len()),
+                    ("by", by.len()),
+                    ("bz", bz.len()),
+                    ("ox", ox.len()),
+                    ("oy", oy.len()),
+                    ("oz", oz.len()),
+                ] {
+                    if got != n {
+                        return Err(len_err(op, what, n, got));
+                    }
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::vec3_add_scaled_batch_into(ax, ay, az, bx, by, bz, s, ox, oy, oz)
+                    .map_err(|_| BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedGeometry,
+                    })
+            }
+            FusedPlan::Norm3BatchF64 { xyz, out } => {
+                let op = "exec_fused_plan(Norm3BatchF64)";
+                let [x, y, z] = xyz;
+                let n = x.len();
+                for (what, got) in [("y", y.len()), ("z", z.len()), ("out", out.len())] {
+                    if got != n {
+                        return Err(len_err(op, what, n, got));
+                    }
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::norm3_batch_into(x, y, z, out).map_err(|_| BackendError::Unsupported {
+                    op,
+                    cap: Capability::FusedGeometry,
+                })
+            }
+            FusedPlan::Unitize3BatchF64 { xyz, o } => {
+                let op = "exec_fused_plan(Unitize3BatchF64)";
+                let [x, y, z] = xyz;
+                let [ox, oy, oz] = o;
+                let n = x.len();
+                for (what, got) in [
+                    ("y", y.len()),
+                    ("z", z.len()),
+                    ("ox", ox.len()),
+                    ("oy", oy.len()),
+                    ("oz", oz.len()),
+                ] {
+                    if got != n {
+                        return Err(len_err(op, what, n, got));
+                    }
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::unitize3_batch_into(x, y, z, ox, oy, oz).map_err(|_| {
+                    BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedGeometry,
+                    }
+                })
+            }
+            FusedPlan::Cross3BatchF64 { a, b, o } => {
+                let op = "exec_fused_plan(Cross3BatchF64)";
+                let [ax, ay, az] = a;
+                let [bx, by, bz] = b;
+                let [ox, oy, oz] = o;
+                let n = ax.len();
+                for (what, got) in [
+                    ("ay", ay.len()),
+                    ("az", az.len()),
+                    ("bx", bx.len()),
+                    ("by", by.len()),
+                    ("bz", bz.len()),
+                    ("ox", ox.len()),
+                    ("oy", oy.len()),
+                    ("oz", oz.len()),
+                ] {
+                    if got != n {
+                        return Err(len_err(op, what, n, got));
+                    }
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::cross3_batch_into(ax, ay, az, bx, by, bz, ox, oy, oz).map_err(|_| {
+                    BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedGeometry,
+                    }
+                })
+            }
+            FusedPlan::Mat3MulVec3BatchF64 { m, v, o } => {
+                let op = "exec_fused_plan(Mat3MulVec3BatchF64)";
+                let [x, y, z] = v;
+                let [ox, oy, oz] = o;
+                let n = x.len();
+                for (what, got) in [
+                    ("y", y.len()),
+                    ("z", z.len()),
+                    ("m0", m[0].len()),
+                    ("m1", m[1].len()),
+                    ("m2", m[2].len()),
+                    ("m3", m[3].len()),
+                    ("m4", m[4].len()),
+                    ("m5", m[5].len()),
+                    ("m6", m[6].len()),
+                    ("m7", m[7].len()),
+                    ("m8", m[8].len()),
+                    ("ox", ox.len()),
+                    ("oy", oy.len()),
+                    ("oz", oz.len()),
+                ] {
+                    if got != n {
+                        return Err(len_err(op, what, n, got));
+                    }
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                // **mat3 走 Rust 层 `_into` helper**（`api::mat3_mul_vec3_batch_into`，免分配；
+                // 与 lasx 侧 `api::mat3_mul_vec3_batch` 数值逐位）。
+                crate::api::mat3_mul_vec3_batch_into(m, x, y, z, ox, oy, oz).map_err(|_| {
+                    BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedGeometry,
+                    }
                 })
             }
         }
@@ -2173,8 +2240,9 @@ mod tests {
         );
     }
 
-    /// **P3 Plan（task-63）→ P1 批1（task-66）**：6 个 kind 的语义映射与数值——
-    /// Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 = 既有容差类；
+    /// **P3 Plan（task-63）→ 批1（task-66）→ 批2（task-69）**：**11 个 kind** 的语义映射与数值——
+    /// Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 = 既有容差类/
+    /// 几何零向量"路径各自语义"（LASX `unitize3` = 0、契约默认 = NaN）；
     /// portable 后端 `supports_plan` 全 false；长度/形状错 ⇒ `Err`（不 panic）。
     #[test]
     fn plan_overrides_map_to_fused_kernels_and_stay_bitwise() {
@@ -2187,8 +2255,13 @@ mod tests {
             PatternKind::LayerNormRows,
             PatternKind::GeluQuick,
             PatternKind::RopeApply,
+            PatternKind::Vec3AddScaledF64,
+            PatternKind::Norm3BatchF64,
+            PatternKind::Unitize3BatchF64,
+            PatternKind::Cross3BatchF64,
+            PatternKind::Mat3MulVec3BatchF64,
         ];
-        // ① 能力位：按 PatternKind 粒度、只低估——本后端 6 个都接；portable 6 个都 false
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端 11 个都接；portable 11 个都 false
         for k in kinds {
             assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
             assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
@@ -2241,23 +2314,22 @@ mod tests {
         let m = rows * cols;
         let xs: Vec<f32> = (0..m).map(|i| (i % 71) as f32 * 0.05 - 1.8).collect();
         let eps = 1e-5f32;
-        for (name, plan) in [
-            ("SoftmaxRows", FusedPlan::SoftmaxRows { rows, cols }),
-            ("RmsNormRows", FusedPlan::RmsNormRows { rows, cols, eps }),
-            (
-                "LayerNormRows",
-                FusedPlan::LayerNormRows { rows, cols, eps },
-            ),
-        ] {
+        for name in ["SoftmaxRows", "RmsNormRows", "LayerNormRows"] {
+            // `FusedPlan` 批2 起**不是 `Copy`**（几何变体自带 f64 缓冲）⇒ 每次用现构造。
+            let mk = || match name {
+                "SoftmaxRows" => FusedPlan::SoftmaxRows { rows, cols },
+                "RmsNormRows" => FusedPlan::RmsNormRows { rows, cols, eps },
+                _ => FusedPlan::LayerNormRows { rows, cols, eps },
+            };
             let mut out_plan = vec![0.0f32; m];
-            be.exec_fused_plan(plan, io(&xs, &mut [], &mut out_plan))
+            be.exec_fused_plan(mk(), io(&xs, &mut [], &mut out_plan))
                 .unwrap();
             let mut out_api = vec![0.0f32; m];
-            match plan {
-                FusedPlan::SoftmaxRows { .. } => {
+            match name {
+                "SoftmaxRows" => {
                     crate::api::softmax_rows_into(&xs, None, rows, cols, 1.0, &mut out_api).unwrap()
                 }
-                FusedPlan::RmsNormRows { .. } => {
+                "RmsNormRows" => {
                     crate::api::rms_norm_into(&xs, None, rows, cols, eps, &mut out_api).unwrap()
                 }
                 _ => crate::api::layer_norm_into(&xs, None, None, rows, cols, eps, &mut out_api)
@@ -2268,7 +2340,7 @@ mod tests {
             }
             let mut out_port = vec![0.0f32; m];
             ScalarBackend
-                .exec_fused_plan(plan, io(&xs, &mut [], &mut out_port))
+                .exec_fused_plan(mk(), io(&xs, &mut [], &mut out_port))
                 .unwrap();
             let d = max_d(&out_plan, &out_port);
             eprintln!("Plan {name}：LASX vs portable 计划解释 max|d| = {d:.3e}");
@@ -2351,7 +2423,8 @@ mod tests {
         let mut r_port = vec![0.0f32; total];
         ScalarBackend
             .exec_fused_plan(
-                rope,
+                // `FusedPlan` 非 Copy ⇒ 现构造（同一字段值）。
+                FusedPlan::RopeApply { rows, cols, n_dims },
                 FusedIo {
                     x: &xr,
                     y: &mut [],
@@ -2368,7 +2441,184 @@ mod tests {
             "RopeApply 计划路与 portable 超界 {d_rope:e}"
         );
 
-        // ⑥ 形状/长度错 ⇒ Err（不 panic）
+        // ⑥ 批2：f64 几何 5 pattern —— Plan 路 ≡ 直接 api **逐位**；unitize3 零向量 = LASX `0`
+        let gn = 257usize;
+        let g = |seed: usize| -> Vec<f64> {
+            (0..gn)
+                .map(|i| ((i * 37 + seed) % 101) as f64 * 0.0625 - 3.0)
+                .collect()
+        };
+        let (gax, gay, gaz) = (g(1), g(2), g(3));
+        let (gbx, gby, gbz) = (g(4), g(5), g(6));
+        let empty_io = || io(&[], &mut [], &mut []);
+        // vec3_add_scaled
+        let (mut o1x, mut o1y, mut o1z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut a1x, mut a1y, mut a1z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Vec3AddScaledF64 {
+                s: 1.25,
+                a: [&gax, &gay, &gaz],
+                b: [&gbx, &gby, &gbz],
+                o: [&mut o1x[..], &mut o1y[..], &mut o1z[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        crate::api::vec3_add_scaled_batch_into(
+            &gax, &gay, &gaz, &gbx, &gby, &gbz, 1.25, &mut a1x, &mut a1y, &mut a1z,
+        )
+        .unwrap();
+        for (p, q) in [(&o1x, &a1x), (&o1y, &a1y), (&o1z, &a1z)] {
+            for (u, v) in p.iter().zip(q) {
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "Vec3AddScaled：Plan 路与 api 不逐位"
+                );
+            }
+        }
+        // norm3
+        let (mut n1, mut n2) = (vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Norm3BatchF64 {
+                xyz: [&gax, &gay, &gaz],
+                out: &mut n1,
+            },
+            empty_io(),
+        )
+        .unwrap();
+        crate::api::norm3_batch_into(&gax, &gay, &gaz, &mut n2).unwrap();
+        for (u, v) in n1.iter().zip(&n2) {
+            assert_eq!(u.to_bits(), v.to_bits(), "Norm3Batch：Plan 路与 api 不逐位");
+        }
+        // cross3
+        let (mut c1x, mut c1y, mut c1z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut c2x, mut c2y, mut c2z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Cross3BatchF64 {
+                a: [&gax, &gay, &gaz],
+                b: [&gbx, &gby, &gbz],
+                o: [&mut c1x[..], &mut c1y[..], &mut c1z[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        crate::api::cross3_batch_into(
+            &gax, &gay, &gaz, &gbx, &gby, &gbz, &mut c2x, &mut c2y, &mut c2z,
+        )
+        .unwrap();
+        for (p, q) in [(&c1x, &c2x), (&c1y, &c2y), (&c1z, &c2z)] {
+            for (u, v) in p.iter().zip(q) {
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "Cross3Batch：Plan 路与 api 不逐位"
+                );
+            }
+        }
+        // mat3（走 Rust 层 `_into` helper）
+        let gm: Vec<Vec<f64>> = (0..9).map(|k| g(10 + k)).collect();
+        let gmr: [&[f64]; 9] = std::array::from_fn(|k| gm[k].as_slice());
+        let (mut m1x, mut m1y, mut m1z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut m2x, mut m2y, mut m2z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Mat3MulVec3BatchF64 {
+                m: gmr,
+                v: [&gax, &gay, &gaz],
+                o: [&mut m1x[..], &mut m1y[..], &mut m1z[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        crate::api::mat3_mul_vec3_batch_into(gmr, &gax, &gay, &gaz, &mut m2x, &mut m2y, &mut m2z)
+            .unwrap();
+        for (p, q) in [(&m1x, &m2x), (&m1y, &m2y), (&m1z, &m2z)] {
+            for (u, v) in p.iter().zip(q) {
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "Mat3MulVec3Batch：Plan 路与 api 不逐位"
+                );
+            }
+        }
+        // unitize3：非零 ≡ api 逐位；**零向量 = LASX 0 / portable 计划解释 = NaN**（路径各自语义）
+        let (mut u1x, mut u1y, mut u1z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        let (mut u2x, mut u2y, mut u2z) = (vec![0.0f64; gn], vec![0.0f64; gn], vec![0.0f64; gn]);
+        be.exec_fused_plan(
+            FusedPlan::Unitize3BatchF64 {
+                xyz: [&gax, &gay, &gaz],
+                o: [&mut u1x[..], &mut u1y[..], &mut u1z[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        crate::api::unitize3_batch_into(&gax, &gay, &gaz, &mut u2x, &mut u2y, &mut u2z).unwrap();
+        for (p, q) in [(&u1x, &u2x), (&u1y, &u2y), (&u1z, &u2z)] {
+            for (u, v) in p.iter().zip(q) {
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "Unitize3Batch：Plan 路与 api 不逐位"
+                );
+            }
+        }
+        let z4 = vec![0.0f64; 4];
+        let (mut zx1, mut zy1, mut zz1) = (vec![f64::NAN; 4], vec![f64::NAN; 4], vec![f64::NAN; 4]);
+        be.exec_fused_plan(
+            FusedPlan::Unitize3BatchF64 {
+                xyz: [&z4, &z4, &z4],
+                o: [&mut zx1[..], &mut zy1[..], &mut zz1[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+        for arr in [&zx1, &zy1, &zz1] {
+            assert!(
+                arr.iter().all(|v| v.to_bits() == 0.0f64.to_bits()),
+                "LASX unitize3 零向量必须是 0（内核语义）"
+            );
+        }
+        let (mut zx2, mut zy2, mut zz2) = (vec![0.0f64; 4], vec![0.0f64; 4], vec![0.0f64; 4]);
+        ScalarBackend
+            .exec_fused_plan(
+                FusedPlan::Unitize3BatchF64 {
+                    xyz: [&z4, &z4, &z4],
+                    o: [&mut zx2[..], &mut zy2[..], &mut zz2[..]],
+                },
+                empty_io(),
+            )
+            .unwrap();
+        for arr in [&zx2, &zy2, &zz2] {
+            assert!(
+                arr.iter().all(|v| v.is_nan()),
+                "契约默认解释的零向量必须是 NaN（组合版 0/0）"
+            );
+        }
+        // 几何长度错 ⇒ Err；空批量 ⇒ Ok
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::Norm3BatchF64 {
+                    xyz: [&gax, &gay, &gaz[..gn - 1]],
+                    out: &mut n1,
+                },
+                empty_io(),
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        let empty = vec![0.0f64; 0];
+        let (mut e0, mut e1, mut e2) = (vec![0.0f64; 0], vec![0.0f64; 0], vec![0.0f64; 0]);
+        be.exec_fused_plan(
+            FusedPlan::Vec3AddScaledF64 {
+                s: 1.0,
+                a: [&empty, &empty, &empty],
+                b: [&empty, &empty, &empty],
+                o: [&mut e0[..], &mut e1[..], &mut e2[..]],
+            },
+            empty_io(),
+        )
+        .unwrap();
+
+        // ⑦ 形状/长度错 ⇒ Err（不 panic）
         assert!(matches!(
             be.exec_fused_plan(
                 FusedPlan::Axpy { alpha: 1.0 },
