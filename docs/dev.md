@@ -7088,6 +7088,35 @@ A/B（A=portable，B=override；6 对丢首对中位；loadavg 7.22/6.26/5.36）
 **真实流量反推**：A 重读（A 行被 32 个列条带各读一遍 ⇒ ≈128 MB）+ C 部分和读写 4 次（≈36 MB）+ B 打包 ≈8 MB ⇒ **≈172 MB / 38 ms ≈ 4.5 GB/s 有效**；
 L1/L2 miss 直接堵 FMA 流水 ⇒ **下一步只能是分块与布局重构（A-blocking / 更宽列条带 / 减少 C 往返），不是汇编**（已派后续任务）。
 
+**分块轮最终结论（修正归因，仍是负结果）**：实现 **A-blocking（m 块 `MC_ROWS=128`，循环次序 `(m块)→(k块)→(列条带)→(块内4行)`）**，流量模型：
+原 A 重读 = strips(32)×m·k·4 = **128 MB**、B≈4 MB、C≈36 MB ⇒ ≈168 MB；A-blocking 后 A=**8 MB**、B 重读≈**32 MB**、C 36 MB ⇒ **≈76 MB（模型 −55%）**；**bitwise 验证通过**（33 项测试含 bit-exact 对照）。
+**实测（grade C，loadavg 8.5–10.6；pin、进程交替、iters=5、9 轮中位）**：1024³ baseline 41.86 vs A-blocking 42.03 = **0.996×（无收益）**；1536³ 155.1 vs 154.0 = 1.007×（噪声内）。
+⇒ **模型预测 −55% 流量却 0 收益 ⇒ A 重读不是瓶颈**：A 只有 4 MB，整块在 **L3**，32 遍重读是 **L3 命中**，不是 DRAM。
+**修正 `§7.44` 上文归因**：所谓"172 MB 流量堵 FMA 流水"应改为 **这些字节绝大部分由 L3 服务、带宽不是限制**；真实 −24%（相对 L1 探针 69.3 GFLOPS）更可能是 **L1 级效应**：
+每个 (条带, k 块) 切换要把 32 KB B 带重新填 L1（1024³ 共 32 条带×4 k 块 = 128 次/面板×2 面板）、**C 部分和的 L1 RMW**、以及微内核外循环/分支开销。
+更宽条带（64/128）需要 32 个累加器（LASX 仅 32 向量寄存器 ⇒ 必溢出）；单 k 块条带 128 KB 超 L1（既有实测 47–49 GFLOPS 更差）⇒ 均未做。
+**GEMM 最终判定（不再盲试）**：1t 1024³ **52.74 GFLOPS = 0.878× OB**、1536³ **52.14 = 0.825×**；已排除微内核编译/调度、k 展开、K_CHUNK、A 预取、B 双缓冲、6 行形状、A-blocking；
+**唯一有依据的下一步 = 用 perf 计数（L1D miss）定位 L1 冲突/条带常驻设计**（本机本会话无 perf 权限，无法定量）⇒ **零改动保留原实现**。
+
+## 7.45 契约瘦身 + 自动化：73 方法盘点、单源真相表、Plan 执行器（试点 axpy/softmax）
+
+**问题**：`Backend` 已 73 方法，"每来一个融合能力就加一个具名方法"，加一个能力要手改 **6 处**（trait/默认实现/scalar 参照/namecheck 白名单/文档/测试）。
+**交付 1（`simd_dsl` `d2e4570`）：单源真相自动化**
+- `src/contract/primitives.tsv`：**73 行**（name / family / capability / tier / 等价类）= trait 方法清单唯一真相；
+- `scripts/gen_primitives.sh`：表 → `scripts/gen/namecheck_whitelist.gen`（`allowed_ops`=表 ∪ **自动发现的 62 个 `scalar` pub fn**；`allowed_components` 从名字 tokens 自动派生）+ `docs/primitives.md`（族计数+明细）；`--check` 防漂移；
+- `scripts/namecheck.sh`：**删除两行手工维护清单**，改读生成物 + 先 `--check`；`tests/primitives_table.rs`：**表↔trait 双向集合相等**、族/tier/class 闭集、生成物新鲜度。
+- **指标（如实）**：加一个原语的手改处 **6 → 3**（trait 1 / 默认实现 1 / **表 1 行**；namecheck/文档/组件/结构测试全自动）；**边界**：方法体、scalar 实现、等价类测试仍需语义判断 ⇒ 不宣称"1 行搞定一切"。
+**交付 2（`simd_dsl` `daa9419`）：Plan 执行器（入口维度瘦身）**
+- 新增 `PatternKind { Axpy, SoftmaxRows }` + `FusedPlan { Axpy{alpha}, SoftmaxRows{rows,cols} }` + `FusedIo{x,y,out}` + `supports_plan`（默认 false）+ `exec_fused_plan`（**portable 默认=解释计划=现有组合**）；
+- **试点**：`axpy_f32`/`softmax_rows_f32` 默认实现改**薄委托** `exec_fused_plan`（签名/语义不变；底层 `axpy_inplace_f32`/`map_rows_sum_f32` 保留）；
+- **数值**：AXPY 计划路径 vs 迁移前 vs 标量参照 **`to_bits` 全等**；softmax 计划路径 vs 迁移前 3 趟序列 **`to_bits` 全等**；vs 标量参照 `max abs 7.45e-9`（原 1e-6 界不变）；
+- **性能（同进程 5 对丢首对中位；loadavg 8.24/6.52/4.50）**：softmax 迁移后 vs 迁移前 **1.027×**、axpy 薄委托 vs 就地原语 **1.009×** ⇒ **不退化**；
+- **指标**：**新增一个 pattern 的成本 = 表 1 行 + 1 个 `match` 臂；trait 方法 0 增长**（新增能力不再扩契约）；本轮试点后 `Backend` 方法 73→75（+2 = `supports_plan`/`exec_fused_plan`），**具名方法未删**——
+  **瘦身是"入口维度"的结构性解法，不是靠删方法**（如实）。
+**未迁清单（兼容保留，不假删；`structure.md §3.1.1` 标注）**：① `rms_norm`/`layer_norm`/`gelu_quick`/`rope_apply`（优先）；
+② 几何 5；③ 量化 4。迁移路径 = 各自变成 `FusedPlan` 变体 + `exec_fused_plan` 解释臂 +（可选）后端 pattern override。
+
+
 
 
 
