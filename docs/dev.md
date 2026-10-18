@@ -7307,11 +7307,15 @@ LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 fal
 | **I4** | contract 内 4 个长度/溢出 helper → `contract::guard`（2 原语 + 2 适配器） | `444a7e4`→`70d9464` | 383 tests 绿、clippy/nightly rustdoc 绿；独立校验 4→2 |
 | **I5** | **API 面快照门禁** `apicheck.sh` + 基线（**463 条**）+ 自测 | `b220241`→`a7912ad` | 自测 6 类（含"同文件同名删一个"防假绿）；CI 步骤绿 |
 | 附加 | CI 增 `Capability consumer guard` / `API surface snapshot guard` 两步 | `simd d4d2dd0` | 本地三脚本绿；CI 随后验证 |
+| **I8** | 本地/CI 门禁不一致 ⇒ `gate_local.sh`（23 步一条命令 + `--check` 比对 CI 全部脚本调用 + 5 用例自测） | `e989c0b`→`2ae08b7` | **实测抓到真实漂移**：合入后 `--check` 报"CI 引用 21、本地缺 2"（namecheck_test/opcheck_test），补齐后缺口 0；`gate_local_test` 5/5 |
+| **I9** | namecheck/opcheck 无自测 ⇒ 各补 4 反例真红且点名 + 2 正例；CI 改为"先自测再门禁" | `e3aa7a9`→`7df0c79` | 各 **6/6**；原门禁不回归（namecheck 163 文件 / opcheck 18 文件） |
 
 **未做（如实留在审计报告的"改进优先级/未做与风险"章节）**：**I6** perceive 家族 `analysis` feature 门控 / rewrite 判断下沉 / reference 门控（breaking 面积大，需单独决策）；
-**I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）；门禁盲区补测（namecheck/opcheck 负例自测）。
-**过程记录**：CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障（非代码问题，已记审计报告的改进实施记录）。
-**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71/#72）。
+**I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）。
+**过程记录（阻塞与恢复，如实）**：① CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障；
+② 审计 I8/I9 落地期间**磁盘配额耗尽（EDQUOT）**：`bash` 工具连 `echo alive` 都写失败、`write` 工具报 `-122`，连续 3 轮无法跑门禁/提交 ⇒ 目标标 blocked；
+用户清理磁盘并重启后**复验**：namecheck/capabilitycheck（当时红）**恢复绿**、`test --features conformance`/clippy/nightly rustdoc/docrefcheck/apicheck/capabilitycheck/gate_local --check/两个自测全绿 ⇒ 证实此前红是磁盘假象，非代码问题。
+**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`/`e989c0b`/`2ae08b7`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71–#74）。
 
 
 
