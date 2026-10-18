@@ -120,3 +120,11 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "geomf64_auto_ab"
 required-features = ["dsl-backend"]
+
+# `f64_map_ab`（P1-4）：**LASX f64 逐元素 override vs portable 默认** A/B——
+# A = `simd_dsl::kernels::scalar::{map_binary,map_ternary,map_affine}_f64`（契约默认实现），
+# B = `LasxBackend::{...}_f64`（本仓 `ops::f64_map` 的 LASX 4×f64 向量内核）。
+# 同进程交替 6 对丢首对中位、n = 1M/8M、先逐位再谈倍率；目标 ≥2×，不足如实记。
+[[example]]
+name = "f64_map_ab"
+required-features = ["dsl-backend"]

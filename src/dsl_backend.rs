@@ -5,13 +5,15 @@
 //!   （`ops::matmul::matmul_f32` / `ops::dot::dot`）——**不绕开、不新写算法、不改语义**；
 //! - **已覆盖（本仓有内核可接的）**：`matmul_f32`/`dot_f32`、**`matmul_f64`/`dot_f64`（IS-2）**、
 //!   **`matmul_bt_f32`（IS-1）**、`reduce_sum_f32`、`map_affine_f32`、`map_binary_f32`、
+//!   **`map_binary_f64`/`map_ternary_f64`/`map_affine_f64`（P1-4，LASX f64 逐元素）**、
 //!   `reduce_{sum,weighted_sum,centered_sq_sum}_cols_f32`、`matmul_pair_psd_f32`、
 //!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
 //!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
 //!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`；
 //! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约、`max/min_{cols,rows}`、
-//!   `map_unary_f32`/`map_binary_scalar_f32`、banded/stencil、f64 逐元素族 ⇒ **走 `simd_dsl` 标量默认**
-//!   （**不 panic**；性能必然不如 api 版，迁移时按"无内核 ⇒ 不替换"如实记）；
+//!   `map_unary_f32`/`map_binary_scalar_f32`、banded/stencil、**f64 逐元素的其他族（如 f64 轴归约、
+//!   `map_unary_f64`）** ⇒ **走 `simd_dsl` 标量默认**（**不 panic**；性能必然不如向量版，
+//!   迁移时按"无内核 ⇒ 不替换"如实记）；
 //! - **线程**：`CallOpts{threads}` **未接**（本后端不按 opts 派活，见文末 ③b-4 留档）；但 **GEMM 内核
 //!   自己**在 `work ≥ 32M` 时走**进程级全局池**（`ops::matmul::matmul_f32`，§7.28；`init_global(1)`
 //!   是逃生门）⇒ **大形状 A/B 的 `threads` 会 >1**，必须在表里打印（`examples/migrate_ab.rs` 已照做）。
@@ -54,7 +56,7 @@
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
-    PackedB, PrecisionClaim, ScalarKind, UnaryOp,
+    PackedB, PrecisionClaim, ScalarKind, TernaryOp, UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -280,6 +282,107 @@ impl Backend for LasxBackend {
             }
             None => simd_dsl::kernels::scalar::map_binary_f32(x, y, out, op)?,
         }
+        Ok(())
+    }
+
+    /// **P1-4：f64 逐元素 LASX 覆盖**（4 f64/lane + 尾部标量；**逐位类**）。
+    ///
+    /// `Add`/`Sub`/`Mul`/`Div` 由 `ops::f64_map::map_binary` 向量化；**`Max`/`Min` 仍委托标量**：
+    /// Rust `f64::max` 的 NaN 语义（另一侧是数就返回它）≠ LASX `xvfmax_d` 的 IEEE 语义。
+    /// **等价类：逐位**（向量指令与标量 IEEE 运算逐位同结果；测试 `f64_map_is_bitwise_vs_scalar`）。
+    fn map_binary_f64(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        out: &mut [f64],
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        if y.len() != x.len() {
+            return Err(len_err("map_binary_f64", "y", x.len(), y.len()));
+        }
+        if out.len() != x.len() {
+            return Err(len_err("map_binary_f64", "out", x.len(), out.len()));
+        }
+        let fast = match op {
+            BinaryOp::Add => Some(crate::ops::f64_map::BinOpF64::Add),
+            BinaryOp::Sub => Some(crate::ops::f64_map::BinOpF64::Sub),
+            BinaryOp::Mul => Some(crate::ops::f64_map::BinOpF64::Mul),
+            BinaryOp::Div => Some(crate::ops::f64_map::BinOpF64::Div),
+            // NaN 语义按 Rust ⇒ 委托标量（同 f32 的口径）
+            _ => None,
+        };
+        match fast {
+            Some(fop) => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+                    "map_binary_f64: out 不得与 x 重叠（契约）"
+                );
+                debug_assert!(
+                    !std::ptr::eq(y.as_ptr(), out.as_ptr()),
+                    "map_binary_f64: out 不得与 y 重叠（契约）"
+                );
+                crate::ops::f64_map::map_binary(x, y, out, fop);
+            }
+            None => simd_dsl::kernels::scalar::map_binary_f64(x, y, out, op)?,
+        }
+        Ok(())
+    }
+
+    /// **P1-4：`map_ternary_f64` 的 LASX 覆盖**（`SubSub = x − y − z`，两次向量减法）。**逐位类**。
+    fn map_ternary_f64(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        out: &mut [f64],
+        op: TernaryOp,
+    ) -> Result<(), BackendError> {
+        if y.len() != x.len() {
+            return Err(len_err("map_ternary_f64", "y", x.len(), y.len()));
+        }
+        if z.len() != x.len() {
+            return Err(len_err("map_ternary_f64", "z", x.len(), z.len()));
+        }
+        if out.len() != x.len() {
+            return Err(len_err("map_ternary_f64", "out", x.len(), out.len()));
+        }
+        match op {
+            // **逐位**：与标量参照同序 `(x − y) − z`，两次减法不重排。
+            TernaryOp::SubSub => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr())
+                        && !std::ptr::eq(y.as_ptr(), out.as_ptr())
+                        && !std::ptr::eq(z.as_ptr(), out.as_ptr()),
+                    "map_ternary_f64: out 不得与输入重叠（契约）"
+                );
+                crate::ops::f64_map::map_ternary(x, y, z, out);
+                Ok(())
+            }
+            // `TernaryOp` 是 `#[non_exhaustive]`（外部 crate 视角）⇒ 将来新增变体一律**委托标量**
+            // （保守、正确优先；与 f32 的 `map_binary_f32` 对未知 `BinaryOp` 的口径一致）。
+            _ => simd_dsl::kernels::scalar::map_ternary_f64(x, y, z, out, op),
+        }
+    }
+
+    /// **P1-4：`map_affine_f64` 的 LASX 覆盖**（`a·x + b`，**故意不融 FMA** ⇒ **逐位类**）。
+    ///
+    /// 用两条向量指令（`xvfmul_d` + `xvfadd_d`）换"与标量参照 `a * v + b` 同序"；
+    /// 若改单条 `xvfmadd_d` 会降到容差类（f32 版本就是这样）——本批优先逐位。
+    fn map_affine_f64(
+        &self,
+        x: &[f64],
+        a: f64,
+        b: f64,
+        out: &mut [f64],
+    ) -> Result<(), BackendError> {
+        if out.len() != x.len() {
+            return Err(len_err("map_affine_f64", "out", x.len(), out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "map_affine_f64: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::f64_map::map_affine(a, b, x, out);
         Ok(())
     }
 
@@ -789,9 +892,12 @@ impl Backend for LasxBackend {
     /// **只低估**：已实现且**有测试**的能力才打开。
     /// * `Packing`：`pack_f32` + `matmul_f32_packed`（逐位断言已过，测试 `packed_bitwise_same_as_matmul`）；
     /// * `MatmulF64`：**IS-2 已接** `matmul_f64`/`dot_f64` → LASX f64 内核（与 `api::*` 逐位，
-    ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）。
+    ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）；
+    /// * **`F64Elementwise`（P1-4 新增）**：`map_binary_f64`/`map_ternary_f64`/`map_affine_f64`
+    ///   已 override 到 `ops::f64_map`（LASX 4 f64/lane；与 `kernels::scalar` **逐位**，
+    ///   测试 `f64_map_is_bitwise_vs_scalar`）。
     ///
-    /// 其余（逐元素/归约/超越/多线程/复数组合步/f64 逐元素）**继续 `false`**（"只报确实为真"；
+    /// 其余（归约/超越/多线程/复数组合步）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
     fn supports(&self, cap: Capability) -> bool {
         // 阶段4：`FusedNorms` / `FusedElementwise` / `FusedGeometry` **只报真**——
@@ -800,6 +906,7 @@ impl Backend for LasxBackend {
             cap,
             Capability::Packing
                 | Capability::MatmulF64
+                | Capability::F64Elementwise
                 | Capability::FusedNorms
                 | Capability::FusedElementwise
                 | Capability::FusedGeometry
@@ -1602,7 +1709,8 @@ mod tests {
                 .is_some(),
             "递推 f64 已在 ③b-1 声明"
         );
-        // **只低估**：`Packing`（packed 已接线且逐位断言过）与 `MatmulF64`（IS-2 已接）为真；
+        // **只低估**：`Packing`（packed 已接线且逐位断言过）、`MatmulF64`（IS-2 已接）与
+        // `F64Elementwise`（P1-4 已接）为真；
         // 其余能力一律 false（`Threaded` 仍 false：`CallOpts` 未接，见 ③b-4 留档）
         assert!(
             be.supports(Capability::Packing),
@@ -1612,8 +1720,73 @@ mod tests {
             be.supports(Capability::MatmulF64),
             "IS-2 后 matmul_f64/dot_f64 有专用实现 ⇒ 应为 true"
         );
+        assert!(
+            be.supports(Capability::F64Elementwise),
+            "P1-4 后 map_*_f64 有 LASX 向量内核且逐位断言过 ⇒ 应为 true"
+        );
         assert!(!be.supports(Capability::Transcendental));
         assert!(!be.supports(Capability::Threaded));
+    }
+
+    /// **P1-4：f64 逐元素 LASX 覆盖 vs `kernels::scalar` 参照**——多形状（含非 4 倍数/尾部/空）
+    /// × 全部 op ⇒ **逐位**（`to_bits()`）；`Max`/`Min` 走标量委托（同样逐位）与形状错误路径。
+    #[test]
+    fn f64_map_is_bitwise_vs_scalar() {
+        use simd_dsl::kernels::scalar;
+        let be = LasxBackend;
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for &n in &[0usize, 1, 3, 4, 5, 15, 16, 17, 33, 1029] {
+            let x: Vec<f64> = (0..n)
+                .map(|i| ((i * 37 % 101) as f64) * 0.1 - 5.05)
+                .collect();
+            let y: Vec<f64> = (0..n).map(|i| ((i * 53 % 97) as f64) * 0.1 + 1.3).collect();
+            let z: Vec<f64> = (0..n).map(|i| ((i * 11 % 89) as f64) * 0.1 - 0.7).collect();
+            for op in [
+                BinaryOp::Add,
+                BinaryOp::Sub,
+                BinaryOp::Mul,
+                BinaryOp::Div,
+                BinaryOp::Max,
+                BinaryOp::Min,
+            ] {
+                let mut got = vec![f64::NAN; n];
+                be.map_binary_f64(&x, &y, &mut got, op).expect("backend");
+                let mut want = vec![f64::NAN; n];
+                scalar::map_binary_f64(&x, &y, &mut want, op).expect("scalar");
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "map_binary_f64 n={n} op={op:?} 不逐位"
+                );
+            }
+            let mut got = vec![f64::NAN; n];
+            be.map_ternary_f64(&x, &y, &z, &mut got, TernaryOp::SubSub)
+                .expect("backend");
+            let mut want = vec![f64::NAN; n];
+            scalar::map_ternary_f64(&x, &y, &z, &mut want, TernaryOp::SubSub).expect("scalar");
+            assert_eq!(bits(&got), bits(&want), "map_ternary_f64 n={n} 不逐位");
+            let mut got = vec![f64::NAN; n];
+            be.map_affine_f64(&x, 0.3, -1.7, &mut got).expect("backend");
+            let mut want = vec![f64::NAN; n];
+            scalar::map_affine_f64(&x, 0.3, -1.7, &mut want).expect("scalar");
+            assert_eq!(bits(&got), bits(&want), "map_affine_f64 n={n} 不逐位");
+        }
+        // 形状错误 ⇒ LengthMismatch（不 panic）
+        let v = vec![1.0f64; 6];
+        let mut o = vec![0.0f64; 6];
+        assert!(
+            be.map_binary_f64(&v, &v[..5], &mut o, BinaryOp::Add)
+                .is_err()
+        );
+        assert!(
+            be.map_binary_f64(&v, &v, &mut o[..5], BinaryOp::Add)
+                .is_err()
+        );
+        assert!(
+            be.map_ternary_f64(&v, &v[..5], &v, &mut o, TernaryOp::SubSub)
+                .is_err()
+        );
+        assert!(be.map_affine_f64(&v, 1.0, 0.0, &mut o[..5]).is_err());
     }
 
     /// **R19-E：逐元素/轴归约族必须与标量参照逐位**（`map_affine` 不融 FMA；轴归约按行序累加），
