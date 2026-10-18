@@ -58,7 +58,8 @@
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
-    PackedB, PrecisionClaim, ReduceMapOp, ScalarKind, TernaryOp, UnaryOp,
+    FusedIo, FusedPlan, PackedB, PatternKind, PrecisionClaim, ReduceMapOp, ScalarKind, TernaryOp,
+    UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -1242,6 +1243,73 @@ impl Backend for LasxBackend {
         })
     }
 
+    // ============ P3 Plan 试点：`supports_plan` / `exec_fused_plan`（task-63）============
+    //
+    // **语义映射（契约 `daa9419` 定死，不是猜）**：
+    // * `FusedPlan::Axpy { alpha }` = `y := alpha·x + y`（**就地**；用 `FusedIo::x` 只读、
+    //   `FusedIo::y` 输出；`FusedIo::out` 必须为空）——与 `axpy_inplace_f32`/`axpy_f32` 同义；
+    // * `FusedPlan::SoftmaxRows { rows, cols }` = `[rows, cols]` 行 softmax（用 `FusedIo::x` 只读、
+    //   `FusedIo::out` 输出；`FusedIo::y` 必须为空）——与 `softmax_rows_f32` 同义。
+    // **本后端映射**：Axpy → `api::axpy`（LASX 就地内核）；SoftmaxRows → `api::softmax_rows_into`
+    // （LASX 1 趟融合核）。**长度/形状校验与具名方法同口径**（错 ⇒ `LengthMismatch`/`ShapeOverflow`）。
+    // 数值：Plan 路 ≡ 本后端具名方法 **逐位**（同一内核）；与 portable 计划解释比 = 既有容差类
+    // （axpy 8.27e-8 / softmax 2.79e-9，见上方融合原语注释）。
+
+    fn supports_plan(&self, kind: PatternKind) -> bool {
+        // 两个 kind 都已接融合核 => 都报 true（按 PatternKind 粒度、只低估）。
+        matches!(kind, PatternKind::Axpy | PatternKind::SoftmaxRows)
+    }
+
+    fn exec_fused_plan(&self, plan: FusedPlan, io: FusedIo<'_>) -> Result<(), BackendError> {
+        match plan {
+            FusedPlan::Axpy { alpha } => {
+                // Plan 语义：y := alpha·x + y（就地）；`out` 不参与（契约为空）。
+                if io.y.len() != io.x.len() {
+                    return Err(len_err(
+                        "exec_fused_plan(Axpy)",
+                        "y",
+                        io.x.len(),
+                        io.y.len(),
+                    ));
+                }
+                if io.x.is_empty() {
+                    return Ok(());
+                }
+                debug_assert_ne!(
+                    io.x.as_ptr(),
+                    io.y.as_ptr(),
+                    "exec_fused_plan(Axpy)：x/y 不得重叠"
+                );
+                crate::api::axpy(alpha, io.x, io.y).map_err(|_| BackendError::Unsupported {
+                    op: "exec_fused_plan(Axpy)",
+                    cap: Capability::FusedElementwise,
+                })
+            }
+            FusedPlan::SoftmaxRows { rows, cols } => {
+                let op = "exec_fused_plan(SoftmaxRows)";
+                let n = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+                    op,
+                    what: "rows×cols",
+                })?;
+                if io.x.len() != n {
+                    return Err(len_err(op, "x", n, io.x.len()));
+                }
+                if io.out.len() != n {
+                    return Err(len_err(op, "out", n, io.out.len()));
+                }
+                if n == 0 {
+                    return Ok(());
+                }
+                crate::api::softmax_rows_into(io.x, None, rows, cols, 1.0, io.out).map_err(|_| {
+                    BackendError::Unsupported {
+                        op,
+                        cap: Capability::FusedNorms,
+                    }
+                })
+            }
+        }
+    }
+
     /// **P5-b：跨步拷贝** → `ops::strided::copy_strided_f32`（`col==1` 走 memcpy 行拷贝）。
     ///
     /// **别名未测**（如实）：本轮**没有**做 `src`/`dst` 重叠检测或测试；契约与 `simd_dsl` 默认实现一致
@@ -2063,5 +2131,140 @@ mod tests {
             be.fft_strided_f32(&mut [0.0f32; 8], &mut [0.0f32; 8], 8, 2)
                 .is_err()
         );
+    }
+
+    /// **P3 Plan 试点（task-63）**：`supports_plan` / `exec_fused_plan` 的语义映射与数值——
+    /// Plan 路 ≡ 本后端具名方法 ≡ 直接 `api::*`（**逐位**）；
+    /// vs portable 计划解释 = 既有容差类（axpy FMA 8.27e-8 / softmax 2.79e-9 相对）；
+    /// portable 后端 `supports_plan` 仍 false（两个 kind）；长度错 ⇒ `Err`。
+    #[test]
+    fn plan_overrides_map_to_fused_kernels_and_stay_bitwise() {
+        use simd_dsl::{FusedIo, FusedPlan, PatternKind, ScalarBackend};
+        let be = LasxBackend;
+
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端两个 kind 都接；portable 两个都 false
+        assert!(be.supports_plan(PatternKind::Axpy));
+        assert!(be.supports_plan(PatternKind::SoftmaxRows));
+        assert!(!ScalarBackend.supports_plan(PatternKind::Axpy));
+        assert!(!ScalarBackend.supports_plan(PatternKind::SoftmaxRows));
+
+        // ② Axpy：Plan 路 ≡ 命名方法 ≡ 直接 api（逐位）
+        let n = 257usize;
+        let x: Vec<f32> = (0..n).map(|i| (i % 37) as f32 * 0.125 - 2.0).collect();
+        let base: Vec<f32> = (0..n).map(|i| (i % 53) as f32 * 0.0625 + 1.0).collect();
+        let mut y_plan = base.clone();
+        be.exec_fused_plan(
+            FusedPlan::Axpy { alpha: 0.375 },
+            FusedIo {
+                x: &x,
+                y: &mut y_plan,
+                out: &mut [],
+            },
+        )
+        .unwrap();
+        let mut y_named = base.clone();
+        be.axpy_f32(&mut y_named, &x, 0.375).unwrap();
+        let mut y_api = base.clone();
+        crate::api::axpy(0.375, &x, &mut y_api).unwrap();
+        for (a, b) in y_plan.iter().zip(&y_named) {
+            assert_eq!(a.to_bits(), b.to_bits(), "Axpy：Plan 路与命名方法不逐位");
+        }
+        for (a, b) in y_plan.iter().zip(&y_api) {
+            assert_eq!(a.to_bits(), b.to_bits(), "Axpy：Plan 路与直接 api 不逐位");
+        }
+        // vs portable 计划解释（容差类：LASX 就地内核用 FMA）
+        let mut y_port = base.clone();
+        ScalarBackend
+            .exec_fused_plan(
+                FusedPlan::Axpy { alpha: 0.375 },
+                FusedIo {
+                    x: &x,
+                    y: &mut y_port,
+                    out: &mut [],
+                },
+            )
+            .unwrap();
+        let d_axpy = y_plan
+            .iter()
+            .zip(&y_port)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("Plan Axpy：LASX vs portable 计划解释 max|d| = {d_axpy:.3e}");
+
+        // ③ SoftmaxRows：Plan 路 ≡ 命名方法（逐位）；vs portable 计划解释容差
+        let (rows, cols) = (16usize, 129usize);
+        let m = rows * cols;
+        let xs: Vec<f32> = (0..m).map(|i| (i % 71) as f32 * 0.05 - 1.8).collect();
+        let mut out_plan = vec![0.0f32; m];
+        be.exec_fused_plan(
+            FusedPlan::SoftmaxRows { rows, cols },
+            FusedIo {
+                x: &xs,
+                y: &mut [],
+                out: &mut out_plan,
+            },
+        )
+        .unwrap();
+        let mut out_named = vec![0.0f32; m];
+        be.softmax_rows_f32(&xs, rows, cols, &mut out_named)
+            .unwrap();
+        for (a, b) in out_plan.iter().zip(&out_named) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "SoftmaxRows：Plan 路与命名方法不逐位"
+            );
+        }
+        let mut out_port = vec![0.0f32; m];
+        ScalarBackend
+            .exec_fused_plan(
+                FusedPlan::SoftmaxRows { rows, cols },
+                FusedIo {
+                    x: &xs,
+                    y: &mut [],
+                    out: &mut out_port,
+                },
+            )
+            .unwrap();
+        let d_sm = out_plan
+            .iter()
+            .zip(&out_port)
+            .fold(0.0f32, |mx, (a, b)| mx.max((a - b).abs()));
+        eprintln!("Plan SoftmaxRows：LASX vs portable 计划解释 max|d| = {d_sm:.3e}");
+        assert!(d_sm <= 1e-5, "SoftmaxRows 计划路与 portable 超界 {d_sm:e}");
+
+        // ④ 形状/长度错 ⇒ Err（不 panic）
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::Axpy { alpha: 1.0 },
+                FusedIo {
+                    x: &[1.0, 2.0, 3.0],
+                    y: &mut [0.0; 2],
+                    out: &mut [],
+                },
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::SoftmaxRows { rows: 2, cols: 3 },
+                FusedIo {
+                    x: &[1.0, 2.0],
+                    y: &mut [],
+                    out: &mut [0.0; 6],
+                },
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            be.exec_fused_plan(
+                FusedPlan::SoftmaxRows { rows: 2, cols: 3 },
+                FusedIo {
+                    x: &[1.0; 6],
+                    y: &mut [],
+                    out: &mut [0.0; 5],
+                },
+            ),
+            Err(BackendError::LengthMismatch { .. })
+        ));
     }
 }

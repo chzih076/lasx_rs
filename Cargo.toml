@@ -37,11 +37,11 @@ lasx_rs_macros = { path = "macros", version = "0.1.0" }
 # （`git ls-remote <panel>` 取实值），否则本仓看到的是**旧快照**——③b-3b 就是因为 rev 钉在 `fc57fc7`
 # 而误判"`IdiomaticBackend` 未导出"（实际 `521e837` 已 `pub use idiomatic::IdiomaticBackend;`）。
 # 改完必须 `cargo update -p simd_dsl` 让 `Cargo.lock` 跟上。
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "6d3e41ab95aa1ea305b68f140cb457378990a8a0", optional = true }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "daa941913371f90ed4bd71cb4384472c041cf670", optional = true }
 # **可选**：`ops_dsl`（算子库，含谱检测整帧 `detect`）——**只给"帧级 A/B"示例用**。
 # 依赖方向仍向下：`lasx_rs → ops_dsl → simd_dsl`；与 `simd_dsl` 同一个 rev（同一 git 仓的 workspace 成员）。
 # 仅在本 feature 下解析 ⇒ 默认构建不受影响（同上：一移动就 bump、并 `cargo update -p ops_dsl`）。
-ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "6d3e41ab95aa1ea305b68f140cb457378990a8a0", optional = true }
+ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "daa941913371f90ed4bd71cb4384472c041cf670", optional = true }
 
 [features]
 # 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
@@ -148,4 +148,12 @@ required-features = ["dsl-backend"]
 # 同进程交替 6 对丢首对中位；先逐位再谈倍率，**≥1.10× 才保留该 override**。
 [[example]]
 name = "quant_i8_ab"
+required-features = ["dsl-backend"]
+
+# `plan_ab`（task-63）：**Plan 路径（`exec_fused_plan`）vs 命名方法 vs 直接 api** A/B——
+# A = `LasxBackend::exec_fused_plan`（override → LASX 融合核），B = 命名方法（`axpy_f32`/
+# `softmax_rows_f32`，同一内核），C = `api::axpy`/`api::softmax_rows_into` 直调。
+# 同进程交替 6 对丢首对中位；A≡B≡C 逐位；**B/A、C/A ≥0.98** 才算 Plan 路径不掉性能。
+[[example]]
+name = "plan_ab"
 required-features = ["dsl-backend"]
