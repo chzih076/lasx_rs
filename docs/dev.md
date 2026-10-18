@@ -7116,6 +7116,16 @@ L1/L2 miss 直接堵 FMA 流水 ⇒ **下一步只能是分块与布局重构（
 **未迁清单（兼容保留，不假删；`simd_dsl` 的 `docs/structure.md` 第 3.1.1 节标注）**：① `rms_norm`/`layer_norm`/`gelu_quick`/`rope_apply`（优先）；
 ② 几何 5；③ 量化 4。迁移路径 = 各自变成 `FusedPlan` 变体 + `exec_fused_plan` 解释臂 +（可选）后端 pattern override。
 
+**交付 3（后端适配，`lasx_rs` `1dca0d8`）：Plan 路径不因抽象掉性能**
+- `dsl_backend.rs`（独占）实现 `supports_plan`：**按 `PatternKind` 粒度如实**（`Axpy`/`SoftmaxRows` 都已接融合核 ⇒ 两个都 true；portable 仍两个 false）；
+  `exec_fused_plan`：`Axpy → api::axpy`（就地）、`SoftmaxRows → api::softmax_rows_into`（LASX 1 趟），长度/形状校验（`LengthMismatch`/`ShapeOverflow`/空 ⇒ `Ok`）；
+- **语义映射读契约 + `tests/fused_plan.rs` 确认、不猜**：Axpy = `y := alpha·x + y`（就地，`io.out` 空）；SoftmaxRows = 行 softmax（`io.out` 输出，`io.y` 空）；
+- **A/B（同进程交替 6 对丢首对中位；threads=12；loadavg 7.56）**：Axpy（1M）Plan **0.358 ms**、命名 0.360、api 0.360 ⇒ **B/A 1.004×、C/A 1.011×**；
+  SoftmaxRows（512×2048）Plan 0.185、命名 0.189、api 0.197 ⇒ **B/A 1.023×、C/A 1.038×**；
+  **三路逐位等价**（axpy/softmax），vs portable 计划解释差 2.38e-7 / 3.96e-9（融合核容差类，与既有原语一致）。
+- ⇒ **Plan 入口 → LASX 融合核闭环**：契约不再为每个融合能力加具名方法，后端只需实现一个执行器；性能/数值与直连 api 同级。
+
+
 
 
 
