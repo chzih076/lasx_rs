@@ -7113,7 +7113,7 @@ L1/L2 miss 直接堵 FMA 流水 ⇒ **下一步只能是分块与布局重构（
 - **性能（同进程 5 对丢首对中位；loadavg 8.24/6.52/4.50）**：softmax 迁移后 vs 迁移前 **1.027×**、axpy 薄委托 vs 就地原语 **1.009×** ⇒ **不退化**；
 - **指标**：**新增一个 pattern 的成本 = 表 1 行 + 1 个 `match` 臂；trait 方法 0 增长**（新增能力不再扩契约）；本轮试点后 `Backend` 方法 73→75（+2 = `supports_plan`/`exec_fused_plan`），**具名方法未删**——
   **瘦身是"入口维度"的结构性解法，不是靠删方法**（如实）。
-**未迁清单（兼容保留，不假删；`structure.md §3.1.1` 标注）**：① `rms_norm`/`layer_norm`/`gelu_quick`/`rope_apply`（优先）；
+**未迁清单（兼容保留，不假删；`simd_dsl` 的 `docs/structure.md` 第 3.1.1 节标注）**：① `rms_norm`/`layer_norm`/`gelu_quick`/`rope_apply`（优先）；
 ② 几何 5；③ 量化 4。迁移路径 = 各自变成 `FusedPlan` 变体 + `exec_fused_plan` 解释臂 +（可选）后端 pattern override。
 
 
