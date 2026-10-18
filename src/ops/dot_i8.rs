@@ -11,8 +11,11 @@ use std::arch::loongarch64::*;
 
 /// LASX-only：本内核没有 `has_lasx()` 降级分支，直接执行 256 位实现。
 /// 在无 LASX 的 CPU 上会执行 LASX 指令（见手册 Caveats）。
+///
+/// **返回 i64 精确和**（P1-5 起拆出：N3 的 FFI 入口按 `as i32` 回绕，契约入口按饱和，
+/// 两者共用同一份向量内核 ⇒ 数值同源）。
 #[inline]
-pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+fn dot_i8_i64(a: &[i8], b: &[i8]) -> i64 {
     let n = a.len();
     let mut s_acc: i64 = 0;
     let mut i = 0;
@@ -117,7 +120,21 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     for j in i..n {
         s_acc += (a[j] as i64) * (b[j] as i64);
     }
-    s_acc as i32
+    s_acc
+}
+
+/// **N3 入口**（`ffi::quant::lasx_dot_i8` 用）：i64 精确和后**按 2^32 截断**（历史语义，**不饱和**）。
+#[inline]
+pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    dot_i8_i64(a, b) as i32
+}
+
+/// **P1-5 契约入口**：`Σ a·b` 的 **i64 精确累加 → 末端一次饱和到 i32**（与
+/// `simd_dsl::kernels::scalar::dot_i8` **逐位**；与 N3 入口的差别只在"回绕 vs 饱和"）。
+#[cfg(feature = "dsl-backend")]
+#[inline]
+pub(crate) fn dot_i8_saturating(a: &[i8], b: &[i8]) -> i32 {
+    dot_i8_i64(a, b).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 /// 数值回归测试：对照独立参考实现。
@@ -189,5 +206,33 @@ mod tests {
             exact_i64(&a, &b),
             "n={n} 全 −128（i32 回绕）"
         );
+    }
+
+    /// **P1-5 契约入口 `dot_i8_saturating`**：i64 精确和 → 末端**一次饱和**到 i32
+    /// （与"回绕"入口 N3 的差别只在末端；覆盖正/负饱和与不饱和的多形状）。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn test_dot_i8_saturating_matches_clamped_exact_reference() {
+        use super::dot_i8_saturating;
+        let clamp = |s: i64| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        for &n in &[0usize, 1, 31, 32, 33, 1024, 1029, 100_000] {
+            let a: Vec<i8> = (0..n)
+                .map(|i| ((i * 53 % 251) as i32 - 125) as i8)
+                .collect();
+            let b: Vec<i8> = (0..n)
+                .map(|i| ((i * 97 % 241) as i32 - 120) as i8)
+                .collect();
+            let exact: i64 = a.iter().zip(&b).map(|(&x, &y)| x as i64 * y as i64).sum();
+            assert_eq!(
+                dot_i8_saturating(&a, &b),
+                clamp(exact),
+                "n={n}: 饱和入口与钳位精确参考不逐位"
+            );
+        }
+        // 正饱和：全 127，n=200_000 ⇒ 3.2e9 > i32::MAX
+        let n = 200_000;
+        assert_eq!(dot_i8_saturating(&vec![127; n], &vec![127; n]), i32::MAX);
+        // 负饱和：全 -128 × 127 ⇒ < i32::MIN
+        assert_eq!(dot_i8_saturating(&vec![-128; n], &vec![127; n]), i32::MIN);
     }
 }

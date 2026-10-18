@@ -49,6 +49,18 @@ pub(crate) fn gemv_i8(
     }
 }
 
+/// **P1-5 契约入口**：`out[row] = Σ_t a[row*k + t]·x[t]`（i8 × i8 → i32）。
+///
+/// **溢出语义同 [`Backend::dot_i8`]**：逐行复用 [`crate::ops::dot_i8::dot_i8_saturating`]
+/// （**i64 精确累加 + 末端一次饱和**），而不是每次乘法后 `saturating_add`（后者与累加顺序相关，
+/// 会违反契约"结果与顺序无关"的要求）。`k = 0` ⇒ `out` 全 0；`j = 0` ⇒ 空操作。
+#[cfg(feature = "dsl-backend")]
+pub(crate) fn gemv_i8_i32(j: usize, k: usize, a: &[i8], x: &[i8], out: &mut [i32]) {
+    for r in 0..j {
+        out[r] = crate::ops::dot_i8::dot_i8_saturating(&a[r * k..(r + 1) * k], x);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +145,42 @@ mod tests {
         let acc: i64 = (0..k).map(|i| w[i] as i64 * x[i] as i64).sum();
         let once = (acc as i32 as f32) * (sw[0] * sx);
         assert_eq!(y[0].to_bits(), once.to_bits(), "出口必须是单次舍入");
+    }
+
+    /// **P1-5 契约入口 `gemv_i8_i32`**：`out[o] = Σ a[o·k+t]·x[t]`（i64 精确 + 末端饱和），
+    /// 与独立参考逐位；覆盖 k=0/j=0/非对齐/饱和。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn test_gemv_i8_i32_matches_exact_reference() {
+        use super::gemv_i8_i32;
+        let clamp = |s: i64| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        for &(j, k) in &[
+            (0usize, 5usize),
+            (3, 0),
+            (4, 31),
+            (5, 32),
+            (2, 33),
+            (3, 1029),
+        ] {
+            let a: Vec<i8> = (0..j * k)
+                .map(|i| ((i * 41 % 251) as i32 - 125) as i8)
+                .collect();
+            let x: Vec<i8> = (0..k)
+                .map(|i| ((i * 59 % 241) as i32 - 120) as i8)
+                .collect();
+            let mut got = vec![0i32; j];
+            gemv_i8_i32(j, k, &a, &x, &mut got);
+            for o in 0..j {
+                let exact: i64 = (0..k).map(|t| a[o * k + t] as i64 * x[t] as i64).sum();
+                assert_eq!(got[o], clamp(exact), "gemv {j}×{k} o={o} 不逐位");
+            }
+        }
+        // 饱和：4032 次 127·127 就到 i32::MAX 的一半……用 k=200_000 保证超界
+        let (j, k) = (2usize, 200_000usize);
+        let a = vec![127i8; j * k];
+        let x = vec![127i8; k];
+        let mut got = vec![0i32; j];
+        gemv_i8_i32(j, k, &a, &x, &mut got);
+        assert_eq!(got, vec![i32::MAX; j], "gemv 饱和结果必须是 i32::MAX");
     }
 }

@@ -6,6 +6,8 @@
 //! - **已覆盖（本仓有内核可接的）**：`matmul_f32`/`dot_f32`、**`matmul_f64`/`dot_f64`（IS-2）**、
 //!   **`matmul_bt_f32`（IS-1）**、`reduce_sum_f32`、`map_affine_f32`、`map_binary_f32`、
 //!   **`map_binary_f64`/`map_ternary_f64`/`map_affine_f64`（P1-4，LASX f64 逐元素）**、
+//!   **`quantize_i8_rows_f32`/`dot_i8`/`gemv_i8`（P1-5，LASX i8 内核；`dequantize_i8_rows_f32`
+//!   未接 ⇒ `Capability::Quant` 仍 `false`）**、
 //!   `reduce_{sum,weighted_sum,centered_sq_sum}_cols_f32`、`matmul_pair_psd_f32`、
 //!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
 //!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
@@ -383,6 +385,84 @@ impl Backend for LasxBackend {
             "map_affine_f64: out 不得与 x 重叠（契约）"
         );
         crate::ops::f64_map::map_affine(a, b, x, out);
+        Ok(())
+    }
+
+    // ============ P1-5：i8 量化族 4 个 override（`Capability::Quant`）============
+    //
+    // **语义红线**（契约写死，与 `kernels::scalar` **逐位**）：
+    // * `quantize_i8_rows_f32`：`x/scale[r]` → **ties-even** → **再 clamp [-128,127]**；
+    //   `NaN ⇒ 0`、`+inf ⇒ 127`、`-inf ⇒ -128`（**先舍入后 clamp**，不可换序——除非证明等价，
+    //   内核里用的是"浮点钳位端点为整数 ⇒ 与先取整再钳位等价"的论证 + 边界单测钉住）。
+    // * `dequantize_i8_rows_f32`：`(q as f32) * scale[r]` 一次乘法。
+    // * `dot_i8` / `gemv_i8`：**i64 精确累加 + 末端一次饱和到 i32**（**不是**中途
+    //   `saturating_add`——那会引入累加顺序依赖、违反契约"结果与顺序无关"）。
+    // 等价类：全部**逐位**（整数映射 / 一次乘法 / i64 精确和），见 `ops::quant_i8` 单测。
+
+    fn quantize_i8_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        scale: &[f32],
+        out: &mut [i8],
+    ) -> Result<(), BackendError> {
+        let op = "quantize_i8_rows_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if out.len() != total {
+            return Err(len_err(op, "out", total, out.len()));
+        }
+        if scale.len() != rows {
+            return Err(len_err(op, "scale", rows, scale.len()));
+        }
+        // 注：`x: &[f32]` 与 `out: &mut [i8]` 在**安全 Rust** 下不可能重叠（类型不同 + 借用检查器），
+        // 所以这里不需要（也无法用 `std::ptr::eq` 表达）别名断言——契约由类型系统守。
+        // SAFETY: 三个长度已校验；`out` 与 `x` 不重叠由契约 + `&mut`/`&` 借用保证。
+        unsafe { crate::ops::quant_i8::quantize_i8_rows_contract(x, rows, cols, scale, out) };
+        Ok(())
+    }
+
+    // **P1-5 未接 `dequantize_i8_rows_f32`**（如实记）：LASX 拓宽类指令是 128-bit lane 语义
+    // （`xvsllwil_h_b` 取每个半区低 8 字节，链到 w 后 lane 顺序为 `[b0..b3,b16..b19]`，实测），
+    // 要拼成连续 8 字节块需要 4 次 unaligned load + `xvpermi_q` 合并，收益不足以抵消复杂度 ⇒
+    // 本方法**走便携默认**；因此 `Capability::Quant` **不置真**（该位语义是"4 个方法全有专用实现"）。
+
+    fn dot_i8(&self, a: &[i8], b: &[i8]) -> Result<i32, BackendError> {
+        let op = "dot_i8";
+        if a.len() != b.len() {
+            return Err(len_err(op, "b", a.len(), b.len()));
+        }
+        Ok(crate::ops::dot_i8::dot_i8_saturating(a, b))
+    }
+
+    fn gemv_i8(
+        &self,
+        j: usize,
+        k: usize,
+        a: &[i8],
+        x: &[i8],
+        out: &mut [i32],
+    ) -> Result<(), BackendError> {
+        let op = "gemv_i8";
+        let total = j
+            .checked_mul(k)
+            .ok_or(BackendError::ShapeOverflow { op, what: "j×k" })?;
+        if a.len() != total {
+            return Err(len_err(op, "a", total, a.len()));
+        }
+        if x.len() != k {
+            return Err(len_err(op, "x", k, x.len()));
+        }
+        if out.len() != j {
+            return Err(len_err(op, "out", j, out.len()));
+        }
+        crate::ops::gemv_i8::gemv_i8_i32(j, k, a, x, out);
         Ok(())
     }
 
@@ -955,6 +1035,10 @@ impl Backend for LasxBackend {
 
     /// 其余（归约/超越/多线程/复数组合步）**继续 `false`**（"只报确实为真"；
     /// 归约/逐元素虽有 override，但能力位口径是"该族有专用实现"，本批不扩大声明面）。
+    ///
+    /// **P1-5 的 `Quant` 仍为 `false`**：4 个方法里 `dequantize_i8_rows_f32` **未 override**
+    /// （LASX 拓宽指令的 128-bit lane 语义使连续 i8 块需要额外的多次 load + 重排，收益不足，
+    /// 见上面注释）⇒ 该位语义是"4 个全有专用实现"，**只接 3 个就不报**（只低估）。
     fn supports(&self, cap: Capability) -> bool {
         // 阶段4：`FusedNorms` / `FusedElementwise` / `FusedGeometry` **只报真**——
         // 对应方法**全部**在本文件 override 到 LASX 内核后才报 `true`（只报确实覆盖的族）。
