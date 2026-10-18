@@ -7246,6 +7246,49 @@ B 双缓冲 0.80×、6×32 形状 1.003×、A-blocking 0.996×、+64B 对齐 1.0
 `axpy_f32`/`softmax_rows_f32` 按试点约定**保留为薄委托**（未假删、已说明）；`ops_dsl` 调用方全部改 Plan 面；
 LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 false + portable 回退）。
 
+## 7.47 降低"其他后端"开发成本：共享校验 + 一致性 harness + 骨架生成器（可量化）
+
+**改造前的实测成本**：`lasx_rs/src/dsl_backend.rs` **2915 行**；其中 `exec_fused_plan` 的**校验+派发 374 行**
+（16 pattern × 每后端重抄长度/形状/溢出/别名口径）；`supports_plan` 22 行；后端自建 **311（lib 档）** 测试。
+
+**四项交付（`simd_dsl`）**：
+1) **`FusedPlan::validate(&self, io: &FusedIo<'_>) -> Result<(), BackendError>`**（`d5c8356`，`src/contract/plan_validate.rs`）：
+   **16 pattern 一处实现**（`rows*cols`/`j*k` 溢出 ⇒ `ShapeOverflow`、长度 ⇒ `LengthMismatch`、空输入 ⇒ `Ok`、
+   Rope 的 `n_dims` 偶数/≤cols/`cos`/`sin` 长度、几何 5 的数组长度、量化 4 的 i8/i32 切片）；portable 解释器先调它。
+2) **conformance harness**（`329aff9`，feature `conformance` 默认关）：`backend_conformance!(MyBackend)` 宏展开
+   **16 个测试 / 15 组**（默认≡scalar 6 组、plan 解释≡具名组合 3 组、`validate` 错误契约 3 组、能力位只报真 2 组、
+   `FusedIo` 口径 1 组）；本仓用 **MinimalBackend** 演示：**只实现 2 个必需方法（≈11 行）+ 1 行宏** ⇒ **15 组全过**。
+3) **骨架生成器** `scripts/gen_backend_skeleton.sh <Name>`（读 `primitives.tsv` + `patterns.tsv`）：生成
+   **167 行可编译 stub**（62 方法：**必需 2** + 走默认 60；`supports_plan` 全 false 模板；**16 臂 `exec_fused_plan`
+   真代码模板** = `plan.validate(&io)?` + portable 回退）；`--check` 幂等/漂移负例；`/tmp` 下游 crate 编译 + 2 个语义测试通过。
+4) **《新后端开发指南》`docs/backend_guide.md`**：分步清单、成本 before/after、**Top10 最值得覆盖方法排序**、
+   线程规则（DSL 不传线程/后端自管/亲和性感知）、能力位只报真+等价类、conformance 用法、诚实边界。
+
+**lasx 落地验证（`bb574c6`）**：`exec_fused_plan` **374 → 216/222 行（−40.6%，成员口径 222，本人复核 216）**；
+删 **21 处 `return Err` 校验 + 5 处 `checked_mul` + 1 处 `n_dims` 检查 + 19 行 helper**，新函数内 `return Err`/`checked_mul` = **0**；
+**conformance 1 行宏 → 15 组全过**（另 2 个 LASX 专项钉住融合差异：能力位如实、等价类界、空输入）；
+两档门禁全绿、`nm -D` 98、逐位不变。
+
+**硬指标（before → after）**：
+| 指标 | before | after |
+|---|---|---|
+| 新后端 plan 校验代码 | 每后端抄 **374 行** | **0 行**（调 1 次 `plan.validate`） |
+| 一致性测试 | 自建 **311** 个 lib 测试 | **1 行宏 = 15 组 / 16 测试** |
+| 新后端起步 | 手抄骨架 | 生成 **167 行可编译 stub**（仅 2 个必需方法要真实现） |
+| 加一个 pattern 的后端成本 | 校验+派发 ~25 行/个 | **0 行校验** + 生成器给出臂模板；只需填内核映射 |
+| lasx `exec_fused_plan` | **374 行** | **216/222 行（−40.6%）** |
+
+**诚实边界（未做/做不到，逐条列）**：① `validate` 仍是手写 `match`（`patterns.tsv` 没有校验规格列，
+**不能从表直接生成**；后续增量 = 给表加一列校验 DSL）；② portable 解释器**各臂内联校验尚未删**
+（共享入口已存在且被所有后端/portable 调用，但"校验只有一份"的最终态仍差一步，属独立小步）；
+③ harness 约定 "`Default` = portable 等价配置"，**融合后端不能直接套**（lasx 用 `LasxPortableBackend` 接入
++ 2 个专项测试钉融合差异）；④ 生成器**不产出内核数学/性能调优/能力位真实性**，只产出骨架与模板；
+⑤ 共享 validate 的 `op` 字段文本统一成契约名 ⇒ **对外错误 message 文本变化、错误变体/判定条件不变**（已记录）。
+
+**Commits**：`simd_dsl` `d5c8356`/`f74ec2f`/`329aff9`（+`8bb5c97`/`4dfc356` 文档与生成器收尾）；
+`lasx_rs` `bb574c6`（落地）、`94a8182`（违规记录）。
+
+
 
 
 
