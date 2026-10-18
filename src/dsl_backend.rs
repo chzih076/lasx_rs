@@ -1069,41 +1069,21 @@ impl Backend for LasxBackend {
             | PatternKind::QuantizeI8Rows
             | PatternKind::DotI8
             | PatternKind::GemvI8 => true,
-            PatternKind::DequantizeI8Rows => false,
+            // 以下两个 kind **如实不接**：`DequantizeI8Rows`（LASX 无连续 i8 块拓宽核）、
+            // `Norm2BatchF64`（simd 批4 新增；LASX 无 f64 norm2 融合核）⇒ `exec_fused_plan`
+            // 对应臂回退 portable 解释（逐位/同序列）。
+            PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => false,
         }
     }
 
     fn exec_fused_plan(&self, plan: FusedPlan<'_>, io: FusedIo<'_>) -> Result<(), BackendError> {
-        /// 行 pattern 的公共校验：`rows×cols` 不溢出、`x`/`out` 等长（与 `fused_rows_len` 同口径）。
-        fn rows_plan_len(
-            op: &'static str,
-            rows: usize,
-            cols: usize,
-            x: &[f32],
-            out: &[f32],
-        ) -> Result<usize, BackendError> {
-            let n = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-                op,
-                what: "rows×cols",
-            })?;
-            for (what, got) in [("x", x.len()), ("out", out.len())] {
-                if got != n {
-                    return Err(len_err(op, what, n, got));
-                }
-            }
-            Ok(n)
-        }
+        // **共享校验（task-80）**：长度/形状/溢出/空/RoPE n_dims/几何数组/量化切片，
+        // 全部由 `FusedPlan::validate` 一处实现（与 portable 解释器**同口径、同错误码**）；
+        // 各臂不再重复校验，只保留"内核不能吃空输入"的执行守卫（不是校验、不产生错误码）。
+        plan.validate(&io)?;
         match plan {
             FusedPlan::Axpy { alpha } => {
                 // Plan 语义：y := alpha·x + y（就地）；`out` 不参与（契约为空）。
-                if io.y.len() != io.x.len() {
-                    return Err(len_err(
-                        "exec_fused_plan(Axpy)",
-                        "y",
-                        io.x.len(),
-                        io.y.len(),
-                    ));
-                }
                 if io.x.is_empty() {
                     return Ok(());
                 }
@@ -1119,8 +1099,7 @@ impl Backend for LasxBackend {
             }
             FusedPlan::SoftmaxRows { rows, cols } => {
                 let op = "exec_fused_plan(SoftmaxRows)";
-                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
-                if n == 0 {
+                if io.x.is_empty() {
                     return Ok(());
                 }
                 crate::api::softmax_rows_into(io.x, None, rows, cols, 1.0, io.out).map_err(|_| {
@@ -1132,8 +1111,7 @@ impl Backend for LasxBackend {
             }
             FusedPlan::RmsNormRows { rows, cols, eps } => {
                 let op = "exec_fused_plan(RmsNormRows)";
-                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
-                if n == 0 {
+                if io.x.is_empty() {
                     return Ok(());
                 }
                 crate::api::rms_norm_into(io.x, None, rows, cols, eps, io.out).map_err(|_| {
@@ -1145,8 +1123,7 @@ impl Backend for LasxBackend {
             }
             FusedPlan::LayerNormRows { rows, cols, eps } => {
                 let op = "exec_fused_plan(LayerNormRows)";
-                let n = rows_plan_len(op, rows, cols, io.x, io.out)?;
-                if n == 0 {
+                if io.x.is_empty() {
                     return Ok(());
                 }
                 crate::api::layer_norm_into(io.x, None, None, rows, cols, eps, io.out).map_err(
@@ -1158,9 +1135,6 @@ impl Backend for LasxBackend {
             }
             FusedPlan::GeluQuick => {
                 let op = "exec_fused_plan(GeluQuick)";
-                if io.out.len() != io.x.len() {
-                    return Err(len_err(op, "out", io.x.len(), io.out.len()));
-                }
                 if io.x.is_empty() {
                     return Ok(());
                 }
@@ -1171,30 +1145,7 @@ impl Backend for LasxBackend {
             }
             FusedPlan::RopeApply { rows, cols, n_dims } => {
                 let op = "exec_fused_plan(RopeApply)";
-                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-                    op,
-                    what: "rows×cols",
-                })?;
-                if !n_dims.is_multiple_of(2) || n_dims > cols {
-                    return Err(BackendError::LengthMismatch {
-                        op,
-                        what: "n_dims（偶数且 ≤ cols）",
-                        expected: cols,
-                        got: n_dims,
-                    });
-                }
-                for (what, got) in [("x", io.x.len()), ("out", io.out.len())] {
-                    if got != total {
-                        return Err(len_err(op, what, total, got));
-                    }
-                }
-                let tbl = rows * (n_dims / 2); // 行数×半维；与契约默认体同口径
-                for (what, got) in [("cos", io.cos.len()), ("sin", io.sin.len())] {
-                    if got != tbl {
-                        return Err(len_err(op, what, tbl, got));
-                    }
-                }
-                if total == 0 {
+                if io.x.is_empty() {
                     return Ok(());
                 }
                 crate::api::rope_into(
@@ -1223,22 +1174,7 @@ impl Backend for LasxBackend {
                 let [ax, ay, az] = a;
                 let [bx, by, bz] = b;
                 let [ox, oy, oz] = o;
-                let n = ax.len();
-                for (what, got) in [
-                    ("ay", ay.len()),
-                    ("az", az.len()),
-                    ("bx", bx.len()),
-                    ("by", by.len()),
-                    ("bz", bz.len()),
-                    ("ox", ox.len()),
-                    ("oy", oy.len()),
-                    ("oz", oz.len()),
-                ] {
-                    if got != n {
-                        return Err(len_err(op, what, n, got));
-                    }
-                }
-                if n == 0 {
+                if ax.is_empty() {
                     return Ok(());
                 }
                 crate::api::vec3_add_scaled_batch_into(ax, ay, az, bx, by, bz, s, ox, oy, oz)
@@ -1250,13 +1186,7 @@ impl Backend for LasxBackend {
             FusedPlan::Norm3BatchF64 { xyz, out } => {
                 let op = "exec_fused_plan(Norm3BatchF64)";
                 let [x, y, z] = xyz;
-                let n = x.len();
-                for (what, got) in [("y", y.len()), ("z", z.len()), ("out", out.len())] {
-                    if got != n {
-                        return Err(len_err(op, what, n, got));
-                    }
-                }
-                if n == 0 {
+                if x.is_empty() {
                     return Ok(());
                 }
                 crate::api::norm3_batch_into(x, y, z, out).map_err(|_| BackendError::Unsupported {
@@ -1268,19 +1198,7 @@ impl Backend for LasxBackend {
                 let op = "exec_fused_plan(Unitize3BatchF64)";
                 let [x, y, z] = xyz;
                 let [ox, oy, oz] = o;
-                let n = x.len();
-                for (what, got) in [
-                    ("y", y.len()),
-                    ("z", z.len()),
-                    ("ox", ox.len()),
-                    ("oy", oy.len()),
-                    ("oz", oz.len()),
-                ] {
-                    if got != n {
-                        return Err(len_err(op, what, n, got));
-                    }
-                }
-                if n == 0 {
+                if x.is_empty() {
                     return Ok(());
                 }
                 crate::api::unitize3_batch_into(x, y, z, ox, oy, oz).map_err(|_| {
@@ -1295,22 +1213,7 @@ impl Backend for LasxBackend {
                 let [ax, ay, az] = a;
                 let [bx, by, bz] = b;
                 let [ox, oy, oz] = o;
-                let n = ax.len();
-                for (what, got) in [
-                    ("ay", ay.len()),
-                    ("az", az.len()),
-                    ("bx", bx.len()),
-                    ("by", by.len()),
-                    ("bz", bz.len()),
-                    ("ox", ox.len()),
-                    ("oy", oy.len()),
-                    ("oz", oz.len()),
-                ] {
-                    if got != n {
-                        return Err(len_err(op, what, n, got));
-                    }
-                }
-                if n == 0 {
+                if ax.is_empty() {
                     return Ok(());
                 }
                 crate::api::cross3_batch_into(ax, ay, az, bx, by, bz, ox, oy, oz).map_err(|_| {
@@ -1324,28 +1227,7 @@ impl Backend for LasxBackend {
                 let op = "exec_fused_plan(Mat3MulVec3BatchF64)";
                 let [x, y, z] = v;
                 let [ox, oy, oz] = o;
-                let n = x.len();
-                for (what, got) in [
-                    ("y", y.len()),
-                    ("z", z.len()),
-                    ("m0", m[0].len()),
-                    ("m1", m[1].len()),
-                    ("m2", m[2].len()),
-                    ("m3", m[3].len()),
-                    ("m4", m[4].len()),
-                    ("m5", m[5].len()),
-                    ("m6", m[6].len()),
-                    ("m7", m[7].len()),
-                    ("m8", m[8].len()),
-                    ("ox", ox.len()),
-                    ("oy", oy.len()),
-                    ("oz", oz.len()),
-                ] {
-                    if got != n {
-                        return Err(len_err(op, what, n, got));
-                    }
-                }
-                if n == 0 {
+                if x.is_empty() {
                     return Ok(());
                 }
                 // **mat3 走 Rust 层 `_into` helper**（`api::mat3_mul_vec3_batch_into`，免分配；
@@ -1367,25 +1249,11 @@ impl Backend for LasxBackend {
                 scale,
                 out,
             } => {
-                let op = "exec_fused_plan(QuantizeI8Rows)";
-                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-                    op,
-                    what: "rows×cols",
-                })?;
-                if x.len() != total {
-                    return Err(len_err(op, "x", total, x.len()));
-                }
-                if out.len() != total {
-                    return Err(len_err(op, "out", total, out.len()));
-                }
-                if scale.len() != rows {
-                    return Err(len_err(op, "scale", rows, scale.len()));
-                }
-                if total == 0 {
+                if x.is_empty() {
                     return Ok(());
                 }
-                // SAFETY: 三个长度已校验；`x: &[f32]` 与 `out: &mut [i8]` 类型不同 ⇒ 安全 Rust 下
-                // 不可能重叠（别名契约由类型系统 + 借用检查器守）。
+                // SAFETY: `validate` 已校验三个长度；`x: &[f32]` 与 `out: &mut [i8]` 类型不同 ⇒
+                // 安全 Rust 下不可能重叠（别名契约由类型系统 + 借用检查器守）。
                 unsafe {
                     crate::ops::quant_i8::quantize_i8_rows_contract(x, rows, cols, scale, out)
                 };
@@ -1399,45 +1267,27 @@ impl Backend for LasxBackend {
                 out,
             } => {
                 // **未接 LASX 核 ⇒ 回退 portable 解释**（与契约默认同序列、逐位；不虚报能力）。
-                let op = "exec_fused_plan(DequantizeI8Rows)";
-                let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
-                    op,
-                    what: "rows×cols",
-                })?;
-                if x.len() != total {
-                    return Err(len_err(op, "x", total, x.len()));
-                }
-                if out.len() != total {
-                    return Err(len_err(op, "out", total, out.len()));
-                }
-                if scale.len() != rows {
-                    return Err(len_err(op, "scale", rows, scale.len()));
-                }
                 simd_dsl::kernels::scalar::dequantize_i8_rows_f32(x, rows, cols, scale, out)
             }
             FusedPlan::DotI8 { a, b, out } => {
-                let op = "exec_fused_plan(DotI8)";
-                if a.len() != b.len() {
-                    return Err(len_err(op, "b", a.len(), b.len()));
-                }
                 *out = crate::ops::dot_i8::dot_i8_saturating(a, b);
                 Ok(())
             }
             FusedPlan::GemvI8 { j, k, a, x, out } => {
-                let op = "exec_fused_plan(GemvI8)";
-                let total = j
-                    .checked_mul(k)
-                    .ok_or(BackendError::ShapeOverflow { op, what: "j×k" })?;
-                if a.len() != total {
-                    return Err(len_err(op, "a", total, a.len()));
-                }
-                if x.len() != k {
-                    return Err(len_err(op, "x", k, x.len()));
-                }
-                if out.len() != j {
-                    return Err(len_err(op, "out", j, out.len()));
-                }
                 crate::ops::gemv_i8::gemv_i8_i32(j, k, a, x, out);
+                Ok(())
+            }
+            // **`Norm2BatchF64`（simd 批4 新增 kind）**：LASX 没有 f64 norm2 融合核 ⇒
+            // `supports_plan` 报 false、这里**回退契约默认解释的组合序列**（与 portable 解释器
+            // 同表达式：`(x²+y²).sqrt()`，f64 精确运算 ⇒ 逐位一致）。
+            FusedPlan::Norm2BatchF64 { xy, out } => {
+                let [x, y] = xy;
+                if x.is_empty() {
+                    return Ok(());
+                }
+                for i in 0..x.len() {
+                    out[i] = (x[i] * x[i] + y[i] * y[i]).sqrt();
+                }
                 Ok(())
             }
         }
