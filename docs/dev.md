@@ -7151,6 +7151,15 @@ C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实
   **三路逐位等价**（axpy/softmax），vs portable 计划解释差 2.38e-7 / 3.96e-9（融合核容差类，与既有原语一致）。
 - ⇒ **Plan 入口 → LASX 融合核闭环**：契约不再为每个融合能力加具名方法，后端只需实现一个执行器；性能/数值与直连 api 同级。
 
+**P1 批1（`simd_dsl` `9af59f7`）：`rms/layer/gelu/rope` → Plan，并删除 4 个具名方法（`Backend` 75 → 71）**
+- `PatternKind`/`FusedPlan` 各 +4；**`FusedIo` 扩展 `cos`/`sin`**（rope 用，其余传 `&[]`）；`exec_fused_plan` 4 臂 = **逐行照抄删除前的默认序列**（rms 1 趟窄三元组、layer 2 段、gelu 7 趟、rope 6+1 趟）；
+- **删除** `rms_norm_rows_f32`/`layer_norm_rows_f32`/`gelu_quick_f32`/`rope_apply_f32`（无兼容壳/死代码）；`axpy`/`softmax` 仍按前一批约定保留薄委托（如实说明）；
+- 调用方同一提交同步：`ops_dsl` 的 rms/layer/gelu/rope `*_auto` 改 `supports_plan`+`exec_fused_plan`；`fused_probe` mock 改 Plan 面；旧测试用"测试内 `PlanCall` 糖"复用调用式（明确不是生产兼容壳）；
+- **验收**：rms/layer/gelu 计划路径 ≡ 删除前旧序列 **`to_bits` 全等**（逐位）；rope vs 标量参照 `max abs 0e0`、尾部逐位；portable `supports_plan` 仍全 false；
+- **自动化收益实测**：**删 4 行 `primitives.tsv` 后，namecheck 白名单/文档/结构测试全自动同步，0 处手改**；`gen_primitives.sh --check` 绿；
+- 门禁：62 test binaries 全过、clippy/rustdoc/docrefcheck/opcheck/layercheck/covercheck/portcheck 全绿。
+- **未假删说明**：无（本轮 4 个方法全部真删；`axpy`/`softmax` 的保留是前一批的显式约定）。
+
 
 
 
