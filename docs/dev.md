@@ -276,7 +276,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ## 4. 测试与验证
 
-当前核心规模：**309 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
+当前核心规模：**311 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
 `cargo test --workspace --release` 另含 **8 个宏测试**（6 单测 + 2 直通集成测试）+ 19 个文档测试、2 个 doc 用例标 ignore）。
 **下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
 总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
@@ -459,7 +459,7 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 
 ```bash
 cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 309 个单元测试（+ 8 个宏测试 + 19 个文档测试）
+cargo test --workspace --release        # 311 个单元测试（+ 8 个宏测试 + 19 个文档测试）
 cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
 cargo fmt --all --check
 cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
@@ -7122,6 +7122,38 @@ C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实
 ④ perf：L1D load miss **3.1×**、store miss **3.6×**、IPC **−8.9%**（指令数仅 +4.2% ⇒ stall 主导）。
 **结论**：在现有 **L1 容量（64 KB/核）/遍历结构**下，这 14–18% **不能靠参数或对齐闭合**；唯一有数据支撑的下一步是
 **"L2 常驻条带 + 更小 k 微块"的混合方案**（让一个条带一次进 L1、4 个 k 块的 C 累加在条带内完成），属**数天级重构**且牵动并行路径与 bitwise 复核 —— **本轮不做、零改动保留原实现**。
+
+### 7.44.2 **突破：差距已抹平（1024³ 0.980×、1536³ 1.002× OB，grade B）——根因是"1t 用例仍库内自动并行"的派发伪影**
+
+**关键复盘（修正 §7.44/§7.44.1 的口径）**：`bench --threads=1` 只关**调用方**线程，`api::matmul` 在
+`work ≥ 32M` 时仍走**库内全局池**；而池按**物理核数 12** 建、进程又被 `taskset` 绑到**单核**
+⇒ 单核上跑 12 线程。pin 单核实测：**全派发 vs 纯内核 = 40.29 vs 37.24 ms（+8.2%，1024³）、
+150.13 vs 140.78 ms（+6.6%，1536³）**。⇒ 此前 `0.878×/0.825×` **主要是派发伪影**，不是纯内核差距
+（纯内核 pin 对比 OB 1t：1024³ ≈0.98×、1536³ ≈0.99×）。
+
+**两处修复（`lasx_rs` `9429852`，逐位不变）**：
+1) **`pool::auto` 按可用 CPU 数封顶**：`available_parallelism()` 尊重 `sched_getaffinity`/cgroup，
+   与 `physical_cores()`（读 sysfs 拓扑、不看亲和性）取 **min**；全机空闲时仍=12（多线程行为不变），
+   `taskset -c N` 时按 N 建池——**这是生产正确性修复，不是测量取巧**；
+2) **`KernelCfg::default()` 打开 `strip_outer`（条带主序 `strip → k块 → 行块`）**：`task-73` 实测 1t
+   内核态 **1024³ +5.1%、1536³ +11.3%**；并行路径固定 `legacy()` 保持旧次序 ⇒ 多线程路径不变。
+
+**正式 A/B（同机 pin cpu4、进程级交替 5 轮丢首轮中位、**grade B**（loadavg<4.5、conc=0））**：
+| 形状 | lasx ms / GFLOPS | OpenBLAS ms / GFLOPS | 比值（lasx/OB） |
+|---|---|---|---|
+| **1024³** | 35.58 / **60.36** | 34.83 / 61.59 | **0.980×** ✅ ≥0.95 |
+| **1536³** | 122.02 / **59.21** | 122.45 / 59.10 | **1.002×** ✅ ≥0.95 |
+其他形状无回归（512³ 0.936 vs 基线 0.771、256³ 1.006、64³ 1.282；均同 runner 对照）。
+
+**已排除的十六个方向（保留为反例）**：循环换序 0.65×、k 展开 0.98×、K_CHUNK 1.01×、A 预取 1.003×、
+B 双缓冲 0.80×、6×32 形状 1.003×、A-blocking 0.996×、+64B 对齐 1.03×、C-once 0.82×、6 行 k-inner 0.88×、
+8 行×5-spill（未实测，算术上非 FMA 指令翻倍）、16×8 微内核（本轮 Lead 实做：逐位通过但 53.2 vs 53.1 GFLOPS
+≈持平，k×2 展开亦无增益；代码留在 `gemm-F` 分支作反例，未合入）、A k-major 打包+permute（ISA 上半区 shuffle
+需 2 条/行 ⇒ 净增指令）、load 槽位假设（IPC 2.88 ⇒ 未饱和）。
+
+**为什么之前会走偏（决策记录）**：`§7.44` 的 perf 证据（L1D miss 3.1×、store miss 3.6×）本身是对的，
+但它们是在**12 线程挤单核**的口径下取的 ⇒ miss 与 IPC 都被线程争用放大。**教训**：**测量 1t 前必须确认
+"库内线程数 = 1"**（本仓 = `pool::init_global(1)` 或等价亲和性），否则得到的是"单核上的多线程"而不是 1t 性能。
 
 
 ## 7.45 契约瘦身 + 自动化：73 方法盘点、单源真相表、Plan 执行器（试点 axpy/softmax）
