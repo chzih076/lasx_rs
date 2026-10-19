@@ -7372,8 +7372,13 @@ T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只�
 - `§7.37` 的 softmax override 4.4×（loadavg 7.22/6.26/5.36）与 map_rows_sum 1.328–1.464×（7.33/6.60/5.21）。
 采纳结论仍保留，但**证据分级如实降为 C**；需正式验收时须在 B 级窗口重跑。
 
-**本轮改进（并行落地，合入状态见后续提交）**：O1 `plan_auto` 模板（16→1）、O4 测试缺口（iso_kernel/laplace/NaN/inf/奇数形状/norm 逐位）、O5 opcheck/opsgraph 4 类盲区、O3 断链修复（已完成）。
-**Commits**：`simd_dsl` 算子审计报告 + O3 修复；`lasx_rs` 本节（§7.49）。
+**本轮改进（全部已合入，含指标）**：
+- **O1 `plan_auto` 模板**：`ops_dsl/src/lib.rs` 两臂宏（Plan / 能力位），3 模块改调；**直调 17 次/9 组 → 3 次/1 处**（宏体内），语义逐字不变（probe 先求值、plan/io 只在融合分支求值、Result 原样透传）；LOC 净 **+32**（宏与文档，非"减少行数"型重构，如实）；65 测试目标全绿；
+- **O4 测试缺口**：**+9 个 `#[test]`**（`iso_kernel_laplace.rs` 新文件 4 条：iso_kernel 奇数 n/NaN/长度错 + laplace 逐位/NaN·inf；matmul/stencil2d/spectral 各补 NaN·inf 与**奇数形状**（k=13、5×7/7×5/3×13、n=13）；composed_ops 补 **norm `to_bits` 逐位直接证据**——证实"逐位 masked_rel=0"口径，无需降级文档）；**未暴露真实 bug**；
+- **O5 门禁增强**：opcheck **3→5 类**（注释/字符串剥离前置、fold+范围字面量），opsgraph（剥离后建边、生产 `use super::*` 判"未解析依赖"、测试模块不建边）；自测 **10/10** 与 **7/7**；真实树：opsgraph 绿（17 模块 0 真边，旧版唯一边是注释假边），opcheck 变严后暴露 **2 处并已收口**（rope.rs 走跨步原语 ⇒ 新增**显式豁免标记** `opcheck-allow-no-macro` + 具体理由，循环/fold/+= 仍查；activations 测试参考级数改 `repeat_n` 避开范围字面量误报）⇒ 真实树绿（18 文件）；
+- **O3 断链修复**：`ops_dsl/src/stencil2d.rs` 两处引用 `tests/stencil5.rs`（不存在）改指真实证据 `ops_dsl/tests/stencil_sparse.rs` / `examples/stencil2d_ab.rs`。
+
+**Commits**：`simd_dsl` `1c89ed3`（O1）、`17043b7`（O4）、`c55d2a5`（O5）、`44c5efe`（审计报告+O3+收口）；`lasx_rs` 本节（§7.49）。
 
 
 
