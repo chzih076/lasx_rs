@@ -7614,7 +7614,25 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   **均未删融合核**。
 - **rev bump**：`simd_dsl`/`ops_dsl` → `a57412e`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
 - **仍缺（如实）**：线程池复用（每次调用创建线程，小算子吃亏）；后端原生并行 vs 引擎并行的统一策略；
-  跨算子融合；11 个模块仅桥入口、13 个入口未进引擎。
+  跨算子融合；11 个模块仅桥入口、13 个入口未进引擎。（**E7/E8 已补入口与部分真实优化，见 §7.52.5**）
+
+### 7.52.5 引擎真实优化扩面（simd `e88c6c4`→`c69f08e`）：8 模块真实优化 + 13 入口补齐（2026-10-19）
+
+- **E7（真实优化扩面）**：`Algorithm` 新增 `MapUnary`/`MapAffine`/`ReduceRows`/`ReduceCols`/`Gather`；
+  `ops_dsl` 迁移 `log` 3（1 趟/2 趟）、`reduce` 6（行归约**并行**、列归约串行）、`embedding_lookup(f32)`
+  （**并行 gather**）。执行层后端方法不变 ⇒ 数值口径不变；并行只按行/id 切 ⇒ 与串行 `to_bits` 全等
+  （simd 新测试守）。`EngineReport` 新增 `op` 字段（非 plan 家族没有 `PatternKind`，`kind` 为占位）。
+- **E8（入口补齐）**：剩余 13 个入口接组合桥：`matmul` 4 变体、`spectral` 3（`detect` 有意外层+内层
+  各一次引擎入口）、`stencil2d` 6 变体；闭包内实现一字未改 ⇒ 数值/错误面不变。
+- **矩阵（`enginecheck --matrix`）**：**真实优化 8 / 仅组合桥 9 / 未接线 0**；再没有任何"未进引擎"的
+  算法入口（多出的 4 个 spectral `pub fn` 是纯配置 getter，不算入口）。
+- **门禁口径同步（simd 侧）**：`opcheck` 第 1 条放宽为"宏调用**或**引擎入口调用"（E7 起"整个算法
+  交给引擎"是合法算法体；`opcheck_test` 10/10 仍守负例）。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `c69f08e`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
+- **验证纪律（如实）**：E7 单独提交 `e88c6c4` 的 CI（runId `1792422999`）**红**，但面板只保留最新
+  `build-summary`、**失败步骤未取到**；本地全门禁通过，紧随的 `c69f08e`（同内容 + E8）CI success。
+  ⇒ 不臆断为 flake，**如实记为未查明原因**；后续若复现再查（已记 `AGENTS.md §43`）。
+
 
 
 
