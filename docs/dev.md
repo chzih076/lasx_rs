@@ -7310,12 +7310,28 @@ LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 fal
 | **I8** | 本地/CI 门禁不一致 ⇒ `gate_local.sh`（23 步一条命令 + `--check` 比对 CI 全部脚本调用 + 5 用例自测） | `e989c0b`→`2ae08b7` | **实测抓到真实漂移**：合入后 `--check` 报"CI 引用 21、本地缺 2"（namecheck_test/opcheck_test），补齐后缺口 0；`gate_local_test` 5/5 |
 | **I9** | namecheck/opcheck 无自测 ⇒ 各补 4 反例真红且点名 + 2 正例；CI 改为"先自测再门禁" | `e3aa7a9`→`7df0c79` | 各 **6/6**；原门禁不回归（namecheck 163 文件 / opcheck 18 文件） |
 
-**未做（如实留在审计报告的"改进优先级/未做与风险"章节）**：**I6** perceive 家族 `analysis` feature 门控 / rewrite 判断下沉 / reference 门控（breaking 面积大，需单独决策）；
+**未做（如实留在审计报告的"改进优先级/未做与风险"章节）**：**I6** 只做了"rewrite 判据下沉"的一部分（规则⑦ 4 子情形，见 §7.48.1），
+perceive 家族 `analysis` feature 门控 / reference 门控仍未实施（breaking 面积大，需单独决策）；
 **I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）。
+
+## 7.48.1 第二轮改进（T1–T4，全部落地；含新门禁）
+
+| # | 改进 | 实测指标 |
+|---|---|---|
+| **T1** | validate **表驱动**：`patterns.tsv` 增 `bind`/`validate` 列（16 行×7 列），生成器产出 16 臂校验（`patterns_gen.rs` 22 行），**删除手写 `plan_validate.rs`（165 行）** | 手写 match **165→0 行**；生成物 +62 行；错误变体/expected/got/what 逐字不变；65 测试目标全绿 |
+| **T2** | **engine 判据下沉**：`criteria::rewrite::{LogPowForm, classify_log_pow}`（规则⑦ 4 子情形，条件/阈值逐字搬迁） | criteria +80 行（17 用例表驱动）/ engine +6 行；`pow_fold` 5→9 测试、4 子情形**逐位**；engine 内阈值残留 **0** |
+| **T3** | **pub 无测试门禁** `pubtestcheck.sh` + 73 条逐项原因 allowlist + 自测 9/9 | pub 项 **327** / 有测试引用 **252** / allowlist 75 / **零引用未豁免 0**；纳入 `cfg(test)` 后零引用名字 145→66；发现 **3 个 dead API**（`decl_nabla`/`is_bit_exact`/`SEPARABLE_MIN_SAVING_PPM`） |
+| **T4** | **§ 编号门禁** `sectioncheck.sh` + 自测 8/8 | 8 文档 **119 处引用**：MISS **0**；映射行跳过 47、跨仓 EXTERNAL 15、例外 41（逐条原因） |
+| 集成 | CI 增 `Pub-without-test guard`/`Section reference guard`；`gate_local.sh` 25 步 | `gate_local --check`：CI 引用 25 脚本 / 覆盖 28 / **缺口 0**；`apicheck` 基线 **463→464**（有意变更，见审计 §11） |
+
+**诚实边界**：T1 的表内校验仍是**人写逻辑搬进表**（微语法=短 Rust 表达式），不是自动推导"正确校验"；T2 只下沉规则⑦的 4 子情形；
+T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只查标题存在性/只认同行前缀/映射行不设防；
+`docrefcheck` 为不误伤门禁自身排除 `sectioncheck*.sh`（样例路径，非真引用）。
 **过程记录（阻塞与恢复，如实）**：① CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障；
 ② 审计 I8/I9 落地期间**磁盘配额耗尽（EDQUOT）**：`bash` 工具连 `echo alive` 都写失败、`write` 工具报 `-122`，连续 3 轮无法跑门禁/提交 ⇒ 目标标 blocked；
 用户清理磁盘并重启后**复验**：namecheck/capabilitycheck（当时红）**恢复绿**、`test --features conformance`/clippy/nightly rustdoc/docrefcheck/apicheck/capabilitycheck/gate_local --check/两个自测全绿 ⇒ 证实此前红是磁盘假象，非代码问题。
-**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`/`e989c0b`/`2ae08b7`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71–#74）。
+③ 第二轮出现一次**既有**负载敏感 A/B 性能测试失败（`plan_delegation_does_not_regress_performance`，loadavg 高时偶发），单测复跑 2/3 通过 ⇒ 判为 flaky、非本轮改动（与 T1 成员报告的 `fused_contract::engine_kpi_*` 同类，已如实记录）。
+**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`/`e989c0b`/`2ae08b7`/`523391d`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71–#74）。
 
 
 
