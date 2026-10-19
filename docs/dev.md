@@ -7380,6 +7380,34 @@ T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只�
 
 **Commits**：`simd_dsl` `1c89ed3`（O1）、`17043b7`（O4）、`c55d2a5`（O5）、`44c5efe`（审计报告+O3+收口）；`lasx_rs` 本节（§7.49）。
 
+## 7.50 算子审计第二收尾：O2 接线 / O6 基准 / dead API 清理（2026-10-19）
+
+**O2 接线（`simd_dsl` `be14fff`）**——先保等价，再谈性能：
+- **axpy 采纳**：`ops_dsl::axpy` 改为 `supports_plan(Axpy) ? exec_fused_plan : 原 3 趟组合`；精度**逐位**
+  （`to_bits` 对拍含 `-0.0`/次正规/`3e38`/`alpha∈{0.375,1,-1.25,0}` 全等）；**A/B：composed/plan = 2.232/2.392/2.232/2.990/3.054/2.482×（6 个独立进程，中位 ≈2.44×）**；
+- **量化三入口新增**：`quantize_i8_rows`/`dot_i8`/`gemv_i8`（走 plan，回退 scalar）；整数全等（ties-even ±0.5/±1.5、clamp 127.5/−129.5、NaN⇒0、±inf⇒端点、dot/gemv 饱和端点 k=200k）；**如实：本仓内零性能差**，收益只可能在外部向量后端；
+- **rope 评估后不接线**：portable 组合/plan = **0.930/0.857/0.911/0.978/0.936/1.000× ⇒ 无收益**（plan 内部同样 6 次跨步+分配）；LASX 单趟核不在本仓测试/门禁范围 ⇒ 无法证明收益。**保留 7 趟组合 + 模块文档记录评估**；
+- 新增 `ops_dsl/tests/wire_plan.rs` **8 个测试**（`PlanOnScalar`/`PlanOnIdiomatic` wrapper 对拍）。
+- **未接**：`SoftmaxRows` 直接、`DequantizeI8Rows`、`Norm2BatchF64`（语义/收益未评估完，留待下轮）。
+
+**O6 基准（`simd_dsl` `2ba6fc8`，`ops_dsl/examples/zero_evidence_ab.rs`，8 case）**——主表 **grade A**（loadavg 2.68/2.24，6 对丢首对中位）：
+| case | A/B | 结论 |
+|---|---|---|
+| rope 8192×128 | **7.316×**（组合慢 7.3×，逐位） | **稳定负结果**：strided 组合多趟开销大（C 窗口 4.3–5.9× 方向一致）；结论是"该组合实现慢"，非"DSL 慢" |
+| gelu erf/quick | 0.989× | 打平（不同近似，只比成本） |
+| embedding f32 / i8 | 0.934× / 1.137× | **i8 在 C 窗口三测 1.14/0.87/1.51× 符号翻转 ⇒ 无稳定结论** |
+| kv_cache | 0.883× | ±12%，需 B/A 级多轮复核 |
+| ln / log2 / log10 | 0.907/0.970/0.954× | 仅 portable 两档（都走标量 libm），无向量化对照 |
+
+**未覆盖（如实）**：外部后端档（`ops_dsl` 硬约束只依赖 `simd_dsl`，LASX 档需本仓另写 example）；lasx 侧 `layer_norm`/`gather`/`scatter`/`cmatmul`/`matmul_bt` 仍无 bench 入口。
+
+**P2 dead API 清理（`simd_dsl` `05632fc`）**：删除 3 个零调用 pub API（`decl_nabla`、`is_bit_exact`、`SEPARABLE_MIN_SAVING_PPM`，公开面 **464→461**，`apicheck --update` 显式更新）；
+**`Tap2::{eq_coeff,negated}` 经编译验证有调用（`src/engine/perceive_stencil_grid.rs:59/62/80/169/175`）⇒ 保留**，并纠正 allowlist 里的错误台账（原写"无调用"）。
+**教训（流程）**：**名字 grep 不能判 dead**——`t.eq_coeff(m)` 的类型在 4 个文件之外推断、`is_bit_exact` 的命中全是测试函数名子串；
+**判据应是"先删、编译绿"**（本轮 `Tap2` 就是靠 E0599×5 当场纠正）。此条已写入 `docs/operator_audit.md` P2 行。
+
+**Commits**：`simd_dsl` `be14fff`（O2）、`2ba6fc8`（O6）、`092e1bd`（P2 合入）、`05632fc`（P2）；`lasx_rs` 本节（§7.50）。
+
 
 
 
