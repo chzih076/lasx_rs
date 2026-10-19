@@ -786,6 +786,11 @@ heredoc 占位"）。**教训重复第 13 次那条**：需要占位就用 shell
 - **功劳照认（本轮）**：E11 把 complex/laplace/diff 升级为引擎真实优化（真实优化 **13** / 桥 4 /
   未接线 0）；在引擎内补 `check_len` 时**被既有契约测试当场抓到**"短缓冲先越界切片"并修好；
   `execute_diff` 的"报告类型不混塞"取舍写进文档。
+- **CI 抖动（如实，不臆断为 flake）**：E11 提交 `fffbf4a` 首次 run `1792427481` **红在 Test release**
+  （48s）；本地用**与 CI 相同命令** `cargo +nightly test --workspace --release` 通过；重跑
+  run `1792427971` **success**。⇒ 记为"CI 抖动/原因未查明"（未取到失败日志，面板只留最新
+  `build-summary`），不写成已知根因；若再复现按 #39/#41 的验证纪律查。
+
 
 
 
