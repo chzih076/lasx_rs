@@ -7633,6 +7633,23 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   `build-summary`、**失败步骤未取到**；本地全门禁通过，紧随的 `c69f08e`（同内容 + E8）CI success。
   ⇒ 不臆断为 flake，**如实记为未查明原因**；后续若复现再查（已记 `AGENTS.md §43`）。
 
+### 7.52.6 引擎真实优化再扩（simd `fe2e191`）：matmul / transpose 并行（2026-10-19）
+
+- **E10（simd 侧）**：`Algorithm` 新增 `MatmulF32`（按输出行块并行）、`MatmulF64`（能力位
+  `MatmulF64` 为真走后端整块，否则行块并行）、`TransposeF32`（按列块并行）；`ops_dsl` 的
+  `matmul_f32`/`matmul_f64`/`transpose_copy_f32` 由组合桥改为 `engine::execute`；
+  `matmul_const`（`_pinned` 编译期形状）**仍桥**（引擎枚举无法表达 const 泛型）。
+- **等价**：分块只切独立输出 ⇒ 与串行 `to_bits` 全等（simd 新测试守）。
+- **实测**（`ScalarBackend`、引擎自动并行 vs 后端直调；同进程交替 6 轮丢首轮取中位；
+  loadavg 5.5 ⇒ **grade C 趋势**）：matmul f32 512³ **3.53×**（308.9→87.4ms）、
+  transpose 1024×2048 **7.07×**（11.75→1.66ms）。
+- **矩阵（simd `enginecheck --matrix`）**：真实优化 **10** / 仅组合桥 **7** / 未接线 **0**。
+- **边界（如实）**：`Capability` 无 `MatmulF32` 位 ⇒ 有专用核的后端也不会被 `NamedCapability` 选中；
+  batched/scaled matmul 仍桥；其余 7 个模块（complex/diff/iso_kernel/kv_cache/laplace/spectral/stencil2d）
+  仍只有组合桥；跨算子融合、线程池仍未做。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `fe2e191`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
+
+
 
 
 
