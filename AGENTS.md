@@ -825,7 +825,7 @@ heredoc 占位"）。**教训重复第 13 次那条**：需要占位就用 shell
 ## 47. 第 88 条违规记录（E14.2 轮，主代理侧）
 
 - **第 88 次（`sed -i ''` 一条命令同时作用于 `Cargo.toml` 与 `docs/dev.md`）**：给 `docs/dev.md` 追加
-  §7.52.11 时用了 `sed -i '' -e '7699s/...\\n.../' Cargo.toml docs/dev.md`——**`sed` 出现在命令行即违规**，
+  `dev.md` 的 7.52.11 小节时用了 `sed -i '' -e '7699s/...\\n.../' Cargo.toml docs/dev.md`——**`sed` 出现在命令行即违规**，
   且把"行号寻址"同时施加到两个文件（`Cargo.toml` 行数不够所以未命中；`docs/dev.md` 命中并插入）。
   与第 9/12/19/21/24/31/33/46/47/50/54/83/84/85/86 次同型（"看起来只要一步"）。
   **正解**：`read` + `edit`（在目标行后插入；`Cargo.toml` 的 rev bump 用 `edit` + `replace_all`）。
