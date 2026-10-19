@@ -32,7 +32,7 @@ dependencies = [
 [[package]]
 name = "ops_dsl"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=8492b3563287cffdc2691518a997270edd402242#8492b3563287cffdc2691518a997270edd402242"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=5235d336b85de6e4deca4ddbdbea3d3054d5c0b1#5235d336b85de6e4deca4ddbdbea3d3054d5c0b1"
 dependencies = [
  "simd_dsl",
 ]
@@ -40,7 +40,7 @@ dependencies = [
 [[package]]
 name = "simd_dsl"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=8492b3563287cffdc2691518a997270edd402242#8492b3563287cffdc2691518a997270edd402242"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=5235d336b85de6e4deca4ddbdbea3d3054d5c0b1#5235d336b85de6e4deca4ddbdbea3d3054d5c0b1"
 dependencies = [
  "simd_dsl_macros",
 ]
@@ -48,4 +48,4 @@ dependencies = [
 [[package]]
 name = "simd_dsl_macros"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=8492b3563287cffdc2691518a997270edd402242#8492b3563287cffdc2691518a997270edd402242"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=5235d336b85de6e4deca4ddbdbea3d3054d5c0b1#5235d336b85de6e4deca4ddbdbea3d3054d5c0b1"

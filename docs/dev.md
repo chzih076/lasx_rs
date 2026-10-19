@@ -7707,6 +7707,16 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   如实写：省 spawn/join，非算术融合；LayerNorm 终止步、P2/P3 融合核仍未做。
 - rev bump 到 `8492b35`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.12 算子层"整条算法"入口（simd `5235d33`）
+
+- simd E14.3：新增 `ops_dsl::pipeline::exec_map_pipeline` —— 只做参数绑定，执行/优化决策全在引擎
+  （`engine::chain::execute_map_chain`）：逐元素链 + 可选 RMS 终止步，引擎按行块**一次并行**跑完。
+- 等价：与逐算子 `engine::execute` 顺序执行 `to_bits` 全等；长度不匹配透传引擎错误码（不越界）。
+- 门禁同步（理由已写）：`enginecheck` 把 `execute_map_chain(` 计入"入口级感知"（链入口，
+  非 `Algorithm` 单算子枚举）；`opcheck` 白名单接受它（与 `execute_composed*` 同级）。
+- 如实边界：仍是**调度层**（省 spawn/join，1.03–1.04×），不是数值融合；`pipeline!` 宏、P2/P3 融合核未做。
+- rev bump 到 `5235d33`；两档 clippy/test、doccheck 全绿。
+
 
 
 
