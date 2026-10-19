@@ -7743,6 +7743,15 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 - 如实：宏调用点数 ≠ 运行期趟数；能力位仍是运行期决策（`engine-trace` feature 才打印细节）。
 - rev bump 到 `94c376f`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.16 P2 `axpy→rms` 融合 ROI 决策（simd `4dba5ac`，**未实现**）
+
+- simd `engine_integration.md §15` 记录量测：Scalar/单线程/n=4M，两趟 18.20ms vs 单趟**标量** 14.10ms
+  = **1.291×（上限）**；但单趟改变归约累加次序 ⇒ `to_bits` 不全等（max_rel 1.309e-7，不是逐位）。
+- 关键判断：LASX 两趟已是向量核，标量单趟大概率负收益 ⇒ P2 要落地必须**同时写 LASX 向量融合核**。
+- 决策：本轮**不实现**；三前置 = 逐位（或容差例外+实测界）/ 两后端 × threads 1/12 同窗口 A/B /
+  按能力位按后端启用。在此之前跨算子只宣称调度层收益（1.03–1.04×），**不宣称数值融合**。
+- rev bump 到 `4dba5ac`；两档 clippy/test、doccheck 全绿。
+
 
 
 
