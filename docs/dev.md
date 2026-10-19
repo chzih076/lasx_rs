@@ -7735,6 +7735,14 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 - 边界：宏只做语法展开、不做数值融合；`Some/None` 由调用方显式写；P2/P3 融合核仍未做。
 - rev bump 到 `d3b97c2`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.15 编译期报告加入"链入口"（simd `94c376f`）
+
+- simd E13 扩展：`ops_dsl/build.rs` 默认打印三类入口（真实优化 / 组合桥 / **链入口**），实测
+  `真实优化 41 / 组合桥 28 / 链入口 1（共 18 模块）`——"多算子整条链交给引擎"在**编译期**可核对；
+  计数只扫 `src/`（`pipeline![` 调用点 + `execute_map_chain`），tests 里的宏调用不计入。
+- 如实：宏调用点数 ≠ 运行期趟数；能力位仍是运行期决策（`engine-trace` feature 才打印细节）。
+- rev bump 到 `94c376f`；两档 clippy/test、doccheck 全绿。
+
 
 
 
