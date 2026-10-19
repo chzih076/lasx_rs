@@ -6737,6 +6737,9 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 组合版慢是**引擎的 KPI**，不是换融合核的理由。
 
 ### 7.32.1 融合加速 A/B（`examples/fused_ab.rs`；threads=12；loadavg 4.90/4.55/5.67；6 对丢首对中位；**6/6 先验逐位**）
+
+> **⚠️ 证据分级 C**：轮前 loadavg（4.90/4.55/5.67）**超过第 6.4 节的 B 级门限**（1min≤4.5）⇒ **本表只作趋势，不作验收**；
+> 需正式采纳时须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
 | 算子 | `api` ms | DSL ms | api/dsl |
 |---|---|---|---|
 | softmax_rows | 1.074 | 1.065 | **1.008×** |
@@ -6765,6 +6768,9 @@ OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，�
 （**逐位但趟数 3/6 vs 融合核 1**）⇒ **BelowThreshold，组合版保留**（符合"组合版是源实现"口径）。
 
 ### 7.32.4 Master 总表（`examples/auto_ab.rs`；threads=12；loadavg 6.20/6.41/6.56；6 对丢首对中位；**全部逐位**）
+
+> **⚠️ 证据分级 C**：轮前 loadavg（6.20/6.41/6.56）**超过 B 级门限**（1min≤4.5）⇒ **本总表只作趋势，不作验收**；
+> 正式结论须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
 
 **`*_auto` / override 路径 vs `lasx_rs::api::*`**：
 | 项 | api ms | auto/override ms | api/auto | 结论 |
@@ -6904,6 +6910,10 @@ B 臂 `*_auto` 复用调用方缓冲**（暂存参数在融合分支被忽略）
 守卫：`Exp` 传非空 `shift` ⇒ `Err`、`ExpShiftedRow` 的 `shift.len()!=rows` ⇒ `Err`、长度错 ⇒ `Err`、`n=0` ⇒ `Ok`、输出与输入不得重叠。
 **趟数**：`softmax_rows_f32` **5 趟 → 3 趟**（行 max → 单趟 `map_rows_sum{ExpShiftedRow}` → 行级 `1/Σ` + 乘）。
 **A/B（同进程交替、5 对丢首对中位）**：
+
+> **⚠️ 证据分级 C**：两轮 loadavg（7.33/5.91/3.51、6.60/7.21/5.09）均**超过 B 级门限** ⇒ **1.328×/1.464× 只作趋势，不作正式验收**；
+> 同节的 LASX override 4.4×（loadavg 7.22/6.26/5.36）亦然。正式结论须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
+
 | 轮次 | loadavg | 新 3 趟 | 旧 5 趟 | 倍率 |
 |---|---|---|---|---|
 | 首测（64×512） | 7.33/5.91/3.51 | 0.2925 ms | 0.3885 ms | **1.328×** |
@@ -7333,6 +7343,37 @@ T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只�
 用户清理磁盘并重启后**复验**：namecheck/capabilitycheck（当时红）**恢复绿**、`test --features conformance`/clippy/nightly rustdoc/docrefcheck/apicheck/capabilitycheck/gate_local --check/两个自测全绿 ⇒ 证实此前红是磁盘假象，非代码问题。
 ③ 第二轮出现一次**既有**负载敏感 A/B 性能测试失败（`plan_delegation_does_not_regress_performance`，loadavg 高时偶发），单测复跑 2/3 通过 ⇒ 判为 flaky、非本轮改动（与 T1 成员报告的 `fused_contract::engine_kpi_*` 同类，已如实记录）。
 **Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`/`e989c0b`/`2ae08b7`/`523391d`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71–#74）。
+
+## 7.49 算子层系统审计 + HEAD 复测 + 数字家/分级修正（2026-10-19）
+
+**审计报告**：`simd_dsl/docs/operator_audit.md`（三片只读审计 + Lead 复核，范围：ops_dsl 18 模块/75 入口、ops_dsl/tests 88 用例、17 宏、四后端）。
+关键结论（实测）：① **16 个 plan kind 里 8 个无算子入口**——`Axpy`/`SoftmaxRows`(直接)/`RopeApply`/`QuantizeI8Rows`/`DequantizeI8Rows`/`DotI8`/`GemvI8`/`Norm2BatchF64`；
+即 **LASX 有融合核但算子层不走**（axpy 仍是 3 趟组合、rope 是 6 处具名 strided、quant 只有 absmax 入口）；
+② `supports_plan ? exec : composed` 模板在 3 模块重复 **8 组/16 次**；③ `iso_kernel`/`laplace` 在 ops_dsl/tests **零引用**；
+④ 文档断链 2 处（`ops_dsl/src/stencil2d.rs` 引不存在的 `tests/stencil5.rs`，已修）；⑤ `opcheck`/`opsgraph` 的 4 类盲区（注释宏名、fold、`use super::*`、注释假边）已实测。
+
+**HEAD matmul 复测（`d74c984`；fresh `/tmp/bench_openblas`；grade B：轮前 loadavg 3.3–4.0、conc=0、3 轮丢首轮、`SETTLE=10`；`scripts/bench_gflops.sh`）**：
+
+| case | lasx med / GFLOPS | OpenBLAS med / GFLOPS | **OB/lasx** |
+|---|---|---|---|
+| 512³ f32 | 4.5922 ms / 45.53 | 4.1846 ms / 52.05 | **0.911** |
+| 512³ f64 | 9.3611 ms / 19.30 | 8.5593 ms / 23.81 | **0.914** |
+| 1024³ f32 | 35.7571 ms / 59.82 | 36.9889 ms / 58.05 | **1.034** |
+
+与历史并列（不挑好的）：1024³ f32 历史 §7.44 记 **0.980×**（旧二进制）→ 本次 HEAD **1.034×**；512³ f32 历史 **0.936×** → 本次 **0.911×**。
+差异来源：轮数（2 轮中位 vs 5 轮）、日期/loadavg、以及 HEAD 前 28 个 `src/ops` 提交；**两次都如实保留**。
+
+**数字家修正（C 片审计发现）**：`docs/ops.md` 第 9.0 节（DSL matmul `0.1367 ms / 368 GFLOP/s`）、第 9.06 节（`diag_cmatmul_routes` 表：Direct 63.13 ms/57.4、Karatsuba 53.35 ms/67.9、单条 15.04 ms/60.2）、
+第 9.10 节（等距递推 0.3524 ms / 0.20× 即快 5.1×）——这些是主表未收录的**第二个数字家**；现已改为**历史记录 + 指向本节**（本节即权威）；`docs/dsl.md` 的对应引用同步改为指向本节。
+
+**C 级窗口标注（C 片审计发现）**：以下 A/B 的轮前 loadavg 超第 6.4 节的 B 级门限（1min>4.5），**只作趋势、不作验收**，已在小节标题/正文显式标注：
+- `§7.32.1` 融合 A/B（loadavg 4.90/4.55/5.67）；
+- `§7.32.4` Master 总表（loadavg 6.20/6.41/6.56）；
+- `§7.37` 的 softmax override 4.4×（loadavg 7.22/6.26/5.36）与 map_rows_sum 1.328–1.464×（7.33/6.60/5.21）。
+采纳结论仍保留，但**证据分级如实降为 C**；需正式验收时须在 B 级窗口重跑。
+
+**本轮改进（并行落地，合入状态见后续提交）**：O1 `plan_auto` 模板（16→1）、O4 测试缺口（iso_kernel/laplace/NaN/inf/奇数形状/norm 逐位）、O5 opcheck/opsgraph 4 类盲区、O3 断链修复（已完成）。
+**Commits**：`simd_dsl` 算子审计报告 + O3 修复；`lasx_rs` 本节（§7.49）。
 
 
 
