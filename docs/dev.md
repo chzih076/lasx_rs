@@ -7548,6 +7548,23 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 6. **剩余缺口（本轮未做，如实）**：`reduce_sum_rows_f32` / `reduce_max_f32` /
    `map_binary_scalar_f32` 仍无 override（`src/ops` 无现成内核，按任务口径不硬造）。
 
+### 7.52.2 引擎接入（simd `b5eb1fb`/`099783c`）：算子不再直调 plan，lasx rev bump（2026-10-19）
+
+- **背景（用户口径）**：此前 `ops_dsl` 各算子自己 `if supports_plan { exec_fused_plan } else { 宏组合 }`，
+  **引擎被绕过**，只能看见单条原语。E1–E3 后：算子只构造 `Algorithm`，由 `engine::execute` 做**唯一决策**
+  （① `supports_plan` ⇒ FusedPlan；② 能力位 ⇒ NamedCapability；③ 否则 ⇒ PortableComposition）并产出
+  `EngineReport`；引擎在 ③ 显式调 `exec_fused_plan_portable`（本仓 override 不吞组合路径）。
+- **门禁**：`simd_dsl/scripts/enginecheck.sh --strict`（算子代码级 `exec_fused_plan`/`supports_plan` = 0；
+  `reduce/norm/quant/geometry/rope/activations` 6/6 经 `engine::execute`），已进 gate_local/CI；
+  等价矩阵见 `simd_dsl/docs/engine_integration.md`（13 变体 × 策略断言）。
+- **本仓影响**：`LasxBackend` 无需改动（`exec_fused_plan` 覆盖语义不变）；**rev bump** 到
+  `simd_dsl 099783c`（`Cargo.toml` 3 处 + lock）。两档 clippy/test、nightly rustdoc、`doccheck`、`nm -D` 98 全绿。
+- **未完成（如实）**：引擎当前是**单算子路由**（`execute_all` 只聚合报告，无跨算子消趟/融合）；
+  **并行选择未进引擎**（融合核 auto-parallel 仍在内核内部；B3：threads=1 组合反快 3–4.7×、
+  threads=12 融合快 2–3×，说明"按线程选策略"是引擎欠账）；未接线模块清单见
+  `simd_dsl/docs/engine_integration.md §6`。
+
+
 **门禁**：`fmt --check` 0；clippy 默认/`dsl-backend` 两档 0；test 两档 0（默认 292、feature 325 个 lib 测试，
 新增 6 个 prims 用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
 
