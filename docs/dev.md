@@ -7322,7 +7322,8 @@ perceive 家族 `analysis` feature 门控 / reference 门控仍未实施（break
 | **T2** | **engine 判据下沉**：`criteria::rewrite::{LogPowForm, classify_log_pow}`（规则⑦ 4 子情形，条件/阈值逐字搬迁） | criteria +80 行（17 用例表驱动）/ engine +6 行；`pow_fold` 5→9 测试、4 子情形**逐位**；engine 内阈值残留 **0** |
 | **T3** | **pub 无测试门禁** `pubtestcheck.sh` + 73 条逐项原因 allowlist + 自测 9/9 | pub 项 **327** / 有测试引用 **252** / allowlist 75 / **零引用未豁免 0**；纳入 `cfg(test)` 后零引用名字 145→66；发现 **3 个 dead API**（`decl_nabla`/`is_bit_exact`/`SEPARABLE_MIN_SAVING_PPM`） |
 | **T4** | **§ 编号门禁** `sectioncheck.sh` + 自测 8/8 | 8 文档 **119 处引用**：MISS **0**；映射行跳过 47、跨仓 EXTERNAL 15、例外 41（逐条原因） |
-| 集成 | CI 增 `Pub-without-test guard`/`Section reference guard`；`gate_local.sh` 25 步 | `gate_local --check`：CI 引用 25 脚本 / 覆盖 28 / **缺口 0**；`apicheck` 基线 **463→464**（有意变更，见审计 §11） |
+| **I6（非破坏部分）** | `analysis`/`reference` 两个 feature：8 个 `perceive_*` 研究模块（3259 行）+ 两档参照后端（561 行）可 opt-in 关闭 | **`default = ["analysis","reference"]` ⇒ 默认构建/API 完全不变**；slim = `cargo build -p simd_dsl --release --no-default-features` 实测通过（可省 **3820 行**）；CI 与 gate_local 各加一步 slim 构建 |
+| 集成 | CI 增 `Pub-without-test guard`/`Section reference guard`/`Slim build`；`gate_local.sh` 26 步 | `gate_local --check`：CI 引用 25 脚本 / 覆盖 28 / **缺口 0**；`apicheck` 基线 **463→464**（有意变更，见审计 §11）；步骤数自测改为**动态**（=run_step 数） |
 
 **诚实边界**：T1 的表内校验仍是**人写逻辑搬进表**（微语法=短 Rust 表达式），不是自动推导"正确校验"；T2 只下沉规则⑦的 4 子情形；
 T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只查标题存在性/只认同行前缀/映射行不设防；
