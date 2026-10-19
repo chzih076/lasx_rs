@@ -7442,6 +7442,25 @@ LASX 支持集删除。**建议**：simd 侧下一 breaking 批次一次性删 `
 且**不依赖融合核**（只调 `ops::gelu_quick` 内核）⇒ 本轮**保留**，未随融合核删除。若确要删，
 建议与 `FusedPlan::GeluQuick` 同一 breaking 批次，并同步那三处文档清单。
 
+**§7.51 收尾（Lead，联合命名收尾）：**
+1) **ROI 判定（用户口径：组合不慢于融合 ⇒ 删融合核）**：Lead 在 `/tmp` 探针用 LasxBackend 实测
+   （grade B、6 对丢首对中位、逐对交替、两次复跑）：softmax **2.41–2.46×**、rms **6.96–6.99×**、
+   layer **4.28–4.36×**、axpy **3.35–3.40×**、geometry norm3 **2.13×** / mat3 **1.43×** ⇒ 保留；
+   **gelu_quick `composed/fused = 0.763–0.773×`（融合核慢 29%）⇒ 删除融合核**（本批已落地）。
+   `FusedPlan::GeluQuick` 变体保留，下一 breaking 批与 `ops_dsl` 历史分支一起删。
+2) **axpy 逐位修正**：旧 LASX 核用 FMA（一次舍入）与契约组合（两次舍入）差 1 ulp ⇒ 改 `vmul→vadd(+0)→vadd`
+   同序，`to_bits` 全等；新 A/B 中位 **1.78×**（5 进程），仍远超门槛。
+3) **`ops_dsl` 命名收尾（simd `b882ebe`）的连带影响**：`*_auto`/`*_composed` 公开名全部删除（每算子一个公开名）。
+   lasx 的三个 example 依赖这些旧后缀 ⇒ **已删除**（`auto_ab` / `composed_ab` / `geomf64_auto_ab`，连同
+   `Cargo.toml` 条目）：其历史数据仍在 §7.32.1/§7.32.4/§7.47，但**不可再从 HEAD 复现**（如实标注）；
+   新口径见 `simd_dsl/docs/operator_audit.md` §9。
+4) **rev bump**：`simd_dsl`/`ops_dsl`/conformance 三处 rev → **`b882ebe`**；`--features dsl-backend` 两档
+   clippy/test、nightly rustdoc、`doccheck`、`nm -D` **98** 全绿。
+5) **命名收尾的回归（Lead 复核）**：`norm` 三算子首版 portable 回退改成 5/8 趟显式组合，实测比原引擎快路径慢
+   **1.43×（Scalar）/1.99×（Idiomatic）** ⇒ 已改回 `rewrite_softmax_rows`/`fuse!` 旧生产路径，复测
+   `new/rewrite = 1.019/1.027`、max_abs=0（逐位）。
+
+
 
 
 
