@@ -7698,6 +7698,15 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   如实写：幅度小，逐元素本身不是瓶颈，跨算子真正的融合需后端新核，P1 新核/P2/P3 未做）。
 - rev bump 到 `7f5b9be`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.11 跨算子链条 + RMS 终止步（simd `8492b35`）
+
+- simd E14.2：`MapChain.term = Some(MapTerm::RmsRows{eps})` —— 逐元素链后在同一行块内直接做行 RMS 归一（
+  `reduce_rows_map_f32` SumSq/SqrtMeanPlusEps/Div），**一次 spawn 跑完**；`ChainReport.termed` 可见。
+- 等价：与"先跑链、再 `engine::execute(RmsNormRows)`"串行/并行均 `to_bits` 全等（simd 测试）。
+- 实测（Scalar，2 步逐元素 + RMS，4.19M 元素，threads=8）：顺序 8.43ms → 链 8.13ms（**1.037×**）；
+  如实写：省 spawn/join，非算术融合；LayerNorm 终止步、P2/P3 融合核仍未做。
+- rev bump 到 `8492b35`；两档 clippy/test、doccheck 全绿。
+
 
 
 
