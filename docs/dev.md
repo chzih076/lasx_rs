@@ -7678,6 +7678,19 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   生产热路径，让生产后端的能力判定也被 LLVM 折掉；`objdump`/IR 验证。
 - **rev bump**：`simd_dsl`/`ops_dsl` → `f65bed1`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
 
+### 7.52.9 跨算子优化计划（simd `1ebeda1`，**仅文档/未实现**）
+
+- 用户问"跨算子有没有计划"。simd `docs/engine_integration.md §14` 落成书面计划，要点：
+  **现状**——单算子都经引擎，但**算子之间**未优化（`execute_all` 仅聚合；中间缓冲、多趟读写、
+  每算子一次线程启动都在）；**设计**——`engine::chain`（slot 缓冲/workspace，引擎看到整张图）+
+  row-block 贯穿整链一次线程启动 + 分级融合（P1 逐元素链/P2 axpy→norm 逐位；P3 matmul epilogue 容差）；
+  **诚实点**——改变数值路径的融合必须新增后端融合核并在两后端×threads A/B 达标才保留
+  （gelu 融合更慢已删先例）；**门禁**——`enginecheck` 链覆盖检查、`engine-trace` 链决策、
+  `SIMD_DSL_NO_FUSE=1` 对照、P1/P2 `to_bits` 全等测试。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `1ebeda1`（本轮 simd 仅加计划文档，无接口变化）；
+  两档 clippy/test、`doccheck` 全绿。
+
+
 
 
 
