@@ -66,6 +66,13 @@ use simd_dsl::{
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LasxBackend;
 
+/// **仅测试钩子**：`LASX_NO_PLAN` 已设置 ⇒ `supports_plan`/`FusedNorms`/`FusedElementwise`
+/// 报 false，让 fsync 探针能在**同一后端**上测得生产组合路径（性能 A/B 用）。
+/// 默认（未设置）行为逐字不变；本函数不参与任何生产分支的语义。
+fn no_plan_hook() -> bool {
+    std::env::var_os("LASX_NO_PLAN").is_some()
+}
+
 /// 长度不符时的错误（与 `simd_dsl` 的默认实现同类）。
 fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) -> BackendError {
     BackendError::LengthMismatch {
@@ -983,6 +990,12 @@ impl Backend for LasxBackend {
         // 阶段4：`FusedNorms` / `FusedElementwise` **只报真**——对应方法全部 override 到 LASX 内核才报。
         // **`FusedGeometry`（批2）/ `Quant`（批3）不再报**：对应具名方法已被 `FusedPlan` 取代；
         // 融合能力由 `supports_plan` 的 kind 承载（本后端几何 5 kind 全真、量化 3/4 真）。
+        //
+        // **测试钩子（env `LASX_NO_PLAN=1`）**：只把 `FusedNorms`/`FusedElementwise` 报 false，
+        // 供基准探针在同一后端上测**生产组合路径**；默认构建/运行行为不变（见 `no_plan_hook`）。
+        if no_plan_hook() && matches!(cap, Capability::FusedNorms | Capability::FusedElementwise) {
+            return false;
+        }
         matches!(
             cap,
             Capability::Packing
@@ -1060,6 +1073,10 @@ impl Backend for LasxBackend {
         // **`GeluQuick`/`DequantizeI8Rows`/`Norm2BatchF64` 明确 false**（不虚报）：
         // GeluQuick = 融合核实测更慢（W3 删除）；Dequantize = 无高效连续 i8 块拓宽核；
         // Norm2BatchF64 = 无 f64 norm2 融合核。三者 `exec_fused_plan` 对应臂都回退 portable 解释。
+        // **测试钩子**：`LASX_NO_PLAN` 已设置 ⇒ 一律 false（基准探针测生产组合路径用）。
+        if no_plan_hook() {
+            return false;
+        }
         match kind {
             PatternKind::Axpy
             | PatternKind::SoftmaxRows
