@@ -7769,6 +7769,16 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   但按访存估算仍个位数百分比。**决定暂不采纳**；若做，需 LASX 实测占比 ≥5% 且融合核 ≥1.05×。
 - rev bump 到 `3a605f6`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.19 目标闭环汇总（simd `027f69e`）：引擎接管证据矩阵
+
+- simd `engine_integration.md §17` 汇总可复核证据：禁止直调 0 处；18 模块 真实优化 14 / 仅组合桥 4 /
+  未接线 0；单算子可断言 `EngineReport`；跨算子链（RMS/LayerNorm 终止步）+ 流水线入口 + `pipeline!` 宏
+  逐位等价；`build.rs` 编译期打印 41/28/1。
+- 优化如实：跨算子目前**仅调度层** 1.03–1.04×；P2/P3 数值融合经实测否决（§15/§16），**未采纳且不宣称**。
+- 已知边界：enginecheck 不剥离 `#[cfg(test)]`（pipeline.rs 计数来自测试，实际为链级入口）。
+- 剩余欠账（非阻塞）：4 个仅桥模块、线程池复用、enginecheck 剥离测试块。
+- rev bump 到 `027f69e`；两档 clippy/test、doccheck 全绿。
+
 
 
 
