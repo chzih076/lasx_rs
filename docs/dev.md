@@ -7589,8 +7589,33 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   softmax/rms/layer/mat3 融合仍赢，且**多线程差距最大**（收益主因是内核内 auto-parallel）。
 - **rev bump**：`simd_dsl`/`ops_dsl` → `4e2222c`；两档 clippy/test、nightly rustdoc、`doccheck`、
   `nm -D` 98 全绿。
-- **引擎侧仍未做（如实）**：组合路径**没有并行**（无按线程选策略能力）、无跨算子融合（`execute_all`
-  只聚合）、11 个模块只有组合桥入口；13 个入口未进引擎。
+- **引擎侧仍未做（如实）**：组合路径**没有并行**（无按线程选策略能力）——**E6 已补，见 §7.52.4**；
+  无跨算子融合（`execute_all` 只聚合）、11 个模块只有组合桥入口；13 个入口未进引擎。
+
+### 7.52.4 引擎并行决策（simd `a57412e`）：组合路径并行化 + 修正后的 B 级三臂（2026-10-19）
+
+- **E6（引擎侧）**：`engine::parallel` 按行/元素切块 + `std::thread::scope`；`engine::execute` 自动选
+  线程数（`available_parallelism`、按规模伸缩），`execute_with_threads`/env `SIMD_DSL_ENGINE_THREADS`
+  可显式控制；组合路径（softmax/rms/layer/norm3）已接线；**并行结果与串行逐位**（测试守）。
+- **修正后三臂（engine 自动并行；LasxBackend；6 轮丢首轮中位；grade B，loadavg≈3.8）**：
+
+  | case | A=lasx api | B=DSL 融合 | C=DSL 组合（并行） | C/B |
+  |---|---|---|---|---|
+  | softmax 1024² | 0.222 | 0.321 | 0.830 | **2.58×** |
+  | rms_norm 1024² | 0.088 | 0.256 | 0.713 | **2.79×** |
+  | layer_norm 1024² | 0.123 | 0.284 | 0.763 | **2.68×** |
+  | axpy 1M | 0.421 | 0.536 | 0.604 | **1.13×** |
+  | norm3 f64 200k | 0.392 | 0.580 | 0.582 | **1.00×** |
+  | mat3_mul_vec3 200k | 2.169 | 3.109 | 7.845 | **2.52×** |
+
+  ⇒ 对比 §7.52.3 的串行组合（threads=12）：softmax 8.49→**2.58**、rms 4.14→**2.79**、
+  layer 12.21→**2.68**（引擎并行把差距缩小 1.5–4.5×）。**“axpy/norm3 删除融合核候选”结论作废**：
+  axpy 并行后 1.13×（线程开销 > 省趟数）、norm3 1.00×（持平但非稳定优势）——
+  **均未删融合核**。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `a57412e`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
+- **仍缺（如实）**：线程池复用（每次调用创建线程，小算子吃亏）；后端原生并行 vs 引擎并行的统一策略；
+  跨算子融合；11 个模块仅桥入口、13 个入口未进引擎。
+
 
 
 
