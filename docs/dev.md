@@ -7564,6 +7564,35 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   threads=12 融合快 2–3×，说明"按线程选策略"是引擎欠账）；未接线模块清单见
   `simd_dsl/docs/engine_integration.md §6`。
 
+### 7.52.3 引擎接入第二波 + **测量校正**（simd `4e2222c`，2026-10-19）
+
+- **引擎口径第二波（simd E4/E5）**：17/17 模块都有引擎入口——**真实优化 6**（`engine::execute`：
+  norm/geometry/quant/rope/activations/axpy）+ **组合桥 11**（`execute_composed*`：入口 + op/stages
+  感知与报告，**无 plan 替换**）；13 个入口如实未迁移（matmul 4 薄变体、spectral 3 计划句柄、
+  stencil2d 6 变体）。门禁 `enginecheck --strict` 自动发现模块、分计两类入口。
+- **测量校正（重要）**：此前三臂探针 **缺少 `-C target-feature=+lasx`**（该 flag 只在 lasx 仓库的
+  `.cargo/config.toml` 生效，独立探针不继承）⇒ LASX intrinsics 退化为函数调用，**组合路径被严重低估**
+  （`map_unary(Exp)` 41ms→1.2ms、`map_rows_sum` 42ms→1.1ms、softmax 组合 41ms→2.9ms @1024²）。
+  基于旧探针的"组合/融合"数字**作废**。
+- **修正后同窗口三臂（grade C 趋势，loadavg 6.6–6.8；组合/融合 >1 ⇒ 融合更快）**：
+
+  | case | threads=1 | threads=12 |
+  |---|---|---|
+  | softmax 1024² | 1.86× | 8.49× |
+  | rms_norm 1024² | 1.24× | 4.14× |
+  | layer_norm 1024² | 2.81× | 12.21× |
+  | axpy 1M | 1.25× | **0.96×** |
+  | norm3 f64 200k | **0.95×** | **0.99×** |
+  | mat3 f64 200k | 2.40× | 1.75× |
+
+  ⇒ **`axpy`/`norm3` 组合 ≈ 融合（删除融合核候选，待 B 级窗口复核后再动）**；
+  softmax/rms/layer/mat3 融合仍赢，且**多线程差距最大**（收益主因是内核内 auto-parallel）。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `4e2222c`；两档 clippy/test、nightly rustdoc、`doccheck`、
+  `nm -D` 98 全绿。
+- **引擎侧仍未做（如实）**：组合路径**没有并行**（无按线程选策略能力）、无跨算子融合（`execute_all`
+  只聚合）、11 个模块只有组合桥入口；13 个入口未进引擎。
+
+
 
 **门禁**：`fmt --check` 0；clippy 默认/`dsl-backend` 两档 0；test 两档 0（默认 292、feature 325 个 lib 测试，
 新增 6 个 prims 用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
