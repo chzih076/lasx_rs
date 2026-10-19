@@ -53,6 +53,14 @@ pub mod dsl_map;
 #[cfg(feature = "dsl-backend")]
 pub mod f64_map;
 
+/// **B1b（M5 续）：组合原语 LASX 内核**——`map_unary_f32`（`Exp`/`Sqrt` 向量化、其余委托标量）
+/// 与 `reduce_rows_map_f32`（`Sum`/`SumSq` 行内 8-lane + epilogue + map；未验证组合委托标量）。
+///
+/// **挂 `dsl-backend`**：唯一调用方是 `src/dsl_backend.rs`（同 feature 门控）；不门控会被
+/// `clippy -D warnings` 的 `dead_code` 判死（AGENTS.md #49）——**不要**用 `#[allow(dead_code)]` 掩盖。
+#[cfg(feature = "dsl-backend")]
+pub mod prims;
+
 /// **P4-b 融合内核**（`energy_dc` 单遍去均值能量、`psd_pair` 成对 epilogue）——
 /// **纯标量、与便携参照逐位**（`to_bits()` 相等）；LASX FMA 版留待拿到正确封装名后补（其容差界届时实测）。
 ///
