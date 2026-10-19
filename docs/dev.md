@@ -7460,6 +7460,97 @@ LASX 支持集删除。**建议**：simd 侧下一 breaking 批次一次性删 `
    **1.43×（Scalar）/1.99×（Idiomatic）** ⇒ 已改回 `rewrite_softmax_rows`/`fuse!` 旧生产路径，复测
    `new/rewrite = 1.019/1.027`、max_abs=0（逐位）。
 
+## 7.52 B1（M5）：LASX 组合原语 override 第一批——`axpy_inplace_f32` 落地 + 5 个缺口如实报（2026-10-19）
+
+**背景（`A_diagnosis.md` §6 M5）**：组合（`fuse!`/宏）路径在 LASX 上会回落到 portable **标量**默认
+⇒ "融合 vs 组合"的 A/B 混着"SIMD vs 标量"。本轮按"有现成 `src/ops` 内核才接、无则报缺口、不硬造"执行。
+
+**已落地 1/6：`axpy_inplace_f32`**（`src/dsl_backend.rs`，映射 `api::axpy` 两舍入 LASX 向量核）
+- **等价类：逐位**（同一 `t = alpha*x + 0.0; y += t` 两次舍入序列，含 `±0`/次正规/大值；
+  `tests/prims_override.rs` 用 `to_bits` 对拍 portable 默认，含非 8 倍数尾巴 n=4099，全等）。
+- **A/B（`examples/prims_ab.rs`，Lead 口径：受控线程；同进程交替 5 对丢首对中位）**：
+
+| threads | n | A=Portable ms | B=LASX ms | A/B | loadavg（grade） |
+|---|---|---|---|---|---|
+| **1**（隔离核效率） | 1M | 0.604 | 0.604 | **1.000×** | 8.71 5.77 6.87 ⇒ **grade C** |
+| **1** | 8M | 14.447 | 13.743 | **1.051×** | 同上 |
+| **12**（生产默认） | 1M | 0.503 | 0.544 | **0.926×** | 8.71 ⇒ grade C |
+| **12** | 8M | 20.855 | 24.592 | **0.848×** | 同上 |
+
+**如实结论**：**逐位成立，但性能无稳定收益**——该原语是 1 趟内存流（8M ≈ 96 MB 流量），
+portable 默认已被 LLVM 自动向量化 ⇒ LASX 手写核落在噪声带（1.00–1.05×/0.85–0.93×，本轮 loadavg 8.7 = grade C）。
+**override 仍保留**：它是 B2 `axpy!` 宏（3 趟→1 趟）的落点，组合路径的收益由 B2 在**宏层**兑现后再测；
+本表只证明"原语级不比 portable 慢/更不更快"。
+
+**缺口 5/6（`src/ops` 无现成内核 ⇒ 本轮不硬造，逐条如实报）**：
+| 原语 | 现状 | 缺口原因 |
+|---|---|---|
+| `reduce_rows_map_f32`（rms/layer 组合回退唯一入口） | 缺 override | `src/ops` 只有**窄版** `map_rows_sum_f32`（`ops/map_rows_sum.rs`，Exp/ExpShiftedRow），**没有通用 RowFuse**（RowReduce×RowEpilogue×map 组合）内核 |
+| `reduce_sum_rows_f32` | 缺 override | 只有 `reduce_sum_cols`（`ops/dsl_map.rs:144`），无按行版 |
+| `reduce_max_f32`（整片 max） | 缺 override | 无整片 max 内核（`reduce_max_rows/cols` 是轴版） |
+| `map_unary_f32`（exp/sqrt 族） | 缺 override | `nn_math` 只有 `exp_vec/exp_seq/sigmoid_*` **内部 helper**，无通用 `UnaryOp` 映射内核（exp 之外还有 Sigmoid/Tanh/Sqrt/Rcp/Log… 且与 libm 非逐位） |
+| `map_binary_scalar_f32` | 缺 override | `dsl_map::map_binary` 是**双数组**版，无标量广播版内核 |
+
+**下一批建议（按 A 诊断优先级）**：`reduce_rows_map_f32`（通用 RowFuse）与 `map_unary_f32`（exp/sqrt 族）
+最值钱——补上后 rms/layer/softmax 的组合路径才真正 SIMD 化；`map_binary_scalar_f32` 可先做双数组+广播小内核。
+
+**门禁**：`fmt --check` 0；clippy **默认/`dsl-backend` 两档 0**；test 两档 0（含新 `tests/prims_override.rs`
+2 个用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
+
+### 7.52.1 B1b（task-108）：`map_unary_f32` + `reduce_rows_map_f32` override——组合路径去标量化（2026-10-19）
+
+**落地**：新增 `src/ops/prims.rs`（**218 行**，`dsl-backend` feature 门控）+ `src/dsl_backend.rs` 两个 override。
+- `map_unary_f32`：`Exp` 用 `nn_math::exp_vec`（8 lane 多项式，尾块用同串 `exp_seq`）；
+  `Sqrt` 用 `lasx_xvfsqrt_s`；**其余变体（Sin/Cos/Ln/Erf/Sigmoid/Rcp/Abs）整片委托
+  `kernels::scalar::map_unary_f32`**（不做未经验证的向量化，等价类优先）。
+- `reduce_rows_map_f32`：`RowReduce::{Sum,SumSq}` × 6 个 `RowEpilogue` × `BinaryOp::{Add,Sub,Mul,Div}`
+  走向量（行内 8-lane 累加 + **与标量多累加器同 lane 同序 hsum** + 标量 epilogue + 向量 map）；
+  `Max` 归约与 `Max/Min` map **整片委托标量参照**（`NaN`/`±0` 语义不为优化让路）；
+  长度/溢出错误码与 portable 默认同口径。
+
+**等价类（实测，`tests/prims_override.rs` 现 6 个测试）**：
+- `map_unary`：`Sqrt` 与全部委托变体 **`to_bits` 逐位**；`Exp` **容差类**，实测
+  `max_rel = 1.675e-7`（vs libm `exp`；声明界 `5e-7`）。
+- `reduce_rows_map`：全矩阵（3 reduce × 6 epilogue × 6 map × cols∈{3,13,16,64} = **432 组**）
+  与 **portable 契约默认（8 lane 多累加器）`to_bits` 逐位**；`Max` 与顺序下限臂逐位；
+  与 `ScalarBackend`（顺序单累加器）的容差类差（行统计量口径）实测 **`max_rel = 1.294e-6`**
+  （cols=1000、SumSq；声明界 `2e-6`）。
+- 错误路径：长度不符/`rows×cols` 溢出与 portable 同 `Err`（新增 2 条断言）。
+
+**A/B（`examples/prims_ab.rs` 扩两节；`THREADS=1|12`；同进程轮转 5 对丢首对中位；
+loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
+
+| 用例（`LASX_NO_PLAN=1` 组合回退） | threads | A=改前(Scalar) ms | B=改后(LASX) ms | F=融合 ms | A/B | B/F |
+|---|---|---|---|---|---|---|
+| rms_norm 1024² | 1 | 3.366 | 1.011 | 0.640 | **3.33×** | 1.58× |
+| layer_norm 1024² | 1 | 7.117 | 1.827 | 1.032 | **3.90×** | 1.77× |
+| softmax_rows 1024² | 1 | 8.843 | 3.344 | 1.818 | **2.64×** | 1.84× |
+| rms_norm 4096×128 | 1 | 1.644 | 0.524 | 0.271 | **3.14×** | 1.93× |
+| layer_norm 4096×128 | 1 | 3.085 | 0.803 | 0.528 | **3.84×** | 1.52× |
+| softmax_rows 4096×128 | 1 | 4.255 | 1.647 | 0.839 | **2.58×** | 1.96× |
+| rms_norm 1024² | 12 | 4.188 | 1.317 | 0.364 | 3.18× | 3.61× |
+| layer_norm 1024² | 12 | 10.359 | 3.852 | 0.484 | 2.69× | 7.96× |
+| softmax_rows 1024² | 12 | 8.623 | 3.095 | 0.360 | 2.79× | 8.59× |
+| rms_norm 4096×128 | 12 | 1.644 | 0.545 | 0.061 | 3.02× | 8.96× |
+| layer_norm 4096×128 | 12 | 3.086 | 0.759 | 0.092 | 4.07× | 8.21× |
+| softmax_rows 4096×128 | 12 | 5.609 | 2.061 | 0.357 | 2.72× | 5.77× |
+
+**结论/边界（如实）**：
+1. **组合路径确实去掉了标量瓶颈**：三个算子生产回退快 **2.6–4.1×**（两线程配置方向一致）；
+   `axpy_inplace` 核效率仍持平（1/12 线程 0.94–0.99×，逐位，与 B1 结论一致）。
+2. **仍未打平融合**（`B/F` 1.5–9.0×）：t1 时 1.5–2.0×；t12 时 3.6–9.0×——后者主要是**融合核内部
+   auto-parallel**（B3 矩阵已测 threads=12 时融合/组合 2.06–3.24×），不是本 override 目标。
+3. **grade C（loadavg 16）**：上表是同窗口趋势；正式验收需 loadavg ≤4.5 的 B 级窗口复跑。
+4. **A 臂是"改前"的近似**：`ScalarBackend` = 顺序单累加器下限臂；旧 Lasx 回退是多累加器标量
+   （softmax 还含 1 个 LASX `reduce_sum`）⇒ A 略慢于真旧值，**收益方向可信、幅度需 B 级复核**。
+5. **A≡B 非逐位**（max_abs 4.8e-7 / 3.1e-6 / 7e-9）：来自"顺序臂 vs 多累加器"的容差类差，
+   不是生产路径差；生产路径等价证据见测试（与 portable 默认 `to_bits` 逐位）。
+6. **剩余缺口（本轮未做，如实）**：`reduce_sum_rows_f32` / `reduce_max_f32` /
+   `map_binary_scalar_f32` 仍无 override（`src/ops` 无现成内核，按任务口径不硬造）。
+
+**门禁**：`fmt --check` 0；clippy 默认/`dsl-backend` 两档 0；test 两档 0（默认 292、feature 325 个 lib 测试，
+新增 6 个 prims 用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
+
 
 
 

@@ -58,8 +58,8 @@
 // （`simd_dsl::backend`/`call`/`equivalence`/`packed`/`route`/`kernel`/`safety`）**已不存在** ⇒ 改走根。
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
-    FusedIo, FusedPlan, PackedB, PatternKind, PrecisionClaim, ReduceMapOp, ScalarKind, TernaryOp,
-    UnaryOp,
+    FusedIo, FusedPlan, PackedB, PatternKind, PrecisionClaim, ReduceMapOp, RowFuse, ScalarKind,
+    TernaryOp, UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -1044,6 +1044,50 @@ impl Backend for LasxBackend {
             op: "axpy_f32",
             cap: Capability::FusedElementwise,
         })
+    }
+
+    /// **组合原语 override（B1/task-106 M5）**：`y := alpha·x + y`（就地，LASX 1 趟向量）。
+    ///
+    /// 这是 `axpy!` 宏（B2）与组合回退的落点：默认实现走 `kernels::scalar::axpy_inplace_f32`
+    /// （逐元素标量）；本 override 映射到 `api::axpy`（LASX 两舍入向量核）。
+    /// **等价类：逐位**（同一 `t = alpha*x + 0.0; y += t` 两次舍入序列，含 ±0 语义；
+    /// `tests/prims_override.rs` 用 `to_bits` 对拍；W3 已把该核从 FMA 改成两次舍入）。
+    fn axpy_inplace_f32(&self, y: &mut [f32], x: &[f32], alpha: f32) -> Result<(), BackendError> {
+        debug_assert_ne!(x.as_ptr(), y.as_ptr(), "axpy_inplace_f32：x/y 不得重叠");
+        crate::api::axpy(alpha, x, y).map_err(|_| BackendError::Unsupported {
+            op: "axpy_inplace_f32",
+            cap: Capability::FusedElementwise,
+        })
+    }
+
+    /// **组合原语 override（B1b/task-108 M5 续）**：逐元素一元——`Exp` 走 LASX 8-lane 多项式、
+    /// `Sqrt` 走 `xvfsqrt_s`（IEEE ⇒ 逐位），**其余变体整片委托
+    /// `kernels::scalar::map_unary_f32`**（逐位不变）。
+    ///
+    /// **等价类**：`Sqrt` 逐位；`Exp` 容差类（实测 rel 界见 `tests/prims_override.rs` 与
+    /// `docs/dev.md §7.52`）；其余（`Sin/Cos/Ln/Erf/Sigmoid/Rcp/Abs`）委托 ⇒ 逐位。
+    /// **意义**：`fuse!`/宏组合路径里的 `map_unary!(Exp)`（softmax 回退、`exp_log_fold` 等）
+    /// 不再回落 portable 标量 libm。
+    fn map_unary_f32(&self, x: &[f32], out: &mut [f32], op: UnaryOp) -> Result<(), BackendError> {
+        crate::ops::prims::map_unary(x, out, op)
+    }
+
+    /// **组合原语 override（B1b/task-108 M5 续）**：窄三元组融合 `RowFuse`
+    /// （`fuse!` 宏的落点，rms/layer/softmax 的生产组合路径）。
+    ///
+    /// **支持**：`RowReduce::{Sum,SumSq}` × `RowEpilogue`（6 变体）× `BinaryOp::{Add,Sub,Mul,Div}`；
+    /// 行内 8-lane 累加与 `kernels::scalar::reduce_rows_map_f32` **同序** ⇒ **逐位**。
+    /// **未验证组合**（`Max` 归约、`Max/Min` map）**整片委托标量参照**（`NaN`/`±0` 语义优先，
+    /// 不为优化让路）；契约错误码与 portable 同口径（`LengthMismatch`/`ShapeOverflow`）。
+    fn reduce_rows_map_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+        plan: RowFuse,
+    ) -> Result<(), BackendError> {
+        crate::ops::prims::reduce_rows_map(x, rows, cols, out, plan)
     }
 
     // ============ P3 Plan：`supports_plan` / `exec_fused_plan`（task-63 + P1 批1 task-66）============

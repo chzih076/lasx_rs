@@ -110,6 +110,12 @@ required-features = ["dsl-backend"]
 name = "geomf64_ab"
 required-features = ["dsl-backend"]
 
+# B1/task-106（M5）：组合原语 override 的 A/B（受控线程 `pool::init_global(1|12)`；只用
+# `dsl-backend` 面：`LasxBackend.axpy_inplace_f32` vs `ScalarBackend` 默认实现）。
+[[example]]
+name = "prims_ab"
+required-features = ["dsl-backend"]
+
 # `geomf64_fused_ab` **已随批2 删除**：5 个几何具名方法（`Backend::*_f64`）在 `b89a32f` 被
 # `FusedPlan` 取代 ⇒ 原「trait override vs api」装置不再有对照臂；几何 A/B 现由 `plan_ab`
 # 的 5 条 Plan 行承接（Plan vs 直接 api）。
