@@ -7649,6 +7649,21 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   仍只有组合桥；跨算子融合、线程池仍未做。
 - **rev bump**：`simd_dsl`/`ops_dsl` → `fe2e191`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
 
+### 7.52.7 引擎真实优化再扩（simd `fffbf4a`）：complex/laplace/diff（2026-10-20）
+
+- **E11（simd 侧）**：`Algorithm` 新增 `ComplexMatmulF32`（6 阶段：4 matmul 行块并行 + 2 逐元素加减；
+  能力位 `ComplexRoutes` 为真报 `NamedCapability`）、`LaplaceForward`（3 阶段）、`DiffRows`
+  （路线选择在 `engine::nabla`）；专用入口 `execute_diff` 返回 `(EngineReport, DiffReport)`。
+  `ops_dsl` 的 `complex::cmatmul_f32`、`laplace::forward`、`diff::diff_rows_f32` 从组合桥改真实路由。
+- **等价/校验**：执行层后端调用与旧宏相同 ⇒ 逐位口径不变；三个变体在**引擎内**做与 portable 同口径的
+  `LengthMismatch` 校验（`laplace_forward_nan_inf_and_contract` 抓到"未校验时短缓冲先越界切片"，已修）。
+- **矩阵（`enginecheck --matrix`）**：真实优化 **13** / 仅组合桥 **4**（iso_kernel、kv_cache、
+  spectral、stencil2d）/ 未接线 **0**。
+- **边界（如实）**：`ComplexMatmulF32` 的 `NamedCapability` 只是策略报告（执行顺序不变，后端没有可选的
+  复数融合核）；4 个模块仍桥；跨算子融合、线程池仍未做。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `fffbf4a`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
+
+
 
 
 
