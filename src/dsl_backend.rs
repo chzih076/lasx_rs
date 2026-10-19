@@ -1040,26 +1040,31 @@ impl Backend for LasxBackend {
     // * `SoftmaxRows { rows, cols }`：行 softmax（`io.x`/`io.out`，`len==rows·cols`）；
     // * `RmsNormRows { rows, cols, eps }`：`out = x/√(mean(x²)+eps)`（`io.x`/`io.out`）；
     // * `LayerNormRows { rows, cols, eps }`：`out = (x−mean)/√(var+eps)`（`io.x`/`io.out`）；
-    // * `GeluQuick`：GELU tanh 近似（等长 `io.x`/`io.out`）；
+    // * `GeluQuick`：GELU tanh 近似（等长 `io.x`/`io.out`）——**W3 起不接**（见下）；
     // * `RopeApply { rows, cols, n_dims }`：半旋转（`io.x`/`io.cos`/`io.sin`/`io.out`；
     //   `cos`/`sin` 长度 = `rows·(n_dims/2)`、`n_dims` 偶数且 ≤ cols）。
-    // **本后端映射**（全部走 LASX 融合核）：Axpy → `api::axpy`；SoftmaxRows → `api::softmax_rows_into`；
+    // **本后端映射**（走 LASX 融合核）：Axpy → `api::axpy`；SoftmaxRows → `api::softmax_rows_into`；
     // RmsNormRows → `api::rms_norm_into`；LayerNormRows → `api::layer_norm_into`；
-    // GeluQuick → `api::gelu_quick_into`；RopeApply → `api::rope_into(RopeMode::NeoX)`。
+    // RopeApply → `api::rope_into(RopeMode::NeoX)`。
+    // **`GeluQuick` 融合核已删（W3）**：实测 LASX 融合核比纯组合**慢 29%**（composed/fused =
+    // 0.763–0.773×）⇒ `supports_plan` 报 false、`exec_fused_plan` 回退 portable 解释；
+    // `FusedPlan::GeluQuick` 变体保留（契约面不删，死亡方式：simd 侧后续单独 breaking 建议）。
     // **长度/形状校验与契约默认解释器同口径**（错 ⇒ `LengthMismatch`/`ShapeOverflow`，空 ⇒ `Ok`）。
     // 数值：Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；与 portable 计划解释比 = 既有容差类
-    // （softmax 2.79e-9、rms 1.83e-7、layer 2.08e-7、gelu 5.26e-3、rope 6.92e-8、axpy 8.27e-8）。
+    // （softmax 2.79e-9、rms 1.83e-7、layer 2.08e-7、rope 6.92e-8）；**axpy 自 W3 起逐位**
+    // （两次舍入核修正，原 FMA 单次舍入差 1 ulp）。
 
     fn supports_plan(&self, kind: PatternKind) -> bool {
-        // **批1 的 6 个 f32 + 批2 的 5 个 f64 几何 + 批3 的 quantize/dot/gemv：全部 true**；
-        // **`DequantizeI8Rows` 明确 false**（LASX 无连续 i8 块的高效拓宽路径 ⇒ 不虚报；
-        // `exec_fused_plan` 该臂回退 portable 解释，见下方注释）。
+        // **f32 的 5 个（Axpy/Softmax/Rms/Layer/Rope）+ 批2 的 5 个 f64 几何
+        // + 批3 的 quantize/dot/gemv：全部 true**；
+        // **`GeluQuick`/`DequantizeI8Rows`/`Norm2BatchF64` 明确 false**（不虚报）：
+        // GeluQuick = 融合核实测更慢（W3 删除）；Dequantize = 无高效连续 i8 块拓宽核；
+        // Norm2BatchF64 = 无 f64 norm2 融合核。三者 `exec_fused_plan` 对应臂都回退 portable 解释。
         match kind {
             PatternKind::Axpy
             | PatternKind::SoftmaxRows
             | PatternKind::RmsNormRows
             | PatternKind::LayerNormRows
-            | PatternKind::GeluQuick
             | PatternKind::RopeApply
             | PatternKind::Vec3AddScaledF64
             | PatternKind::Norm3BatchF64
@@ -1069,10 +1074,9 @@ impl Backend for LasxBackend {
             | PatternKind::QuantizeI8Rows
             | PatternKind::DotI8
             | PatternKind::GemvI8 => true,
-            // 以下两个 kind **如实不接**：`DequantizeI8Rows`（LASX 无连续 i8 块拓宽核）、
-            // `Norm2BatchF64`（simd 批4 新增；LASX 无 f64 norm2 融合核）⇒ `exec_fused_plan`
-            // 对应臂回退 portable 解释（逐位/同序列）。
-            PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => false,
+            PatternKind::GeluQuick | PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => {
+                false
+            }
         }
     }
 
@@ -1133,15 +1137,12 @@ impl Backend for LasxBackend {
                     },
                 )
             }
+            // **W3（task-104）：GELU 融合核已删**（实测比纯组合慢 29%，composed/fused 0.763–0.773×）。
+            // `supports_plan` 报 false；本臂**回退 portable 解释器**（`ScalarBackend` 的契约默认
+            // 实现）⇒ 与 portable 解释臂逐位，调用方按 `supports_plan` 选路不会踩到更慢的核。
+            // `FusedPlan::GeluQuick` 变体**保留**（契约面不删；死亡方式由 simd 侧单独提 breaking）。
             FusedPlan::GeluQuick => {
-                let op = "exec_fused_plan(GeluQuick)";
-                if io.x.is_empty() {
-                    return Ok(());
-                }
-                crate::api::gelu_quick_into(io.x, io.out).map_err(|_| BackendError::Unsupported {
-                    op,
-                    cap: Capability::FusedElementwise,
-                })
+                simd_dsl::ScalarBackend.exec_fused_plan(FusedPlan::GeluQuick, io)
             }
             FusedPlan::RopeApply { rows, cols, n_dims } => {
                 let op = "exec_fused_plan(RopeApply)";
@@ -2116,10 +2117,11 @@ mod tests {
         );
     }
 
-    /// **P3 Plan（task-63）→ 批1（task-66）→ 批2（task-69）**：**11 个 kind** 的语义映射与数值——
-    /// Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 = 既有容差类/
-    /// 几何零向量"路径各自语义"（LASX `unitize3` = 0、契约默认 = NaN）；
-    /// portable 后端 `supports_plan` 全 false；长度/形状错 ⇒ `Err`（不 panic）。
+    /// **P3 Plan（task-63）→ 批1（task-66）→ 批2（task-69）→ W3（task-104）**：**13 个 kind**
+    /// 的语义映射与数值——Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 =
+    /// 既有容差类/几何零向量"路径各自语义"（LASX `unitize3` = 0、契约默认 = NaN）；
+    /// portable 后端 `supports_plan` 全 false；`GeluQuick`/`Dequantize`/`Norm2` 如实 false
+    /// 且回退 portable 解释；长度/形状错 ⇒ `Err`（不 panic）。
     #[test]
     fn plan_overrides_map_to_fused_kernels_and_stay_bitwise() {
         use simd_dsl::{FusedIo, FusedPlan, PatternKind, ScalarBackend};
@@ -2129,7 +2131,6 @@ mod tests {
             PatternKind::SoftmaxRows,
             PatternKind::RmsNormRows,
             PatternKind::LayerNormRows,
-            PatternKind::GeluQuick,
             PatternKind::RopeApply,
             PatternKind::Vec3AddScaledF64,
             PatternKind::Norm3BatchF64,
@@ -2141,11 +2142,13 @@ mod tests {
             PatternKind::DotI8,
             PatternKind::GemvI8,
         ];
-        // ① 能力位：按 PatternKind 粒度、只低估——本后端 14 个接；portable 全 false。
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端 13 个接；portable 全 false。
         for k in kinds {
             assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
             assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
         }
+        // **W3：GeluQuick 融合核删除**（融合比组合慢 29%）⇒ 如实 false
+        assert!(!be.supports_plan(PatternKind::GeluQuick));
         // **DequantizeI8Rows 如实不报**（无 LASX 核；exec 走 portable 回退，见下）
         assert!(!be.supports_plan(PatternKind::DequantizeI8Rows));
         /// 空 `FusedIo` 构造（`cos`/`sin` 只 RopeApply 用）。
@@ -2229,35 +2232,23 @@ mod tests {
             assert!(d <= 1e-5, "{name} 计划路与 portable 超界 {d:e}");
         }
 
-        // ④ GeluQuick：Plan 路 ≡ 直接 api（逐位）；vs portable = 既有容差类（文档界 5.26e-3）
+        // ④ GeluQuick（**W3 删除融合核**）：能力位 false；`exec_fused_plan` 回退 portable 解释器，
+        //    与 portable 后端的解释结果**逐位**（不再有 LASX 融合核路径；Lead 实测组合快于融合 29%）。
         let xg: Vec<f32> = (0..257).map(|i| (i % 43) as f32 * 0.125 - 2.5).collect();
         let mut g_plan = vec![0.0f32; xg.len()];
         be.exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_plan))
             .unwrap();
-        let mut g_api = vec![0.0f32; xg.len()];
-        crate::api::gelu_quick_into(&xg, &mut g_api).unwrap();
-        for (a, b) in g_plan.iter().zip(&g_api) {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "GeluQuick：Plan 路与直接 api 不逐位"
-            );
-        }
         let mut g_port = vec![0.0f32; xg.len()];
         ScalarBackend
             .exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_port))
             .unwrap();
-        let d_gelu = max_d(&g_plan, &g_port);
-        // 文档界 5.26e-3 是**相对峰值**；这里按相对值断言（绝对差随输入幅值放大，不能用绝对界）。
-        let peak = g_plan.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-12);
-        let rel_gelu = d_gelu / peak;
-        eprintln!(
-            "Plan GeluQuick：LASX vs portable 计划解释 max|d| = {d_gelu:.3e}（相对 {rel_gelu:.3e}）"
-        );
-        assert!(
-            rel_gelu <= 1.2e-2,
-            "GeluQuick 计划路与 portable 相对超界 {rel_gelu:e}（文档界 5.26e-3）"
-        );
+        for (idx, (a, b)) in g_plan.iter().zip(&g_port).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "GeluQuick 回退臂 @ {idx} 与 portable 解释不逐位"
+            );
+        }
 
         // ⑤ RopeApply：Plan 路 ≡ 直接 api（RopeMode::NeoX）逐位；vs portable 容差
         let (rows, cols, n_dims) = (8usize, 64usize, 32usize);
