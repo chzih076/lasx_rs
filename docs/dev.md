@@ -7690,6 +7690,14 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 - **rev bump**：`simd_dsl`/`ops_dsl` → `1ebeda1`（本轮 simd 仅加计划文档，无接口变化）；
   两档 clippy/test、`doccheck` 全绿。
 
+### 7.52.10 跨算子 MVP：`engine::chain::execute_map_chain`（simd `7f5b9be`）
+
+- simd E14 MVP：逐元素链（Unary/Affine）按行块**一次 thread::scope** 跑完整链，两块缓冲交替、末步写 out；
+  与逐算子顺序执行/`engine::execute` 均 `to_bits` 全等；ops_dsl 的 `pipeline!` 宏未接。
+- 实测（Scalar，3 步逐元素，4.19M 元素，threads=8）：顺序 9.69ms → 链 9.33ms（**1.038×**；
+  如实写：幅度小，逐元素本身不是瓶颈，跨算子真正的融合需后端新核，P1 新核/P2/P3 未做）。
+- rev bump 到 `7f5b9be`；两档 clippy/test、doccheck 全绿。
+
 
 
 
