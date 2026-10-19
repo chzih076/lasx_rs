@@ -7761,6 +7761,14 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   按能力位启用，并重过三前置（逐位/实测界、两后端 A/B、按能力位）。
 - rev bump 到 `6eb8e85`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.18 P3 matmul epilogue 融合 ROI（simd `3a605f6`，**暂不采纳**）
+
+- simd §16 实测（Scalar/threads=1）：512³ matmul 306.12ms，+bias 303.67ms（噪声内）、+erf 307.43ms；
+  2048×64×512：92.80ms → +bias 93.59ms（+0.9%）→ +erf 107.88ms（erf 计算 +15.4%，**融合省不掉**）。
+- 结论：P3 融合只能省 epilogue 访存那一趟，Scalar 上占比 ~0–1%；LASX 上 matmul 更快占比会升，
+  但按访存估算仍个位数百分比。**决定暂不采纳**；若做，需 LASX 实测占比 ≥5% 且融合核 ≥1.05×。
+- rev bump 到 `3a605f6`；两档 clippy/test、doccheck 全绿。
+
 
 
 
