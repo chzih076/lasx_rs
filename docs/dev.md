@@ -7717,6 +7717,14 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 - 如实边界：仍是**调度层**（省 spawn/join，1.03–1.04×），不是数值融合；`pipeline!` 宏、P2/P3 融合核未做。
 - rev bump 到 `5235d33`；两档 clippy/test、doccheck 全绿。
 
+### 7.52.13 链 + 行 LayerNorm 终止步（simd `00e15ac`）
+
+- simd E14.4：`MapTerm::LayerRows{eps}` —— 块内跑完逐元素链（落 tmp）后，对该块调用引擎既有
+  `Algorithm::LayerNormRows`（threads=1）写 out；块内不另起 thread::scope，整链仍一次 spawn。
+- 等价：行间独立 ⇒ 与"先跑链、再逐算子 LayerNormRows"在 threads=1/8 下 `to_bits` 全等。
+- **实测：本轮未测**（无空闲窗口）——不写没测过的数；按 14.1/14.2 同构预期 ~1.03×。
+- 边界：复用 portable 组合、非新融合核；P2/P3、pipeline! 宏未做；rev bump 到 `00e15ac`。
+
 
 
 
