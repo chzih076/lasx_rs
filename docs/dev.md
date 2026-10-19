@@ -7663,6 +7663,22 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
   复数融合核）；4 个模块仍桥；跨算子融合、线程池仍未做。
 - **rev bump**：`simd_dsl`/`ops_dsl` → `fffbf4a`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
 
+### 7.52.8 引擎决策可见性（simd `f65bed1`）：默认编译期打印、运行时零成本（2026-10-20）
+
+- **用户口径**："决策尽量在编译期；默认打印决策内容，避免运行时读变量影响性能和稳定性。"
+- **默认编译期打印（simd 侧）**：`ops_dsl/build.rs` 每次编译把 `模块 → engine::execute×N +
+  execute_composed*×M` 打到 cargo 输出（`cargo:warning=[simd_dsl][compile-time] …`；默认开、
+  **不读任何运行时环境变量、默认路径无运行时分支**）。实测一次打印：真实优化 38 / 组合桥 28，17 模块。
+- **运行时 trace 改为 feature 门控**：未开 `engine-trace` ⇒ `enabled()` 编译期常量 `false`；
+  开 feature + `SIMD_DSL_ENGINE_TRACE=1` 才打印每次决策。实测（axpy n=8，300k 次）：
+  引擎每调用开销 161ns → **23.5ns**（默认）、trace 检查 134ns → **0ns**；
+  `ScalarBackend::supports_plan` 常量折叠 0ns。
+- **剩余（E13 待做，如实）**：能力位仍是后端实例属性（`dyn Backend` 与 LASX 测试钩子
+  `LASX_NO_PLAN` 阻止全常量折叠）——下一步做常量能力描述（`#[inline] fn caps()`）+ 把测试钩子移出
+  生产热路径，让生产后端的能力判定也被 LLVM 折掉；`objdump`/IR 验证。
+- **rev bump**：`simd_dsl`/`ops_dsl` → `f65bed1`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
+
+
 
 
 
