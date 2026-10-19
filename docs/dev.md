@@ -7725,6 +7725,16 @@ loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
 - **实测：本轮未测**（无空闲窗口）——不写没测过的数；按 14.1/14.2 同构预期 ~1.03×。
 - 边界：复用 portable 组合、非新融合核；P2/P3、pipeline! 宏未做；rev bump 到 `00e15ac`。
 
+### 7.52.14 `pipeline!` 宏：编译期把整条链展开给引擎（simd `d3b97c2`）
+
+- simd E14.5：`ops_dsl::pipeline![be, rows, cols, threads, term; x, tmp, out; step, …]` 是
+  `macro_rules!` ⇒ **编译期展开成定长 `[MapStep; N]`** + 一次 `exec_map_pipeline`；步数/顺序在展开结果可见，
+  运行期引擎做行块调度/并行（`ChainReport`）。
+- 等价：`ops_dsl/tests/pipeline_macro.rs` 证明与逐算子 `engine::execute` 顺序执行 `to_bits` 全等
+  （RMS 终止步 + 纯逐元素链两种形态），并断言 `steps/termed/row_blocked`。
+- 边界：宏只做语法展开、不做数值融合；`Some/None` 由调用方显式写；P2/P3 融合核仍未做。
+- rev bump 到 `d3b97c2`；两档 clippy/test、doccheck 全绿。
+
 
 
 
