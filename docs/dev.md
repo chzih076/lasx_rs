@@ -7408,6 +7408,40 @@ T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只�
 
 **Commits**：`simd_dsl` `be14fff`（O2）、`2ba6fc8`（O6）、`092e1bd`（P2 合入）、`05632fc`（P2）；`lasx_rs` 本节（§7.50）。
 
+## 7.51 W3：GeluQuick 融合核删除 + axpy 逐位修正 + simd rev bump（2026-10-19）
+
+**动机（Lead 实测 ROI，grade B，6 对丢首对中位；composed/fused）**：softmax 2.41–2.46×、rms 6.96–6.99×、
+layer 4.28–4.36×、**gelu_quick 0.763–0.773×（融合核比组合慢 29%）**、axpy 3.35–3.40×**但 bitwise=false**
+（max_abs 2.44e-4 ≈ 1 ulp）、geometry norm3 2.13×/mat3 1.43×（逐位）。
+
+**1) GeluQuick 融合核删除（lasx 侧）**：`supports_plan` 由 true 改 **false**（true 计数 **14 → 13**，
+false 集合 = `GeluQuick`/`DequantizeI8Rows`/`Norm2BatchF64`）；删 `exec_fused_plan` 的 LASX 臂，
+改为**回退 portable 解释器**（`simd_dsl::ScalarBackend.exec_fused_plan`，与 portable 逐位）；
+`FusedPlan::GeluQuick` 变体**保留**（契约面不删）。**`api::gelu_quick_into` 保留**（理由见下"偏差"）。
+**simd 侧待 Lead 收尾**：`ops_dsl::activations::gelu_quick_auto` 的 `plan_auto!(GeluQuick)` 分支
+（W2 改名合入后由 Lead 改纯组合）。
+
+**2) axpy 逐位修正（硬承诺达成）**：LASX 内核由**单条 FMA**（一次舍入）改为 `t = alpha·x + 0.0`、
+`y = y + t`（两次舍入；向量序列 `vmul → vadd(+0) → vadd`，尾段标量同序）⇒ 与契约默认解释器
+**逐位**（含 `±0` 语义）。证据：`plan_ab` 示例新增"融合 vs 组合（`t=alpha·x+0.0` + `y+t` + copy）"
+逐位断言 **`to_bits` 全等**（修正前 `0.763–0.773×` 报告同时带 `bitwise=false`）。
+**新 A/B（5 个独立进程；composed/fused）**：**1.734× / 1.729× / 1.782× / 2.255× / 2.217×**
+（中位 ≈**1.78×**，融合仍快；`Plan vs api::axpy` ≈1.0×——同一内核，纯噪声）。原"1 ulp 容差"声明
+不再需要（文档/测试已按逐位更新）。
+
+**3) simd rev bump**：`Cargo.toml` 的 `simd_dsl`/`ops_dsl`/dev-dep rev `329aff9` → **`83c21a2`**
+（`cargo update -p simd_dsl`；`Cargo.lock` 同步）⇒ lasx 与当前 simd 契约（`plan_auto!`、量化三入口等）一致。
+
+**4) 死 kind 清单（只建议、不删契约）**：`DequantizeI8Rows`（LASX 无高效 i8 拓宽核）、
+`Norm2BatchF64`（无 f64 norm2 融合核）保持"支持=false + portable 回退"；`GeluQuick` 本轮从
+LASX 支持集删除。**建议**：simd 侧下一 breaking 批次一次性删 `PatternKind::GeluQuick` +
+`FusedPlan::GeluQuick` + `ops_dsl` 的 auto 分支（三处同批，避免半删状态）。
+
+**偏差（如实，待 Lead 决策）**：任务书写"删除 `gelu_quick_into`"；但它是**公共 Rust API**
+（`docs/ops.md §5.11` 对外承诺、`docs/dsl-rust-surface-inventory.md §3.2` 入册、api 单测覆盖），
+且**不依赖融合核**（只调 `ops::gelu_quick` 内核）⇒ 本轮**保留**，未随融合核删除。若确要删，
+建议与 `FusedPlan::GeluQuick` 同一 breaking 批次，并同步那三处文档清单。
+
 
 
 

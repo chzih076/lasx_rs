@@ -127,7 +127,9 @@ fn vec3_plan<'a>(
 
 fn main() {
     let be = LasxBackend;
-    println!("# Plan 后端 A/B：`exec_fused_plan`（11 kind）vs 直接 `api::*`（后端 = LasxBackend）");
+    println!(
+        "# Plan 后端 A/B：`exec_fused_plan`（13 kind；GeluQuick 融合核已于 W3 删除）vs 直接 `api::*`（后端 = LasxBackend）"
+    );
     println!(
         "- threads = {}；loadavg = `{}`（同进程交替 {ROUNDS} 对丢首对取中位）",
         lasx_rs::pool::global().threads(),
@@ -138,7 +140,6 @@ fn main() {
         PatternKind::SoftmaxRows,
         PatternKind::RmsNormRows,
         PatternKind::LayerNormRows,
-        PatternKind::GeluQuick,
         PatternKind::RopeApply,
         PatternKind::Vec3AddScaledF64,
         PatternKind::Norm3BatchF64,
@@ -160,7 +161,7 @@ fn main() {
     println!("| 用例 | A=Plan ms | B=直接 api ms | B/A | 等价类 |");
     println!("|---|---|---|---|---|");
 
-    // ================= f32：Axpy / Softmax / Rms / Layer / Gelu / Rope =================
+    // ================= f32：Axpy / Softmax / Rms / Layer / Rope =================
     {
         let n = 1usize << 20;
         let x = sample(n, 3);
@@ -208,6 +209,59 @@ fn main() {
             },
         );
         row("Axpy（1M）", a, b, eq);
+        // **W3（task-104）逐位修正的 A/B**：融合计划路（两次舍入核）vs 纯组合 3 趟
+        // （`t = alpha·x + 0.0` + `y + t` + copy，与 `ops_dsl::reduce::axpy_f32` 同序）。
+        // 注意：`ya` 已被上面的 A/B 循环反复累加 ⇒ 逐位对拍要用**新鲜**缓冲单独跑一次。
+        let mut y_plan_bit = base.clone();
+        be.exec_fused_plan(
+            mk_f32_plan("Axpy", 0, 0, 0.0, alpha, 0),
+            FusedIo {
+                x: &x,
+                y: &mut y_plan_bit,
+                out: &mut [],
+                cos: &[],
+                sin: &[],
+            },
+        )
+        .unwrap();
+        let mut yc = base.clone();
+        let (mut tmpc, mut accc) = (vec![0.0f32; n], vec![0.0f32; n]);
+        be.map_affine_f32(&x, alpha, 0.0, &mut tmpc).unwrap();
+        be.map_binary_f32(&base, &tmpc, &mut accc, simd_dsl::BinaryOp::Add)
+            .unwrap();
+        yc.copy_from_slice(&accc);
+        let eq_comp = if bits_eq(&y_plan_bit, &yc) {
+            "融合 vs 组合 **逐位**（W3 修正后）"
+        } else {
+            "**融合 vs 组合不逐位！**"
+        };
+        let mut yp2 = base.clone();
+        let mut yc2 = base.clone();
+        let (mut tmp2, mut acc2) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let (ac, bc) = ab(
+            || {
+                be.exec_fused_plan(
+                    mk_f32_plan("Axpy", 0, 0, 0.0, alpha, 0),
+                    FusedIo {
+                        x: &x,
+                        y: &mut yp2,
+                        out: &mut [],
+                        cos: &[],
+                        sin: &[],
+                    },
+                )
+                .unwrap();
+                black_box(yp2[0]);
+            },
+            || {
+                be.map_affine_f32(&x, alpha, 0.0, &mut tmp2).unwrap();
+                be.map_binary_f32(&base, &tmp2, &mut acc2, simd_dsl::BinaryOp::Add)
+                    .unwrap();
+                yc2.copy_from_slice(&acc2);
+                black_box(yc2[0]);
+            },
+        );
+        row("Axpy 组合（1M）", ac, bc, eq_comp);
     }
 
     let (rows, cols) = (512usize, 2048usize);
@@ -256,32 +310,10 @@ fn main() {
         lasx_rs::api::layer_norm_into(x, None, None, rows, cols, eps, o).unwrap()
     });
 
-    // GeluQuick（等长）
-    {
-        let xg = sample(1usize << 20, 7);
-        let m = xg.len();
-        let (mut ga, mut gb) = (vec![0.0f32; m], vec![0.0f32; m]);
-        be.exec_fused_plan(FusedPlan::GeluQuick, f32_io(&xg, &mut ga))
-            .unwrap();
-        lasx_rs::api::gelu_quick_into(&xg, &mut gb).unwrap();
-        let eq = if bits_eq(&ga, &gb) {
-            "A≡api **逐位**"
-        } else {
-            "**不逐位！**"
-        };
-        let (a, b) = ab(
-            || {
-                be.exec_fused_plan(FusedPlan::GeluQuick, f32_io(&xg, &mut ga))
-                    .unwrap();
-                black_box(ga[0]);
-            },
-            || {
-                lasx_rs::api::gelu_quick_into(&xg, &mut gb).unwrap();
-                black_box(gb[0]);
-            },
-        );
-        row("GeluQuick（1M）", a, b, eq);
-    }
+    // **W3（task-104）：GeluQuick 融合核已删**——LASX 融合核实测比纯组合慢 29%
+    // （Lead 实测 composed/fused = 0.763–0.773×）⇒ `supports_plan(GeluQuick)` 报 false、
+    // `exec_fused_plan` 回退 portable 解释器。本表不再有 GeluQuick 行；
+    // `FusedPlan::GeluQuick` 变体保留在契约面（删除建议由 simd 侧单列 breaking）。
     // RopeApply
     {
         let (rr, cc, nd) = (1024usize, 128usize, 64usize);
