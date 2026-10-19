@@ -7457,6 +7457,43 @@ LASX 支持集删除。**建议**：simd 侧下一 breaking 批次一次性删 `
 4) **rev bump**：`simd_dsl`/`ops_dsl`/conformance 三处 rev → **`b882ebe`**；`--features dsl-backend` 两档
    clippy/test、nightly rustdoc、`doccheck`、`nm -D` **98** 全绿。
 5) **命名收尾的回归（Lead 复核）**：`norm` 三算子首版 portable 回退改成 5/8 趟显式组合，实测比原引擎快路径慢
+
+## 7.52 B1（M5）：LASX 组合原语 override 第一批——`axpy_inplace_f32` 落地 + 5 个缺口如实报（2026-10-19）
+
+**背景（`A_diagnosis.md` §6 M5）**：组合（`fuse!`/宏）路径在 LASX 上会回落到 portable **标量**默认
+⇒ "融合 vs 组合"的 A/B 混着"SIMD vs 标量"。本轮按"有现成 `src/ops` 内核才接、无则报缺口、不硬造"执行。
+
+**已落地 1/6：`axpy_inplace_f32`**（`src/dsl_backend.rs`，映射 `api::axpy` 两舍入 LASX 向量核）
+- **等价类：逐位**（同一 `t = alpha*x + 0.0; y += t` 两次舍入序列，含 `±0`/次正规/大值；
+  `tests/prims_override.rs` 用 `to_bits` 对拍 portable 默认，含非 8 倍数尾巴 n=4099，全等）。
+- **A/B（`examples/prims_ab.rs`，Lead 口径：受控线程；同进程交替 5 对丢首对中位）**：
+
+| threads | n | A=Portable ms | B=LASX ms | A/B | loadavg（grade） |
+|---|---|---|---|---|---|
+| **1**（隔离核效率） | 1M | 0.604 | 0.604 | **1.000×** | 8.71 5.77 6.87 ⇒ **grade C** |
+| **1** | 8M | 14.447 | 13.743 | **1.051×** | 同上 |
+| **12**（生产默认） | 1M | 0.503 | 0.544 | **0.926×** | 8.71 ⇒ grade C |
+| **12** | 8M | 20.855 | 24.592 | **0.848×** | 同上 |
+
+**如实结论**：**逐位成立，但性能无稳定收益**——该原语是 1 趟内存流（8M ≈ 96 MB 流量），
+portable 默认已被 LLVM 自动向量化 ⇒ LASX 手写核落在噪声带（1.00–1.05×/0.85–0.93×，本轮 loadavg 8.7 = grade C）。
+**override 仍保留**：它是 B2 `axpy!` 宏（3 趟→1 趟）的落点，组合路径的收益由 B2 在**宏层**兑现后再测；
+本表只证明"原语级不比 portable 慢/更不更快"。
+
+**缺口 5/6（`src/ops` 无现成内核 ⇒ 本轮不硬造，逐条如实报）**：
+| 原语 | 现状 | 缺口原因 |
+|---|---|---|
+| `reduce_rows_map_f32`（rms/layer 组合回退唯一入口） | 缺 override | `src/ops` 只有**窄版** `map_rows_sum_f32`（`ops/map_rows_sum.rs`，Exp/ExpShiftedRow），**没有通用 RowFuse**（RowReduce×RowEpilogue×map 组合）内核 |
+| `reduce_sum_rows_f32` | 缺 override | 只有 `reduce_sum_cols`（`ops/dsl_map.rs:144`），无按行版 |
+| `reduce_max_f32`（整片 max） | 缺 override | 无整片 max 内核（`reduce_max_rows/cols` 是轴版） |
+| `map_unary_f32`（exp/sqrt 族） | 缺 override | `nn_math` 只有 `exp_vec/exp_seq/sigmoid_*` **内部 helper**，无通用 `UnaryOp` 映射内核（exp 之外还有 Sigmoid/Tanh/Sqrt/Rcp/Log… 且与 libm 非逐位） |
+| `map_binary_scalar_f32` | 缺 override | `dsl_map::map_binary` 是**双数组**版，无标量广播版内核 |
+
+**下一批建议（按 A 诊断优先级）**：`reduce_rows_map_f32`（通用 RowFuse）与 `map_unary_f32`（exp/sqrt 族）
+最值钱——补上后 rms/layer/softmax 的组合路径才真正 SIMD 化；`map_binary_scalar_f32` 可先做双数组+广播小内核。
+
+**门禁**：`fmt --check` 0；clippy **默认/`dsl-backend` 两档 0**；test 两档 0（含新 `tests/prims_override.rs`
+2 个用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
    **1.43×（Scalar）/1.99×（Idiomatic）** ⇒ 已改回 `rewrite_softmax_rows`/`fuse!` 旧生产路径，复测
    `new/rewrite = 1.019/1.027`、max_abs=0（逐位）。
 

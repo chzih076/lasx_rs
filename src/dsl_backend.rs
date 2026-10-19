@@ -1033,6 +1033,20 @@ impl Backend for LasxBackend {
         })
     }
 
+    /// **组合原语 override（B1/task-106 M5）**：`y := alpha·x + y`（就地，LASX 1 趟向量）。
+    ///
+    /// 这是 `axpy!` 宏（B2）与组合回退的落点：默认实现走 `kernels::scalar::axpy_inplace_f32`
+    /// （逐元素标量）；本 override 映射到 `api::axpy`（LASX 两舍入向量核）。
+    /// **等价类：逐位**（同一 `t = alpha*x + 0.0; y += t` 两次舍入序列，含 ±0 语义；
+    /// `tests/prims_override.rs` 用 `to_bits` 对拍；W3 已把该核从 FMA 改成两次舍入）。
+    fn axpy_inplace_f32(&self, y: &mut [f32], x: &[f32], alpha: f32) -> Result<(), BackendError> {
+        debug_assert_ne!(x.as_ptr(), y.as_ptr(), "axpy_inplace_f32：x/y 不得重叠");
+        crate::api::axpy(alpha, x, y).map_err(|_| BackendError::Unsupported {
+            op: "axpy_inplace_f32",
+            cap: Capability::FusedElementwise,
+        })
+    }
+
     // ============ P3 Plan：`supports_plan` / `exec_fused_plan`（task-63 + P1 批1 task-66）============
     //
     // **语义映射（契约 `9af59f7` 定死，不是猜；先读 backend.rs + tests/fused_plan.rs）**：
