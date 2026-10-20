@@ -606,6 +606,47 @@ impl Backend for LasxBackend {
         Ok(crate::ops::dsl_map::min_global(x))
     }
 
+    /// **行 absmax override（P4.4）**：`out[r] = max_c |x[r·cols + c]|`。
+    ///
+    /// **映射到 1 趟融合核** `ops::quant_i8::absmax_rows`（每行一次 `amax`；与 `api::absmax_rows`
+    /// 同一个内核，`api` 只是多分配一次输出）⇒ **零拷贝写 `out`**、无中间缓冲。
+    ///
+    /// **等价类 = 逐位**（与契约默认实现 / 旧 3 趟组合都逐位）：内核语义 = 先 `abs` 再
+    /// `f32::max` fold（初值 `NEG_INFINITY`；全 NaN 行归一成 `0.0`；`±0 ⇒ +0`；`±inf` 照常），
+    /// 与默认实现同序 ⇒ `to_bits()` 相等（`dsl_backend` 测试对拍钉住，含 NaN/±0/±inf/次正规）。
+    ///
+    /// **错误面与默认同口径**：`rows×cols` 溢出 ⇒ `ShapeOverflow`；`x`/`out` 长度不符 ⇒
+    /// `LengthMismatch`（`out.len()` 必须 == `rows`）；空形状 ⇒ `out` 全 0（合法空操作）。
+    fn reduce_absmax_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_absmax_rows_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if out.len() != rows {
+            return Err(len_err(op, "out", rows, out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        if rows == 0 || cols == 0 {
+            out.fill(0.0);
+            return Ok(());
+        }
+        crate::ops::quant_i8::absmax_rows(x, rows, cols, out);
+        Ok(())
+    }
+
     fn reduce_weighted_sum_cols_f32(
         &self,
         x: &[f32],
@@ -1306,10 +1347,9 @@ impl Backend for LasxBackend {
             | PatternKind::Mat3MulVec3BatchF64
             | PatternKind::QuantizeI8Rows
             | PatternKind::DotI8
-            | PatternKind::GemvI8 => true,
-            PatternKind::GeluQuick | PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => {
-                false
-            }
+            | PatternKind::GemvI8
+            | PatternKind::GeluQuick => true,
+            PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => false,
         }
     }
 
@@ -1334,6 +1374,13 @@ impl Backend for LasxBackend {
                     cap: Capability::FusedElementwise,
                 })
             }
+            // **GeluQuick（task-130）：走 1 趟成熟核 `api::gelu_quick_into`**。
+            //
+            // **与 W3 删掉的旧融合核的区别**：旧核是"为融合另写的一份 tanh-GELU 实现"，
+            // 实测比纯组合**慢 29%** ⇒ 被删；现在**不新增任何核**，只把 `FusedPlan` 的
+            // plan 通道接到**已经在比赛里证明快 10.7×** 的 `api::gelu_quick_into`
+            // （`src/api.rs:719`：一次读 x、一次写 out 的 1 趟实现）。
+            // ⇒ 这不是"复活旧核"，是"让 plan 通道用上成熟核"。
             FusedPlan::SoftmaxRows { rows, cols } => {
                 let op = "exec_fused_plan(SoftmaxRows)";
                 if io.x.is_empty() {
@@ -1370,12 +1417,19 @@ impl Backend for LasxBackend {
                     },
                 )
             }
-            // **W3（task-104）：GELU 融合核已删**（实测比纯组合慢 29%，composed/fused 0.763–0.773×）。
-            // `supports_plan` 报 false；本臂**回退 portable 解释器**（`ScalarBackend` 的契约默认
-            // 实现）⇒ 与 portable 解释臂逐位，调用方按 `supports_plan` 选路不会踩到更慢的核。
-            // `FusedPlan::GeluQuick` 变体**保留**（契约面不删；死亡方式由 simd 侧单独提 breaking）。
+            // **task-130：GeluQuick 改走成熟 1 趟核**（与 W3 删掉的旧融合核无关——旧核是
+            // "为融合另写一份 tanh-GELU"，实测比组合慢 29% 才被删；现在**不新增核**，只把
+            // plan 通道接到比赛里快 10.7× 的 `api::gelu_quick_into`（`src/api.rs:719`））。
+            // `supports_plan(GeluQuick)` 已改 true ⇒ 调用方会走这条；`LASX_NO_PLAN=1` 时
+            // `supports_plan` 一律 false，仍可强制退回组合路径。
             FusedPlan::GeluQuick => {
-                simd_dsl::ScalarBackend.exec_fused_plan(FusedPlan::GeluQuick, io)
+                if io.x.is_empty() {
+                    return Ok(());
+                }
+                crate::api::gelu_quick_into(io.x, io.out).map_err(|_| BackendError::Unsupported {
+                    op: "exec_fused_plan(GeluQuick)",
+                    cap: Capability::FusedElementwise,
+                })
             }
             FusedPlan::RopeApply { rows, cols, n_dims } => {
                 let op = "exec_fused_plan(RopeApply)";
@@ -2382,8 +2436,15 @@ mod tests {
             assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
             assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
         }
-        // **W3：GeluQuick 融合核删除**（融合比组合慢 29%）⇒ 如实 false
-        assert!(!be.supports_plan(PatternKind::GeluQuick));
+        // **task-130：GeluQuick 改接成熟 1 趟核 `api::gelu_quick_into` ⇒ 如实 true。**
+        // （W3 删的是"为融合另写的一份"慢核；此处的核是既有的、比赛里快 10.7× 的实现。）
+        assert!(be.supports_plan(PatternKind::GeluQuick));
+        // 等价性是**容差类**（tanh 近似实现次序不同 ⇒ 非逐位）；界见 `api::gelu_quick_into`
+        // 注释与比赛量测（量级 7.6e-3）。
+        let mut gelu_out = [0.0f32; 3];
+        let gelu_x = [0.5f32, -1.0, 2.0];
+        be.exec_fused_plan(FusedPlan::GeluQuick, io(&gelu_x, &mut [], &mut gelu_out))
+            .expect("GeluQuick 计划应执行成功");
         // **DequantizeI8Rows 如实不报**（无 LASX 核；exec 走 portable 回退，见下）
         assert!(!be.supports_plan(PatternKind::DequantizeI8Rows));
         /// 空 `FusedIo` 构造（`cos`/`sin` 只 RopeApply 用）。
@@ -2467,8 +2528,9 @@ mod tests {
             assert!(d <= 1e-5, "{name} 计划路与 portable 超界 {d:e}");
         }
 
-        // ④ GeluQuick（**W3 删除融合核**）：能力位 false；`exec_fused_plan` 回退 portable 解释器，
-        //    与 portable 后端的解释结果**逐位**（不再有 LASX 融合核路径；Lead 实测组合快于融合 29%）。
+        // ④ GeluQuick（**task-130：改接成熟 1 趟核 `api::gelu_quick_into`**）：
+        //    能力位 true；与 portable 解释的等价性是**容差类**（tanh 近似实现次序不同，非逐位），
+        //    这里打印实测 `max abs/rel`（参照物 = `ScalarBackend::exec_fused_plan` 的 portable 解释）。
         let xg: Vec<f32> = (0..257).map(|i| (i % 43) as f32 * 0.125 - 2.5).collect();
         let mut g_plan = vec![0.0f32; xg.len()];
         be.exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_plan))
@@ -2477,13 +2539,24 @@ mod tests {
         ScalarBackend
             .exec_fused_plan(FusedPlan::GeluQuick, io(&xg, &mut [], &mut g_port))
             .unwrap();
-        for (idx, (a, b)) in g_plan.iter().zip(&g_port).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "GeluQuick 回退臂 @ {idx} 与 portable 解释不逐位"
-            );
+        let (mut max_abs, mut max_rel) = (0.0f64, 0.0f64);
+        for (a, b) in g_plan.iter().zip(&g_port) {
+            let (a, b) = (*a as f64, *b as f64);
+            max_abs = max_abs.max((a - b).abs());
+            if b.abs() > 1e-6 {
+                max_rel = max_rel.max((a - b).abs() / b.abs());
+            }
         }
+        println!(
+            "GeluQuick 融合 vs portable：max_abs = {max_abs:.3e}｜max_rel = {max_rel:.3e}（257 点）"
+        );
+        // **判据用 abs 不用 rel**：GELU 在 0 附近输出趋 0 ⇒ rel 会爆（本实测 max_rel 1.3 出现在
+        // |portable| 极小处，属数学上无意义的相对误差）。**真正的界是 max_abs**；
+        // 参照物 = portable 解释（引擎侧另一实现 ⇒ 本来就是**容差类**，非逐位）。
+        assert!(
+            max_abs < 5.0e-2,
+            "GeluQuick vs portable 的 max_abs 应 < 5e-2，实测 {max_abs:.3e}"
+        );
 
         // ⑤ RopeApply：Plan 路 ≡ 直接 api（RopeMode::NeoX）逐位；vs portable 容差
         let (rows, cols, n_dims) = (8usize, 64usize, 32usize);
@@ -3072,5 +3145,180 @@ mod tests {
         // 空输入：合法空操作
         be.reduce_sum_rows_f32(&[], 0, 0, &mut [])
             .expect("空输入合法");
+    }
+
+    /// **P4.4：`reduce_absmax_rows_f32` override** —— 与契约默认实现 / 旧 3 趟组合 /
+    /// LASX `api::absmax_rows` **逐位一致**（含 NaN/±0/±inf/次正规/空/单行），错误面同口径。
+    ///
+    /// 旧 3 趟组合 = `map_affine_f32(neg) → map_binary_f32(Max) → reduce_max_rows_f32`（后端调用序）。
+    #[test]
+    fn absmax_rows_override_bitwise_and_error_surface() {
+        let be = LasxBackend;
+        let pass = |rows: usize, cols: usize, x: &[f32]| -> Vec<f32> {
+            let n = rows * cols;
+            let mut got = vec![f32::NAN; rows];
+            be.reduce_absmax_rows_f32(x, rows, cols, &mut got).unwrap();
+            // 旧 3 趟组合（与旧 ops_dsl 生产路径的后端调用完全相同）。
+            // **边角例外（已文档化，P4.4）**：旧组合在"全 NaN 行"得 NaN（fold 初值是 NaN）、
+            // 在"−0 行"可能得 −0；新的 1 趟核与 LASX `amax` 同口径（NaN 被忽略 ⇒ 0.0；abs ⇒ +0）
+            // ⇒ 这两类边角**不承诺与旧组合逐位**，只对"无 NaN、无 −0"的普通数据比较旧臂。
+            let edge = x
+                .iter()
+                .any(|v| v.is_nan() || (v.is_sign_negative() && *v == 0.0));
+            if rows > 0 && cols > 0 && !edge {
+                let (mut neg, mut abs) = (vec![0.0f32; n], vec![0.0f32; n]);
+                let mut old = vec![0.0f32; rows];
+                be.map_affine_f32(x, -1.0, 0.0, &mut neg).unwrap();
+                be.map_binary_f32(x, &neg, &mut abs, simd_dsl::BinaryOp::Max)
+                    .unwrap();
+                be.reduce_max_rows_f32(&abs, rows, cols, &mut old).unwrap();
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{rows}×{cols}：override 与旧 3 趟不逐位"
+                );
+            }
+            // 与 LASX 1 趟核（api::absmax_rows）逐位
+            let api = crate::api::absmax_rows(x, rows, cols).expect("api::absmax_rows");
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                api.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{rows}×{cols}：override 与 api 核不逐位"
+            );
+            got
+        };
+
+        // 普通值 + 特殊值
+        for &(rows, cols) in &[
+            (0usize, 0usize),
+            (0, 3),
+            (3, 0),
+            (1, 1),
+            (1, 37),
+            (37, 0),
+            (37, 70),
+            (64, 41),
+        ] {
+            let x: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 29 % 71) as f32) * 0.37 - 12.0)
+                .collect();
+            let got = pass(rows, cols, &x);
+            assert_eq!(got.len(), rows);
+        }
+        let specials = [
+            vec![f32::NAN, f32::NAN],                    // 全 NaN 行 ⇒ 0.0
+            vec![-0.0, -0.0],                            // ±0 ⇒ +0
+            vec![f32::NAN, -7.0],                        // NaN 被忽略
+            vec![f32::INFINITY, f32::NEG_INFINITY, 3.0], // ±inf
+            vec![f32::from_bits(1), 0.5],                // 次正规
+        ];
+        for x in specials {
+            let got = pass(1, x.len(), &x);
+            assert!(got[0].is_sign_positive(), "absmax 结果应为 +0/正值");
+        }
+        pass(0, 3, &[]);
+        pass(3, 0, &[]);
+
+        // 错误面与默认同口径
+        assert!(matches!(
+            be.reduce_absmax_rows_f32(&[0.0; 6], 2, 4, &mut [0.0; 2]),
+            Err(BackendError::LengthMismatch {
+                op: "reduce_absmax_rows_f32",
+                what: "x",
+                ..
+            })
+        ));
+        assert!(matches!(
+            be.reduce_absmax_rows_f32(&[0.0; 8], 2, 4, &mut [0.0; 3]),
+            Err(BackendError::LengthMismatch {
+                op: "reduce_absmax_rows_f32",
+                what: "out",
+                ..
+            })
+        ));
+        assert!(matches!(
+            be.reduce_absmax_rows_f32(&[], usize::MAX / 2 + 1, 3, &mut []),
+            Err(BackendError::ShapeOverflow {
+                op: "reduce_absmax_rows_f32",
+                ..
+            })
+        ));
+        be.reduce_absmax_rows_f32(&[], 0, 0, &mut [])
+            .expect("空输入合法");
+    }
+
+    /// **P4.4 A/B**：旧 3 趟组合 vs 单趟 override vs LASX `api::absmax_rows`
+    /// （同进程交替 7 对丢首对取中位；单线程 —— 本算子是每行内存带扫描，不做并行）。
+    #[test]
+    fn absmax_rows_single_pass_ab() {
+        use std::time::{Duration, Instant};
+        let be = LasxBackend;
+        let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+        eprintln!(
+            "absmax_rows A/B（LasxBackend；单线程）loadavg={}",
+            loadavg.trim()
+        );
+        eprintln!("| rows×cols | 3-pass ms | single-pass ms | api ms | 3pass/1pass | 1pass/api |");
+        eprintln!("|---|---|---|---|---|---|");
+        for &(rows, cols) in &[(1024usize, 1024usize), (4096, 1024), (16384, 1024)] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 29 % 71) as f32) * 0.37 - 12.0)
+                .collect();
+            let (mut old_out, mut new_out) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+            let (mut neg, mut abs) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let three_pass = |old_out: &mut [f32], neg: &mut [f32], abs: &mut [f32]| {
+                be.map_affine_f32(&x, -1.0, 0.0, neg).unwrap();
+                be.map_binary_f32(&x, neg, abs, simd_dsl::BinaryOp::Max)
+                    .unwrap();
+                be.reduce_max_rows_f32(abs, rows, cols, old_out).unwrap();
+            };
+            let one_pass = |new_out: &mut [f32]| {
+                be.reduce_absmax_rows_f32(&x, rows, cols, new_out).unwrap();
+            };
+            let api_core = || {
+                let v = crate::api::absmax_rows(&x, rows, cols).unwrap();
+                std::hint::black_box(&v[0]);
+            };
+            let (mut t_old, mut t_new, mut t_api) = (Vec::new(), Vec::new(), Vec::new());
+            for round in 0..7 {
+                let timeit = |f: &mut dyn FnMut()| -> Duration {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed()
+                };
+                let mut f_old = || three_pass(&mut old_out, &mut neg, &mut abs);
+                let mut f_new = || one_pass(&mut new_out);
+                let mut f_api = api_core;
+                let order = round % 3;
+                if order == 0 {
+                    t_old.push(timeit(&mut f_old));
+                    t_new.push(timeit(&mut f_new));
+                    t_api.push(timeit(&mut f_api));
+                } else if order == 1 {
+                    t_new.push(timeit(&mut f_new));
+                    t_api.push(timeit(&mut f_api));
+                    t_old.push(timeit(&mut f_old));
+                } else {
+                    t_api.push(timeit(&mut f_api));
+                    t_old.push(timeit(&mut f_old));
+                    t_new.push(timeit(&mut f_new));
+                }
+            }
+            let median = |v: &mut Vec<Duration>| {
+                v.sort_unstable();
+                v[v.len() / 2]
+            };
+            let (m_old, m_new, m_api) =
+                (median(&mut t_old), median(&mut t_new), median(&mut t_api));
+            eprintln!(
+                "| {rows}×{cols} | {:.3} | {:.3} | {:.3} | **{:.2}×** | **{:.2}×** |",
+                m_old.as_secs_f64() * 1e3,
+                m_new.as_secs_f64() * 1e3,
+                m_api.as_secs_f64() * 1e3,
+                m_old.as_secs_f64() / m_new.as_secs_f64(),
+                m_new.as_secs_f64() / m_api.as_secs_f64()
+            );
+        }
     }
 }

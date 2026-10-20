@@ -515,12 +515,13 @@ bash scripts/bench_openblas.sh
 | gather/scatter、跨步三原语 | 纯拷贝/换访存 ⇒ 逐位（三次 A/B 全过门限：1.205×/1.277×/1.134×） |
 | NN 行算子（`softmax_rows`/`rms_norm`/`layer_norm`/`rope`） | 与参照同序 ⇒ 逐位（`rms`/`layer` max abs = 0e0；`rope` powf hoist 后与逐元素重算全等） |
 | 量化（`quantize_i8_rows`/`dequantize_i8_rows`/`dot_i8`/`gemv_i8`） | ties-even + clamp；dot/gemv **i64 累加 + 终点饱和到 i32** ⇒ 逐位 |
+| `absmax_rows`（单趟化后） | 普通数据与旧 3 趟组合/LASX 核**逐位**；**边角语义固定为 LASX `amax` 口径**：全 NaN 行 → `0.0`（旧组合 NaN）、`−0` → `+0`（旧组合可能 −0）；测试钉住（`ops_dsl/tests/batch3_ops.rs`、`tests/prims_override.rs`） |
 
 **容差类（必须带实测界与参照物）**：
 
 | 类别 | 实测界 / 依据 |
 |---|---|
-| `gelu_quick`（tanh 近似） | 文档界 `5.26e-3`（与融合核近似路径不同）；portable 默认与 f32 参照另测 |
+| `gelu_quick`（tanh 近似，**两条路径不逐位**） | portable 组合（默认/`LASX_NO_PLAN=1`）与 f32 参照的界 `5.26e-3`；**融合快路径**（`exec_fused_plan(GeluQuick)` = `api::gelu_quick_into`）vs portable：实测 **`max abs 2.063e-2`**（257 点，参照 = portable 解释器；GELU 近 0 处 rel 无意义 ⇒ 判据用 abs），**声明界 abs `5e-2`**，测试钉住 |
 | `gelu_erf`（A&S 7.1.26） | 实测 `max abs 3.626e-7`、`max rel 3.683e-5`；声明界 **abs `1e-6`**，不声称逐位 |
 | 拉普拉斯递推核 | 安全区内 ≤1e-4；全网格误差 ≤4.4e-14；超区**逐行回退 libm 且逐位一致** |
 | 拉普拉斯权重（`s^k` 折进核） | 相对 6.62e-16 但不逐位（契约差异必须声明）；`k=0` 7.81e-3 → `k=2` 7.81e1（1.0e4×@\|s\|≈112） |
@@ -750,6 +751,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `4387c9c` / `f7b01a0` + 本仓 `354d3b8` | rev bump（HEAD 待 bump） | P4.2 接线 spectral（稳态 0 alloc/帧、逐位 12 摘要、A/B 0.89–0.97×；峰值未降）；`reduce_sum_rows_f32` override+并行（4M 阈值、逐位、4.2M 8.55×，grade A）⇒ 第二批积压全部闭环 |
 | 2026-10-20 | `0dff23b` | rev bump（HEAD 待 bump） | **引擎×后端双重并行修复**：后端报 `Capability::Threaded` 时引擎 matmul 不再外层切块（LASX 1024³：嵌套 21.4ms → 6.0ms） |
 | 2026-10-20 | `ee1619d` | rev bump（HEAD 待 bump） | **P4.2 峰值收尾**：分阶段早释放把 detect 同时存活峰值降到 **8.0156 MiB**（模型 8.02 MiB，差 0.012%）；resident 9.54 MiB、稳态 0 alloc |
+| 2026-10-20 | `75b31dd` / `b497671` / `6abb2b3` | rev bump（HEAD 待 bump） | 比赛缺口清零：absmax_rows 单趟化（8×→1.0–1.12×）、gelu_quick 融合快路径（10.7×→0.97–0.99×）、FFT 峰值 8.02 MiB、stages/plan 复用（稳态 2 次/256 B） |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -770,8 +772,8 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 | layer_norm | 512×2048 | 0.994× | 1.008× | 逐位 |
 | axpy | n≈4.2M | 0.934× | 0.998× | 逐位 |
 | cmatmul（均 Direct 路线） | 512³ 复数 | **0.869×** | **0.804×** | 逐位 |
-| **gelu_quick** | n≈4.2M | **10.655×** | **11.306×** | 容差（rel 7.606e-3） |
-| **absmax_rows** | 512×8192 | **7.981×** | **8.724×** | 逐位 |
+| **gelu_quick**（修复前） | n≈4.2M | **10.655×** | **11.306×** | 容差（rel 7.606e-3） |
+| **absmax_rows**（修复前） | 512×8192 | **7.981×** | **8.724×** | 逐位 |
 | geometry f64 `norm3` | n=1M | ≈0.96× | — | 逐位 |
 | geometry f64 `unitize3` | n=1M | ≈0.92× | — | 逐位 |
 
@@ -787,6 +789,18 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
    `spectral detect`/`stencil2d`（LASX 无对应库算子）、几何 f32（LASX 仅有 f64 版本）、FFT（两臂均无实现）。
 5. 公平性限制：LASX 臂是"库算子"，DSL 臂是"宏算子 + 同一后端"——两者都未含输入生成/校验/打包；
    所有数字都是本机同窗口趋势，跨窗口不可比。
+
+#### 7.3.1 两个缺口修复后的复测（loadavg 3.04→2.67，A 级窗口）
+
+| 算子 | t=1 修复前→后 | t=12 修复前→后 | 修复动作 |
+|---|---|---|---|
+| `gelu_quick` | **10.655× → 0.966×（逐位）** | **11.306× → 0.985×（逐位）** | LASX `exec_fused_plan(GeluQuick)` 直接调成熟 1 趟核 `api::gelu_quick_into`，`supports_plan` 报 true（不再复活 W3 旧融合核）；两臂同为该核 ⇒ 逐位 |
+| `absmax_rows` | **7.981× → 1.124×（逐位）** | **8.724× → 1.045×（逐位）** | 新增 `Backend::reduce_absmax_rows_f32` 单趟原语 + `Algorithm::AbsMaxRows` + LASX override（调 `api::absmax_rows` 同款核） |
+
+复测其余行不变（matmul 1.013/1.043×、dot 1.000/0.985×、sum 1.003/1.021×、cmatmul 0.857/0.866× 仍 DSL 更快）。
+**语义登记（例外，见 §5.2）**：`absmax_rows` 单趟化把边角语义固定为 LASX `amax` 口径——全 NaN 行输出 `0.0`（旧组合为 `NaN`）、`−0` 输出 `+0`（旧组合可能保留 `−0`）；普通数据与旧路径**逐位**。
+`gelu_quick` 的融合核与 portable 组合仍是**容差类**（实测 `max abs 2.063e-2`，参照 = portable 解释器；组合禁制时仍走 portable）。
+
 
 
 
@@ -851,6 +865,9 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 | LASX 行归约自动并行 | **已落地**：`reduce_rows_map_f32` 8K 阈值按行块并行（逐位）；8K 2.71×、128K 8.68×、67M 2.48×（loadavg≈5 ⇒ 趋势）；**`reduce_sum_rows_f32` override + 行块并行**（4M 阈值、逐位；4.2M 8.55×、67M 2.17×，grade A）；**max/min 族 6 方法 override**：4 个轴方向 4M 阈值并行（行方向 4.2M 6.2–6.3×、67M 5.4–5.6×；列方向 ≤33.5M 中性、67M 6×），整片 max/min 保持顺序 fold（保 NaN payload/±0 逐位）；阈值以下 0.93–1.04× 无退化 | 本仓 `a7b61a6`、`354d3b8`、`be7f8f1` |
 | 引擎×后端双重并行（比赛发现） | **已修复**：LASX 报 `Capability::Threaded` ⇒ 引擎 matmul 不再外层行切块；1024³ 嵌套 21.4ms → 6.0ms，DSL/LASX 比值 3.9× → **0.996×**（比赛实测） | simd `0dff23b`；本仓 `9b92c24` 起 |
 | DSL vs LASX 性能比赛 | **已产出可复核台架与对照表**（§7.3）：同内核路径 DSL 税 ≈0（matmul 1.000×/0.996×、cmatmul DSL 更快 0.80–0.87×）；真实缺口：gelu_quick 10.7–11.3×、absmax_rows 8.0–8.7×；缺口 op（A 臂无公开入口）如实跳过 | 本仓 `9b92c24`；simd `ee1619d` |
+| `absmax_rows` 单趟化（比赛缺口） | **已修复**：新 `Backend::reduce_absmax_rows_f32` 单趟原语 + `Algorithm::AbsMaxRows` + LASX override（`api::absmax_rows` 同款核）；比赛 **7.98×/8.72× → 1.124×/1.045×**，普通数据与旧 3 趟**逐位**；边角语义固定为 LASX `amax`（全 NaN 行→0.0、−0→+0，登记 §5.2） | simd `75b31dd`；本仓 `d19f621`+ |
+| `gelu_quick` 融合快路径（比赛缺口） | **已修复**：LASX `exec_fused_plan(GeluQuick)` 直接调成熟 1 趟核 `api::gelu_quick_into`（不复活 W3 旧融合核）、`supports_plan` 报 true；比赛 **10.655×/11.306× → 0.966×/0.985×**；融合 vs portable 为容差类（`max abs 2.063e-2`，界 5e-2，登记 §5.2） | simd `b497671`；本仓 `d19f621`+ |
+| FFT 峰值 + 复用 API | **已收尾**：re/im 连续前缀直接当 xr/xi（删 2 个 p×b 拷贝）⇒ Auto(FFT) 峰值 **8.50→8.02 MiB**（与 Direct 同值）；`SpectralStages::ensure_capacity`+`detect_into`、`SpectralPlan` 复用 ⇒ 稳态每帧分配 **49 次/22.14 MB → 2 次/256 B**（只剩 ⑬ `RewriteReport` 返回值）；逐位（16 摘要） | simd `b497671`、`6abb2b3` |
 
 ---
 
