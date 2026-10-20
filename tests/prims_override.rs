@@ -6,7 +6,9 @@
 //!   本文件的后两个测试覆盖**全矩阵**与**奇数 cols（3/13）**，并打印实测 rel 界。
 //!
 //! `reduce_sum_rows_f32` 已由 `src/ops/dsl_map.rs` 接上（8-lane 顺序 fold，与默认实现**逐位**，本轮起有 override）；
-//! 其余原语（`reduce_max_f32`/`map_binary_scalar_f32`）仍缺 `src/ops` 现成内核。
+//! **P4.3 起 `max/min` 轴归约 4 个方向 + 整片 `max/min` 也已 override**（逐位；轴归约按独立轴并行，
+//! 整片不并行——全 NaN 轴的 payload 位模式随比较次序变化，见 `dsl_backend.rs` 注释）；
+//! 其余原语（`map_binary_scalar_f32`）仍缺 `src/ops` 现成内核。
 #![cfg(feature = "dsl-backend")]
 
 use lasx_rs::dsl_backend::LasxBackend;
@@ -288,4 +290,122 @@ fn reduce_rows_map_override_keeps_error_contract() {
         be.reduce_rows_map_f32(&[0.0f32; 1], usize::MAX, 2, &mut out, plan)
             .is_err()
     );
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// **P4.3：`max/min` 轴归约 + 整片归约的 6 个 override 与 portable 默认逐位一致**。
+///
+/// 覆盖：NaN（含**全 NaN 轴** ⇒ NaN payload 的位模式也要相等）、±0、±inf、次正规、单元素、
+/// 奇数长度、`cols=1`/`rows=1`。错误面：长度不符 / `rows×cols` 溢出 / 归约轴为 0。
+#[test]
+fn axis_extreme_overrides_are_bitwise_vs_portable() {
+    let be = LasxBackend;
+    let portable = ScalarBackend;
+    let mut base = sample(64 * 41); // 容纳下面最大形状（64×41 = 2624）
+    // 边界值（NaN payload 不同：静默 NaN 与 signaling 形态各取一个）
+    base[0] = f32::NAN;
+    base[1] = f32::from_bits(0x7fc0_1234); // 非标准 payload
+    base[2] = -0.0;
+    base[3] = 0.0;
+    base[4] = f32::INFINITY;
+    base[5] = f32::NEG_INFINITY;
+    base[6] = f32::from_bits(1); // 次正规
+
+    for &(rows, cols) in &[(1usize, 1usize), (1, 37), (37, 1), (37, 70), (64, 41)] {
+        let x = &base[..rows * cols];
+        let mut got = vec![0.0f32; cols.max(rows)];
+        let mut want = vec![0.0f32; cols.max(rows)];
+        macro_rules! check_axis {
+            ($m:ident, $len:expr) => {
+                got[..$len].fill(0.0);
+                want[..$len].fill(0.0);
+                be.$m(x, rows, cols, &mut got[..$len]).expect("Lasx");
+                portable
+                    .$m(x, rows, cols, &mut want[..$len])
+                    .expect("portable");
+                assert_eq!(
+                    bits(&got[..$len]),
+                    bits(&want[..$len]),
+                    "{} {rows}×{cols} 不逐位",
+                    stringify!($m)
+                );
+            };
+        }
+        check_axis!(reduce_max_cols_f32, cols);
+        check_axis!(reduce_min_cols_f32, cols);
+        check_axis!(reduce_max_rows_f32, rows);
+        check_axis!(reduce_min_rows_f32, rows);
+    }
+
+    // **全 NaN 轴**：结果 NaN，且 payload 位模式逐位一致（这是"不向量化"的直接理由）。
+    let all_nan = vec![f32::from_bits(0x7fc0_0001); 8 * 4];
+    let mut got = vec![0.0f32; 4];
+    let mut want = vec![0.0f32; 4];
+    be.reduce_max_cols_f32(&all_nan, 8, 4, &mut got).unwrap();
+    portable
+        .reduce_max_cols_f32(&all_nan, 8, 4, &mut want)
+        .unwrap();
+    assert_eq!(bits(&got), bits(&want), "全 NaN 轴 payload 不逐位");
+    // 行方向：输出长度 = rows = 8。
+    let (mut got_rows, mut want_rows) = (vec![0.0f32; 8], vec![0.0f32; 8]);
+    be.reduce_min_rows_f32(&all_nan, 8, 4, &mut got_rows)
+        .unwrap();
+    portable
+        .reduce_min_rows_f32(&all_nan, 8, 4, &mut want_rows)
+        .unwrap();
+    assert_eq!(
+        bits(&got_rows),
+        bits(&want_rows),
+        "全 NaN 行 payload 不逐位"
+    );
+
+    // **整片 max/min**：n = 0（幺元）/1/2/37/超长（含边界值）逐位一致。
+    for n in [0usize, 1, 2, 37, 1000] {
+        let x = &base[..n.min(base.len())];
+        assert_eq!(
+            be.reduce_max_f32(x).unwrap().to_bits(),
+            portable.reduce_max_f32(x).unwrap().to_bits(),
+            "整片 max n={n} 不逐位"
+        );
+        assert_eq!(
+            be.reduce_min_f32(x).unwrap().to_bits(),
+            portable.reduce_min_f32(x).unwrap().to_bits(),
+            "整片 min n={n} 不逐位"
+        );
+    }
+
+    // 错误面：形状不符 / 溢出 / 归约轴为 0（错误变体与 op 名一致）
+    assert!(matches!(
+        be.reduce_max_cols_f32(&[0.0; 6], 2, 4, &mut [0.0; 4]),
+        Err(simd_dsl::BackendError::LengthMismatch {
+            op: "reduce_max_cols_f32",
+            what: "x",
+            ..
+        })
+    ));
+    assert!(matches!(
+        be.reduce_min_rows_f32(&[0.0; 8], 2, 4, &mut [0.0; 3]),
+        Err(simd_dsl::BackendError::LengthMismatch {
+            op: "reduce_min_rows_f32",
+            what: "out",
+            ..
+        })
+    ));
+    assert!(matches!(
+        be.reduce_max_cols_f32(&[], 0, 4, &mut [0.0; 4]),
+        Err(simd_dsl::BackendError::LengthMismatch {
+            op: "reduce_max_cols_f32",
+            ..
+        })
+    ));
+    assert!(matches!(
+        be.reduce_min_cols_f32(&[], usize::MAX, 2, &mut [0.0; 2]),
+        Err(simd_dsl::BackendError::ShapeOverflow {
+            op: "reduce_min_cols_f32",
+            ..
+        })
+    ));
 }

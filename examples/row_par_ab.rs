@@ -246,6 +246,56 @@ fn main() {
             },
         );
         row("reduce_sum_rows", n, t1, tn);
+
+        // **P4.3（task-124）**：`max/min` 轴归约（切与归约轴无关的另一维 ⇒ 逐位）。
+        let (mut c2, mut cn2) = (vec![0.0f32; cols], vec![0.0f32; cols]);
+        let (mut m2, mut mn2) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+        for (name, op) in [
+            ("reduce_max_cols", f32::max as fn(f32, f32) -> f32),
+            ("reduce_min_cols", f32::min),
+        ] {
+            parallel::reduce_extreme_cols(&p1, &x, rows, cols, &mut c2, op);
+            parallel::reduce_extreme_cols(&pn, &x, rows, cols, &mut cn2, op);
+            assert!(
+                c2.iter()
+                    .map(|v| v.to_bits())
+                    .eq(cn2.iter().map(|v| v.to_bits()))
+            );
+            let (t1, tn) = ab(
+                || {
+                    parallel::reduce_extreme_cols(&p1, &x, rows, cols, &mut c2, op);
+                    black_box(&c2);
+                },
+                || {
+                    parallel::reduce_extreme_cols(&pn, &x, rows, cols, &mut cn2, op);
+                    black_box(&cn2);
+                },
+            );
+            row(name, n, t1, tn);
+        }
+        for (name, op) in [
+            ("reduce_max_rows", f32::max as fn(f32, f32) -> f32),
+            ("reduce_min_rows", f32::min),
+        ] {
+            parallel::reduce_extreme_rows(&p1, &x, rows, cols, &mut m2, op);
+            parallel::reduce_extreme_rows(&pn, &x, rows, cols, &mut mn2, op);
+            assert!(
+                m2.iter()
+                    .map(|v| v.to_bits())
+                    .eq(mn2.iter().map(|v| v.to_bits()))
+            );
+            let (t1, tn) = ab(
+                || {
+                    parallel::reduce_extreme_rows(&p1, &x, rows, cols, &mut m2, op);
+                    black_box(&m2);
+                },
+                || {
+                    parallel::reduce_extreme_rows(&pn, &x, rows, cols, &mut mn2, op);
+                    black_box(&mn2);
+                },
+            );
+            row(name, n, t1, tn);
+        }
     }
 
     println!("loadavg(结束) = {}", loadavg());

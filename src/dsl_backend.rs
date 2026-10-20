@@ -86,6 +86,38 @@ fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) ->
     }
 }
 
+/// **轴 `max/min` 归约的公共校验**（P4.3；与 `simd_dsl::kernels::scalar` 的默认实现**逐条同口径**）：
+/// 先 `rows×cols` 溢出、再 `x`/`out` 长度、最后"归约轴长度为 0"（错误信息逐字一致）。
+fn axis_extreme_check(
+    op: &'static str,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &[f32],
+    out_len: usize,
+    axis_len: usize,
+) -> Result<(), BackendError> {
+    let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+        op,
+        what: "rows×cols",
+    })?;
+    if x.len() != total {
+        return Err(len_err(op, "x", total, x.len()));
+    }
+    if out.len() != out_len {
+        return Err(len_err(op, "out", out_len, out.len()));
+    }
+    if axis_len == 0 {
+        return Err(BackendError::LengthMismatch {
+            op,
+            what: "rows/cols（max/min 归约至少需要一个元素）",
+            expected: 1,
+            got: 0,
+        });
+    }
+    Ok(())
+}
+
 impl Backend for LasxBackend {
     fn name(&self) -> &'static str {
         "lasx_rs"
@@ -479,6 +511,99 @@ impl Backend for LasxBackend {
         );
         crate::ops::dsl_map::reduce_sum_rows(x, rows, cols, out);
         Ok(())
+    }
+
+    // ================= P4.3：`max/min` 轴归约 + 整片归约 override =================
+    //
+    // **等价类 = 逐位**：默认实现是"初值取该轴首元素，之后逐元素 `f32::max/min` fold"；
+    // 本仓内核**逐字复制**该 fold（`ops::dsl_map`），并行只切**与归约轴无关的另一维** ⇒ 每输出的
+    // 元素次序不变 ⇒ `to_bits()` 相等（`tests/prims_override.rs` 钉住，含 NaN/±0/全 NaN 轴）。
+    // **不向量化**：`f32::max` 对"全 NaN 轴"返回的 NaN payload 依赖比较次序 ⇒ 换结合次序会破逐位。
+    // **错误面**：`axis_extreme_check` 与默认实现逐条同口径（溢出/长度/归约轴为 0）。
+
+    /// 轴 `max`（沿 `rows`）；P4.3 override。
+    fn reduce_max_cols_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_max_cols_f32";
+        axis_extreme_check(op, x, rows, cols, out, cols, rows)?;
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_max_cols(x, rows, cols, out);
+        Ok(())
+    }
+
+    /// 轴 `min`（沿 `rows`）；P4.3 override。
+    fn reduce_min_cols_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_min_cols_f32";
+        axis_extreme_check(op, x, rows, cols, out, cols, rows)?;
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_min_cols(x, rows, cols, out);
+        Ok(())
+    }
+
+    /// 轴 `max`（沿 `cols`）；P4.3 override。
+    fn reduce_max_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_max_rows_f32";
+        axis_extreme_check(op, x, rows, cols, out, rows, cols)?;
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_max_rows(x, rows, cols, out);
+        Ok(())
+    }
+
+    /// 轴 `min`（沿 `cols`）；P4.3 override。
+    fn reduce_min_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_min_rows_f32";
+        axis_extreme_check(op, x, rows, cols, out, rows, cols)?;
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_min_rows(x, rows, cols, out);
+        Ok(())
+    }
+
+    /// **整片 `max`**（P4.3 override）：**不并行**——整片归约没有"独立轴"可切，树形归约会让
+    /// "全 NaN"时的 NaN payload / ±0 位模式随次序变化 ⇒ 保**逐位**就保持顺序 fold（与默认同一代码）。
+    /// 空输入 = 幺元 `NEG_INFINITY`（与默认一致，永远 `Ok`）。
+    fn reduce_max_f32(&self, x: &[f32]) -> Result<f32, BackendError> {
+        Ok(crate::ops::dsl_map::max_global(x))
+    }
+
+    /// **整片 `min`**（P4.3 override）：语义/不并行理由同 [`Backend::reduce_max_f32`]；
+    /// 空输入 = 幺元 `POSITIVE_INFINITY`。
+    fn reduce_min_f32(&self, x: &[f32]) -> Result<f32, BackendError> {
+        Ok(crate::ops::dsl_map::min_global(x))
     }
 
     fn reduce_weighted_sum_cols_f32(

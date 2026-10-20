@@ -322,3 +322,143 @@ pub(crate) fn reduce_sum_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f3
     }
     reduce_sum_rows_rows(x, cols, out, rows);
 }
+
+// ================= P4.3：max/min 轴归约（4 个方向）的 LASX override + 自动并行 =================
+//
+// **等价类 = 逐位**（与 `simd_dsl::kernels::scalar` 的默认实现逐位相等）：
+// 默认实现的语义是"**初值取该轴首元素**，之后逐元素 `f32::max`/`f32::min` fold"。
+// 这里**逐字复制**该 fold（不向量化、不改结合次序），并行只切**与归约轴无关的另一维**
+// （列归约切列块、行归约切行块）⇒ 每��输出的元素次序完全不变 ⇒ `to_bits()` 相等。
+//
+// **为什么不向量化**：`f32::max/min` 无舍入（看似可任意重排），但 **NaN payload 的位模式**
+// 在"全 NaN 轴"上会随比较次序变化（`f32::max` 对两个 NaN 返回其中一个的操作数），
+// ±0 的符号也依赖实现细节 ⇒ 想保**逐位**就不能换结合次序。并行（切独立轴）是零风险的加速点。
+
+/// 轴 `max`：沿 `rows` 归约、保留 `cols`（`out[c] = max_r x[r·cols + c]`）。
+pub(crate) fn reduce_max_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    reduce_extreme_cols(x, rows, cols, out, f32::max);
+}
+
+/// 轴 `min`：沿 `rows` 归约、保留 `cols`。
+pub(crate) fn reduce_min_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    reduce_extreme_cols(x, rows, cols, out, f32::min);
+}
+
+/// 轴 `max`：沿 `cols` 归约、保留 `rows`（`out[r] = max_c x[r·cols + c]`）。
+pub(crate) fn reduce_max_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    reduce_extreme_rows(x, rows, cols, out, f32::max);
+}
+
+/// 轴 `min`：沿 `cols` 归约、保留 `rows`。
+pub(crate) fn reduce_min_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    reduce_extreme_rows(x, rows, cols, out, f32::min);
+}
+
+/// 轴归约的自动并行阈值（元素数；由 `examples/row_par_ab.rs` 实测定）。
+///
+/// **实测**（12 线程、loadavg≈5（趋势级）、同进程 1t vs auto、6 对丢首对取中位；判据 ≥1.10）：
+///
+/// * **行方向**（`max/min_rows`）：8K–3.1M **0.97–1.01×（中性）**；**4.2M 6.20×/6.28×**、
+///   16.7M 5.77×/5.71×、33.5M 5.70×/5.65×、67M 5.39×/5.55× ⇒ 拐点在数据超 L3。
+/// * **列方向**（`max/min_cols`）：8K–33.5M **0.93–1.04×（中性；串行本身是跨行走访、
+///   并行不改变每列次序但也摊不开带宽）**；**67M 6.31×/5.88×**（超大矩阵才有效）。
+///
+/// ⇒ 阈值取 **4M 元素**（`1<<22`，与行和同口径）：阈值以下走串行（**不许变慢**）；
+/// 4.2M 起行方向稳定 ≥5×，列方向中性（0.98–1.04）到 67M 才 6×（如实记：列方向收益在超大矩阵）。
+pub(crate) const PAR_MIN_EXTREME_ELEMS: u128 = 1 << 22; // 4M 元素
+
+/// 沿 `rows` 归约（列方向）的入口：按**列块**并行（每列的行序不变 ⇒ 逐位）。
+fn reduce_extreme_cols(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    op: fn(f32, f32) -> f32,
+) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_EXTREME_ELEMS && pool.threads() > 1 && cols >= 8 {
+        crate::parallel::reduce_extreme_cols(pool, x, rows, cols, out, op);
+        return;
+    }
+    reduce_extreme_cols_range(x, rows, cols, 0, cols, out, op);
+}
+
+/// 沿 `cols` 归约（行方向）的入口：按**行块**并行（每行的列序不变 ⇒ 逐位）。
+fn reduce_extreme_rows(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    op: fn(f32, f32) -> f32,
+) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_EXTREME_ELEMS && pool.threads() > 1 && rows >= 2 {
+        crate::parallel::reduce_extreme_rows(pool, x, rows, cols, out, op);
+        return;
+    }
+    reduce_extreme_rows_range(x, cols, out, rows, op);
+}
+
+/// 列区间 `[c0, c1)` 的 max/min（每列：初值 = 第 0 行，之后按 `r` 升序 fold）。
+pub(crate) fn reduce_extreme_cols_range(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    c0: usize,
+    c1: usize,
+    out_chunk: &mut [f32],
+    op: fn(f32, f32) -> f32,
+) {
+    for c in c0..c1 {
+        // SAFETY: 调用方已校验 `rows·cols ≤ x.len()`、`c < cols`、`rows ≥ 1`。
+        let mut acc = x[c];
+        for r in 1..rows {
+            acc = op(acc, x[r * cols + c]);
+        }
+        out_chunk[c - c0] = acc;
+    }
+}
+
+/// 行区间 `[r0, r1)` 的 max/min（每行：初值 = 本行第 0 列，之后按 `c` 升序 fold）。
+pub(crate) fn reduce_extreme_rows_range(
+    x: &[f32],
+    cols: usize,
+    out: &mut [f32],
+    rows_local: usize,
+    op: fn(f32, f32) -> f32,
+) {
+    for r in 0..rows_local {
+        let row = &x[r * cols..(r + 1) * cols];
+        let mut acc = row[0];
+        for &v in &row[1..] {
+            acc = op(acc, v);
+        }
+        out[r] = acc;
+    }
+}
+
+/// 整片 `max`（**逐位**：与默认实现同一 fold；空输入 = 幺元 `NEG_INFINITY`）。
+pub(crate) fn max_global(x: &[f32]) -> f32 {
+    let mut it = x.iter().copied();
+    let Some(mut acc) = it.next() else {
+        return f32::NEG_INFINITY;
+    };
+    for v in it {
+        acc = acc.max(v);
+    }
+    acc
+}
+
+/// 整片 `min`（**逐位**：空输入 = 幺元 `POSITIVE_INFINITY`）。
+pub(crate) fn min_global(x: &[f32]) -> f32 {
+    let mut it = x.iter().copied();
+    let Some(mut acc) = it.next() else {
+        return f32::INFINITY;
+    };
+    for v in it {
+        acc = acc.min(v);
+    }
+    acc
+}

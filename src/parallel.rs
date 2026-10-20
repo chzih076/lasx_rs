@@ -906,6 +906,45 @@ pub fn reduce_sum_rows(
     });
 }
 
+/// **轴 `max/min` 列方向并行版**：按**列块**切（每列的行序不变 ⇒ **逐位**）。
+///
+/// `op` 必须是 `f32::max` 或 `f32::min`（调用方 `dsl_map` 的两个入口各传一个）。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_extreme_cols(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    op: fn(f32, f32) -> f32,
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
+        crate::ops::dsl_map::reduce_extreme_cols_range(x, rows, cols, c0, c0 + clen, o, op);
+    });
+}
+
+/// **轴 `max/min` 行方向并行版**：按**行块**切（每行的列序不变 ⇒ **逐位**）。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_extreme_rows(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    op: fn(f32, f32) -> f32,
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, 1)], |r0, rlen, [o]| {
+        let r1 = r0 + rlen;
+        crate::ops::dsl_map::reduce_extreme_rows_range(&x[r0 * cols..r1 * cols], cols, o, rlen, op);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,6 +1059,48 @@ mod tests {
                 bits(&b),
                 "reduce_sum_rows {rows}×{cols} 并行不逐位"
             );
+        }
+    }
+
+    /// **task-124**：`max/min` 轴归约的并行分块与单线程**逐位一致**
+    /// （列/行方向都只切"与归约轴无关"的另一维 ⇒ 每输出的元素次序不变）。
+    ///
+    /// 数据含 `NaN`/`±0`/`±inf`（切分不改变每轴 fold 次序 ⇒ 连 NaN/±0 的位模式也要相等）。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn test_axis_extreme_parallel_bit_for_bit() {
+        let p1 = crate::pool::WorkerPool::new(1);
+        let p4 = crate::pool::WorkerPool::new(4);
+        for &(rows, cols) in &[(37usize, 70usize), (1, 9), (9, 1), (64, 41), (8, 8)] {
+            let n = rows * cols;
+            let mut x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+                .collect();
+            x[0] = f32::NAN;
+            x[1] = -0.0;
+            x[2 % n] = 0.0;
+            x[3 % n] = f32::INFINITY;
+            x[4 % n] = f32::NEG_INFINITY;
+            let (mut a, mut b) = (vec![0.0f32; rows.max(cols)], vec![0.0f32; rows.max(cols)]);
+            for (is_max, cols_axis) in [(true, true), (false, true), (true, false), (false, false)]
+            {
+                let op: fn(f32, f32) -> f32 = if is_max { f32::max } else { f32::min };
+                let len = if cols_axis { cols } else { rows };
+                a[..len].fill(0.0);
+                b[..len].fill(0.0);
+                if cols_axis {
+                    super::reduce_extreme_cols(&p1, &x, rows, cols, &mut a[..len], op);
+                    super::reduce_extreme_cols(&p4, &x, rows, cols, &mut b[..len], op);
+                } else {
+                    super::reduce_extreme_rows(&p1, &x, rows, cols, &mut a[..len], op);
+                    super::reduce_extreme_rows(&p4, &x, rows, cols, &mut b[..len], op);
+                }
+                assert_eq!(
+                    bits(&a[..len]),
+                    bits(&b[..len]),
+                    "max/min 轴并行不逐位（{rows}×{cols}, is_max={is_max}, cols_axis={cols_axis}）"
+                );
+            }
         }
     }
 
