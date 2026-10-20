@@ -746,6 +746,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `4dba5ac` / `6eb8e85` / `3a605f6` | rev bump | axpy→rms ROI（未实现）/ 不采纳 / matmul epilogue ROI |
 | 2026-10-20 | `027f69e` | rev bump（HEAD `6981945`） | 目标闭环汇总（引擎接管证据矩阵） |
 | 2026-10-20 | `9de506a` / `7c40fc3` / `51b214c` | rev bump（HEAD 待 bump） | 欠账结清：入口计数剥离 `cfg(test)`（33/28/1）、`iso_kernel`/`kv_cache` 升级（真实优化 15/组合桥 3/未接线 0）、线程池实测不采纳；文档大清理（docs 2452→1570，AGENTS 835→97） |
+| 2026-10-20 | `e79308c` / `dc93583` / `0e89761` + 本仓 `a7b61a6` | rev bump（HEAD 待 bump） | 第二批积压：P4.2 三桶缓冲池（64× 内存，未接线）、f64 契约/geometry auto 核对闭环、LASX 行归约自动并行（8K 阈值，8K 2.71×/128K 8.68×，loadavg>3 趋势）；P4.1 判"已落地无剩余" |
 
 
 ## 8. 已知边界与欠账
@@ -803,6 +804,10 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 入口计数含测试代码 | **已结清**：`enginecheck`/`build.rs` 剥离 `#[cfg(test)]`；编译期打印 33/28/1（旧 41 虚增 8 次） | simd `9de506a` |
 | P2/P3 数值融合 | **不采纳**（P2 上限 1.291×→向量后端 1.107× 且非逐位；P3 epilogue 占比 0–1%） | simd ROI 记录 |
 | 文档臃肿 | **已清理**：dev 7807→~870、ops 2705→1200、AGENTS 835→97；simd docs 2452→1570 | 本轮提交 |
+| P4.1 归约/epilogue 融合 | **已落地、无剩余**：spectral detect 已 2 趟（plan 复用 1 趟）⇒ 已到 1 读 1 写下限，无可再融趟数 | simd `ops_dsl/src/spectral.rs` :234/:287/:370/:390 |
+| P4.2 liveness 三桶池 | **已交付（内存口径）**：`ops_dsl/src/pool.rs`，64 帧×3 桶 alloc 192→3、bytes 18.89 MB→295 KB（64×）；借出清零/逐位一致；**尚未接线** spectral（端到端每帧省 13.6 MiB 待集成） | simd `e79308c`；liveness 21.61→8.02 MiB |
+| f64 逐元素/轴归约 + geometry auto | **已闭环**：6 方法默认委托 scalar（5 逐位 + 行和容差实测 rel ≤1e-14）；5 个 f64 几何入口经 `engine::execute`，引擎按 `supports_plan` 选融合/组合（cap 不参与）；两路与零向量语义已测 | simd `dc93583` |
+| LASX 行归约自动并行 | **已落地**：`reduce_rows_map_f32` 8K 阈值按行块并行（逐位）；8K 2.71×、128K 8.68×、67M 2.48×（loadavg≈5 ⇒ 趋势）；阈值以下走原串行不变慢；`reduce_sum_rows_f32` **未采纳**（无 override，须改 dsl_backend 另立项） | 本仓 `a7b61a6` |
 
 ---
 
