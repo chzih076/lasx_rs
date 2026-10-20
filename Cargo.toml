@@ -157,3 +157,23 @@ required-features = ["dsl-backend"]
 [[example]]
 name = "plan_ab"
 required-features = ["dsl-backend"]
+
+# `dsl_vs_lasx_ab`（task-126，性能比赛测试台第一批）：**DSL 算子 vs LASX 库算子**——
+# A = `lasx_rs::api::*`（手写 LASX 内核），B = `ops_dsl::*`（DSL 宏算子 + `LasxBackend`）。
+# 一个进程只跑一个臂/一个 threads（`SIMD_DSL_ENGINE_THREADS` 引擎只读一次）；进程级交替由
+# `scripts/dsl_vs_lasx_ab.sh` 做（≥5 轮丢首轮、中位+极差、同时打印等价类与 loadavg）。
+# 覆盖：matmul 1024³ / dot / sum / softmax_rows / rms_norm / layer_norm / gelu_quick / axpy /
+# absmax_rows / cmatmul（Direct 路线）；`sum_cols`/`sum_rows`/`weighted_sum_cols` 因 LASX 无公开
+# `api::*` 入口**本轮不测**（如实写在 example 文件头）。
+[[example]]
+name = "dsl_vs_lasx_ab"
+required-features = ["dsl-backend"]
+
+# `dsl_vs_lasx_ab2`（性能比赛·第二批，收窄版）：几何 f64 的 A/B（LASX `api::*_batch_into` ↔
+# `ops_dsl::geometry::*_f64`）。仅覆盖**两边都有、同 dtype 同语义**的 `norm3`/`unitize3`；
+# `vec3_add_scaled`/`cross3`（DSL 侧带额外暂存参数未读全）、spectral/stencil（LASX 无公开入口）、
+# 几何 f32（LASX 仅 f64 版本）均**如实跳过**（见 example 文件头）。
+[[example]]
+name = "dsl_vs_lasx_ab2"
+required-features = ["dsl-backend"]
+
