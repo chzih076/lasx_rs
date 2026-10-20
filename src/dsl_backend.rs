@@ -3247,8 +3247,16 @@ mod tests {
             .expect("空输入合法");
     }
 
-    /// **P4.4 A/B**：旧 3 趟组合 vs 单趟 override vs LASX `api::absmax_rows`
-    /// （同进程交替 7 对丢首对取中位；单线程 —— 本算子是每行内存带扫描，不做并行）。
+    /// **P4.4 A/B：旧 3 趟组合 vs 单趟 override vs LASX `api::absmax_rows`（性能探针，不进 CI）**。
+    ///
+    /// **为什么 `#[ignore]`**：本测试纯测量（**没有任何时间阈值断言**），却要在 16M 元素 × 3 形状上
+    /// 扫 3 臂多轮——放在 CI 里既拖时间、又让"机器负载"混进 CI 日志。证据价值保留：
+    /// 手动跑 `cargo test --release -p lasx_rs --lib absmax_rows_single_pass_ab -- --ignored --nocapture`。
+    ///
+    /// **口径（抗噪）**：同进程交替 **8 对（丢首对 ⇒ 7 对）**，同时打印**中位比值**与 **min 比值**。
+    /// 为什么 min：共享机器负载**只增不减** ⇒ 每臂的 min 更接近"无噪速度"；正式验收仍用
+    /// 进程级交替 + 中位（本探针只是趋势证据，不据此下"采纳/不采纳"结论）。
+    #[ignore = "性能探针（无断言、16M×3 形状）：cargo test --release -p lasx_rs --lib absmax_rows_single_pass_ab -- --ignored --nocapture"]
     #[test]
     fn absmax_rows_single_pass_ab() {
         use std::time::{Duration, Instant};
@@ -3258,8 +3266,10 @@ mod tests {
             "absmax_rows A/B（LasxBackend；单线程）loadavg={}",
             loadavg.trim()
         );
-        eprintln!("| rows×cols | 3-pass ms | single-pass ms | api ms | 3pass/1pass | 1pass/api |");
-        eprintln!("|---|---|---|---|---|---|");
+        eprintln!(
+            "| rows×cols | 3-pass ms(med) | 1-pass ms(med) | api ms(med) | 3pass/1pass(med) | 1pass/api(med) | 3pass/1pass(min) | 1pass/api(min) |"
+        );
+        eprintln!("|---|---|---|---|---|---|---|---|");
         for &(rows, cols) in &[(1024usize, 1024usize), (4096, 1024), (16384, 1024)] {
             let n = rows * cols;
             let x: Vec<f32> = (0..n)
@@ -3281,7 +3291,7 @@ mod tests {
                 std::hint::black_box(&v[0]);
             };
             let (mut t_old, mut t_new, mut t_api) = (Vec::new(), Vec::new(), Vec::new());
-            for round in 0..7 {
+            for round in 0..8 {
                 let timeit = |f: &mut dyn FnMut()| -> Duration {
                     let t = Instant::now();
                     f();
@@ -3305,19 +3315,30 @@ mod tests {
                     t_new.push(timeit(&mut f_new));
                 }
             }
+            // 丢首对（预热）：三臂同时丢，保持配对。
+            t_old.remove(0);
+            t_new.remove(0);
+            t_api.remove(0);
             let median = |v: &mut Vec<Duration>| {
                 v.sort_unstable();
                 v[v.len() / 2]
             };
+            let min = |v: &mut Vec<Duration>| {
+                v.sort_unstable();
+                v[0]
+            };
             let (m_old, m_new, m_api) =
                 (median(&mut t_old), median(&mut t_new), median(&mut t_api));
+            let (n_old, n_new, n_api) = (min(&mut t_old), min(&mut t_new), min(&mut t_api));
             eprintln!(
-                "| {rows}×{cols} | {:.3} | {:.3} | {:.3} | **{:.2}×** | **{:.2}×** |",
+                "| {rows}×{cols} | {:.3} | {:.3} | {:.3} | **{:.2}×** | **{:.2}×** | **{:.2}×** | **{:.2}×** |",
                 m_old.as_secs_f64() * 1e3,
                 m_new.as_secs_f64() * 1e3,
                 m_api.as_secs_f64() * 1e3,
                 m_old.as_secs_f64() / m_new.as_secs_f64(),
-                m_new.as_secs_f64() / m_api.as_secs_f64()
+                m_new.as_secs_f64() / m_api.as_secs_f64(),
+                n_old.as_secs_f64() / n_new.as_secs_f64(),
+                n_new.as_secs_f64() / n_api.as_secs_f64()
             );
         }
     }

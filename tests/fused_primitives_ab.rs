@@ -4,7 +4,8 @@
 //! 注意：本轮两个 LASX 覆盖是**标量**实现（FMA 版待封装名核对），所以这里的对比是
 //! "**标量融合核** vs **现有向量化两步路径**"——若融合核更慢，如实记录，不做接线。
 //!
-//! 口径：同进程、交替 A/B、每臂 5 轮丢弃首轮、取中位数；`loadavg` 与 n 一起打印。
+//! 口径（抗噪）：同进程、交替 A/B、**8 对丢首对（7 对）**，同时打印**中位**与 **min** 比值
+//! （负载只增不减 ⇒ min 更接近无噪速度；本测试**没有时间阈值断言**，只打印证据，不会因负载抖动）。
 #![cfg(feature = "dsl-backend")]
 
 use std::time::Instant;
@@ -59,19 +60,30 @@ fn fused_primitives_ab_same_process() {
             .unwrap();
     };
 
-    // 预热 + 交替测量
+    // 预热 + 交替测量。
+    // **抗噪口径（本测试无时间阈值断言，只影响打印证据质量）**：同进程交替 **8 对、丢首对（7 对）**；
+    // 同时给**中位比值**与 **min 比值**——共享机器负载只增不减，min 更接近"无噪速度"；
+    // 正式验收（若将来加门限）仍用进程级交替 + 中位，**min 只用于趋势判断**。
     arm_b(&b, &mut out_b);
     let iters = 3;
     let mut ta = Vec::new();
     let mut tb = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..8 {
         ta.push(time(|| arm_a(&b, &mut tmp, &mut tmp2, &mut out_a), iters));
         tb.push(time(|| arm_b(&b, &mut out_b), iters));
     }
-    let (ma, mb) = (median(ta), median(tb));
+    ta.remove(0); // 丢首对（预热）
+    tb.remove(0);
+    let (ma, mb) = (median(ta.clone()), median(tb.clone()));
+    let (mina, minb) = (
+        ta.iter().copied().fold(f64::INFINITY, f64::min),
+        tb.iter().copied().fold(f64::INFINITY, f64::min),
+    );
     eprintln!(
-        "energy: 多步 {ma:.4} ms / 融合 {mb:.4} ms ⇒ 融合/多步 = {:.3}×（<1 才是更快）",
-        mb / ma
+        "energy: 多步 {ma:.4} ms（min {mina:.4}）/ 融合 {mb:.4} ms（min {minb:.4}）\
+         ⇒ 融合/多步 = {:.3}×（中位）/ {:.3}×（min；<1 才是更快）",
+        mb / ma,
+        minb / mina
     );
     // 数值对齐（仅确认两臂算的是同一个东西；容差类给实测界）
     let mut worst = 0.0f32;

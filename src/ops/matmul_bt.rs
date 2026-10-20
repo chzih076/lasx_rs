@@ -110,13 +110,19 @@ mod tests {
         assert!(matmul_bt_f32(2, 3, 3, &[0.0; 6], &[0.0; 9], &mut out[..5]).is_err());
     }
 
-    /// **三臂 A/B 实测**（§5 口径：同进程交替、5 轮丢首轮、中位）。
+    /// **三臂 A/B 实测（性能探针，不进 CI）**。
     ///
     /// 臂：① 物化转置 `bᵀ`（`n×k→k×n`）+ 行点积（≈现状"物化转置 + matmul"的数据移动量）
     /// ② **NT 内核**（本文件）｜③ 分块转置（32 行一块）+ 行点积
     ///
-    /// **口径如实**：①/③ 在测试内自包含实现（**未调用 `api::matmul`** —— 其形参顺序本轮未核对，
-    /// 不凭猜写）；`docs/dev.md §7.25` 的数字以本测试输出为准。
+    /// **为什么 `#[ignore]`**：①/③ 是**朴素三重循环**（2048×128×2048 下每臂已 ~0.5 G MAC），
+    /// 多轮在共享 CI 机器上纯属拖时间；且本测试**无时间阈值断言**（只有 `>0` 合理性）。
+    /// 数值等价由**非 ignore** 的 [`bitwise_same_as_naive`]（小形状、逐位）覆盖。
+    /// 手动跑：`cargo test --release -p lasx_rs --lib three_arm_ab -- --ignored --nocapture`。
+    ///
+    /// **口径（抗噪）**：同进程交替 **8 轮、丢首轮（7 个样本）**，同时打印中位与 **min** 比值
+    /// （负载只增不减 ⇒ min 更接近无噪速度；正式采纳结论仍看进程级交替 + 中位）。
+    #[ignore = "性能探针（无时间阈值断言，朴素臂很重）：cargo test --release -p lasx_rs --lib three_arm_ab -- --ignored --nocapture"]
     #[test]
     fn three_arm_ab() {
         let shapes = [(1024usize, 64usize, 1024usize), (2048, 128, 2048)];
@@ -125,19 +131,19 @@ mod tests {
             let b = data(n * k, 0.25);
             let out = RefCell::new(vec![0.0f32; m * n]);
             let bt = RefCell::new(vec![0.0f32; k * n]);
-            let med = |f: &mut dyn FnMut()| -> f64 {
+            let med = |f: &mut dyn FnMut()| -> (f64, f64) {
                 let mut v = Vec::new();
-                for _ in 0..5 {
+                for _ in 0..8 {
                     let t0 = Instant::now();
                     f();
                     v.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                v.remove(0);
+                v.remove(0); // 丢首轮（预热）
                 v.sort_by(f64::total_cmp);
-                v[v.len() / 2]
+                (v[v.len() / 2], v[0])
             };
             // ① 物化转置 + 行点积
-            let t1 = med(&mut || {
+            let (t1, min1) = med(&mut || {
                 let mut bt = bt.borrow_mut();
                 let mut o = out.borrow_mut();
                 (0..n).for_each(|j| {
@@ -151,11 +157,11 @@ mod tests {
                 });
             });
             // ② NT 内核
-            let t2 = med(&mut || {
+            let (t2, min2) = med(&mut || {
                 matmul_bt_f32(m, k, n, &a, &b, &mut out.borrow_mut()).unwrap();
             });
             // ③ 分块转置（32 行一块）+ 行点积
-            let t3 = med(&mut || {
+            let (t3, min3) = med(&mut || {
                 let mut bt = bt.borrow_mut();
                 let mut o = out.borrow_mut();
                 let mut j0 = 0usize;
@@ -174,13 +180,13 @@ mod tests {
                 }
             });
             println!(
-                "P5-b 三臂 m={m},k={k},n={n}：① 物化转置+点积 {t1:.3} ms｜② NT 内核 {t2:.3} ms｜③ 分块转置+点积 {t3:.3} ms ⇒ **①/② = {:.3}×**（≥1.10 才采纳）、③/② = {:.3}×",
+                "P5-b 三臂 m={m},k={k},n={n}：① 物化转置+点积 {t1:.3} ms（min {min1:.3}）｜② NT 内核 {t2:.3} ms（min {min2:.3}）｜③ 分块转置+点积 {t3:.3} ms（min {min3:.3}）⇒ **①/② = {:.3}×（中位）/ {:.3}×（min）**（≥1.10 才采纳）、③/② = {:.3}×（中位）",
                 t1 / t2,
+                min1 / min2,
                 t3 / t2
             );
             assert!(t1 > 0.0 && t2 > 0.0 && t3 > 0.0);
-            // 三臂结果必须逐位一致（① 的转置只是搬数据，运算序相同）
-            matmul_bt_f32(m, k, n, &a, &b, &mut out.borrow_mut()).unwrap();
+            // 数值等价由非 ignore 的 `bitwise_same_as_naive`（小形状、逐位）覆盖；本探针只测时间。
         }
     }
 }

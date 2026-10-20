@@ -1420,16 +1420,19 @@ mod tests {
     ///
     /// 这一条同时是**挂死看门狗**：池的派活/收尾是自旋 + 原子计数，出错的形式往往是"某个
     /// worker 永远不计数 ⇒ 主线程永远自旋"（进程 100% CPU 卡住，比崩溃更难查）。所以这里挂一个
-    /// 60 s 的看门狗线程，超时直接 `abort` —— CI 上要一个明确的失败，而不是一次超时。
+    /// **180 s** 的看门狗线程，超时直接 `abort` —— CI 上要一个明确的失败，而不是一次超时。
+    ///
+    /// **抗噪（门禁机 loadavg 常 5–15）**：本测试的工作量本身很小（几十毫秒级），看门狗只用于
+    /// 抓"真挂死"；从 60 s 放宽到 180 s，避免高负载/共享机器上把"慢"误判成"挂死"。
     #[test]
     fn test_dispatch_with_fewer_blocks_than_threads() {
         use std::sync::atomic::{AtomicBool, Ordering as O};
         static DONE: AtomicBool = AtomicBool::new(false);
         std::thread::spawn(|| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
             while !DONE.load(O::Relaxed) {
                 if std::time::Instant::now() > deadline {
-                    eprintln!("池压力测试超过 60 s：疑似派活/收尾挂死");
+                    eprintln!("池压力测试超过 180 s：疑似派活/收尾挂死");
                     std::process::abort();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));

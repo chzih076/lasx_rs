@@ -318,30 +318,33 @@ mod tests {
         let ids: Vec<u32> = (0..256u32).map(|i| (i * 16) % n_rows as u32).collect();
         let mut out_fast = vec![0.0f32; ids.len() * row_len];
         let mut out_naive = vec![0.0f32; ids.len() * row_len];
-        let med = |f: &mut dyn FnMut()| -> f64 {
+        // **抗噪口径**：同进程交替 **8 轮、丢首轮（7 个样本）**；同时给中位与 **min** 比值
+        // （负载只增不减 ⇒ min 更接近无噪速度）；本测试无时间阈值断言，只做趋势证据。
+        let med = |f: &mut dyn FnMut()| -> (f64, f64) {
             let mut v = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..8 {
                 let t = Instant::now();
                 f();
                 v.push(t.elapsed().as_secs_f64() * 1e3);
             }
             v.remove(0);
             v.sort_by(f64::total_cmp);
-            v[v.len() / 2]
+            (v[v.len() / 2], v[0])
         };
-        let fast = med(&mut || {
+        let (fast, min_fast) = med(&mut || {
             gather_rows_f32(&table, row_len, row_len, &ids, &mut out_fast, row_len).unwrap();
         });
-        let naive = med(&mut || {
+        let (naive, min_naive) = med(&mut || {
             ids.iter().enumerate().for_each(|(t, &id)| {
                 let s = id as usize * row_len;
                 out_naive[t * row_len..(t + 1) * row_len].copy_from_slice(&table[s..s + row_len]);
             });
         });
         println!(
-            "P5-a A/B（n_rows={n_rows}, row_len={row_len}, {} 行）：内核 {fast:.4} ms｜朴素 {naive:.4} ms｜**朴素/内核 = {:.3}×**",
+            "P5-a A/B（n_rows={n_rows}, row_len={row_len}, {} 行）：内核 {fast:.4} ms（min {min_fast:.4}）｜朴素 {naive:.4} ms（min {min_naive:.4}）｜**朴素/内核 = {:.3}×（中位）/ {:.3}×（min）**",
             ids.len(),
-            naive / fast
+            naive / fast,
+            min_naive / min_fast
         );
         assert_eq!(
             out_fast.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

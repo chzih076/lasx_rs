@@ -403,20 +403,23 @@ mod tests {
         let out = RefCell::new(vec![0.0f32; rows * cols]);
         // 臂①的"物化"中间缓冲（连续）
         let tmp = RefCell::new(vec![0.0f32; rows * cols]);
-        let med = |f: &mut dyn FnMut() -> usize| -> (f64, usize) {
+        // **抗噪口径**：同进程交替 **8 轮、丢首轮（7 个样本）**；同时给中位与 **min** 比值。
+        // 共享机器负载只增不减 ⇒ min 更接近无噪速度；本测试无时间阈值断言（只做趋势证据，
+        // 正式验收仍用进程级交替 + 中位）。
+        let med = |f: &mut dyn FnMut() -> usize| -> (f64, f64, usize) {
             let mut v = Vec::new();
             let mut acc = 0usize;
-            for _ in 0..5 {
+            for _ in 0..8 {
                 let t0 = Instant::now();
                 acc += f();
                 v.push(t0.elapsed().as_secs_f64() * 1e3);
             }
-            v.remove(0);
+            v.remove(0); // 丢首轮（预热）
             v.sort_by(f64::total_cmp);
-            (v[v.len() / 2], acc)
+            (v[v.len() / 2], v[0], acc)
         };
         // 臂①：**物化**（跨步→连续中间缓冲）+ 再一次连续拷贝到输出（= "先转成连续再 op" 的两趟，P5-b 现状路径）
-        let (t1, it1) = med(&mut || {
+        let (t1, min1, it1) = med(&mut || {
             let mut t = tmp.borrow_mut();
             let mut o = out.borrow_mut();
             copy_strided_f32(&src, src_st, &mut t, dst_st, rows, cols).unwrap();
@@ -424,14 +427,15 @@ mod tests {
             o.iter().map(|v| v.to_bits()).fold(0u32, u32::wrapping_add) as usize
         });
         // 臂②：**跨步直接做**（单趟；src_st.col=2 ⇒ 跨步读，dst 连续写）
-        let (t2, it2) = med(&mut || {
+        let (t2, min2, it2) = med(&mut || {
             let mut o = out.borrow_mut();
             copy_strided_f32(&src, src_st, &mut o, dst_st, rows, cols).unwrap();
             o.iter().map(|v| v.to_bits()).fold(0u32, u32::wrapping_add) as usize
         });
         println!(
-            "P5-b strided copy A/B（rows={rows}, cols={cols}, src_st.col=2）：臂①物化 {t1:.3} ms｜臂②跨步直接 {t2:.3} ms｜**臂①/臂② = {:.3}x**（>=1.10 才写推广）；iters {it1}/{it2}",
-            t1 / t2
+            "P5-b strided copy A/B（rows={rows}, cols={cols}, src_st.col=2）：臂①物化 {t1:.3} ms（min {min1:.3}）｜臂②跨步直接 {t2:.3} ms（min {min2:.3}）｜**臂①/臂② = {:.3}x（中位）/ {:.3}x（min）**（>=1.10 才写推广）；iters {it1}/{it2}",
+            t1 / t2,
+            min1 / min2
         );
         assert!(t1 > 0.0 && t2 > 0.0);
     }
