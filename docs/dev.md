@@ -801,6 +801,11 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 **语义登记（例外，见 §5.2）**：`absmax_rows` 单趟化把边角语义固定为 LASX `amax` 口径——全 NaN 行输出 `0.0`（旧组合为 `NaN`）、`−0` 输出 `+0`（旧组合可能保留 `−0`）；普通数据与旧路径**逐位**。
 `gelu_quick` 的融合核与 portable 组合仍是**容差类**（实测 `max abs 2.063e-2`，参照 = portable 解释器；组合禁制时仍走 portable）。
 
+**读数口径（重要）**：上表 `0.966×/0.985×` 与 `1.124×/1.045×` 是 **A 级窗口（loadavg 3.04→2.67）** 的台架读数。
+独立核验在 **C 级窗口（loadavg 4.2–8.8）** 复测 t=1 得到 gelu 0.886–1.155（中位 ≈0.978）、absmax 0.764–1.534（中位 ≈0.93、min ≈1.005）
+⇒ **在 loadavg >4 时不要引用精确比值**；重测以 A 级窗口台架为准（`scripts/dsl_vs_lasx_ab.sh` 会在表头自动标"趋势"、并按 loadavg>3 提示）。
+
+
 
 
 
