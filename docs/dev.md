@@ -1,225 +1,244 @@
-# lasx_rs 开发文档：架构与性能
+# lasx_rs 开发文档：架构、契约与性能
 
-> 面向**维护者与二次开发者**：内部分层、不可破坏的约定、测试与 CI、性能方法学与实测数据。
-> **Rust API 与池用法**（算子语义、数值契约、`api`/`view`/`plan`/`shape`/`pool`）见
-> [`docs/ops.md`](ops.md)；**C ABI**（符号清单与逐符号原型、内存与安全模型、能力探测与降级、
-> ABI 稳定性）见 [`docs/c-abi.md`](c-abi.md)；
-> **平台给的外部约束**（LA664 勘误、内核生命周期）与由外部契约派生的待补项见
-> [`docs/platform.md`](platform.md)。
+> 面向**维护者与二次开发者**：内部分层、不可破坏的约定、公式 DSL/引擎、性能方法学与实测结论、
+> 精度承诺、接口冻结，以及**历史里程碑与已知欠账**。
+>
+> **文档地图**（数字只写在一处，避免多副本漂移）：
+>
+> | 文档 | 职责 |
+> |---|---|
+> | 本文 `docs/dev.md` | 架构与决策记录、**性能数据与测量方法学**、精度承诺、接口冻结、里程碑、欠账 |
+> | `docs/ops.md` | Rust API 与池用法：算子语义、数值契约、`api`/`view`/`plan`/`shape`/`pool` |
+> | `docs/c-abi.md` | C ABI：符号清单与逐符号原型、内存与安全模型、能力探测与降级、ABI 稳定性 |
+> | `docs/platform.md` | 平台外部约束：LA664 勘误、内核生命周期、由外部契约派生的待补项 |
+> | `AGENTS.md` | 流程规则（标准工具、提交、冻结改动流程、门禁判据、测量纪律） |
 
 **文档信息**
 
 | 项 | 内容 |
 |---|---|
 | 适用代码版本 | `master` |
-| 最近一次全面修订 | 2026-09-25（全量复测 + 文档重写；口径见 §7 开头） |
-| 性能数据的位置 | 全部实测数据在 **§7**（唯一权威位置）；编译期常量/阈值的 A/B 对照在各自的设计小节内，每处注明交替方式与轮数 |
-| 目标读者 | 维护者、二次开发者，以及需要复核设计决策依据的人 |
-| 文档性质 | **决策记录**：每个结论都附依据（实测或推导）与被否掉的选项；结论变更时保留原委，不静默覆盖 |
-
-**目录**
-
-| 节 | 内容 |
-|---|---|
-| §1–§2 | 仓库结构与分层；不可破坏的约定（位精确、FFI 硬契约、数值约定、错误通道） |
-| §3 | 并行层：设计、`&self` 改造与池的实测 |
-| §4–§5 | 测试与验证；构建、工具链与 CI |
-| §6 | 性能方法学与机器上限（口径、机器参数、微内核上限、A/B 可信口径） |
-| §7 | **全部实测数据**（锚点、各内核、矩阵乘、真实调用形态、横向对照） |
-| §8–§9 | 矩阵乘深挖；大集与形状专项 |
-| §10 | 被否掉的尝试（负面结果清单）与方法学教训 |
-| §11 | 复现步骤 |
-| §12 | 已知缺口与待办 |
-| §13 | 三轮定向优化（除法换乘法、四元数推广、多核打包病理） |
-| §14 | 池的调度策略层：编译期选路 + 穷尽枚举 |
-| §15–§16 | 两条定向优化的实测结论；双缓冲打包流水 |
-| §17 | unsafe 审查：工具、策略与一次真实收获 |
-| §18–§19 | 矩阵视图与打包计划；形状进类型与公式 DSL（契约、实测、决策、接口冻结） |
-| §20 | NN 侧 N1 批次：8 个算子的当前设计、依据与被否掉的方案 |
-| §21 | int8 推理的算子缺口：消费者形态、量化实测依据、与三项架构改动的交互（对应 `docs/ops.md` §12.3 的 N3 批次） |
-| §22 | crates.io 发布：决定、实测前置条件、被否掉的选项，以及两段 crate 文档义务 |
-
-**性能数据只有一份，在 §7**（2026-09-25 全量复测）。本文其余章节引用读数时只给指针、
-不复制表——**同一份数字存两处最终会漂移**（2026-09-25 重写时发现同一个算子的带宽在
-4 个地方各有一份，数值已互相矛盾）。
-
-除特别注明外，实测数据均为 **2026-09-25** 一次性全量测量（口径见 §7 开头：内核表绑核、
-线程表不绑核）：Loongson-3B6000（LoongArch64/LA664，2.2 GHz，24 逻辑核），负载 ≈2–3，
-`rustc 1.100.0-nightly`。**本机有后台负载，同一读数跨轮次能差 ±20%**，因此文中给出范围，
-或注明该读数是同一轮 A/B 的对照；不同时间的绝对值不可直接比较。
+| 文档性质 | **决策记录**：每个结论给依据（实测或推导）与被否方案；结论变更时保留原委、旧数字标"取代"，不静默覆盖 |
+| 数据位置 | **全部性能数据在 §4**（唯一权威位置）；A/B 的门限来源写在 §4 的方法学与 §3 的各设计小节里 |
+| 目标读者 | 维护者、二次开发者、需要复核设计依据的人 |
+| 环境口径 | 除注明外：Loongson-3B6000（LoongArch64/LA664，2.2 GHz，24 逻辑核），`rustc 1.100.0-nightly`，本机常驻负载 2.5–3 |
 
 ---
 
-## 1. 仓库结构与分层
+## 1. 总览与文档口径
+
+### 1.1 本文怎么读
+
+* 想改代码：先读 **§3.1（不可破坏的约定）** 与 **§6（接口冻结与契约）**，再读要动的算子所在小节。
+* 想复核数字：只看 **§4**；§4 的表都带口径（交替方式、轮数、`loadavg`、分级）与"能否跨窗口比较"的说明。
+* 想知道某项优化为什么没做：看 **§3.6/§4.5（被否掉的尝试）** 与 **§7 里程碑表**。
+* 想知道现在缺什么：看 **§8（已知边界与欠账）**。
+
+### 1.2 文档纪律（写在门禁里，不是口号）
+
+1. **数字只写一处**：同一读数不得在多个章节各存一份（历史教训：同一算子的带宽在 4 处各有副本，数值互相矛盾）。
+   本文引用别处读数时只给指针 + 结论。
+2. **跨文档引用必须点名文档**：`docs/ops.md` §X、`docs/c-abi.md` §X、`AGENTS.md` §X；
+   **裸 `§N` 只允许指向本文**。理由：早前规则是"任一文档有该编号即通过"，编号池变大后裸引用会**退而命中别的文档**
+   ——引用"能解析"但指向错的文档，漂移不会被发现。`scripts/doccheck.sh` 已按"按文档解析"实现。
+3. **同一 `§X` 在同一文档被引用超过 12 次 ⇒ 门禁红**（引用噪音会滚到 20+ 次）。要多次指向同一处时，
+   用"上面/下一小节"或合并叙述，不要重复编号。
+4. **改小节编号后必须全仓自查**：`doccheck` 只校验真正的 `§N` 引用，**看不见"文内序号"**（①②③、`⑦-8a` 这类）
+   与"如上/下条"式指代 ⇒ 重排编号后要手工 `grep` 对齐；这类引用是作者责任，门禁保不了。
+5. **表格每行列数必须一致**（错列会静默渲染坏，`doccheck` 会红）；**导出符号数**必须与源码
+   `src/ffi/*.rs` 的 `pub extern "C" fn lasx_*` 实际计数一致（当前 **98 个导出符号**）。
+6. **结论变更要留痕**：被推翻的结论保留"原结论 + 推翻它的实测与数字 + 新结论"，并注明"取代原小节"。
+
+### 1.3 性能口径速查（细节见 §4.1）
+
+* **正式口径 = 同进程、调用级交替 A/B**：一个进程里各臂都链进去、同一份数据同一批缓冲、
+  计时前双检查（各臂互在 `tol` 内 **且** 与串行参考逐位一致）、≥6 对丢首对、中位数 + 极差、
+  逐对 `loadavg` + A/B/C 分级、每臂报 `iters`/`ms_max`、并列打印**对手身份行**。
+* **跨进程/跨窗口的旧数字一律不可引用**：同一档位跨窗口可差 2–3×；单次取样在本机可造成 4.4× 的假象。
+* **绑核只对单线程内核减噪**；任何带线程的表**必须不绑核**（绑核会把池测成"负扩展"，见 §3.2）。
+* 本机 loadavg 常驻 2.5–3 ⇒ A 级（≤3）基本不可达，绝大多数正式轮是 **B 级**；C 级只作趋势。
+
+---
+
+## 2. 架构、引擎与公式 DSL
+
+### 2.1 仓库结构与分层
 
 ```text
 lasx_rs/
 ├── src/
-│   ├── lib.rs            # crate 根：模块声明 + 历史 API 重导出
-│   ├── ops/              # 算子实现，**一个算子一个 .rs**（31 个文件）
-│   ├── ffi/              # 符号导出层：裸指针 → 切片 → ops（11 个文件）
-│   ├── api.rs            # 安全 Rust API（切片入、Result 出，32 个 pub fn）
-│   ├── view.rs           # 矩阵视图 MatRef/MatMut（形状+跨距，构造时校验）
-│   ├── plan.rs           # MatmulPlan：把 B 打包一次、反复算 A·B
-│   ├── arch/             # LASX/LSX 样板：类型别名、载入/存储/广播、SimdPath
-│   ├── pool.rs           # 常驻工作池 WorkerPool
-│   ├── parallel.rs       # 池化的组合算子（matmul 行切、RK4 数组切）
-│   ├── aligned.rs        # AlignedVec / AlignedBuf（32 字节对齐）
-│   └── scalar_ref.rs     # 标量参考实现（测试与基准对照）
-├── cli/                  # 基准与分派检查工具（12 个套件）
-├── examples/             # 调用方示例与 A/B 工具（6 个）
-├── yll/                  # YouLiLong 脚本语言的原生扩展
-└── docs/                 # ops.md（用法）+ dev.md（本文）
+│   ├── ops/              # 算子实现（一个算子一个 .rs）
+│   ├── ffi/              # 符号导出层：裸指针 → 切片 → ops（_checked 变体写 int *status）
+│   ├── api.rs            # 安全 Rust API（切片入、Result 出）
+│   ├── view.rs           # 矩阵视图 MatRef/MatMut（形状 + 跨距，构造时校验）
+│   ├── plan.rs           # MatmulPlan：B 打包一次、反复算 A·B
+│   ├── shape.rs          # 形状进类型：Mat/MatBuf/Prepared/Policy（Auto/Single/Exact）
+│   ├── parallel.rs       # 池化组合算子（matmul 行切、RK4 数组切）
+│   ├── pool/             # 常驻工作池 WorkerPool（派活/唤醒/切块/重入/panic 兜底）
+│   ├── arch/             # LASX/LSX 样板：类型别名、load/store/broadcast、SimdPath
+│   ├── laplace.rs        # 拉普拉斯变换/逆变换/递推核（实验与生产混合，见 §3.6）
+│   ├── fast_trig.rs      # 超越函数 recon（原型，opt-in，不改默认路径）
+│   └── aligned.rs        # AlignedVec/AlignedBuf（32 字节对齐）
+├── macros/               # lasx_rs_macros：公式 DSL 的 proc-macro（publish = false）
+├── cli/ examples/ yll/   # 基准、A/B 装置、示例、YouLiLong 扩展
+└── docs/                 # ops.md / c-abi.md / platform.md / dev.md（本文）
 ```
 
-分层职责与"谁能改什么"：
+**分层职责与不变量**：
 
 | 层 | 职责 | 不变量 |
 |---|---|---|
-| `ops/` | 纯计算，吃 `&[T]` / `&mut [T]`，不碰裸指针 | 每条向量路径必须与标量参考**逐位一致** |
-| `ffi/` | `#[unsafe(no_mangle)] extern "C"`，裸指针 → 切片，`_checked` 变体写 `int *status` | 导出符号中原始 15 个的签名与语义永不改动（清单与计数见 `docs/c-abi.md`） |
-| `api.rs` | 安全 Rust 接口，做长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
-| `view.rs` + `plan.rs` | 形状/跨距对象化与打包复用（纯 Rust，不导出符号） | 视图/计划只做布局与打包，不引入新的累加次序（§18.4） |
-| `pool.rs` + `parallel.rs` | 并行派活，切块必须与串行结果逐位一致 | 切块边界不得改变每个元素的累加次序 |
-| `arch/` | `transmute` 与 intrinsic 的唯一集中地 | 内核代码里不出现裸 `m256i` ↔ `m256` 转换 |
-| `cli/` / `examples/` | 只测量与演示，不参与生产路径 | 基准不得为"好看"而改口径 |
+| `ops/` | 纯计算，吃 `&[T]`/`&mut [T]`，不碰裸指针 | 每条向量路径与标量参考**逐位一致** |
+| `ffi/` | `#[unsafe(no_mangle)] pub extern "C"`，裸指针 → 切片；`_checked` 多一个 `int *status` | 原始 15 个符号**签名与语义永不改**；只能追加 |
+| `api.rs` | 安全 Rust 接口，长度/域校验，返回 `Result<_, api::Error>` | 校验不得改变计算结果（位精确同样成立） |
+| `view.rs`/`plan.rs` | 形状/跨距对象化、打包复用 | 只做布局与打包，不引入新累加次序 |
+| `shape.rs` | 形状进类型 + 策略（`Policy`） | `Policy::threads` 是**纯判据**：不建池、不派活 |
+| `pool/`+`parallel.rs` | 并行派活 | 切块边界不得改变每个元素的累加次序 ⇒ 与串行**逐位一致** |
+| `arch/` | `transmute`/intrinsic 的唯一集中地 | 内核代码不出现裸 `m256i`↔`m256` 转换 |
+| `cli/`/`examples/` | 只测量与演示 | 基准不得为"好看"改口径 |
 
-### 1.1 内部命名规范
+**零依赖**：`Cargo.toml` 无第三方依赖；工具链必须能开 `#![feature(stdarch_loongarch)]`
+（当前用 nightly；稳定工具链不可用）。
 
-一条总则：**名字写"它是什么"，不写"它怎么实现"**；下面每条都是它的推论。
+### 2.2 命名规范（要点 + 已裁决的 5 条例外）
 
-| 规则 | 内容 | 一句话理由 |
+总则：**名字写"它是什么"，不写"它怎么实现"**。推论：
+
+* 一算子一文件 `src/ops/<op>.rs`，入口名 = 算子名；`_lasx`/`_lsx`/`_scalar` **就是** ISA 路径，
+  入口 `<op>` 内按 `SimdPath::detect()` 分派。
+* 地形名照留：`tile4x32*`（4 行 × 32 列微内核）、`row_tail*`（一行列尾）、`cols*`（列块）、
+  `*_chunk`（k 分块）、`*_packed`（打包面板路径）——地形是读者真正需要的信息。
+* 一词一义：批量 `_batch`、免分配 `_into`、缩放 `*_scaled`；f32/f64 兄弟模块同拼写。
+* 不塞细节：不写位宽/展开因子/块大小等实现参数（改了名就对外宣称了实现）。
+
+**2026-10-15 已裁决保留的 5 条"看似不一致"**（规范是给人读的，不为一致性制造破坏）：
+
+| # | 保留项 | 理由 |
 |---|---|---|
-| 一算子一文件 | `src/ops/<op>.rs`，入口名 = 算子名 | 按算子名就能找到文件 |
-| 路径后缀 | `_lasx` / `_lsx` / `_scalar` **就是** ISA 路径；入口 `<op>` 内按 `SimdPath::detect()` 分派 | 看后缀就知道跑哪条指令流 |
-| 地形名照留 | `tile4x32*` = 4 行 × 32 列的微内核；`row_tail*` = 一行的列尾；`cols*` = 列块；`*_chunk` = k 分块；`*_packed` = 打包面板路径 | 地形是读者真正需要的信息，不是实现细节 |
-| 一词一义 | 同一概念只用一种拼法（批量 `_batch`、无分配版 `_into`、缩放 `*_scaled`）；f32/f64 兄弟模块对同一概念**同拼写** | 同一件事有两个名字，grep 就会漏 |
-| 不塞细节 | 不写位宽、展开因子、块大小、冗余 dtype（模块名已限定 dtype） | 改向量宽度不该连带改一片名字 |
-| 非分派后缀 | `_seq` / `_vec` 指"同一串 op 的标量写法 / 向量写法"（`nn_math`、`j2_accel_vec`），不是 ISA 分派 | 没有第二条 ISA 路径，叫 `_scalar` 反而误导 |
-| 导出与冻结 | 导出符号 `lasx_<算子>`（`_checked` = 校验版，**只能追加**）；冻结的三条接口（池的行块闭包、`Prepared::apply*`、`Policy::threads`）**名字不改**，要改先按 `AGENTS.md` 规则 3 记录 | C ABI 与 proc-macro 按字面名字引用 |
-| 常量与测试 | 阈值常量 `PACK_MIN_*` / `COL_*` / `K_ALIGN*` / `L1_BUDGET` / `K_CHUNK` 注明**实测来源**；测试 `test_<算子>_matches_reference`（数值）、`<路径>_bit_exact`（位精确） | 从名字能反查到测量记录 |
+| ① | `batch_distance2d` | C ABI 只追加不改（改名即破坏兼容） |
+| ② | `ballistic_step` | 同上（`lasx_ballistic_step` 不能改名） |
+| ③ | 按行三拼法（`per_token`/`per_channel`/`_rows` 与 `per_row` 并存） | 有意别名：消费端已有两种叫法 |
+| ④ | 一 op 三名（`Mat::mul*` / `Prepared::apply*` / `MatmulPlan::run*`） | 这是**分层**：便捷层、冻结预打包层、按行执行层 |
+| ⑤ | 显式 `_f32` 后缀 | 规则是"f32 默认省略"，但 `matmul_f32_packed` 等保留显式以表语义 |
 
-注释与提交信息用中文；提交信息写清"动机 + 实测数据 + 被否掉的选项"。
+### 2.3 构建、工具链与平台防呆
 
-**已裁决（2026-10-15）**：下面 5 条曾按"一词一义"提出来，逐条裁决为**保留**——规范是给人读的，
-不是给整齐用的。
+* **平台绑定是显式的**：本库指 LoongArch LASX/LSX；x86_64 原生构建在**编译/安装期**就带一句人话失败，
+  而不是退化成运行期静默错结果。
+* **五道防线**（按触发顺序，细节见代码与 `docs/platform.md`）：构建脚本探测 → `compile_error!` 兜底 →
+  `#![feature(stdarch_loongarch)]` → 安装期 `readelf` 架构检查（**必须 `LC_ALL=C`**：`readelf` 字段名会被本地化）→
+  运行期 `detect()` 能力探测。
+* 实测（2026-10-15）：x86_64 原生构建错误条数 **36 → 1**；`nm -D` 不变；`scripts/check_header.c` 0 项失败。
+* **文档引用规范**（2026-10-15 收紧，见 §1.2）：跨文档必须点名；裸 `§N` 只指本文。
 
-- **① `batch_distance2d` 保留**：C ABI **只追加不改**（改名即破坏兼容），且 `docs/c-abi.md §9.1`
-  已定 `lasx_<domain>_<op>` 的读法（`batch` 在前 = domain 为 `batch`、op 为 `distance2d`）⇒ 合规；
-  Rust `api::batch_distance2d` 与 FFI 同名，C 用户按名映射不会错位，这比"后缀整齐"值钱。
-- **② `ballistic_step` 保留**：同上（`lasx_ballistic_step` 不能改名）。批量语义由模块头与文档说明，
-  不靠名字后缀。
-- **③ 按行三拼法保留**（`per_token` / `per_channel` / `_rows` 与 `per_row` 并存）：这是**有意别名**
-  ——同一个内核按调用方的词汇给不同语义名（`api.rs` 已写明），别名比强行统一更贴近使用者。
-- **④ 一 op 三名保留**（`Mat::mul*` / `Prepared::apply*` / `MatmulPlan::run*`）：这是**分层**，
-  不是命名不一致——`shape` 的便捷层、冻结的预打包层、`plan` 的按行执行层，各司其职。
-- **⑤ 显式 `_f32` 保留（允许例外）**：规则是"f32 默认省略后缀"（`dot` / `sum` / `axpy`），但
-  **与 `matmul_f64` / `matmul_i8` 这类兄弟并列出现**时允许写成 `matmul_f32`，以便与兄弟对读。
+### 2.4 公式 DSL（`lasx_rs_macros`）
 
-**零依赖**：`Cargo.toml` 没有任何第三方依赖；稳定工具链不可用（需要 `#![feature(stdarch_loongarch)]`）。
+* **范围（v1）**：`操作数 '=' 操作数 '*' 操作数`（矩阵乘）与一维 `dot!`/`gemv!`；操作数 `x[M, K]`；
+  `x[M,K] * w[K,N]` 与 `w[K,N] * x[M,K]` 都认（按共享下标判角色，归一成同一 input/weight）；
+  乘积右侧可不写方括号 = `Prepared` 计划；可带标量前缀；支持编译期形状/字面量。
+* **诊断**：报错锚点规则按解析器实现（行列位置 → 用户 token）；"缺 `bc` / 下标不同名"这类语义错误 ⇒ 编译期报错。
+* **覆盖矩阵与缺口**：一维 DSL、批量样本视图 `shape::batch` 已落地；缺口与下一步逐项见 `docs/ops.md` 的 DSL 覆盖表。
+* **`shape::batch` 修过一个发布构建的 UB**：批量视图的元素访问曾越过切片边界，已修并加回归测试（引用/长度双检查）。
+* **接口冻结**：宏生成代码直接调用的三个接口已冻结（池行块闭包、`Prepared::apply*`、`Policy::threads`）——见 §6.1。
 
----
+### 2.5 DSL 能知道什么 / 不能知道什么（超越函数优化决策）
 
-## 2. 不可破坏的约定（改代码前必读）
+结论（2026-10-16，四轮实验）：**表达式级代数重写可以做，但"把内核委派给 LLVM 自动向量化"不划算**。
 
-### 2.1 位精确承诺
+* **代数重写（可做）**：等距字面量 + 索引线性 ⇒ 编译期可判安全区；运行期步长 ⇒ 改写但须运行期检查；
+  非常量/非等距/非线性 ⇒ **完全不改写**；未挂 `#[fast_trig]` ⇒ 不改写。
+* **递推核落地（有限）**：精度安全区实测很宽（全网格 ≤4.4e-14），安全区内 ≤1e-4、超区**逐行回退 libm 且逐位一致**；
+  真交替 A/B：小 NB −43.5%、大 NB −59.0%（负数 = 更快；数值见历史指标口径）。
+* **"委派 LLVM"的收益缺口**：惯用迭代器版相对手写 LASX，核 1.48×、组合 1.09×（LLVM 自动向量化能吃掉大部分
+  但吃不掉全部）；朴素标量版是 6.24×/3.20×。
+* **决策（保留的裁决）**：① "完全 SIMD"红线取 **A**：`lasx_rs` 作为专门后端**保留手写内核**，不把内核外包给 LLVM；
+  ② **核↔矩阵乘融合不采用**（现场生成 libm 与物化两条路都试过，见 §3.6 与本条的历史记录）。
+* **锁步宽度扫描**：`L ∈ {2,4,8,16}` 惯用定长数组版与手写 LASX 逐位一致（f64 + 无 `mul_add` = 逐位类），
+  但**没有变体达到"快 ≥3%"**的超越门槛（`L=4` 0.99×、其余更慢）。
 
-同一算子的**所有实现路径**（LASX 256 位 / LSX 128 位 / 标量尾 / 打包 / 列块 / 分块）对同一输入必须给出
-**逐位相同**的 `f32`/`f64` 结果。测试用 `to_bits()` 比较而不是 `assert_eq!` 浮点值。
+### 2.6 跨算子链与编译期报告（引擎接管，2026-10-19/20）
 
-推论（这些是"红线"，改动时必须一并检查）：
+`simd_dsl` 侧把优化从"算子内部"推进到"算子之间"；lasx_rs 侧只做 rev bump + 覆盖验证：
 
-- 不能为了让向量化更顺而改变浮点结合次序：例如 `norm3` 固定 `x² + (y²+z²)`，`quat_*` 固定标量在前的乘法次序。
-- k 方向分块、行分块、列分块**可以**切，但每个输出元素沿 k 的累加次序必须保持递增；f32/f64 部分和落到内存再读回是精确的，所以"分块 + 回写 C"不破坏位精确（见 §9.3）。
-- 归约类内核（`sum`、`dot`）的固定分块方式决定了结果，改动分块宽度会改变结果 —— 除非同步改标量参考，否则不允许。
-- 换更快的近似（`xvfrecpe` + 牛顿迭代、`xvrsqrt` 等）属于**改数值**，需要明确授权后才可做。
+* `engine::chain::execute_map_chain`（simd `7f5b9be`）→ 链 + RMS 终止步（`8492b35`）→ 算子层"整条算法"入口（`5235d33`）
+  → 链 + 行 LayerNorm 终止步（`00e15ac`）→ `pipeline!` 宏把整条链在编译期展开给引擎（`d3b97c2`）
+  → 编译期报告加入"链入口"（`94c376f`）。
+* 引擎把组合路径**并行化**（`a57412e`）、真实优化扩面（8 模块 + 13 入口，`e88c6c4`→`c69f08e`）、
+  matmul/transpose 并行（`fe2e191`）、complex/laplace/diff 优化（`fffbf4a`）、决策可见性（编译期打印 + 运行时零成本，`f65bed1`）。
+* **2026-10-20 现状**：18 个 `ops_dsl` 模块 = **真实优化 15 / 仅组合桥 3 / 未接线 0**
+  （`iso_kernel`/`kv_cache` 在 `7c40fc3` 升级为 `Algorithm::IsoKernelBuild`/`KvCacheWrite`，逐位等价）；
+  组合桥剩 `pipeline`（链入口）、`spectral`、`stencil2d`——后两者**不升级**有硬证据（阶段数是运行期变量、
+  最大 97 阶段、算法知识归属算子层，见 `simd_dsl` 侧评估记录）。
+* **ROI 判定（如实）**：`axpy→rms` 融合、matmul epilogue 融合均**暂不采纳**（向量化后端下收益只剩 1.107×，见 §7 表）；
+  **线程池亦不采纳**（`forbid(unsafe_code)` 下 std 无作用域池；实测空 scope 12 线程 267µs，
+  axpy n=262144 并行仅 0.35×、1M 0.98×、4M 1.63×）。
+  `7.52.19` 给出"引擎接管证据矩阵"并闭环。
+* 证据与结论：见 §7 里程碑表中 2026-10-19/20 各行；数字只在 §4 与 `lasx_rs/docs/dev.md` 的历史表内（不复制）。
 
-### 2.2 FFI 硬契约
+### 2.7 crates.io 发布（决定与前置条件）
 
-- 最初的 15 个 `lasx_*` 符号（`lasx_alloc`、`lasx_dot`、`lasx_dot_f64`、`lasx_sum`、`lasx_axpy`、`lasx_matmul`、
-  `lasx_matmul_f64`、`lasx_dot_i8`、`lasx_dot_q4`、`lasx_ballistic_step`、`lasx_batch_distance2d`、
-  `lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch`）
-  的**签名与语义永不改动**；任何性能改动都必须保证它们的行为不变。
-- 新增能力一律"追加新符号"（例如后续新增的 7 个姿态/几何批处理算子）或走 Rust API（`api.rs`、`pool`），
-  不改老符号。
-- 每次改动后校验符号集合：
+* **决定**：发布（`publish = false` 的宏 crate 不发布）；edition 2024 迁移已完成。
+* **实测确认的前置条件**：包内容/`cargo package` 可打包、文档链接可解析、两个 crate 文档义务（`README`/crate docs）
+  已补齐、发布门禁（fmt/clippy/test/doccheck/nm）全绿。
+* **被否掉的选项**：把宏 crate 一起发布、依赖第三方 crate 简化、跳过 `_checked` 符号（均否，理由见 git 历史）。
+* **打包与安装**（2026-10-15）：`cargo package` + 本地 `cargo install --path` 验证；产物与源码树一致。
 
-```bash
-cargo build --release
-nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*' | sort -u
-# 当前：87 个（46 个裸版本 + 41 个 _checked），与上一版比较应只有"新增"
-```
+## 3. 后端与内核
 
-**当前值（2026-10-15）**：87 个 = 46 裸 + 41 `_checked`（上一行的 75 是更早的旧值；2026-10-15 追加了 `docs/ops.md` §4.8 的 4 个元信息/内存符号后是 87）；权威清单与原型在 `docs/ops.md` §4 与 `include/lasx_rs.h`，并由 `scripts/check_header.c` 逐符号校验（取地址 ⇒ 缺符号/改名/原型漂移即编译或链接失败）。
+### 3.1 不可破坏的约定（改代码前必读）
 
-### 2.3 数值约定（跨算子汇总）
+**位精确承诺**：同一算子的**所有实现路径**（LASX 256 位 / LSX 128 位 / 标量尾 / 打包 / 列块 / 分块）
+对同一输入必须给出**逐位相同**的 `f32`/`f64` 结果；测试用 `to_bits()` 比较，不用浮点 `assert_eq!`。
+
+红线（改动时必须一并检查）：
+
+* 不为向量化顺畅改浮点结合次序（`norm3` 固定 `x² + (y²+z²)`；`quat_*` 固定标量在前的乘法次序）。
+* k/行/列分块**可以**切，但每个输出元素沿 k 的累加次序必须保持递增；部分和落内存再读回是精确的。
+* 归约类（`sum`/`dot`）的固定分块方式决定结果；改分块宽度必须同步改标量参考。
+* 换更快近似（`xvfrecpe` + 牛顿、`xvrsqrt` 等）＝**改数值**，需明确授权。
+
+**FFI 硬契约**：最初 15 个 `lasx_*` 符号（`lasx_alloc`/`lasx_dot`/`lasx_dot_f64`/`lasx_sum`/`lasx_axpy`/
+`lasx_matmul`/`lasx_matmul_f64`/`lasx_dot_i8`/`lasx_dot_q4`/`lasx_ballistic_step`/`lasx_batch_distance2d`/
+`lasx_norm3_batch`/`lasx_vec3_add_scaled_batch`/`lasx_j2_accel_batch`/`lasx_rk4_j2_step_batch`）
+**签名与语义永不改动**；新能力一律**追加**（后续姿态/几何批处理、元信息/内存、计划句柄）；
+C ABI 只追加不改名。当前 **98 个导出符号**（源码 `src/ffi/*.rs` 计数；权威清单与原型在 `docs/c-abi.md`），
+每次改动用 `nm -D --defined-only` + `scripts/check_header.c` 逐符号校验。
+
+**数值约定（跨算子）**：
 
 | 约定 | 内容 |
 |---|---|
-| 四元数 | **标量在前** `(w, x, y, z)`；归一化时 `\|q\| < 1e-15 → (1,0,0,0)` |
+| 四元数 | **标量在前** `(w,x,y,z)`；归一化 `\|q\| < 1e-15 → (1,0,0,0)` |
 | 零向量 | `unitize3` 对 `\|v\| = 0` 返回 `(0,0,0)`（不是 NaN） |
-| 旋转方向 | `quat_rotate_batch` / `quat_to_dcm_batch` 按 **body → inertial** 的 R |
-| `norm3` | `sqrt(x² + (y²+z²))`（这个结合次序是契约） |
+| 旋转方向 | `quat_rotate_batch`/`quat_to_dcm_batch` 按 **body → inertial** |
+| `norm3` | `sqrt(x² + (y²+z²))`（结合次序是契约） |
 | 量化点积 | `dot_i8`：i8×i8 精确 i64；`dot_q4`：每 32 字节一组 scale，组内精确整数点积后乘 scale 积进 f64 |
-| 分批求和 | `sum`/`dot` 的向量宽度决定分块，尾块按同样结合次序处理 |
-| 溢出 | 所有长度参数按 `usize` 检查；`m*k` 等乘积溢出走 `api::Error::Overflow`，标量参考不参与 |
+| 分批求和 | `sum`/`dot` 的向量宽度决定分块，尾块按同样结合次序 |
+| 溢出 | 长度按 `usize` 检查；`m*k` 乘积溢出 ⇒ `api::Error::Overflow`，标量参考不参与 |
 
-### 2.4 错误通道
+**错误通道**：C ABI `_checked` 末尾 `int *status`（成功 0、失败负错误码域），裸版不校验（历史契约）；
+Rust `api.rs` 返回 `Result<_, api::Error>`（`Shape`/`Overflow`/`NotFinite`/`NotPositive`）；
+`parallel::*` 的失败经 `assert` 上抛，池用 `catch_unwind` + `resume_unwind` 保证 panic 不被吞。
 
-- C ABI：`lasx_*_checked` 在末尾多一个 `int *status`，成功写 0、失败写负值域错误码；裸版本不校验（历史契约）。
-- Rust：`api.rs` 的每个函数返回 `Result<_, api::Error>`，`Error` 覆盖 `Shape`（长度不符）、`Overflow`（乘积溢出）、
-  `NotFinite`（输入含 NaN/Inf，仅对声明了该检查的算子）、`NotPositive`（如 `sum` 的长度为 0 之类）。
-- `parallel.rs` 侧的失败通过 `assert` 上抛（`WorkerPool` 用 `catch_unwind` + `resume_unwind` 保证 panic 不被吞）。
+### 3.2 并行层（`WorkerPool`）
 
----
-
-## 3. 并行层
-
-`WorkerPool`（`src/pool.rs`）是库内的常驻池，**不是线程池库**：
+池是库内常驻池，**不是线程池库**：
 
 | 机制 | 说明 |
 |---|---|
-| 派活 | 原子代次 + 定长作业槽（`MAX_ARRAYS = 16` 个指针 + 长度），派活只做指针算术与几次写入 |
-| 唤醒 | worker 先自旋一小会儿再休眠（本机实测这比每次都 futex 唤醒快得多） |
-| 粒度 | 一次调用涉及的元素总数 < `MIN_PARALLEL_LEN = 4096` 时**原地串行**，不派活 |
-| 切块 API | `for_each_chunk_mut`（单数组）、`for_each_chunks_mut`（多数组同一范围）、`for_each_row_block_mut`（按行块，用于矩阵乘） |
-| 借用 | 派活接口取 `&self`，内部 `Mutex` 把派活者串行化（多线程可共用一个池） |
-| 重入 | 线程局部标志拦重入派活（`&self` 之后借用检查器不再能挡），当场 panic 而不是死锁 |
-| panic | worker 内 `catch_unwind`，主线程 `resume_unwind`，不吞异常；`during` panic 由析构守卫兜住 |
+| 派活 | 原子代次 + 定长作业槽（`MAX_ARRAYS = 16` 个指针+长度），只做指针算术与几次写入 |
+| 唤醒 | worker 先自旋一小会儿再休眠（实测比每次 futex 唤醒快得多） |
+| 粒度 | 元素总数 < `MIN_PARALLEL_LEN = 4096` 时**原地串行**，不派活 |
+| 切块 | `for_each_chunk_mut` / `for_each_chunks_mut` / `for_each_row_block_mut`（矩阵乘用行块） |
+| 借用 | 派活接口取 `&self`，内部 `Mutex` 串行化派活者 ⇒ 多线程可共用一个池 |
+| 重入 | 线程局部标志拦重入（`&self` 后借用检查器挡不住），当场 panic 而不是死锁 |
+| panic | worker 内 `catch_unwind`、主线程 `resume_unwind`；`during` panic 由析构守卫兜住 |
 
-`parallel.rs` 是"组合算子"层：`matmul_f32/f64` 按行块切（块粒度 4 行，与微内核的 4 行对齐）、
-`rk4_j2_step_batch` 按 6 个 SOA 数组切。切块只为并行，**不改变每个元素的运算次序**。
+`parallel.rs` 是组合算子层：`matmul_f32/f64` 按行块切（4 行，与微内核 4 行对齐）、`rk4_j2_step_batch`
+按 6 个 SOA 数组切；切块只为并行，不改变每个元素的运算次序。
 
-### 3.1 池的实测（`lasx_rk4_j2_step_batch`，n = 2^18，原地单步）
-
-**完整表在 §7.7**（2026-09-25 复测，不绑核）。结论：
-
-- 池相对单线程 **8.15×（12 线程）/ 8.11×（24 线程）**，2/4 线程是 2.03×/4.04×（近线性）；
-- 8 线程之后停在 ~8.1× 不再涨——**内存带宽**（§7.1 的 12 线程聚合上限 22 GB/s），
-  不是派活开销（派活已被池压到微秒级，24 次线程创建/回收的固定开销 ≈486 µs）；
-- 跨步复用的真实收益：65536 星 × 200 步场景里池建一次跨 200 步复用 → 比每步新建线程快
-  **2.55×**、比单线程快 **8.09×**（数据在 §7.7）。
-
-> **测这张表必须不绑核**（口径见 §6.4）：先用 `taskset -c 4` 跑全量套件时，`mt` 表得到
-> "12 线程 0.72×、24 线程 0.73×"——同一份二进制不绑核再跑就是 8.15×/8.11×。绑核把 12 个
-> worker 全塞进一个核，测出来的是"单核上的上下文切换"，与"池扩展性"无关。
-
-### 3.2 `&mut self` → `&self`：为什么、代价多少（2026-09-24）
-
-**动机**：上层需要一个"进程级共享池"（`pool::global`）给 `Auto` 策略用——否则每次派活都要
-从调用点传入一个 `&mut WorkerPool`，声明式接口无法保留。一个进程一个池同时消除了"每个脚本
-线程各建一个池 → 线程数相乘"的超订。
-
-**做法**：`WorkerPool` 加一把 `busy: Mutex<()>`，派活入口（`dispatch_rows`/`dispatch_jobs`）
-从填槽一直持到 `wait()` 返回——这正是原来 `&mut self` 提供的那个保证，只是从编译期搬到
-运行期；`Shared` 的 `unsafe impl Sync` 依据是"派活互斥 + 代次发布 + done 计数"，
-`in_flight` 是 `AtomicBool`，`parallel::*` 与所有调用方（cli / examples / yll）都取 `&pool`。
-
-代价有两处，下面各有实测：
-
-#### 3.2.1 同步开销：45 ns，看不见
-
-`examples/pool_shared_sync.rs` 实测：
+**`&mut self` → `&self`（2026-09-24）**：加 `busy: Mutex<()>`，派活期间持有（把原 `&mut` 保证从编译期搬到运行期）；
+`Shared` 的 `Sync` 依据"派活互斥 + 代次发布 + done 计数"。代价实测：
 
 | 同步动作 | 每次耗时 |
 |---|---|
@@ -228,4096 +247,313 @@ nm -D --defined-only target/release/liblasx_rs.so | grep -o 'lasx_[A-Za-z0-9_]*'
 | `Mutex::lock/unlock`（无竞争） | 34.0 ns |
 | 最坏合计（三样都付） | **45.0 ns** |
 
-把它加在 DYN 档最小的热路径上（`K=N=256`、`M=16`，单次 34.1 µs）：34.1 → 34.2 µs（**+0.1%**，
-落在噪声里）；`M=64/256/1024` 的变化在 −1.4%~+0.4% 之间，即噪声本身。
+端到端 A/B（进程级交替、3–8 轮）：512³/1024³ matmul 与 rk4 线程表差 0%~+0.2%（均在噪声内）。
+同期修掉一个真实问题：`during` panic 展开会跳过 `wait()` ⇒ 悬垂闭包（UB）；现在发布后立即挂 `WaitGuard`，
+正常路径 `disarm()` 交还 `wait()`，展开路径只收工不续抛。回归测试 4 个（含重入 panic / 共享池并发 / 单例）。
 
-#### 3.2.2 端到端 A/B：无回归
+**池的实测**（`rk4_j2_step_batch`，n = 2^18，不绑核）：12 线程 **8.15×**、24 线程 **8.11×**（2/4 线程 2.03×/4.04×）；
+8 线程后停在 ~8.1× 是**内存带宽**不是派活开销；跨步复用（65536 星 × 200 步）比每步新建线程快 **2.55×**、比单线程快 **8.09×**。
+**必须不绑核测**：绑核时同一二进制测出"12 线程 0.72×、24 线程 0.73×"（把 worker 全塞一个核）。
 
-用 `git worktree` 拉出改动前的 `577d5f8` 各建一份二进制，**进程级交替**跑（每轮 old/new 相邻），
-取中位数：
+**并行起效档位**（`K=N=256`、12 线程、逐位对照）：M=16 **1.98×（池更慢）**、M=32 1.00×（平衡）、
+M=64 0.79×、M=128 0.55×、M=256 0.46×、M=1024 0.29× ⇒ 行数不足时不并行；判据还需"每线程行数 ≥ 4"。
 
-| 负载 | 改动前 | 改动后 | 差 |
-|---|---|---|---|
-| `matmul_ab 512³ pool 12`（3 轮） | 1.14 ms | 1.14 ms | 0% |
-| `matmul_ab 512³ pool64 12`（3 轮） | 91.6 µs 组的均值 91.3 | 均值 92.4 | +1.2%（噪声） |
-| `matmul_ab 1024³ pool 12`（8 轮，均值） | 8.78 ms | 8.80 ms | +0.2% |
-| `lasx_bench mt` rk4 n=2^18 ×12 线程（3 轮，中位数） | 737.7 µs | 739.3 µs | +0.2%（噪声） |
+### 3.3 矩阵乘深挖
 
-1024³ 这一档的**中位数**看着差 2.8%，但两组样本都明显双峰（8.0–9.4 ms），均值只差 0.2%，
-且 45 ns 的机制量级对 8.5 ms 的调用是 0.0005%——因此判定为背景负载噪声，不是回归。
-（该次测量的机器 load average > 3，方法学见 §6.4。）
+**三条路径与分派**：`Packed`（B 打包成 4×32 面板，主路径）／`Cols`（预转置 + 按列切）／`Stream`
+（小形状、流式）；分派判据在 `ops::matmul`（`COL_BLOCK`/`COL_ORDER_*`/`PACK_MIN_*`/`WIDE_N_FOR_COLS`/
+`K_ALWAYS_PACK` 等常量，带实测来源）。
 
-**同期修正的一个实际问题（`during` panic → 悬垂闭包）**：`dispatch_*` 的顺序是
-"发布 → `during()` → `wait()`"。`during` 是**用户代码**，它 panic 时展开会跳过 `wait()`，
-而 worker 此刻正在调用 `f` —— `f` 活在主线程栈帧上，栈一展开就是**悬垂闭包**（UB）。
-这个窗口容易被漏掉：`parallel` 里传入的 `during` 通常只是打包循环，而
-`for_each_row_block_mut_picked_deferred` 的文档强调"`during` 捕获不到 `arrays`"——
-该约束针对的是数据竞争，不覆盖 panic 展开。当前实现是在发布之后立即挂 `WaitGuard`：正常路径
-`disarm()` 交还给 `wait()`（保留"worker panic 续抛"的语义），展开路径由析构兜住、
-只收工不续抛（展开中再 panic 会 abort）。回归测试：
-`test_during_panic_leaves_pool_clean`、`test_reentrant_dispatch_panics_instead_of_deadlock`、
-`test_shared_pool_concurrent_dispatch`、`test_global_pool_is_a_singleton`。
+* **打包（packing）**：必须**向量拷贝**（2026-09-28 改为向量拷贝；标量逐元素打包会成为瓶颈）。
+* **k 分块**：`L1_BUDGET`/`K_CHUNK` 由 L1 容量与实测标定；分块边界两侧（k=384/385/386）位精确性有测试。
+* **阈值重标定**：k 下限 **192 → 64**（实测更小 k 也值得打包）。
+* **当前性能与参照**：单线程 512³ f32 ≈ 87% 天花板、f64 ≈ 89%；2048³ 缺口归因（PMU，2026-09-28）：
+  A 的 1 GiB 流量决定（69%），不是内核指令。
+* **多核病理与修复**：原并行层打包串行 + 每个 4 行块重读整个 B ⇒ B 流量 ≈ `(m/4)·k·n·4` 字节；
+  改为**每个线程各自打包一份 B**（面板共享）后 1024³ 24 线程 97.5 → 393.3 GFLOP/s（**3.9×**），16 线程 421 GFLOP/s。
 
-**同时标定出的并行起效档位**（`examples/pool_shared_sync.rs`，`K=N=256`，12 线程，逐位对照过）：
+### 3.4 大集与形状专项
 
-| M | 单线程 | 12 线程 | 池/单线程 |
-|---|---|---|---|
-| 16 | 34.2 µs | 67.6 µs | **1.98×（池更慢）** |
-| 32 | 66.1 µs | 66.0 µs | 1.00×（盈亏平衡） |
-| 64 | 131.6 µs | 104.4 µs | 0.79× |
-| 128 | 249.4 µs | 137.0 µs | 0.55× |
-| 256 | 506.0 µs | 234.6 µs | 0.46× |
-| 1024 | 2156.9 µs | 627.8 µs | 0.29× |
+* **判据：算力受限还是带宽受限**：先用"锚点占比"定位（同规模纯搬运 GB/s 为分母），再看指令密度；
+  单线程命中率的判别见 §4.3 的横向对照表。
+* **`100×448×19147` 形状**：同日 **55.0 GFLOP/s**，与 OpenBLAS 54.8 持平（旧表 41.6–44.1 是更早窗口）。
+* **k 分块的位精确性依据**：部分和落内存再读回是精确的 ⇒ 分块+回写 C 不破坏位精确（前提：每元素 k 序递增）。
+* **跨距别名（2 的幂 n）**：2 的幂跨距会触发缓存组冲突；该形状用列块路径规避（实测见 §4.4 的宽薄形状）。
 
-这是上层 `Auto` 策略判据的输入：**行数不足时不并行**（M=16 时派活开销超过计算本身，慢一倍），
-且判据需同时考虑"每线程行数 ≥ 4"（微内核按 4 行复用 B）与总工作量。
+### 3.5 池的调度策略层
 
----
+* **设计**：零尺寸类型 + 单态化 + 穷尽 `match` ⇒ 策略在编译期确定，运行期零分支；`Pick` 四档
+  （`RowBlock`/`Dynamic`/`Blocked`/`Chunk`），多块与动态领取进内核（行块闭包签名冻结，见 §6.1）。
+* **实测（静态 vs 动态）**：动态档判据 `threads ≥ 20 && per_thread ≥ 32`（块长取每线程的 1/4）；
+  未达判据时静态档持平或更好（细调空间受噪声 ±10% 限制，暂不再细分）。
+* **两个负面结果**：① 手工把 worker 绑定到列瓦片 ⇒ 位精确但**更慢**（面板读量不变，多付屏障），已回退；
+  ② "面板粒度入口"同因更慢，已回退。方法学教训：**跨台架差 1.4× 不能直接推结构原因**，先做同进程交替对照。
 
-## 4. 测试与验证
+### 3.6 定向优化与被否掉的尝试（内核侧）
 
-当前核心规模：**311 个单元测试**（口径：`cargo test --release --lib -- --list | grep -c ": test$"`；
-`cargo test --workspace --release` 另含 **8 个宏测试**（6 单测 + 2 直通集成测试）+ 19 个文档测试、2 个 doc 用例标 ignore）。
-**下面是历次新增的来源清单，不是能加和到总数的账本**——它只回答"多出来的测试是干什么的"，
-总数一律以上面的实测口径为准。**历史上正是"写一个凑不出的总数"造成了计数漂移**，所以清单
-与总数分开维护：
-
-- 27 个在 §20 的六个算子、11 个在 §19.13 的一维 DSL、12 个在 §19.14 的批量样本视图、
-  18 个在 §21 的 N3 批次（量化/反量化/GEMV/批量 GEMM/C ABI）；
-- 2 个是 §21.9 里 k 方向归约那两项（逐位一致 + 错误/退化）、2 个是 §20.7 的池化 `gemv_f16`、
-  2 个是同节池协议修复的回归（含 60 s 看门狗）；
-- `docs/platform.md` §1 的 LA664 勘误回归 1 个（动态分块跑两次逐位一致）、
-  int8 端到端口径的实测+守界 1 个（`docs/ops.md` §2.15，最坏 6.05e-3 ≤ 1e-2）、
-  `layer_norm` 3 个（`docs/ops.md` §2.16：逐位一致、平移不变性、空偏置保 `−0.0`）、
-  `gather_rows`/`gather_rows_i8` 4 个（`docs/ops.md` §2.17：逐位一致、int8 每行反量化、表尾贴边、api 错误路径）、
-  int8 家族的 `_into` 1 个（量化/反量化/absmax/gemv/matmul 的免分配版与分配版逐位一致 + 错误路径）、
-  int8 的整模型级口径 1 个（合成 12 层栈，实测 7.250e-4 ≤ 5e-3，同上 `docs/ops.md` §2.15）、
-  激活的 `_into` 1 个（`silu`/`gelu_quick`/`gelu_erf` 免分配版逐位一致 + 错误路径，
-  分配占比实测 10–15%）、`quat_to_dcm_batch` 的"api ≡ FFI"逐位对拍 1 个
-  （起因同节：两条入口快慢差 2.3×，先证明数值一致）；
-- C ABI 调用体验那批 3 个（§19.16）：`lasx_has_lasx` 与 `detect()` 逐点对应且 `force(true) ⇒ 0`
-  1 个、`lasx_version` 非 NULL/NUL 结尾/与 `CARGO_PKG_VERSION` 一致 1 个、
-  `lasx_status_message` 覆盖 0..6 与未知码均非 NULL 1 个（`lasx_free` 的配对与两种 no-op
-  并进了既有的 `src/ffi/memory.rs` 用例，未增条数）；
-- **计划句柄那批 6 个（§19.17）**：`run_block_into` 与整块逐位一致（覆盖 k=384/385 两侧、
-  `m` 不整除、`rows` 非 4 的倍数、`n` 非 32 的倍数）1 个 + 按块入口的形状错误 1 个
-  （`src/plan.rs`）；`parallel::matmul_f32_plan_with_stats` 与 `api::matmul` 逐位一致且统计量自洽
-  1 个（`src/parallel.rs`）；FFI 侧 3 个（`src/ffi/matmul_plan.rs`）——`run`/便利层与
-  `lasx_matmul` 逐位一致（1/0 线程都覆盖）、`_checked` 状态码与"失败不触碰输出"、
-  **`prepare`/`run` 不建池**（线程本地建池计数，契约证据；**不是**数 `/proc/self/task`——
-  那种写法在并行测试框架下 flaky，CI run 1792063289 就是这么红的）。
-- `matmul`/`matmul_f64` 的 `_into` 孪生 1 个（DSL 整顿 slice 1，`src/api.rs`）：脏缓冲 `NaN` 起步 ⇒
-  与分配版**逐位一致**（同时证明"整块覆盖、无旧值泄漏"）、f32 侧与 `matmul_scaled_into(1,0)` 同源、
-  **`k = 0`** 整块写 `+0.0`（脏缓冲实测，锁住内核行为而不是靠零初始化）、空形状与
-  `a`/`b`/`out` 三条 `Error::Shape`。
-- 诊断/口径 1 个（`#[ignore]`）：`parallel::diag_pool_vs_plan`——**同进程交替**对照"池 vs 计划"
-  两条并行驱动（跨台架公平性要求里新增的那一条就是靠它落地的）；默认不跑，按需
-  `cargo test --release -p lasx_rs --lib diag_pool_vs_plan -- --ignored --nocapture`。
-- 实验 1 个（`#[ignore]`）：`parallel::diag_tile_binding_vs_rows`——**剖析小节 ⑩ 实验 A** 的
-  "worker↔列瓦片手工绑定 vs 行切"同进程交替对照（每轮都断言与 `api::matmul` 逐位一致）；
-  配 `LASX_DIAG_ARM=rows|tile` 可分臂上 `perf stat`。
-- 阈值 1 个（`#[ignore]`）：`parallel::diag_static_vs_dynamic_grid`——**H2 阈值表**（剖析小节 ⑩）：
-  扫 `threads × per_thread` 网格，同进程交替 `Pick::RowBlock` vs `Pick::Dynamic`，判据"动态赢
-  ≥3% 才算动态"；配 `LASX_DIAG_ARM=static|dynamic` 可分臂上 `perf stat`。
-- 等待 1 个（`#[ignore]`）：`parallel::diag_spin_limit`——**H2 等待策略扫描**（剖析小节 ⑩）：
-  同进程交替 `SPIN_LIMIT ∈ {128,1024,4096}`（测试用覆盖钩子 `pool::set_spin_limit_for_test`，
-  生产默认值不动）；配 `LASX_SPIN_LIMIT=<n>` 可分臂上 `perf record` 取自旋占比。
-- 池缓存 1 个（`#[ignore]`）：`ffi::matmul_plan::diag_threaded_pool_cache`——**便利层池缓存的
-  同进程 A/B**（"缓存进句柄" vs "每次现建池"，7 轮交替中位数）；结果见 ⑪ 的口径更正。
-- DSL 基线 1 个（`#[ignore]`）：`parallel::diag_dsl_vs_manual`——**实验 A**：DSL 生成代码那条路
-  （`Mat::prepare()` hoist + `Prepared::apply_into`）vs 手动最优，同进程交替；改前/改后见 ⑫。
-- DSL 补测 1 个（`#[ignore]`）：`parallel::diag_dsl_pick_shapes`——宽薄/小形状上"改前 `Blocked`
-  vs 改后 `pick_rows`"的**同进程交替**（靠 `LASX_SHAPE_OLD_PICK` 翻转），每轮位精确断言；见 ⑫。
-- **拉普拉斯实战 9 个**（`src/laplace.rs`，2026-10-15 加，**CI 跑**）：3 组解析对照（`1↔1/s`、
-  `e^{-at}↔1/(s+a)`、`sin(ω₀t)↔ω₀/(s²+ω₀²)`，f32/f64 **实虚部都比**）+ 加密收敛（固定 `T`、
-  `Δt` 减半 ⇒ 误差 ~4× 下降，即梯形 `O(Δt²)`）+ 边界（`ω=0 ⇒ 虚部恒 0`、`s=0` 的截断和口径、
-  小 `N` 不出 NaN）+ **位精确**（DSL 路径与 `api::matmul` 行切参考逐位一致）。
-  **权重方案那一阶新加 4 个**（2026-10-15 晚）：`convergence_order_trapezoid_vs_simpson`
-  （**梯形 ≈4× vs Simpson ≈16×**，并断言 `T=6.4` 时 Simpson 被**截断地板**卡住的现象）、
-  `simpson_analytic_three_cases`（Simpson 下 3 组解析对照仍过且误差更小）、
-  `bit_exact_both_weightings`（**两种权重各断言一次**位精确）、
-  `simpson_fallback_and_boundaries`（`N<3`/偶数 `N` ⇒ **整段回退梯形** + 标记；`s=0`/`ω=0`）。
-  用法与误差表见 `docs/ops.md` §9.0。
-- **逆变换 7 个**（`src/ilaplace.rs`，2026-10-16 加，**CI 跑**）：`minimal_one_over_s`（`F=1/s`
-  的最小验证——盯 `½`/`π/T`/`1/T` 三处系数）、`n_scan_after_jump_subtraction`（**扣除后 vs 未扣除
-  的 N 扫描并排**，断言扣除后 N=512 ≤1e-3 且远快于 1/N）、`analytic_exp_and_sin`（`1/(s+a)` 批量
-  + `sin(ω₀t)`，≤1e-3）、`t_zero_is_jump_average`（`t=0` 给 `f₀/2`，**不当 bug 修**）、
-  `cross_check_vs_bromwich`（与**独立** Bromwich 梯形积分结构互证）、
-  `param_check_rejects_bad_choices`（`2T` 周期与 `a·t_max ≲ 8` 硬约束）、
-  `exponential_sum_bit_for_bit`（指数和 DSL vs 行切参考**逐位**——f32 用 `api::matmul`、
-  f64 用同序手工）。方法与限制见 `docs/ops.md` §9.05。
-- **代数重写 pass 6 个**（`src/rewrite.rs::tests`，2026-10-16 加；**识别+判定+守卫/回退，宏 crate 未集成**）：
-  `positive_literal_isometric`（等距字面量 + 索引线性 ⇒ 可改写且**编译期可判安全区**）、
-  `positive_runtime_const_needs_runtime_check`（运行期步长 ⇒ 可改写但**须运行期检查**）、
-  `negative_non_isometric_or_nonlinear`（**负例：非常量/非等距步长、参数非线性 ⇒ 完全不改写**）、
-  `safe_zone_uses_library_constants`（**安全区与库内同源**：`safe()` 转发 `laplace::recurrence_safe`，
-  常量与 `RECURRENCE_MAX_*` **相等**且判据逐点一致）、
-  `no_opt_in_means_no_rewrite`（**未挂 `#[fast_trig]` ⇒ 完全不重写**；挂上则可改写，作对照）、
-  `generated_path_guard_and_fallback`（**安全区行 <1e-9；超区行 `ω·Δt=2.0` 与 libm 逐位一致**、
-  `all_safe=false`）。规约/进度/未测项见 `docs/dev.md` §9.5.1/§9.5.2。
-- **递推核落地 3 个**（`src/laplace.rs::recurrence_tests`，2026-10-16 加）：`stability_scan_phase_and_n`
-  （**误差 vs `ω·Δt` × `N` 全表**，全网格 ≤4.4e-14 ⇒ **安全区很宽**，并实证阈值内 <1e-9）、
-  `recurrence_entry_falls_back_outside_safe_zone`（安全区内 ≤1e-4；**超区逐行回退 libm 且逐位一致**）、
-  诊断 `#[ignore]` `diag_recurrence_vs_libm_ab`（**真交替 A/B：小 NB −43.5%、大 NB −59.0%**）。
-  入口/判据/例外清单见 `docs/ops.md` §9.10.1。
-- **锁步宽度扫描 2 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**形状机制实验**）：
-  `lockstep_widths_bitwise_same_as_lasx`（**`L ∈ {2,4,8,16}` 的惯用定长数组版与手写 LASX 逐位一致** ⇒
-  f64+无 `mul_add` = **逐位类**）、诊断 `#[ignore]` `diag_lockstep_width_sweep`
-  （**同源基准对比**：手写 LASX 0.1934 ms；`L=2` 1.16×、**`L=4` 0.99×（−1.3%，持平）**、
-  `L=8` 5.82×、`L=16` 19.01× ⇒ **没有变体达到"快 ≥3%"的超越门槛**）。
-- **核↔矩阵乘融合 3 个 + 1 诊断**（`src/laplace.rs::fused_tests`，2026-10-16 加；**opt-in，默认路径不变**）：
-  诊断 `#[ignore]` `raw_arm`（env `LASX_ARM=a|b|c1|c2` + `LASX_NB=2|64` 单臂测量，可配
-  `perf stat -e llc-loads,llc-load-misses` 收分臂流量；打印 ms/`iters`/`ms_max`/loadavg + `VmHWM`）。
-  `fused_libm_bitwise_same_as_materialized`（**现场 libm 生成 vs 物化 ⇒ `to_bits()` 逐位一致**，
-  含实/虚部）、`fused_libm_bitwise_with_column_tail`（**列尾 NB=1/2/31/33 仍逐位**——尾列复用现有
-  `row_tail_range_f32`，不新增标量路径）、`fused_recurrence_within_tolerance`（现场递推 ⇒ **容差类**）。
-  入口 `laplace_batch_f32_fused(..., FusedMode::{Libm,Recurrence})`；融合内核
-  `ops::matmul::matmul_f32_packed_gen` / `matmul_f32_packed_rows_gen`（**A 行按需生成，只留 `4×k` 面板**）。
-  **流量/A-B/峰值内存未测**（见本条之后的说明）。
-- **委派 LLVM 实验 2 个**（`src/fast_trig.rs::recon`，2026-10-16 加，**第四轮扩为四变体**）：
-  `lasx_vs_scalar_bitwise_same_order`（**(A) 手写 LASX = (B) 朴素 = (B') 惯用迭代器 三者逐位一致**，
-  核 8 行×N=1024 实/虚部 + 组合步 n=4096 三种实现；`to_bits()` 全等 ⇒ "不开 fast-math 不重结合/
-  不 FMA 收缩"的实测锚点）、诊断 `#[ignore]` `diag_delegate_to_llvm`（四变体：
-  **(B')/(A)：核 1.48×（68%）、组合 1.09×（92%）**；**(B)/(A)：核 6.24×、组合 3.20×**）。
-  分界线与结论见 `docs/dev.md` §9.5.3/§9.5.4。
-- **超越函数 recon 4 个**（`src/fast_trig.rs::recon`，2026-10-16 加；**原型、opt-in、不改默认**）：
-  `table_size_report`（共享表 **129 项 × 16 B = 2064 B**）、`accuracy_vs_libm`（(b) 表+多项式
-  绝对 2.37e-10 / 掩码相对 1.39e-6 / f32 ULP 16；**(c) 等距递推 1.36e-17 / 5.47e-14 / ULP 0**）、
-  诊断 `#[ignore]` `diag_kernel_construction_three_routes`（**递推 0.20×（快 5.1×）、表+多项式
-  1.45×（更慢）**）与 `diag_kernel_share_small_and_large_nb`（核占比 **61.7%（小 NB）/77.1%（大 NB）**，
-  递推路线推算改后 **−49.7% / −62.1%**）。决策与注解草案见 `docs/dev.md` §9.5，数据见
-  `docs/ops.md` §9.10。
-- **C 阶 4 个**（2026-10-16）：`ops::cmatmul::c_tests::{c_dsl_bitwise_same_as_direct, c_dsl_length_check}`
-  （**DSL 表面 `CMat::mul_into` 与直接调用逐位一致** + 长度校验返回 `None`）、
-  `laplace::c_route_tests::complex_route_matches_old_within_tolerance`（**正向"一次复数乘"与旧
-  "两条实乘"容差内一致、解析三组仍过**；**同源实测复数路线更慢 1.16×/1.17× ⇒ 默认仍用旧路线**）、
-  诊断 `#[ignore]` `laplace::c_perf::diag_laplace_two_real_vs_one_complex`；另 **`compile_fail`
-  doctest**（`CMat::<2,3>` 乘 `CMat::<4,5>` 编不过）进 CI 文档测试步骤；**逆变换性能表在
-  `J×N×NB=256×1024×512` 重做**（`ilaplace::perf::diag_ilaplace_perf`）：只指数和 19.40 ms /
-  55.34 复数 GFLOP·s，含 `F` 32.83 ms（`F` 占 40.9%）。见 `docs/ops.md` §9.07。
-- **`s^k` 折进核 vs 后乘 5 个**（`src/laplace.rs::weighted_tests`，2026-10-16 加）：
-  `weighted_k0_bitwise_same_as_plain`（**`k=0` 与旧核逐位一致**——f32/f64 `to_bits()`；实现上直接委派
-  `kernels64`）、`folded_vs_postmultiply_difference_is_roundoff`（折进核 vs 后乘 **最大绝对差 8.88e-16、
-  相对 6.62e-16**，并断言**两者不逐位** ⇒ 契约差异声明）、`weighted_k1_k2_three_analytic_cases`
-  （`k=1/2` 三组解析 `s^kF`）、`weighted_round_trip_through_inverse`（加权核 → 减初值 → 逆变换：
-  8.6e-5…9.7e-4）、`weighted_k3_and_large_s`（`k=3` 可跑 + **核量级随 `|s|^k` 放大**：
-  `k=0` 7.81e-3 → `k=2` 7.81e1，**1.0e4×**@`|s|≈112`）。路线分工与契约见 `docs/ops.md` §9.09。
-- **导数定理（运算微积分）4 个**（`src/laplace.rs::derivative_tests`，2026-10-16 加）：
-  `derivative_theorem_three_analytic_cases`（`e^{−2t}`/`sin(3t)`/`t` 三组 `L{f″}` 解析对照，
-  实虚部，<1e-12；并断言通用式与二阶特化**逐位一致**）、
-  `derivative_theorem_round_trip_through_inverse`（**端到端往返**：`G(s)=s²F−s·f₀−f₁` 交给库内
-  `invert_batch_f64`（开跳变扣除 `f0=f″(0⁺)`）⇒ `f″` 误差 8.6e-5…9.7e-4）、
-  `derivative_theorem_wrong_init_leaves_residual`（**初值取错的后果**：残差 = `ε·s`，实测
-  `s∈{2,8,32}` ⇒ 0.02/0.08/0.32 与 `ε·s` 逐位吻合）、
-  `derivative_theorem_step_counterexample`（**阶跃/含 δ 不适用**的反例：定理给 0，真值是 `δ′`）。
-  定理、初值契约与限制见 `docs/ops.md` §9.08。
-- **复数矩阵乘 7 个 + 3 个诊断**（`src/ops/cmatmul.rs`，2026-10-16 加，A 阶 + B0）：
-  `direct_matches_four_real_matmul_bitwise`（**直算 vs 4 条实矩阵乘的组合逐位一致**——位精确契约）、
-  `routes_agree_within_tolerance`（两路线互比 + 与逐元素参考，f32/f64 各 8 个形状含 `k=1`/`n=1`/
-  非 4 倍 rows/非 32 倍 n）、`complex_identities`（`A·I=A` 逐位、`i·i=−1`）、`zero_dim_shapes`、
-  `large_shape_and_buffer_reuse`（`192×768×3072` 复用输出缓冲）；
-  **B0 两个**：`combine_bit_exact_vs_scalar`（**向量组合与标量组合逐位一致**，`n=1..40` 全扫、
-  f32/f64、`a−b`/`a+b`/`a−b−c` 三种）与 `shapes_still_pass_after_vector_combine`（8 个边界形状）；
-  诊断（`#[ignore]`）：`perf::diag_cmatmul_routes`（直算 vs Karatsuba vs 实矩阵乘基准）、
-  `b0_perf::diag_combine_scalar_vs_vector`（**组合步 标量 vs 向量**，实测收益 0.19% ⇒ 不是瓶颈）与
-  `ilaplace::perf::diag_ilaplace_perf`（指数和 vs 含 `F`；该规模下判为无效测量）。
-  表示/路线/契约差异与 **"完全 SIMD" 的逐指令佐证**见 `docs/ops.md` §9.06。
-- 池契约 2 个：`shape::pool_init_tests::small_shapes_do_not_construct_a_pool`（**CI 跑**，线程本地
-  建池计数 + "计数器活着"的正对照，见 ⑫）与 `pool::global_pool_contract_tests::init_global_first_use_then_frozen`
-  （`#[ignore]`，需 `--test-threads=1` 串行跑：首次成功 / 之后 `false` / 线程数 = 物理核）。
-
-> **它为什么加不出总数**：上面逐项相加 = **87**，而 N1 前基线是 128 ⇒ 应有 98 个增量，
-> **还差 11 个**——那批属于更早批次、当时没有逐条登记。所以本清单按"来源"读，不按"账本"读；
-> 数字一律以实测口径为准。
-
-| 测试类型 | 目的 | 例子 |
+| 方向 | 结论 | 关键数字 |
 |---|---|---|
-| 参考对照 | 与 `scalar_ref` 的独立实现比数值（带容差） | `test_matmul_f32_matches_reference` |
-| **位精确** | 不同路径之间逐位一致（`to_bits`） | `packed_paths_bit_exact`、`cols_bit_exact`、`packed_f64_bit_exact` |
-| LSX 对照 | 强制 LSX 路径后与 LASX 结果逐位比对 | `lasx_force_lsx_thread` 相关用例 |
-| 边界 | 空、单元素、非 4/8/16/32 倍数、尾部行列 | `test_*_edges` |
-| 溢出/错误 | `api::Error::Overflow`、`Shape` 分支 | `api` 层用例 |
-| 量化精度 | `dot_i8`/`dot_q4` 对照精确整数参考 | `test_dot_q4_matches_exact_reference` |
+| 除法换乘法（rk4） | **采纳**：每元素每步除法 12 → 4 次 | 37 → **43.3 M 元素/s（+16%）**；精度实测 ≤ ulp 级 |
+| 同一手法推广到四元数 | **部分采纳** | `quat_normalize` **+52%**、`quat_rotate` **+17%**；`quat_to_dcm` −3~5% ⇒ **否**（store-bound，9 写） |
+| 估算倒数 + 牛顿迭代 | **否**：本机不划算（先量后改） | 见 §4.5 |
+| 双缓冲打包流水（多面板） | **采纳** | **+24~29%**；"先确认被测机制确实被触发"是配套方法学 |
+| f64 微内核 2 行 × 32 列 | **否**（探针数据不支持） | 见 §4.5 |
+| 宽形状 A 打包 / C 分块 / k 分块 | **否**：机制上无效或现状已最优 | 见 §4.5 |
+| 核↔矩阵乘融合（现场生成 libm） | **不采用**（opt-in 实验，默认路径不变） | 物化 vs 现场：libm 逐位一致（含列尾）；递推版容差类；流量/峰值内存未测 |
+| unsafe 审查 | **采纳工具链** | Miri + cargo-careful 接入；`cargo careful` 抓到一处契约违反（已修） |
+| 拉普拉斯/逆变换/导数定理/权重 | **落地**（契约与误差表见 `docs/ops.md`） | 解析三例、收敛阶、位精确/容差分类见 §5 |
 
-**加一个算子的清单**（照做即可保持仓库一致性）：
+**拉普拉斯族要点**（细节在 `docs/ops.md`）：
 
-1. `src/ops/<算子>.rs`：写 LASX 与 LSX（若适用）两条路径 + 标量尾，注释写清数值约定与出处；
-2. `src/ffi/<分类>.rs`：加 `#[unsafe(no_mangle)] pub extern "C" fn lasx_<算子>` 与 `_checked` 变体（后者用 `ffi::checked` 的样板）；
-3. `src/lib.rs`：重导出（历史 API 兼容层）并在 `api.rs` 加安全版本；
-4. 测试至少三条：对照参考、位精确（路径间）、边界；
-5. `cli/src/suites/<分类>.rs` 加一行基准（含规模与吞吐单位），`cli/src/suites/mod.rs` 注册套件名；
-6. `docs/ops.md` 补语义，`docs/dev.md` 若涉及新阈值/新结论则在 §9/§10 记一条；
-7. `cargo fmt --all && cargo clippy --workspace --release --all-targets && cargo test --release`（CI 会再跑一遍，零警告是硬门槛）。
+* 递推核：精度安全区实测很宽（误差 ≤4.4e-14），安全区内 ≤1e-4、超区**逐行回退 libm 且逐位一致**；
+  诊断 A/B：小 NB −43.5%、大 NB −59.0%（负数 = 更快）。
+* 权重方案：梯形 O(Δt²) vs Simpson O(Δt⁴)（实测 4× vs 16× 下降；`T=6.4` 时 Simpson 被截断地板卡住）；
+  `s^k` 折进核 vs 后乘：相对 6.62e-16、**两者不逐位**（契约差异必须声明）；`k=0` 误差 7.81e-3 → `k=2` 7.81e1（1.0e4×@|s|≈112）。
+* 逆变换：扣除跳变后 N=512 ≤1e-3；`t=0` 给 `f₀/2`（**契约，不当 bug 修**）。
+* 复数矩阵乘：直算 = 4 条实矩阵乘组合**逐位一致**（位精确契约）；同源实测复数路线仍慢 1.16×/1.17× ⇒ 默认保留旧路线。
 
-`scalar_ref` 的注意事项：**"+lasx 下 LLVM 会自动向量化标量参考"**，所以基准里的"标量列"常常不是真标量
-（例如 `dot` 小 n 时"标量"反而更快，是因为它走了不同的循环结构）。要"真标量"必须用
-`lasx_force_lsx_thread`/`-C target-feature=-lasx` 之类的手段隔离，或直接看**锚点占比**（§6.1）。
+### 3.7 NN 侧 N1 批次（算子契约要点）
 
----
+8 个算子全部落地（语义在 `docs/ops.md`）：`softmax_rows`/`rms_norm`/`layer_norm`/`silu`/`gelu_quick`/
+`gelu_erf`/`rope`/`dot_f16`+`gemv_f16`。设计要点：
 
-## 5. 构建、工具链与 CI
+* **行级数学放标量域**（`rms_norm`/`layer_norm`）：行内归约用固定次序，保证与参照逐位；
+  `layer_norm` 有"平移不变性 / 空偏置保 `−0.0`"契约测试。
+* **`exp` 共用件**（`ops::nn_math`）：`silu`/`gelu` 共用；`gelu_quick` 是 tanh 近似（容差类）；
+  `gelu_erf` 用 A&S 7.1.26（实测 `max abs 3.626e-7`、`max rel 3.683e-5`，声明界 abs `1e-6`、**容差类**）。
+* **`rope`**：表输入（`cos/sin`）两种配对；`powf` hoist 出内层循环后位精确（与逐元素重算 `powf` 参考 `to_bits()` 全等）；
+  剩余成本主要是 f64 `sin_cos`（12288 次 ≈232 µs），"并行建表"实测否（std::thread 路线）。
+* **f16**：`dot_f16`/`gemv_f16` 的累加次序是契约（转换原语固定）；小形状整块驻缓存，
+  33.5 MB 那档掉到 DRAM（吞吐 4.2→64.69 GB/s 的区间由形状决定）。
+* **未完成**：激活算子的算力瓶颈（缩短 `exp` 多项式/重排依赖链）；**f16 GEMM（prefill）未做**；
+  GGML 量化格式互操作（N2，按需）。
+
+### 3.8 int8 推理路径（N3 批次）
+
+* **消费者**：0.2B 判别式决策模型（端侧）⇒ 需要 per-token 激活量化 / `gemv_i8` / `matmul_i8` / 整数归一化。
+* **实测反转（否掉立项推算）**：`matmul_i8` 打不过 f32 GEMM（复用发生在错误的地方 ⇒ 换到 L2 后仍受 ~12 GB/s 限制）；
+  原估"6.9×"被推翻；端到端 **10–20 ms 立项目标也被推翻**，改为分档验收。
+* **落地状态**：量化生产端、per-token scale、`gemv_i8` 已落地；`matmul_i8` 保留（有量化依据但非性能路径）；
+  整数 softmax/归一化未做（保活胶水实测不值得做整数版；`_into` 版收益已单独落地）。
+* **实现时定下的三条契约**（都有实测支撑）：ties-even 舍入 + clamp；dot/gemv **i64 累加 + 终点饱和到 i32**；
+  端到端口径最坏 **6.05e-3 ≤ 1e-2**（12 层合成栈实测 7.250e-4 ≤ 5e-3）。
+
+
+## 4. 性能与测量方法学
+
+> **本节是性能数字的唯一权威位置**（历史教训：同一读数多处副本最终数值互相矛盾）。
+> 其它章节引用时只给结论与指针，不复制表。
+
+### 4.1 口径总纲（正式口径 = 同进程调用级交替 A/B）
+
+1. **同进程、调用级交替**：一个进程里各臂都链进去；**同一份数据、同一批缓冲**；每对交替；
+   计时前**双检查**（各臂互相在 `tol` 内 **且** 我方与**串行参考逐位一致**）。
+2. **≥6 对、丢弃首对**，各臂**中位数 + 极差**；每臂报 `iters` 与 `ms_max`（有这两个数读者才能判断窗口）。
+3. **逐对 `loadavg` + 分级**：A（1/5 分钟同时 ≤3）/ B（可作正式数）/ C（只作趋势）。
+   本机桌面常驻 2.5–3 且测量本身 +1.0 ⇒ **只要在测量，1 分钟 loadavg 必然 >3**，A 级基本不可达。
+4. **并列打印对手身份行**：跨库对照必须声明对手构建（见 §4.4 的 OpenBLAS 身份行），
+   否则"只差 4%"可能比的是通用 C 兜底。
+5. **跨进程/跨窗口的旧数字一律不可引用**：同一档位跨窗口可差 **2–3×**；"差 N 倍"必须先做同进程交替复核
+   （这条规矩来自三次同型教训）。**单次取样在本机可造成 4.4× 的假象。**
+6. **绑核规则**：`taskset -c N` 只对**单线程内核**减噪；**任何带线程的表必须不绑核**
+   （12 worker 挤一个核会测出"负扩展"：同一二进制绑核 0.72×/0.73× vs 不绑核 8.15×/8.11×）。
+7. **跨库/跨台架公平性四条**：同一确定性数据与预热；CBLAS 布局映射明确；**计时前先验一致性**（逐元素互比）；
+   线程对齐且切法标注（"怎么切"决定一切；位精确 > 速度）。
+8. **前台窗口纪律**：门禁/测量命令不接管道（判据只看脚本自身退出码）；测量前检查 `loadavg`、`nice` 降权、
+   大尺寸先小后大、不混跑两个线程库。
+
+### 4.2 机器与上限（先知道天花板在哪）
+
+* 机器：Loongson-3B6000（LoongArch64/LA664，2.2 GHz，24 逻辑核）；`rustc 1.100.0-nightly`；
+  桌面常驻负载 2.5–3；跨轮次同一读数可差 ±20%，所以文中给范围或注明"同轮 A/B 对照"。
+* **FP 流水线与 A 广播墙**（`examples/kernel_probe.rs`，2026-09-28 复测）：GEMM 微内核的实测上限是
+  **2.0 FMA/周期**；**"A 广播墙"假设被证伪**——换用不同广播指令实测仍是 **2.00、0.186 ms 与 kernel 完全相同**，
+  成本记在"每个 k 步 8 条访存形式的操作"这个数量上，与是 load 还是 broadcast、走哪个端口无关。
+* 探针方法学：纯 FMA 探针必须 **≥16 条独立累加链**才量得到吞吐（8 条链量到的是延迟上限）；
+  纯 FMA 一轮仅 ~0.7 µs，须用 **5×10⁶ 轮**（访存型内核用 200 轮）否则计时分辨率不足（表现为"被优化掉"）。
+* `/tmp` 探针必须自己带 `+lasx`（仓库 `.cargo/config.toml` 的目标特性不会自动作用于外部探针）。
+
+### 4.3 大集锚点、各内核与真实调用形态
+
+**大集锚点（工作集 4–32 MiB，纯搬运；单位 GB/s；前五列绑核/后两列不绑核）**：
+
+| 规模 | 单流只读 | 双流只读 | 双流字节读 | 6 流 3读3写 | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 |
+|---|---|---|---|---|---|---|---|
+| 4 Mi | 14.7 | 10.5 | 39.9 | 6.7 | 7.8 | 24.3 | 16.7 |
+| 16 Mi | 11.4 | 9.5 | 12.9 | 6.6 | 7.1 | 18.1 | 17.1 |
+| 8 Mi (f32) | 11.4 | 10.3 | 21.0 | 6.5 | 7.3 | 19.7 | 15.6 |
+| 32 Mi (f32) | 10.7 | 9.6 | 9.3 | 6.8 | 7.2 | 18.5 | 16.4 |
+
+要点：单线程流式 **6.5–14.7 GB/s**，12 线程 **15.6–24.3 GB/s**；读写混合比纯读低 30–40%；
+6 流压在 6.5–6.8 GB/s 且与规模无关 ⇒ **大集下并行度比指令宽度重要**。
+
+**大集下各内核占比**（内核吞吐 / 同规模纯搬运锚点）：`norm3_batch` f64 66–68%、`vec3_add_scaled` 84–96%、
+`j2_accel_batch` 58–74%、`rk4_j2_step` f64 单线程 32–40% / 12 线程 72–86%、`dot` 89–95%、`sum` 81–94%、
+`axpy` 108–125%（读写混合锚点偏低所致）。**先在这一列定位"离锚点多远"，再决定优化方向。**
+
+**三类 NN 内核的横向对照**（同为单线程、同一口径；"每条流的带宽"能差 5 倍以上，差别全在"每字节要算多少指令"）：
+
+| 内核 | 访存遍数 | 每条流的带宽 | 受限原因 |
+|---|---|---|---|
+| `rms_norm` | 2 | 6.1–9.1 GB/s | 接近单流锚点（10.7–14.7） |
+| `softmax_rows` | 3（max / exp+sum / 归一） | 1.7–2.2 GB/s | 多一遍 |
+| `silu` / `gelu_quick` | 2 | 1.9–4.6 GB/s | **算力**：每 8 元素 ~19 条向量指令 + 一次除法 |
+| `gelu_erf` | 2 | 1.8–2.7 GB/s | 算力（比 silu 多 5 项 Horner + 一次除法） |
+| `rope`·NeoX | 2.5（含表） | 13.3–28.7 GB/s | 算力轻，小形状整块驻缓存 |
+| `dot_f16` | 2（f16 权重 + f32 向量） | 38.1–68.3 GB/s | 小形状 L1/L2 驻留 |
+| `gemv_f16` | ~2.5 | 4.2–64.7 GB/s | 小形状在缓存，33.5 MB 档掉到 DRAM |
+
+**真实调用形态**（2026-09-25 批 T 不绑核 6 轮，丢弃首轮）：
+
+* 池扩展性：rk4 n=2^18 单线程 → 2 线程 2.03× → 4 线程 4.04× → 8 线程后停在 **8.1–9.1×**（内存带宽）。
+* 融合内核 vs 拼原语（RK4 步，20 步）：拼接版慢 **3.5×**（除调用开销外，中间量每次都要写回内存再读；
+  融合版中间量从未离开寄存器）⇒ **"融合"仍是最有效的调用侧优化**。
+* C ABI vs Rust 切片 API 的固定开销：n=64 **19 ns vs 13 ns**、n=256 **26 ns vs 22 ns**（小数组高频调用时可见）；
+  24 次线程创建/回收固定开销 ≈486 µs。
+* 大矩阵乘铺多核（`parallel::matmul_f32`，12 线程）：256³ 仍流量受限（每 4 行块重读整个 B，≈16 MB/调用）；
+  m ≥ 512 后共享面板生效；线程数不是越多越好（1080³/1024³ 的扫描见 §3.3/§3.6）。
+
+### 4.4 矩阵乘 vs OpenBLAS 的现行结论
+
+> **对手身份行**（本节所有 "vs OpenBLAS" 数字共用；装置每次运行第一行自动打印完整 `OBIDENT`）：
+> **OpenBLAS 0.3.34、`DYNAMIC_ARCH`、core `la464`（LA64 优化内核，非通用 C 兜底）、`NO_AFFINITY`、`MAX_THREADS=32`**。
+> 调用模型必须一起写：下文"只差 4%"是**调用方自己驱动（plan + 调用方线程）**模型下的数字。
+
+**单线程**（绑核 `-c 4`）：**小形状本库领先**（64³ +27%、128³ +14%），**256³ 打平**，
+**384³/512³ 本库慢 5–6%**（旧记录"256³–512³ 打平 ±5%"已被本轮细化）；f64 128³ 旧记录有误，已修正。
+
+**多线程 `192×768×3072` f32 @12**（单线程同形状 15.67 ms 作扩展比分母；判据顺序：**位精确 > 速度**）：
+
+| 路径 | 数字 | 位精确 | 说明 |
+|---|---|---|---|
+| `rows`（调用方按行切） | **62.6 G** | ✅ 10/10 逐位 | 每次调用重打包整个 B（9.44 MB ×12 ≈ 113 MB/调用）⇒ 几乎不扩展（1.08×） |
+| `cols`（预转置按列切） | **236.2 G** | ❌ 6/10 形状不逐位 | 快但换路径；"要不要切、怎么切"必须由库给 |
+| 计划句柄 `plan`（futex 握手） | 正式中位数 **239.8 G**（3.7293 ms / 242.9 G 独立复跑） | ✅ 计时前断言 | 每调用握手成本显著 |
+| `plan-tight`（握手最小化） | **245.8 G** | ✅ `OBTIGHT bitexact=yes` | 两次 6 轮正式跑均为 B/C 混合窗口 |
+| 结构上界（支撑"库/API 没问题"） | **346–355 G** | — | 瓶颈是 L3 片上带宽 + 停顿，不是 DRAM/TLB |
+| 每调用开并行区（`omp` 档） | 199.2 G | ✅ | 握手更贵 |
+| 便利层 `threaded`（现建现拆池） | 129.9 G | ✅ | 每调用 12 线程创建/回收 |
+
+* **C 侧天花板**：旧 ABI 表达不出"打包一次 + 调用方线程" ⇒ ≈236 G；计划句柄落地（ABI 87→94）后到 245.8 G；
+  **"≥300 G 的正式中位数"在本机当前窗口给不出**（两次 6 轮正式跑 245.8 / 242.9）⇒ 结论取"结构性达成、窗口受限"，
+  不把单次 306.6 G 观察当结论。
+* **宽薄 `256×64×4096` f32 @12**：`plan` **0.6355 ms（211.2 G）** vs OpenBLAS 0.6122 ms（219.2 G）——落后 3.6%。
+* **12 线程峰值**：`m192×768×3072` 最佳 **297.23 GFLOP/s（0.839× OB）**；`512³` 12 线程 OB 305.8–337.3 G，
+  本库多线程仍落后（并行打包是已知缺口，见 §8）。
+* **1t 用例的派发伪影已查清（重要修正）**：2026-10 之前"1t 仍库内自动并行"导致 1t 对比被低估；
+  显式关自动并行后 **1024³ 0.980×、1536³ 1.002× OpenBLAS（grade B）** ⇒ **差距已抹平**，根因是测量口径而非内核。
+* **窗口纪律**：同档位跨窗口可差 2–3×（示例：同一 `--split=plan` 档高负载窗口三次 74.7/77.9/108.6 G，
+  `iters` 被压到 13–18）；报告必须带 `iters`/`ms_max`。
+* **perf 口径**：硬件事件（`llc-loads`/`llc-load-misses`）本机可用；**软件事件（context-switches/
+  cpu-migrations）在此机器上不计到这些线程**（不得用它们支撑"同步没问题"）。比率必须**同一次运行内**算
+  （中位数相除会印出 >100% 的缺失率——曾发生，已修）。
+
+### 4.5 被否掉的尝试（负面结果清单）
+
+| 尝试 | 结论 | 数字/原因 |
+|---|---|---|
+| 矩阵乘：k 方向并行（split-K） | **否** | 改变累加次序 ⇒ 不逐位；与硬承诺冲突 |
+| 矩阵乘：f64 微内核 2 行 × 32 列 | **否** | 探针数据不支持（见 §4.2 的 2.0 wall） |
+| 矩阵乘：宽形状 A 打包 | **否** | 机制上无效（A 只读一遍，打包反而多一遍） |
+| 矩阵乘：宽形状 C 分块 / k 分块 | **否** | 现状已最优（§3.4 的 55.0 G 与 OB 持平） |
+| 矩阵乘：列瓦片（H1）/ 面板粒度入口 | **否** | 位精确做到了，但 ms 只降 4.3–4.7%、L3 流量反 +6% ⇒ 已回退 |
+| `dot_q4` 追锚点 | **否** | 3.6–7.2 GB/s（38–44%）；已到 2.0 FMA/周期墙，除非授权改浮点结合次序 |
+| 估算倒数 + 牛顿迭代 | **否** | 本机实测不划算（先量后改；见 §3.6） |
+| `std::thread` 并行建 rope 表 | **否** | 唤醒/同步成本吃掉收益（池的唤醒成本另计） |
+| GPT-2 类 OpenAI 手稿的外部成果 | **无可直接使用者** | 2026-10-06 评估：论文/数值方法与本库算子缺口不匹配 |
+| int8 整数版 softmax/归一化 | **否** | 保活胶水实测不值得做整数版（`_into` 收益已单独落地） |
+| 融合原语（P4-e）初期标量版 | **否→后被推翻** | 标量融合比向量化两步慢 **1.793×**（负结果）；向量化后 **0.363× ⇒ 快 2.75×** 且逐位 |
+| 稀疏 5 点 stencil：红黑分块 | **否** | 4096² 实测 0.82–0.86×；三行滚动缓冲 **1.38–1.75×（逐位）** 才采纳 |
+| gather/scatter 8-lane 大改 | **否（收益上限低）** | 1.037×（memcpy 上限）；两条负结果比正结果更有价值 |
+| 核↔矩阵乘融合（现场生成） | **不采用** | 见 §3.6；融合原语走契约层是另一条路（§3.6/§7） |
+| "完全 SIMD"外包给 LLVM | **否（红线取 A）** | LLVM 迭代器版核 1.48×/组合 1.09×，朴素 6.24×/3.20×；专门后端保留手写 |
+
+**方法学教训（多次出现）**：① 跨台架/跨窗口差 1.4× 不能直接推结构原因（先同进程交替）；
+② "差 N 倍"必须同进程复核（三次同型教训）；③ 测量前先确认被测机制确实被触发（否则测的是没生效的路径）；
+④ 中位数相除会伪造比率（同一次运行内算）；⑤ 负载窗口要当场判废（C 级只作趋势）。
+
+### 4.6 复现命令
 
 ```bash
-cargo build --release                     # 库 + CLI 的默认构建
-cargo test --workspace --release        # 311 个单元测试（+ 8 个宏测试 + 19 个文档测试）
-cargo clippy --workspace --release --all-targets   # 零警告是硬门槛
-cargo fmt --all --check
-cargo run -p lasx_bench --release -- <套件名子串>   # 基准（不给过滤就跑全部）
-cargo run --release --example matmul_ab -- 512 512 512 packed
-```
-
-- 工具链：nightly（`#![feature(stdarch_loongarch)]`）。`.cargo/config.toml` 里
-  `rustflags = ["-C", "target-feature=+lasx"]`，因此**默认产物就假定 CPU 有 LASX**；
-  无 LASX 的机器需要显式去掉该 flag 并接受"LASX-only 内核会执行非法指令"（见 ops.md 的 Caveats）。
-- 两个 workflow：`.github/workflows/ci.yml`（GitHub 侧）与 `git-panel-ci.yml`（局域网 panel 侧）。
-  panel CI 四步：`Format check` → `Build release` → `Test release` → `Clippy (zero warnings guard)`，
-  约 20–25 s；**CI 从不跑基准**（基准受负载影响，不适合当门禁）。
-- 提交纪律：中文提交信息；一次改动一个主题；**必须写明受控 A/B 的读数与口径**；被否掉的方案也要记（§10）。
-
-### 5.1 平台绑定与防呆（2026-10-15）
-
-**这不是提升可移植性，而是让错误显式**：本库是 LoongArch LASX/LSX 的**指令集绑定**
-（`src/` 里大量文件直接用 intrinsic/内联汇编，**0 处标量兜底**），所以"用错平台"必须在
-**编译期/安装期**就带着一句人话失败，而不是退化成运行期静默错结果、或埋在几十条
-"目标不支持该指令"里。
-
-**五道防线**（按触发顺序）：
-
-| # | 位置 | 挡什么 / 怎么挡 |
-|---|---|---|
-| 1 | `build.rs` | 判**目标架构**（`CARGO_CFG_TARGET_ARCH`）：非 `loongarch64` ⇒ 打印人话并 `exit(1)`。判的是**目标**，所以 `cargo check --target loongarch64` 的交叉检查照常通过（`.github/workflows/ci.yml` 的 `cross-check` job 正是这条路径） |
-| 2 | `src/lib.rs`、`cli/src/main.rs` | `#[cfg(not(target_arch = "loongarch64"))] compile_error!(…)`：给**绕过构建脚本**的场景兜底（vendored 源码、直接调 rustc） |
-| 3 | `include/lasx_rs.h` 顶部 | `#error` + 逃生阀 `LASX_RS_ALLOW_FOREIGN_ARCH`（**只关掉编译期检查，不会让运行时可用**） |
-| 4 | `scripts/install.sh` | `LC_ALL=C readelf -h` 核对 `Machine:` 是 LoongArch，不符 ⇒ **拒绝安装**；`readelf` 缺失 ⇒ 降级为告警 |
-| 5 | `examples/c/Makefile` | `uname -m` 非 `loongarch64` ⇒ `$(error …)`；`FOREIGN=1` 显式覆盖（并定义头里的逃生阀） |
-
-**为什么以构建脚本为主、`compile_error!` 只兜底**：`compile_error!` **不会中止**这次编译——
-rustc 会把其余源码的错误一起报出来。实测 x86_64 原生构建时，它先冒出 **35 条**内在函数/
-目标特性错误，那句人话被埋在第 361 行；构建脚本先退出后，整个输出只剩 **1 条**。这条经验对
-任何"想用一个 `compile_error!` 表达平台要求"的 crate 都成立。
-
-**第 4 道防线为什么必须 `LC_ALL=C`**：`readelf` 的**字段名**会被本地化（本机是"系统架构:"
-而不是"Machine:"），不钉 locale 的 `grep 'Machine:'` 会**永远匹配不到**——也就是"校验看起来
-在跑、其实每次都通过"。这是防呆本身最容易出的错：**校验不能是假的**。
-
-**必须区分的两件事**（检测手段与失败时机都不同，别混写）：
-
-| | **错架构**（x86 / arm …） | **LSX-only 机型（无 LASX）**，如 2K3000 / 3B6000M |
-|---|---|---|
-| 构建 / 安装 | 被上面 5 道防线挡住 ⇒ **根本出不来** | 正常构建、正常安装、正常运行 |
-| 危险 | 产物完全不可用（不是"慢一点"） | 仅调 `[LASX-only]` 符号时 SIGILL |
-| 手段 / 时机 | 编译期 + 安装期（构建脚本 / `compile_error!` / `#error` / `readelf`） | **运行时**：`lasx_has_lasx()`（C）/ `SimdPath::detect()`（Rust）先问再调 |
-
-一句话：**"错架构"是编译/安装期问题（防呆）；"无 LASX"是运行时问题（先问再调）**。
-C 侧的能力语义与 `[LASX-only]` 清单见 `docs/c-abi.md` §2.6/§6 与 `docs/ops.md` §3.2/§3.3。
-
-**实测（2026-10-15，本机 Loongson-3B6000）**：本机构建不受影响；C 头 `#error` 用
-`#undef __loongarch__` 的 `/tmp` 探针复现（加逃生阀则通过）；用 `/tmp` 探针造
-`e_machine=62`（x86-64）的最小 ELF 冒充产物 ⇒ `install.sh` 拒绝安装（exit 1）；真产物照常装上；
-`cargo +nightly check -p lasx_rs -Zbuild-std --target x86_64-unknown-linux-gnu` 的错误数
-**36 → 1**；`nm -D` 仍 87、`scripts/check_header.c` 仍 0 项失败、`examples/c` 两条路径都跑通。
-
-### 5.2 文档引用规范：跨文档必须点名（2026-10-15）
-
-文档之间的 `§` 引用有两条硬规则，由 `scripts/doccheck.sh` 强制（规则与理由也写在脚本顶部）：
-
-- **裸 `§N`（形如 `§N` / `§N.M`，不带文档名）只允许指向本文件**的章节：解析时只在**引用所在
-  文档**自己的编号集合里找，找不到即 `MISS`。
-- **跨文档引用必须点名文档**：`docs/ops.md §N`、`docs/c-abi.md §N`、`README.md §N`…；
-  `本文 §N` / `本节 §N` 指当前文件。（本文引用别处时同样适用——写这一节本身也要点名。）
-
-**为什么**：早前的规则是"任一文档有该编号即通过"（全局并集）。一旦编号池变大——例如新增
-`docs/c-abi.md` 的 §1–§10——别处裸写的 `§7` 就会**退而命中他文档的同号小节**：引用看着能解析，
-实际指错了文档，规则**静默变松**、编号漂移不会被发现。收紧成"按文档解析"后这条退化路径被
-门禁挡住；收紧当轮**当场暴露并修掉 24 处**跨文档裸引用（`docs/dev.md` 15 处、`docs/ops.md`
-3 处、`docs/c-abi.md` 3 处、`README.md` 与 `README.en.md` 各 1 处、`AGENTS.md` 2 处）。
-
----
-
-## 6. 性能方法学与机器上限
-
-### 6.1 口径：小规模比"相对标量"，大规模比"锚点占比"
-
-- 工作集装得下 L2/L3 时，报 `LASX/标量` 与 `LASX/LSX`（宽度红利是否吃到）。
-- 工作集远超 L3 时，"相对标量"失去意义（两者都被带宽压平），改报：
-
-```text
-实际 GB/s = 本次调用必须搬运的字节数 / 时间
-锚点      = 同规模、同读写比例的"纯搬运"实测 GB/s
-占比      = 实际 / 锚点
-```
-
-锚点必须**实测且分档**（本机对"单流/双流/6 流/读写混合"都敏感，见 §7.1）。
-
-### 6.2 机器
-
-| 项 | 值 |
-|---|---|
-| CPU | Loongson-3B6000（LA664 核），2.2 GHz，12 物理核 × 2 SMT = 24 逻辑核 |
-| 缓存 | L1d 64 KiB/核，L2 3 MiB/核，L3 32 MiB 共享 |
-| 内存 | ~15 GB |
-| 向量 | LASX 256 位（8×f32 / 4×f64），LSX 128 位 |
-
-### 6.3 上限：FP 流水线与 A 广播墙（`examples/kernel_probe.rs`，2026-09-28 复测）
-
-| 探针 | 内容 | FMA/周期 | GFLOP/s |
-|---|---|---|---|
-| `fma16` | 16 条 `xvfmadd.s`，无访存 | **3.99** | **140.4**（f32 吞吐上限；`lasx_bench fma` 组 2026-10-15 方差法复测 139.4，极差 130.9–140.1——同一上限的两次独立测量） |
-| `dfma16` | 16 条 `xvfmadd.d`，无访存 | **3.99** | **70.2**（f64 吞吐上限） |
-| `norepl` | 16 FMA + 4 条 B 载入 | 2.66 | 93.8 |
-| `kernel` | 16 FMA + 4 条 B 载入 + 4 条 A 标量广播（`xvreplgr2vr.w`） | **2.00** | 70.3（0.186 ms/轮） |
-| `kernel_lr` | 同 `kernel`，A 广播改 `xvldrepl.w`（载入-复制） | **2.00** | 70.3–70.4（0.186 ms/轮） |
-| `dkernel` | 同 `kernel`，f64（4 行 × 16 列） | **2.00** | 35.2 |
-| `cRxC` | 扫描行 × 列（累加器 ≤ 16） | **2.00** | — |
-
-历史与复测：2026-09-22 首测是 3.96/3.97/2.66/2.00/1.99；2026-09-25 把
-`fma16/dfma16/norepl/kernel/dkernel` 与 `cRxC` 的 8 个合法变体全部复测一致；**2026-09-28
-三行重测**（绑核 `taskset -c 4`，逐变体 3 行）得到的就是上表：`fma16` 3.99/140.3–140.5、
-`dfma16` 3.99/70.2、`norepl` 2.66/93.7–93.8、`kernel` 2.00/70.3、`kernel_lr` 2.00/70.3–70.4、
-`dkernel` 2.00/34.6–35.2（首行 1.97 是被瞬时后台负载压的，同一轮内 `fma16` 也是 2.99 而不是 3.99
-——**这台的瞬时负载能把读数压低 25%**，所以探针结论一律取多行中位、并且先看 `fma16` 是否在 3.99）。
-`cRxC` 是模板名，实际变体是 `c2x48/c2x64/c3x40/c4x32/c4x40/c5x32/c6x16/c8x16`，逐个都停在 2.00。
-
-`kernel_lr` 这一行是 2026-09-28 新增的：`stdarch` 里有 `lasx_xvldrepl_w::<IMM>`
-（从内存取一个 `f32` 广播到所有 lane），它和 `xvreplgr2vr.w`（GPR → 向量）走的是
-**不同的发射端口**。如果 A 广播墙是端口冲突造成的，这一行应该回到 2.66 —— 实测仍然是
-**2.00、每轮 0.186 ms 与 `kernel` 完全相同**，于是"换广播指令就能突破 2.0"这条假设被证伪：
-**成本记在"每个 k 步 8 条访存形式的操作"这个数量上，与它们是载入还是广播、走哪个端口无关**。
-
-三条结论：
-
-1. **FP 流水线是"4 条 256 位 FMA/周期"，与元素宽度无关**（所以 f64 的 FLOP 上限正好是 f32 的一半）。
-2. **只要含 A 标量广播，内核就停在 2.0 FMA/周期**，与行数/列数/累加器个数无关（每行每 k 步恰好 2 周期）。
-   k 展开（把 uops/FMA 从 1.94 降到 1.59）实测仍是 1.99、换广播指令实测仍是 2.00
-   ⇒ **既不是发射宽度受限，也不是广播端口受限**，微内核没有进一步压缩的空间。
-3. 因此矩阵乘的**可达天花板**：f32 70.3、f64 35.2 GFLOP/s。想再高只能改算法结构（多累加器、
-   A 打包 + lane 广播），或者接受数值变化。**2026-09-28 的实际占比**（打包改成向量拷贝后，§8.5）：
-   f32 86–97%、f64 83–95%；小形状（64³/128³）走流式、不打包，能达到 97%。
-
-两个**测量陷阱**（均实际遇到过）：
-
-- **链数**：纯 FMA 探针必须 ≥ 16 条独立累加链才量得到吞吐；8 条链时量到的是延迟上限
-  （FMA 延迟 ≈3 周期）。套件（`cli/src/suites/micro.rs`）用 16 链，且不写死读数——
-  **套件里的数字必须现算**。
-- **重复次数**：纯 FMA 一轮只有约 0.7 µs。若沿用访存型内核的"每样品 200 轮"，计时分辨率不足以
-  解析它，结果表现为"被优化掉了"（实测打印 0.000 ms）。探针对纯 FMA 用 5×10⁶ 轮、访存型用 200 轮。
-
-### 6.4 A/B 的可信口径
-
-本机有后台负载（同形状跨轮次 ±20%），所以：
-
-| 方法 | 用法 | 陷阱 |
-|---|---|---|
-| **进程级交替** | 同一形状交替跑 A/B 两个进程，各取中位数 | 最稳；单轮仍可能偏，至少 3 轮 |
-| **stash 单文件重建** | 只改一个文件，`cp` 备份 → 构建 → 换回 → 再构建，得到两个二进制再交替 | 适合"两个版本"的对比 |
-| 同进程交替 | 同一进程里交替调用两条路径 | **会被彼此的缓存足迹污染**，只在两者足迹相近时可用 |
-| 单次跨进程比较 | 直接比两次运行的绝对读数 | 不可用（跨轮次 ±20%） |
-| **绑核** | `taskset -c N` 跑单线程内核 | 对**单线程内核**是减噪；对**任何带线程的表**则会导致错误结论——12 个 worker 挤一个核会测出"负扩展"（§3.1） |
-
-基准里的固定开销也要算清：`SimdPath::detect()` ≈ 0.9 ns/次（线程级 TLS + 原子读），
-`lasx_dot` n=24 只要 22 ns，因此**小规模时应先看分派开销**（`dispatch` 套件），不应把它归因于内核慢。
-
-**陷阱：`/tmp` 探针必须自己带 `+lasx`。** 仓库的 `.cargo/config.toml` 里有
-`-C target-feature=+lasx`，而 `/tmp` 下的临时 crate 不会继承它——于是同一个
-`lasx_rs::lasx_matmul(1024,1024,1024)` 在没带 flag 的探针里量到 **0.9 GFLOP/s**
-（走 LSX/标量回退），带上 flag 才是 61.8 GFLOP/s，差 **65×**。凡是"看一眼绝对吞吐"的
-临时探针，第一件事是把 `.cargo/config.toml` 抄过去；只比"同进程内两种写法"的探针
-不受影响（两种写法同等对待）。
-
-还有一条**同一进程内两个套件能差 1.4×**的实例，已查清——**不是套件口径问题，而是测量
-窗口**：`lasx_dot` n = 4096 在 2026-09-25 全量运行里是 372 ns，在按本节纪律重做的
-进程级交替里两个套件都是 257–265 ns（差 <1%），见 §7.7。由此需要修订一条结论：
-**"5 个样品取中位数"不能保护跨窗口的漂移**（5 个样品都落在同一个窗口内），
-因此判断快慢只能依靠交替测量，不能依靠"改前跑一次、改后跑一次"。实测到的窗口间差异可达 **40%**。
-
-**另有一条"表里某一列不可跨轮比较"的实例（2026-10-15 方差法复测）**：`act` 组
-（`lasx_silu` / `lasx_gelu_quick`）的**"标量"列呈双峰**——n=1024 的 6 轮里 2 轮 ≈6 µs、
-4 轮 ≈12 µs（恰好 ~2×），而同一行的 LASX 列稳定在 891–966 ns。后果：**该列的"比值"只在
-同轮内可比**，中位数会落在较慢的那一档、极差把两档都包进去。处置：§7.4 照实给
-`中位数（极差）` 并加注，跨轮引用该列时只作趋势；要判定该列的改动，必须用进程级交替。
-
-**分级（2026-10-15 修订）**：本机桌面常驻（浏览器 + 合成器 + 音频）已占 **2.5–3**，而
-**单个 bench 进程本身 +1.0**（单线程满载）⇒ **只要在测量，1 分钟 loadavg 必然 >3**，
-"`load ≤3`"这条阈值在本机**物理不可达**——历史数据里的"load ≈2–3"就是这个原因，不是
-"没等到窗口"。所以分级改为：
-
-| 级别 | 条件 | 用途 |
-|---|---|---|
-| **A** | 1min **且** 5min 均值 ≤ 3 | 真安静机器上的判据（本会话不可达） |
-| **B** | 1min ≤ 4.5、**无其它 bench/编译并发**，且两臂**同窗口成对交替** | 可作正式数 |
-| **C** | 其余 | 趋势，不可当验收 |
-
-不论哪一级，**每轮都要记 `loadavg`**。同窗口成对交替是保护"比值可比"的手段（负载对两臂
-同阶），`load` 阈值只是用来排除"有别的重活在抢机器"。
-
-**跨库对照（vs OpenBLAS / MKL 之类）在上述口径之外再加四条公平性要求**——装置与权威清单在
-`scripts/bench_openblas.c` 头部注释（本节只立规矩，§7.10 用它）：
-
-| 要求 | 不满足会怎样 |
-|---|---|
-| **同一形状、同一确定性数据、同一预热**（固定种子生成，两库读同一份 `a`/`b`；各自热身后再取样） | 数据/预热不同 ⇒ 比的是数据与冷启动，不是实现 |
-| **布局正确、不替对手改布局**：CBLAS 是列主序 ⇒ 显式 `CblasRowMajor` 并给对 `lda/ldb/ldc`（行主序 `A(m×k)`/`B(k×n)`/`C(m×n)` ⇒ `k/n/n`）；**不要**为了"顺手"把对手的缓冲转置掉 | 布局写错能让对手"看起来慢"（或算出别的东西）；转置对手缓冲则改变了它的访存模式 |
-| **先验一致性**：计时**之前**两条实现按容差互比（f32 `1e-3`、f64 `1e-9`），不通过就**中止、不进入计时** | 比的可能是错的东西；这条同时证明对方 API 的调用（布局/维度）没写错 |
-| **线程对齐并写明控制方式**：同档两边同线程数；对方用 `openblas_set_num_threads()` **且**设 `OPENBLAS_NUM_THREADS`（双保险）；本库侧必须写清是**池**还是**调用方切分**，剪裁方式不同（切行/切列）要分别报数并**标注不对称** | 线程数不同 ⇒ 比的是调度；切法不同 ⇒ 比的是打包量（§7.10 的 12 线程行就是实例） |
-| **跨台架比较先做"同进程交替"对照**：两条路线在**同一个进程里交替**跑、各取中位数 —— 这是把"库内结构差异"与"台架/窗口差异"分开的**唯一**便宜手段（`src/parallel.rs` 的 `#[ignore]` 诊断测试 `diag_pool_vs_plan` 就是它） | 直接拿"A 台架 X G vs B 台架 Y G"推结构原因会得出**错误结论**——本仓出现过一次真实案例：跨台架差 1.4× 被解释成"循环次序结构不同"，同进程对照一测**方向相反**（计划 346–355 G vs 池 292–300 G），错误解释已回退（§7.10 ⑥ (4)） |
-| **必须声明对手的构建与内核**（2026-10-15 审加）：每次对照的**第一行**就写出对手的 build / 内核 / 线程后端 / 实际线程数（装置已自动打印 `OBIDENT`，例如 `OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY la464 MAX_THREADS=32 / core=la464`），并**存档** | 不写清"跟谁比"的数字没有意义：对手可能是**通用 C 兜底**、也可能是**本机架构优化内核**，两者能差一倍；本仓差点把"只差 4%"写在一个没交代身份的对手上 |
-| **"差 N 倍"必须先同进程交替复核**（2026-10-15 晚立的硬规矩，**三次同型教训**） | **跨窗口比较会系统性夸大差距**——同一晚被同类问题抓到**三次**（一次比一次严重，具体旧值见 git 历史）；诱因都是"跨分批取中位数再相除"或"坏窗口" ⇒ **只把同进程数字当结论**，**跨进程/跨窗口的旧数字一律不可引用** |
-| **正式口径 = 同进程调用级交替 A/B**（2026-10-15 口径变更，**用户裁决"改为同进程，本来 simd 就不是跨进程的"**） | **SIMD 库的性能就是"同一进程、同一份数据上，调它它干多久"**；跨进程（分次运行）把**进程启动、每进程建池、调度、他人干扰**都掺进来 ⇒ 那不是库的性能。规程（已实现为 `--impl=alt`）：一个进程里各臂都链进去、**调用级交替**、**同一份数据同一批缓冲**、**计时前双检查**（各臂互相在 `tol` 内 **且** 我方与**串行参考逐位一致**）、**≥6 对、丢首对**、各臂**中位数+极差**、**逐对 `loadavg` + A/B/C 分级**、每臂报 `iters`/`ms_max`、并列打印**对手身份行**。**跨进程数一律标"参考/旧账"** |
-| **亲和性必须对称**（审加）：**两边都绑**到同一组核、或**两边都不绑**；并查清**对手 build 是否自己关了 affinity**（本机 OpenBLAS 是 `NO_AFFINITY`，压根不绑） | 一边绑一边不绑 ⇒ 比的是调度不是实现；只绑单线程档、不绑多线程档 ⇒ 两档口径不一致（本仓 2026-10-15 审计确认"`taskset` 包住整个进程 ⇒ 本来对称"，但**依据必须每次写明**） |
-
----
-
-## 7. 各算子实测（2026-09-25 全量复测）
-
-复现：`cargo run -p lasx_bench --release`（不给过滤就跑全部），或 `-- <子串>` 只跑匹配的套件
-（如 `-- dot_q4`）。计时为"预热后自适应重复到 ~25 ms/样品、5 次取中位数"（进程内），
-表里的数字是**进程级 6 轮**的结果。
-
-> 小节标题保留建档时的日期；本节的**现行数字**全部来自 **2026-10-15 方差法全量复测**（口径见下）。
-
-**2026-10-15 复测的口径**：
-
-1. **6 轮 = 丢弃首轮 + 后 5 轮取中位数**；每个数字写作 `中位数（极差 最小–最大）`。
-2. **单线程内核表绑核测**（批 P，`taskset -c 4`），**带线程的表不绑核**（批 T）——绑核会把池
-   测成**负扩展**：2026-09-25 那次先跑了绑核的全量套件，`mt` 表得到"12 线程 0.72×、24 线程
-   0.73×"，同一份二进制不绑核再跑就是 **8.15×/8.11×**，绑核那张表已丢弃。§7.1 的 12 线程两列
-   与 §7.2 的 12 线程行取批 T，其余取批 P。
-3. **度量版本**：批 P/T = `aab6746`（sha256 `bcb946fb…`）；§7.3 与 §7.7 的 `matmul`/`plan` 行
-   = `5a2059d`（sha256 `78332ea6…`，批 M64）。其余含矩阵乘的行未重测，已与 `Epi::Plain` 版
-   （`5a2059d`）同窗口对照：**9 行里 8 行差异在 ±0.4% 内**（唯一例外 f32 64³ +1.3–2%，已重测）。
-4. **分级**（定义见 §6.4）：本机桌面常驻负载 ≈2.5–3，A 级（1 分钟与 5 分钟同时 ≤3）基本不可达
-   ⇒ 绝大多数轮为 **B 级（可作正式数）**，C 级轮只作趋势并单独标注。各轮**轮前** loadavg
-   （1 分钟/5 分钟）与级别：
-
-| 批次 | 1 | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
-| P 绑核内核表 | 4.60/3.71 C | 2.81/3.49 B | 2.93/3.49 B | 2.78/3.42 B | 3.02/3.55 B | 2.54/3.45 B |
-| T 不绑核线程表 | 4.67/3.89 C | 2.80/3.50 B | 2.92/3.46 B | 3.16/3.44 B | 3.19/3.65 B | 2.68/3.44 B |
-| M64 `matmul`/`plan` | 3.45/3.55 B | 2.64/3.24 B | 3.16/3.22 B | 3.21/3.31 B | 3.04/3.15 B | **2.58/2.96 A** |
-
-> 每轮的完整 `uptime` 原文（before/after）在提交信息里留证、可复核；批 P/T 的首轮（C 级）按
-> 纪律丢弃，不入中位数。
->
-> **A/B 类的测量不在这张表里**，在各自的设计小节（k 分块的 `L1_BUDGET`、列块宽度的
-> `COL_BLOCK`、调度的 `row_gran`、打包流水、融合上限…），**每一处都写明交替方式、轮数与
-> 取值依据**。两类数据的前提不同：本节的表是"同一窗口的横向截面 + 6 轮极差"，只能同表内
-> 比较；A/B 是"两个二进制来回切"，可以跨窗口比较。混在一张表里会误导，因此分开放。
-
-### 7.1 大集锚点（工作集 4–32 MiB，纯搬运）
-
-| 规模 | 单流只读 | 双流只读 | 双流**字节**读 | **6 流 3读3写** | 单线程拷贝 | 12 线程只读 | 12 线程拷贝 |
-|---|---|---|---|---|---|---|---|
-| 4 Mi | 14.7（14.6–15.1） | 10.5（10.2–10.6） | 39.9（39.6–40） | 6.7（6.6–7.1） | 7.8（7.5–8） | 24.3（22.4–24.8） | 16.7（16.3–17.1） |
-| 16 Mi | 11.4（11.2–11.6） | 9.5（9.2–9.6） | 12.9（12.4–13.1） | 6.6（6.4–6.8） | 7.1（6.8–7.9） | 18.1（16.3–19.3） | 17.1（16.8–17.4） |
-| 8 Mi (f32) | 11.4（11.2–11.4） | 10.3（10.2–10.6） | 21（20.5–21.1） | 6.5（6.1–6.6） | 7.3（7.1–7.7） | 19.7（18.5–21.5） | 15.6（15.5–16.4） |
-| 32 Mi (f32) | 10.7（10.6–11.1） | 9.6（8–10.1） | 9.3（7.2–10） | 6.8（6.5–6.8） | 7.2（7–7.5） | 18.5（17.2–19.3） | 16.4（16.1–17） |
-
-（单位 GB/s。**前五列是绑核口径（批 P），后两列是不绑核口径（批 T）**——12 线程行绑核会把池测成
-负扩展，见本节开头第 2 条。"字节读锚点的数组是每流 n 字节"与 f64 行 footprint 相差 8 倍，只能比
-同 footprint 的行；"6 流 3读3写"是 `j2_accel_batch` 这类"3 进 3 出"内核的形态。）
-
-要点：**单线程流式 6.5–14.7 GB/s，12 线程 15.6–24.3 GB/s**；读写混合比纯读低约 30–40%；
-6 流压在 6.5–6.8 GB/s 且与规模无关。大集下**并行度比指令宽度重要**。
-（12 线程只读的 4 Mi 行（24.3）高于其余三行（18.1–19.7），与 2026-09-25 那批"32 Mi 行最高
-（22.0）"的形态相反；两批的差都在本机窗口波动范围内，只能同窗口比较。）
-
-### 7.2 大集下各内核的占比
-
-| 内核 | 规模 | 实际 GB/s | 锚点 GB/s | 占比 |
-|---|---|---|---|---|
-| `norm3_batch` f64 | 4 Mi / 16 Mi | 8.6（8.5–8.7） / 7（6.3–7.6） | 13（12.9–13.2） / 10.4（10.2–10.6） | 66%（65–68%） / 68%（61–72%） |
-| `vec3_add_scaled` f64 | 4 Mi / 16 Mi | 10.4（10.3–10.7） / 9.6（8.9–9.9） | 12.5（12.3–12.6） / 10（9.8–10.3） | 84%（82–86%） / 96%（90–98%） |
-| `j2_accel_batch` f64 | 4 Mi / 16 Mi | 5.1（4.8–5.1） / 3.7（3.7–4.3） | 6.7（6.6–7.1） / 6.6（6.4–6.8） | 74%（71–77%） / 58%（54–65%） |
-| `rk4_j2_step` f64（单线程） | 4 Mi / 16 Mi | 3.6（3.6–3.7） / 3.7（3.6–3.8） | 11.3（11.1–11.4） / 9.2（9.1–9.7） | 32%（32–33%） / 40%（38–41%） |
-| `rk4_j2_step` f64（12 线程） | 4 Mi / 16 Mi | 14.4（14.2–15.2） / 15.2（14.9–15.7） | 20.5（19.4–20.9） / 17.7（16.6–18.1） | 72%（69–74%） / 86%（85–92%） |
-| `dot` f32 | 8 Mi / 32 Mi | 10.6（9.8–10.6） / 9.7（9.4–9.8） | 11.4（11.2–11.4） / 10.7（10.6–11.1） | 93%（86–95%） / 89%（88–91%） |
-| `sum` f32 | 8 Mi / 32 Mi | 10.3（10.3–10.6） / 8.7（8.4–8.8） | 11.4（11.2–11.4） / 10.7（10.6–11.1） | 92%（90–94%） / 81%（79–82%） |
-| `axpy` f32 | 8 Mi / 32 Mi | 12.5（12.3–12.5） / 10.4（9.8–11） | 10（9.9–10.1） / 9.6（9.4–9.8） | 124%（123–125%） / 108%（102–115%） |
-| `dot_i8` | 8 Mi / 32 Mi | 10.8（9.8–16.3） / 5.9（5.8–6.1） | 21（20.5–21.1） / 9.3（7.2–10） | 51%（47–77%） / 64%（59–82%） |
-| `dot_q4` | 8 Mi / 32 Mi | 8.8（6.4–9.4） / 4.4（3.9–4.4） | 21（20.5–21.1） / 9.3（7.2–10） | 41%（31–44%） / 48%（40–59%） |
-| `dot_f64` | 4 Mi / 16 Mi | 10.1（10–10.5） / 9.2（8.4–9.4） | 14.7（14.6–15.1） / 11.4（11.2–11.6） | 69%（68–72%） / 81%（73–83%） |
-
-判定：`rk4_j2_step` 单线程仍是**算力受限**（每元素 1 sqrt + 多次除，§13 把除法
-降到每元素 4 次后到 43.6 M sample/s）；`dot_q4` 是**发射受限**（§6.3 的 2 FMA/周期墙）；
-`vec3_add_scaled`/`axpy`/`sum` 的"超过 100%"是因为它们读多写少，而锚点按"读+写"计。
-**12 线程的 rk4 到 86%**（15.2 GB/s，不绑核口径，批 T）——单线程各行为绑核口径（批 P）。
-`dot_i8`/`dot_q4` 两行的 8 Mi 档极差偏大（9.8–16.3、6.4–9.4 GB/s），是这两行本身对
-窗口敏感，引用时只做同窗口比较。
-
-### 7.3 矩阵乘（算力型）
-
-| 形状 | 时间 | GFLOP/s | 相对 §6.3 天花板 |
-|---|---|---|---|
-| f32 512³ | 4.36（4.31–4.41） ms | **61.5（60.8–62.2）** | 88%（70.3） |
-| f32 384³ | 1.86（1.85–1.87） ms | 60.7（60.5–61.2） | 86% |
-| f32 256³ | 534.8（529.7–573.6） µs | 62.7（58.5–63.4） | 89% |
-| f32 128³ | 62.7（62.3–63.2） µs | 66.9（66.4–67.3） | 95% |
-| f32 1024³ | 38.46（37.56–39.21） ms | 55.8（54.8–57.2） | 79% |
-| f32 2048³ | 324.92（321.96–329.69） ms | **52.9（52.1–53.4）** | 75%（超出 L3 后回落） |
-| f64 512³ | 8.68（8.57–9.73） ms | 30.9（27.6–31.3） | 88%（35.1） |
-| f64 256³ | 1.16（1.15–1.21） ms | 28.9（27.8–29.3） | 82% |
-| f64 128³ | 137.1（134.9–138.1） µs | 30.6（30.4–31.1） | 87% |
-
-（f32 512³/384³/256³/128³ 与 f64 三行来自批 M64 的 `matmul` 组（**绑核**，二进制 `5a2059d`）；
-1024³/2048³ 来自批 P 的 `large` 组（绑核）。§8.5 的交叉对照表是 2026-09-25 另一窗口的
-OpenBLAS 对照读数，与本表不并排比较。）
-
-### 7.4 小规模逐内核（相对标量/LSX）
-
-| 内核 | n | LASX | 强制 LSX | 标量 | LASX/标量 | LASX/LSX | 吞吐 |
-|---|---|---|---|---|---|---|---|
-| `lasx_dot` f32 | 8 | 5（5–7） ns | 5（5–6） ns | 6 ns | 1.2（0.86–1.2）× | 1（0.71–1.2）× | 1.6（1.14–1.6） G elem/s |
-| `lasx_dot` f32 | 16 | 10 ns | 10 ns | 11 ns | 1.1× | 1× | 1.6 G elem/s |
-| `lasx_dot` f32 | 24 | 13（13–14） ns | 15（14–15） ns | 18（18–19） ns | 1.38（1.36–1.38）× | 1.15（1.07–1.15）× | 1.85（1.71–1.85） G elem/s |
-| `lasx_dot` f32 | 32 | 14（14–15） ns | 17（16–18） ns | 27（27–28） ns | 1.93（1.87–2）× | 1.21（1.14–1.21）× | 2.29（2.13–2.29） G elem/s |
-| `lasx_dot` f32 | 48 | 16（15–18） ns | 24（23–25） ns | 43（43–46） ns | 2.69（2.56–2.87）× | 1.5（1.39–1.6）× | 3（2.67–3.2） G elem/s |
-| `lasx_dot` f32 | 64 | 19（19–21） ns | 30（29–31） ns | 59（59–63） ns | 3.11（3–3.26）× | 1.53（1.48–1.58）× | 3.37（3.05–3.37） G elem/s |
-| `lasx_dot` f32 | 256 | 26（26–28） ns | 54（53–59） ns | 322（321–329） ns | 12.35（11.75–12.38）× | 2.04（2–2.11）× | 9.85（9.14–9.85） G elem/s |
-| `lasx_dot` f32 | 4096 | 270（267–295） ns | 658（654–712） ns | 5.6 µs | 20.67（19.05–20.9）× | 2.44（2.41–2.45）× | 15.17（13.88–15.34） G elem/s |
-| `lasx_dot` f32 | 65536 | 11.9（11.7–13.1） µs | 18.9（18.7–20.1） µs | 90.1（89.7–92.3） µs | 7.58（7.03–7.66）× | 1.59（1.53–1.6）× | 5.51（4.99–5.6） G elem/s |
-| `lasx_dot` f32 | 1048576 | 186（183.5–205.3） µs | 288.9（286.8–310.5） µs | 1.44（1.44–1.48） ms | 7.75（7.2–7.83）× | 1.55（1.51–1.57）× | 5.64（5.11–5.71） G elem/s |
-| `lasx_sum` f32 | 65536 | 6（5.9–6.7） µs | — | 89.7（89.6–91.9） µs | 14.89（13.7–15.11）× | — | 10.88（9.76–11.05） G elem/s |
-| `lasx_sum` f32 | 4194304 | 470.5（465.4–531.1） µs | — | 6.05（6–6.17） ms | 12.85（11.61–12.91）× | — | 8.92（7.9–9.01） G elem/s |
-| `lasx_axpy` f32 | 65536 | 13.2（13.2–14.5） µs | — | 13.3（13.3–14.9） µs | 1.01（1.01–1.03）× | — | 9.93（9.06–9.96） G elem/s |
-| `lasx_axpy` f32 | 4194304 | 2.45（2.36–3.09） ms | — | 2.79（2.73–3.15） ms | 1.13（1.02–1.23）× | — | 3.42（2.72–3.56） G elem/s |
-| `lasx_dot_f64` | 32768 | 18.7（18.7–18.8） µs | — | 44.9（44.8–46.5） µs | 2.4（2.4–2.47）× | — | 1.75（1.74–1.76） G elem/s |
-| `lasx_dot_f64` | 2097152 | 1.94（1.91–2.13） ms | — | 5.07（5–5.77） ms | 2.63（2.62–2.71）× | — | 1.08（0.98–1.1） G elem/s |
-| `lasx_dot_i8` | 65536 | 5.6（5.6–6.1） µs | — | 10.3（10.2–11.1） µs | 1.82（1.82–1.84）× | — | 11.68（10.8–11.69） G elem/s |
-| `lasx_dot_i8` | 4194304 | 510.7（482.7–526.6） µs | — | 747.5（738–781.3） µs | 1.49（1.45–1.53）× | — | 8.21（7.96–8.69） G elem/s |
-| `lasx_dot_i8` | 33554432 | 9.69（9.32–10.42） ms | — | 12.81（11.77–13.53） ms | 1.31（1.19–1.39）× | — | 3.46（3.22–3.6） G elem/s |
-| `lasx_dot_q4` | 65536 | 11.6（11.6–12.4） µs | — | 140（139.5–152.8） µs | 12.04（12.01–12.34）× | — | 11.27（10.58–11.31） G nibble/s |
-| `lasx_dot_q4` | 4194304 | 931.7（873.5–1080） µs | — | 9.19（9.14–10.03） ms | 10.16（8.54–10.52）× | — | 9（7.78–9.6） G nibble/s |
-| `lasx_dot_q4` | 33554432 | 15.07（14.43–15.29） ms | — | 73.56（73.26–82.11） ms | 5.01（4.83–5.37）× | — | 4.45（4.39–4.65） G nibble/s |
-| `lasx_gemv_f16` | 1×2048 | 190（190–206） ns | — | 4.9（4.9–5.3） µs | 25.96（25.91–26.4）× | — | 64.69（59.67–64.69） GB/s |
-| `lasx_gemv_f16` | 64×2048 | 18.4（18.4–20.3） µs | — | 321.3（319.2–347.8） µs | 17.35（17.04–17.44）× | — | 14.67（13.34–14.72） GB/s |
-| `lasx_gemv_f16` | 1024×2048 | 295.3（293.7–321） µs | — | 5.15（5.14–5.6） ms | 17.44（17.35–17.57）× | — | 14.25（13.1–14.32） GB/s |
-| `lasx_gemv_f16` | 4096×4096 | 7.99（7.85–8.88） ms | — | 43.28（43.02–46.55） ms | 5.4（5.24–5.48）× | — | 4.2（3.78–4.28） GB/s |
-| `lasx_gemv_f16` | 32×8192 | 34.6（34.5–37.6） µs | — | 649.6（648.3–707） µs | 18.8（18.76–18.82）× | — | 16.09（14.83–16.13） GB/s |
-| `lasx_dot_f16` | 1024 | 98（98–107） ns | — | 2.5（2.5–2.7） µs | 25.1（24.85–25.18）× | — | 62.69（57.42–62.69） GB/s |
-| `lasx_dot_f16` | 4096 | 360（359–391） ns | — | 9.8（9.8–10.5） µs | 27.27（26.92–27.33）× | — | 68.27（62.85–68.46） GB/s |
-| `lasx_dot_f16` | 16384 | 2.6（2.6–2.8） µs | — | 40.1（39.8–43.2） µs | 15.5（15.3–15.6）× | — | 38.12（34.81–38.22） GB/s |
-| `lasx_softmax_rows` | 128×128 | 22.7（22.6–24.3） µs | — | 104（103.8–113） µs | 4.6（4.58–4.65）× | — | 5.78（5.4–5.8） GB/s |
-| `lasx_softmax_rows` | 512×512 | 322.3（321.8–345.5） µs | — | 1.62（1.62–1.79） ms | 5.04（5.02–5.19）× | — | 6.51（6.07–6.52） GB/s |
-| `lasx_softmax_rows` | 1024×1024 | 1.27（1.27–1.38） ms | — | 6.46（6.46–7.37） ms | 5.09（5.08–5.35）× | — | 6.6（6.09–6.62） GB/s |
-| `lasx_softmax_rows` | 2048×2048 | 6.78（6.71–7.55） ms | — | 27.62（27.25–30.92） ms | 4.07（4.03–4.1）× | — | 4.95（4.45–5） GB/s |
-| `lasx_softmax_rows` | 32×4096 | 156.1（155.8–169.2） µs | — | 800.2（797.7–885.6） µs | 5.13（5.12–5.23）× | — | 6.72（6.2–6.73） GB/s |
-| `lasx_softmax_rows` | 4096×128 | 746.2（744.1–804.1） µs | — | 3.35（3.34–3.71） ms | 4.49（4.49–4.61）× | — | 5.62（5.22–5.64） GB/s |
-| `lasx_rms_norm` | 128×128 | 9.7（9.7–10.1） µs | — | 28.4（28.4–29.5） µs | 2.92（2.91–2.93）× | — | 13.47（12.95–13.51） GB/s |
-| `lasx_rms_norm` | 512×512 | 123.7（123.5–129.3） µs | — | 408.7（408.1–424.5） µs | 3.3（3.28–3.31）× | — | 16.95（16.22–16.97） GB/s |
-| `lasx_rms_norm` | 1024×1024 | 467.6（464.7–491） µs | — | 1.61（1.61–1.67） ms | 3.46（3.4–3.5）× | — | **17.94（17.08–18.05） GB/s** |
-| `lasx_rms_norm` | 2048×2048 | 2.74（2.64–3.02） ms | — | 7.67（7.61–8.2） ms | 2.83（2.71–2.88）× | — | 12.25（11.1–12.72） GB/s |
-| `lasx_rms_norm` | 32×4096 | 57.3（57.2–60.5） µs | — | 199.4（199–206.6） µs | 3.48（3.42–3.48）× | — | 18.29（17.34–18.33） GB/s |
-| `lasx_rms_norm` | 4096×128 | 344.9（344.6–361.2） µs | — | 919.9（918.6–956.6） µs | 2.67（2.65–2.67）× | — | 12.16（11.61–12.17） GB/s |
-| `lasx_silu` | 1024 | 892（891–966） ns | — | 12.3（6–12.7） µs | 13.17（6.69–13.83）× | — | 9.18（8.48–9.19） GB/s |
-| `lasx_gelu_quick` | 1024 | 952（952–1000） ns | — | 12.3（6–12.7） µs | 12.42（6.27–12.96）× | — | 8.61（7.99–8.61） GB/s |
-| `lasx_gelu_erf` | 1024 | 1.5（1.5–1.6） µs | — | 11.3（9.4–11.9） µs | 7.53（6.32–7.99）× | — | 5.49（5.16–5.5） GB/s |
-| `lasx_silu` | 65536 | 65.8（65.6–71） µs | — | 792.9（406.7–818.7） µs | 11.53（6.19–12.06）× | — | 7.97（7.38–7.99） GB/s |
-| `lasx_gelu_quick` | 65536 | 68.6（68.4–73.8） µs | — | 793.1（406.6–819） µs | 11.1（5.94–11.57）× | — | 7.65（7.11–7.66） GB/s |
-| `lasx_gelu_erf` | 65536 | 106.5（106.2–114.1） µs | — | 1.13（0.76–1.17） ms | 10.49（7.13–10.67）× | — | 4.92（4.59–4.93） GB/s |
-| `lasx_silu` | 1048576 | 1.03（1.03–1.1） ms | — | 12.78（6.58–13.17） ms | 11.98（6.36–12.38）× | — | 8.11（7.63–8.13） GB/s |
-| `lasx_gelu_quick` | 1048576 | 1.17（1.11–1.22） ms | — | 12.76（6.59–13.22） ms | 10.91（5.92–11.19）× | — | 7.17（6.89–7.55） GB/s |
-| `lasx_gelu_erf` | 1048576 | 1.75（1.71–1.83） ms | — | 18.33（12.25–18.87） ms | 10.3（7.18–10.8）× | — | 4.81（4.58–4.91） GB/s |
-| `lasx_silu` | 8388608 | 14.68（14.43–14.99） ms | — | 101.91（54.43–105.24） ms | 6.82（3.63–7.27）× | — | 4.57（4.48–4.65） GB/s |
-| `lasx_gelu_quick` | 8388608 | 14.42（14.38–14.79） ms | — | 101.93（54.21–105.38） ms | 6.89（3.76–7.33）× | — | 4.65（4.54–4.67） GB/s |
-| `lasx_gelu_erf` | 8388608 | 17.32（17.21–18.71） ms | — | 146.05（97.73–151.14） ms | 8.3（5.64–8.78）× | — | 3.88（3.59–3.9） GB/s |
-| `lasx_rope`·NeoX | 1×128 | 35（35–39） ns | — | 48（47–55） ns | 1.37（1.34–1.41）× | — | 36.57（32.82–36.57） GB/s |
-| `lasx_rope`·GptJ（标量） | 1×128 | 113（113–124） ns | — | 126（126–140） ns | 1.12（1.11–1.13）× | — | 11.33（10.32–11.33） GB/s |
-| `lasx_rope`·NeoX | 32×128 | 571（570–635） ns | — | 1.4（1.4–1.5） µs | 2.4（2.33–2.4）× | — | **71.73（64.5–71.86） GB/s** |
-| `lasx_rope`·GptJ（标量） | 32×128 | 3.2（3.2–3.5） µs | — | 3.9（3.9–4.3） µs | 1.23（1.22–1.23）× | — | 12.82（11.74–12.84） GB/s |
-| `lasx_rope`·NeoX | 512×128 | 19.7（19.6–22.1） µs | — | 45.2（45–49.1） µs | 2.29（2.22–2.29）× | — | 33.27（29.65–33.37） GB/s |
-| `lasx_rope`·GptJ（标量） | 512×128 | 60.4（60.2–67.5） µs | — | 81.3（80.9–91.1） µs | 1.35（1.34–1.35）× | — | 10.86（9.71–10.89） GB/s |
-| `lasx_rope`·NeoX | 4096×128 | 157.2（156.9–179.9） µs | — | 359.8（358.6–397.3） µs | 2.29（2.21–2.29）× | — | 33.35（29.14–33.41） GB/s |
-| `lasx_rope`·GptJ（标量） | 4096×128 | 482.7（481.4–546.5） µs | — | 650.6（644.9–725.6） µs | 1.34（1.33–1.35）× | — | 10.86（9.59–10.89） GB/s |
-| `lasx_rope`·NeoX | 8×4096（转前 128 列） | 5.9（5.9–6.5） µs | — | 6.1（6.1–6.9） µs | 1.04（1.04–1.06）× | — | 55.9（50.36–55.95） GB/s |
-| `lasx_rope`·GptJ（标量） | 8×4096（转前 128 列） | 6.4（6.4–7.1） µs | — | 6.8（6.8–7.5） µs | 1.06× | — | 51.23（46.13–51.34） GB/s |
-
-（f16 的"标量"列是同口径的朴素循环；`gelu_erf` 的标量列是同一个 A&S f32 式子的循环——
-**不能**用 f64 的"真 erf"当参照，那会给出 400–500× 的假倍数，见 §20.5。
-**激活组的"标量"列呈双峰**：6 轮里 2 轮约 6 µs、4 轮约 12 µs（n=1024，恰好 ~2×），而 LASX 列
-本身稳定（891–966 ns）⇒ 这一列的**比值只在同轮内可比**，跨轮极差只作趋势。）
-
-两组读数值得对着看：
-
-- **`dot` 的 n=8/16 两行 `LASX/标量` 已在 1 附近**（1.2 / 1.1；n=8 的极差 0.86–1.2 跨过 1）——
-  小 n 的向量建立成本与标量快路径基本抵消（2026-09-25 那批是 0.53×/0.58×，此后的分派开销
-  优化把这块补上了）；`axpy` 的标量列被 LLVM 自动向量化（§4），所以只有 1.01–1.13×。
-- **`softmax`(4.95–6.72) 与 `rms_norm`(12.16–18.29) 差一倍多，是遍数决定的**（3 条流 vs 2 条流）；
-  **激活**(3.88–9.18) 与 `rms_norm` 同为 2 条流却只有一半 ⇒ 算力受限（每 8 元素约 19 条向量指令
-  + 一次向量除法）。这三个数字放在一起才说明问题，见 §7.8 的横向对照。
-
-### 7.5 批量物理/姿态内核
-
-| 内核 | n | LASX | 标量 | 比 | 吞吐 |
-|---|---|---|---|---|---|
-| `lasx_norm3_batch` f64 | 65536 | 127.3（127.2–127.9） µs | 127.4（127.2–127.8） µs | 1× | 514.7（512.5–515.2） M sample/s |
-| `lasx_norm3_batch` f64 | 1048576 | 2.84（2.63–3.04） ms | 2.81（2.63–3.09） ms | 1.02（0.99–1.06）× | 369.5（344.9–399.2） M sample/s |
-| `lasx_vec3_add_scaled_batch` f64 | 1048576 | 8.95（8.77–10.21） ms | 9.22（8.7–10.03） ms | 1.01（0.98–1.05）× | 703.3（616.4–717.7） M elem/s |
-| `lasx_batch_distance2d` f32 | 1048576 | 1.11（1.11–1.12） ms | 1.11（1.11–1.12） ms | 1× | 941.6（935.8–943.6） M point/s |
-| `lasx_j2_accel_batch` f64 | 65536 | 292.3（291.7–322.9） µs | 367.7（365.8–385.2） µs | **1.25（1.19–1.27）×** | 224.2（203–224.7） M sample/s |
-| `lasx_j2_accel_batch` f64 | 1048576 | 9.62（9.34–10.68） ms | 9.74（9.02–11.78） ms | 1.02（0.94–1.1）× | 108.9（98.1–112.2） M sample/s |
-| `lasx_ballistic_step` f32 | 65536 | 130.6（129–148.1） µs | 153.9（153.5–170.4） µs | 1.19（1.15–1.21）× | 502（442.6–508.1） M shot/s |
-| `lasx_ballistic_step` f32 | 1048576 | 3.29（3.28–3.69） ms | 3.7（3.64–4.38） ms | 1.12（1.11–1.19）× | 318.4（284–319.5） M shot/s |
-| `lasx_rk4_j2_step_batch` f64 | 16384 | 377.9（376.6–389.8） µs | 450.5（444.5–464.2） µs | 1.19（1.18–1.2）× | 43.4（42–43.5） M sample/s |
-| `lasx_rk4_j2_step_batch` f64 | 262144 | 6.27（6.25–6.5） ms | 7.39（7.37–7.81） ms | 1.18（1.17–1.2）× | 41.8（40.3–41.9） M sample/s |
-
-姿态/几何 7 个内核（两个规模）：
-
-| 内核 | n=4096 | 标量 | 比 | n=262144 | 标量 | 比 |
-|---|---|---|---|---|---|---|
-| `lasx_cross3_batch` | 6.4（6.3–7.1） µs | 40.8（40.7–44.9） µs | **6.39（6.3–6.43）×** | 843.4（827.6–943.5） µs | 3.45（3.4–3.92） ms | **4.1（4.04–4.15）×** |
-| `lasx_mat3_mul_vec3_batch` | 13.3（13.3–14.3） µs | 110.8（110.4–120.7） µs | **8.33（8.32–8.43）×** | 2.73（2.54–2.83） ms | 9.32（9.26–10.28） ms | **3.63（3.39–3.65）×** |
-| `lasx_quat_mul_batch` | 14.2（14.1–15.3） µs | 61.3（61.1–67.6） µs | **4.33（4.32–4.41）×** | 1.7（1.62–1.79） ms | 5.21（5.1–6.05） ms | 3.08（2.93–3.38）× |
-| `lasx_unitize3_batch` | 20.1（20.1–20.2） µs | 60.2（60.1–70.1） µs | 2.99（2.99–3.47）× | 1.3（1.29–1.34） ms | 4.07（4.06–4.85） ms | 3.14（3.11–3.62）× |
-| `lasx_quat_normalize_batch` | **17.6（17.6–17.9） µs** | 85.6（85.4–93.3） µs | **4.87（4.85–5.21）×** | **1.15（1.15–1.19） ms** | 6.06（5.96–7.06） ms | **5.27（5.2–5.92）×** |
-| `lasx_quat_to_dcm_batch` | 43.5（43.2–45.3） µs | 133.5（133.4–147.4） µs | 3.09（3.07–3.25）× | 3.85（3.81–4.34） ms | 9.68（9.63–10.93） ms | 2.52（2.45–2.56）× |
-| `lasx_quat_rotate_batch` | **45.3（45.2–47.8） µs** | 163.1（162.4–178.1） µs | **3.61（3.59–3.73）×** | **3.88（3.81–4.18） ms** | 11.4（11.28–12.68） ms | **2.98（2.89–3.03）×** |
-
-（这组算子的"单元素算力/字节比"很低——叉积 9 flop 读 48 B 写 24 B——所以规模一大就趋近内存
-带宽，缓存驻留时才是 SIMD 的主场：同一内核 4096 档普遍比 262144 档高 1.4–2.4×。与 2026-09-22
-那次相比，`cross3`/`mat3_mul_vec3` 的 262144 档从 3.88×/3.39× 变成 4.1×/3.63×，`quat_mul`
-从 2.85× 变成 3.08×——这三处的标量列波动较大，只作同窗口比较。）
-
-- `norm3`/`vec3_add_scaled`/`distance2d` 的"标量列"是 1.00×：这些内核的标量参考在 `+lasx` 下
-  被 LLVM 完整向量化，所以**这三行的"标量"其实是另一份向量实现**；它们的收益要看大集占比（§7.2）。
-- 姿态批处理 7 个内核在"标量真的没被向量化"的口径下是 **2.98–8.23×**。
-- `rk4`/`j2`/`ballistic` 的标量列**没有**被 LLVM 向量化（有 sqrt/除法/分支），所以 1.14–1.21×
-  是可信的 SIMD 收益；再往上是内存带宽。
-
-### 7.6 对齐与分派开销
-
-| 项 | 结果 |
-|---|---|
-| 32/64 字节对齐（`lasx_dot`，偏移 1 元素） | n=1024 1.09（1.08–1.1）×、n=2048 1.2（1.19–1.21）×、n=4096 1.29（1.28–1.29）×、n=8192 1.51（1.42–1.58）× |
-| 大集（n=65536） | 对齐 11.9（11.7–13） µs vs 未对齐 13.5（13.4–14.9） µs = **1.14×**（对齐仍占优；2026-09-25 那批记的 0.92× 本轮未复现） |
-| `lasx_dot_f64` | 4096/65536 都是 1.00×（f64 内核用 `xvld`，对 32 字节对齐不敏感） |
-| `SimdPath::detect()` | 0.91（0.91–1.02） ns/次（空循环基线 0.46 ns = **2.0（1.9–2.2）×**） |
-| `hardware()`（纯原子读） | 0.93（0.91–0.97） ns/次（**2.0（2–2.1）×**） |
-
-### 7.7 真实调用形态
-
-> **口径**：本节各表来自 2026-10-15 方差法复测的**批 T（不绑核）**——进程级 6 轮
-> （丢弃首轮、取后 5 轮中位数），每个数字写作 `中位数（极差）`；轮前 1 分钟 loadavg 为
-> `4.67 C / 2.80 B / 2.92 B / 3.16 B / 3.19 B / 2.68 B`（首轮 C 级丢弃），二进制 `aab6746`。
-> 带线程的表不绑核的理由见 §7 开头第 2 条。
-
-**多线程扩展性**（`lasx_rk4_j2_step_batch`，n = 2^18 原地单步，**不绑核**）：
-
-| 线程数 | 每次新建线程 | 库内常驻池 | 池相对 1 线程 | 池效率 |
-|---|---|---|---|---|
-| 1 | — | 6.35（6.24–6.49） ms | 1× | 100% |
-| 2 | 3.21（3.18–3.31） ms | 3.07（3.05–3.12） ms | 2.08（2.03–2.1）× | 104（102–105）% |
-| 4 | 1.69（1.68–1.7） ms | 1.55（1.52–1.57） ms | 4.09（3.97–4.27）× | 102（99–107）% |
-| 6 | 1.19（1.19–1.2） ms | 1.12（1.1–1.31） ms | 5.67（4.81–5.89）× | 95（80–98）% |
-| 8 | 978.1（973.4–985） µs | 1.04（0.81–1.11） ms | 6.14（5.71–7.96）× | 77（71–100）% |
-| 12 | 932.7（921.8–939.2） µs | 736.9（734.7–754.6） µs | 8.62（8.38–8.79）× | 72（70–73）% |
-| 24 | 901.9（875.3–917.9） µs | 699（693.7–702.4） µs | 9.08（8.99–9.25）× | 38（37–39）% |
-
-> 24 次线程创建/回收的固定开销 ≈ 486 µs（只影响"每次新建线程"一列）。
-> 8→24 线程停在 ~9.1×（不再涨）：这是**内存带宽**（§7.1 的 12 线程聚合上限 24.3 GB/s），
-> 不是派活开销——池的派活已经压到微秒级。**这张表必须不绑核测**，见本节口径。
-
-**多星多步轨道传播**（n = 65536 星 × 200 步，dt = 10 s，不绑核）：
-
-| 推进方式 | 200 步总时间 | 吞吐 | 相对单线程 |
-|---|---|---|---|
-| 单线程 | 302.69（301.18–306.32） ms | 43.3（42.8–43.5） M sample·step/s | 1× |
-| 12 线程 · 每步新建线程 | 83.81（80.91–84.35） ms | 156.4（155.4–162） M | 3.61（3.59–3.75）× |
-| 12 线程 · 库内常驻池（跨步复用） | **37.47（37.21–37.63） ms** | **349.8（348.3–352.2） M** | **8.08（8.01–8.17）×** |
-
-**融合内核 vs 拼原语**（RK4 步，n = 65536，20 步）：
-
-| 调用策略 | FFI 调用/步 | 20 步总时间 | 吞吐 |
-|---|---|---|---|
-| `lasx_rk4_j2_step_batch`（融合） | **1** | **30.06（29.94–30.15） ms** | 43.6（43.5–43.8） M sample·step/s |
-| 拼 18 次原语（`j2_accel` + `vec3_add_scaled`） | 18 | 106.44（106.13–115.72） ms | 12.3（11.3–12.4） M |
-
-> 拼接版慢 **3.5×**：除了 18 次调用开销，每次调用都要把 6–9 个 f64 数组写回内存再读出来，
-> 而这些中间量在融合版里从未离开寄存器。**"融合"仍是本库最有效的调用侧优化。**
-
-**小数组高频调用**（每种规模 200000 次，取每次耗时）：
-
-| 内核 | n | 每次调用 | 吞吐 | 说明 |
-|---|---|---|---|---|
-| `lasx_dot` f32 | 8 | 5（5–6） ns | 1.6（1.33–1.6） G elem/s | 走标量快路径（无能力探测） |
-| `lasx_dot` f32 | 16 | 10（9–10） ns | 1.6（1.6–1.78） G elem/s | 走标量快路径 |
-| `lasx_dot` f32 | 64 | 19（19–21） ns | 3.37（3.05–3.37） G elem/s | 走 LASX（每次过一次分派） |
-| `lasx_dot` f32 | 256 | 26（26–27） ns | 9.85（9.48–9.85） G elem/s | 走 LASX |
-
-**C ABI vs Rust 切片 API**（同规模对照）：n=64 19（19–21） vs 13 ns、n=256 26（25–27） vs 22 ns、
-n=4096 272（264–275） vs 259（257–261） ns ⇒ **这层安全包装没有可测开销**（差值在 ±5 ns 内，
-符号还不稳定）。注意需要输出缓冲的 `api`（`matmul`/`norm3_batch`/`gemv_f16`）返回**新分配**的
-对齐缓冲，热循环里要把分配器算进去。
-
-**"两张表差 1.4×"已查清：不是套件口径，是测量窗口。** 2026-09-25 的全量运行里
-`lasx_dot` n = 4096 在 `dot` 套件是 372 ns、在 `scenario` 热循环里是 261 ns。按 §6.4 的
-**进程级交替、3 轮、丢弃首轮**重测（`dot` 套件与 `scenario` 套件轮流跑）：
-
-| 轮次 | `dot` 套件的 n=4096 | `scenario` 热循环（C ABI / `api`） |
-|---|---|---|
-| 1 | 263 ns | 257 / 264 ns |
-| 2 | 264 ns | 258 / 265 ns |
-
-**两个口径一致到 1% 以内**（263–265 vs 257–265 ns）。因此那 372 ns 来自**整次运行落在了一个
-更差的机器状态窗口**——不是"自适应重复 + 5 次中位数"这套方法有偏，而是**该方法不能保护跨窗口
-的漂移**：5 个样品都在同一个窗口里，中位数自然是该窗口的中位数。
-
-两个后果，均已写进 §6.4：
-
-1. **本节的表只能同表内比较**。整张表是一次连续采集（同一个窗口），行间可比；跨窗口（换一天、
-   换一次运行）必须重测，不能拿两个不同运行的数字相减。
-2. **要判断"某改动是快了还是慢了"，唯一可信的做法是进程级交替**，而不是"改前跑一遍、改后
-   跑一遍"。该次复测到的窗口间差异是 **40%**（263 → 372 ns），比大多数优化的幅度都大。
-
-**大矩阵乘铺到多核**（`parallel::matmul_f32`，12 线程，不绑核）：
-
-| 规模 | 单线程 | 12 线程 | 加速比 | 多核 GFLOP/s |
-|---|---|---|---|---|
-| 64³ | 7.7（7.6–7.7） µs | 2（2–2.1） µs | 3.76（3.64–3.78）× | 257.9（249.9–258.8） |
-| 128³ | 62.5（62.2–65.4） µs | 10.7（10.4–12.3） µs | **5.89（5.06–6.14）×** | **393.4（340.4–404）** |
-| 256³ | 527.4（524.1–549.4） µs | 104.7（100.6–113.8） µs | **5.15（4.63–5.28）×** | 320.5（294.7–333.7） |
-| 512³ | 4.45（4.36–4.89） ms | 809.7（807.1–811.4） µs | 5.51（5.38–6.03）× | 331.5（330.8–332.6） |
-
-> 加速比到不了 12×：`lasx_matmul` 一次算 4 行 × 32 列，每个 4 行块都要重读整个 `B`，
-> 所以 `B` 的流量 ≈ `(m/4)·k·n·4` 字节（256³ = 16 MB/次调用）——压的是共享缓存而不是派活。
-> 修法（并行层打包一次、各线程只读共享面板）只在 `m ≥ 512` 生效，所以 256³ 这一档
-> 仍是流量受限。线程数不是越多越好：1080³/1024³ 的扫描见 §13.7 与 §16.3。
-
-### 7.8 横向对照：三类 NN 内核为什么差这么多
-
-把 §7.4 里 NN 那几行放在一起（同为单线程、同一口径）：
-
-| 内核 | 访存遍数 | 每条流的带宽 | 实测吞吐 | 受限原因 |
-|---|---|---|---|---|
-| `rms_norm` | 2（读 + 写） | 6.1–9.1 GB/s | 12.16–18.29 GB/s | 接近单流锚点（§7.1 的 10.7–14.7） |
-| `softmax_rows` | 3（max / exp+sum / 归一） | 1.7–2.2 GB/s | 4.95–6.72 GB/s | 同上，但**多一遍** |
-| `silu`/`gelu_quick` | 2 | 1.9–4.6 GB/s | 3.88–9.18 GB/s | **算力**：每 8 元素 ~19 条向量指令 + 一次除法 |
-| `gelu_erf` | 2 | 1.8–2.7 GB/s | 3.59–5.49 GB/s | 算力（比 silu 多 5 项 Horner + 一次除法） |
-| `rope`·NeoX | 2.5（含表） | 13.3–28.7 GB/s | 33.27–71.73 GB/s | 算力很轻，小形状整块驻缓存 |
-| `dot_f16` | 2（f16 权重 + f32 向量） | — | 38.12–68.27 GB/s | 同上（L1/L2 驻留） |
-| `gemv_f16` | ~2.5 | — | 4.2–64.69 GB/s | 小形状在缓存里，33.5 MB 那档掉到 DRAM |
-
-**这张表是本节最有用的一页**：同样的 SIMD 宽度下，"每条流的带宽"能差 5 倍以上，
-差别全部来自"每字节要算多少指令"。想让某个内核更快，先在这一列上定位它离锚点多远。
-
-### 7.9 N3：int8 GEMV / 批量 GEMM 与量化生产端（2026-10-02）
-
-> **本节数字分两类（2026-10-15 整理）**：
-> **① 横截面表**（下面第一、二张）来自 2026-10-15 方差法复测的**批 P（绑核）**——进程级 6 轮
-> （丢弃首轮、取后 5 轮中位数），每个数字写成 `中位数（极差）`；轮前 1 分钟 loadavg 为
-> `4.60 C / 2.81 B / 2.93 B / 2.78 B / 3.02 B / 2.54 B`（首轮 C 级丢弃），二进制 `aab6746`。
-> **② 其余内容**（f32 同形状对照、批量 vs 逐 token、池扩展、两个判别实验）是 **2026-10-02 的
-> 调查记录**：各有自己的口径与结论，**不是可一键重跑的横截面表、本轮未复测**，数值保持原样。
-
-**int8 横截面（2026-10-15，批 P，绑核）**：
-
-| 内核 | 形状 | LASX 时间 | 标量 | LASX/标量 | 吞吐 |
-|---|---|---|---|---|---|
-| `lasx_gemv_i8` | 768×768 | 49.1（48.8–53.1） µs | 100.8（100.6–108.2） µs | 2.05（2.04–2.06）× | 12.09（11.19–12.15） GB/s |
-| `lasx_gemv_i8` | 768×3072 | 222.3（221.6–242.5） µs | 393.5（392.6–421.3） µs | 1.77（1.74–1.77）× | 10.64（9.75–10.68） GB/s |
-| `lasx_gemv_i8` | 3072×768 | 190.5（188–210） µs | 404.4（402.1–432.8） µs | 2.12（2.06–2.14）× | 12.45（11.3–12.62） GB/s |
-| `lasx_gemv_i8` | 1×3072 | 182（182–196） ns | 450（450–478） ns | 2.47（2.44–2.47）× | **33.78（31.37–33.78） GB/s** |
-| `lasx_gemv_i8` | 64×768 | 2.9（2.9–3.1） µs | 7.4（7.4–7.9） µs | 2.56（2.52–2.57）× | 17.36（15.96–17.45） GB/s |
-| `lasx_quantize_i8_per_row` | 192×768 | 77（76.8–84.7） µs | 598.2（596.9–601） µs | 7.77（7.07–7.77）× | 9.58（8.72–9.61） GB/s |
-| `lasx_quantize_i8_per_tensor` | 192×768 | 78.2（78.1–79.1） µs | 616.2（615.6–644.6） µs | 7.88（7.81–8.24）× | 9.42（9.32–9.44） GB/s |
-| `lasx_quantize_i8_per_row` | 192×3072 | 272.8（271–306.5） µs | 2.37（2.37–2.5） ms | 8.7（8.15–8.74）× | 10.81（9.62–10.89） GB/s |
-| `lasx_quantize_i8_per_tensor` | 192×3072 | 313.6（311.8–355.5） µs | 2.47（2.46–2.6） ms | 7.87（7.3–7.89）× | 9.4（8.3–9.46） GB/s |
-| `lasx_absmax_rows` | 192×3072 | 88（87.5–96） µs | 963.9（962.2–1020） µs | 10.96（10.6–10.99）× | 26.83（24.59–26.97） GB/s |
-| `lasx_amax` | 192×3072 | 86.6（85.9–94.8） µs | 959.6（956.5–1010） µs | 11.08（10.64–11.14）× | 27.25（24.88–27.47） GB/s |
-
-（本表只列批 P 覆盖的列——**没有**旧表的"f32 同形状对照 / 比值"列：那来自 2026-10-02 的独立
-测量，不能与本节新数写在同一行里相减。）
-
-**批量 `lasx_matmul_i8`（2026-10-15，批 P，绑核，同口径）**：
-
-| 形状（token×k×n） | `lasx_matmul_i8` | 标量 | 吞吐 |
-|---|---|---|---|
-| 192×768×768 | 9.13（9.08–10.01） ms | 9.11（9.07–10.14） ms | 145.4（132.6–146.1） M/s |
-| 192×768×3072 | 35.73（35.4–38.38） ms | 36.02（35.3–38.75） ms | 136.2（126.8–137.5） M/s |
-| 192×3072×768 | 41.91（41.71–46.2） ms | 41.78（41.59–46.08） ms | 84.4（76.6–84.8） M/s |
-
----
-
-**以下为 2026-10-02 的调查记录（本轮未复测，数值保持原样）**
-
-`cargo run -p lasx_bench --release -- int8`，`taskset -c 4`，进程级 3 轮（丢弃首轮、取中位数；
-轮间差 ≤1%，下表是第 2/3 轮的中位数）。形状取 §21.2 那个 118M 判别式编码器的真实层形状
-（hidden 768、FFN 3072、序列 192）。
-
-| 内核 | 形状 | 时间 | 吞吐（权重/读写字节） | f32 同形状对照 | 比值 |
-|---|---|---|---|---|---|
-| `lasx_gemv_i8` | 768×768 | 49.2 µs | 12.05 GB/s | `lasx_matmul`(n=1) 796 µs（2.97 GB/s） | **16.2×** |
-| `lasx_gemv_i8` | 768×3072 | 220.7 µs | 10.72 GB/s | 3.22 ms（2.93 GB/s） | **14.6×** |
-| `lasx_gemv_i8` | 3072×768 | 190.9 µs | 12.43 GB/s | 3.20 ms（2.97 GB/s） | **16.8×** |
-| `lasx_gemv_i8` | 1×3072 | 182 ns | **33.8 GB/s** | 4.2 µs（5.84 GB/s） | 23.1× |
-| `lasx_gemv_i8` | 64×768 | 2.9 µs | 17.5 GB/s | 66.4 µs（3.00 GB/s） | 22.9× |
-| `lasx_quantize_i8_per_row` | 192×768 | 76.9 µs | 9.60 GB/s | 标量 598 µs | 7.8× |
-| `lasx_quantize_i8_per_tensor` | 192×768 | 79.5 µs | 9.27 GB/s | 标量 617 µs | 7.8× |
-| `lasx_quantize_i8_per_row` | 192×3072 | 271.8 µs | 10.85 GB/s | 标量 2.37 ms | 8.7× |
-| `lasx_quantize_i8_per_tensor` | 192×3072 | 315.4 µs | 9.35 GB/s | 标量 2.47 ms | 7.8× |
-| `lasx_absmax_rows` / `lasx_amax` | 192×3072 | 87.2 / 87.0 µs | 27.0 / 27.1 GB/s | 标量 965 / 960 µs | 11.1× |
-
-三条读数（都直接影响 §21 的结论）：
-
-1. **大形状上 `gemv_i8` 已是带宽饱和**：10.7–12.4 GB/s 贴着 §7.1 的**单流只读锚点 12.0 GB/s**；
-   而 `1×3072`（4 KB 权重、L1 驻留）能跑 **33.8 GB/s** ⇒ 瓶颈是**访存**，不是整数算力。
-   含义：model 尺寸上再做指令级优化，收益上限就是"把 12 GB/s 抬到 33 GB/s"那一段，
-   而那段只有数据进缓存才拿得到。
-2. **14.6–16.8× 必须拆开读**：= 4×（int8 每权重 1 B vs f32 4 B）× **3.6–4.2×**，后者来自
-   f32 对照走的 `lasx_matmul`(n=1) 是 **GEMM 的打包路径**（只有 2.94–2.97 GB/s），
-   不是 f32 GEMV 的上限（§7.4 里 f32 `dot` 是 41.8–68.5 GB/s，按元素/秒与 int8 同量级）。
-   **所以 int8 的真实收益就是那 4× 流量**，与 §21.5 的推算一致；把 14–16× 当成
-   "int8 比 f32 实现快 15 倍"会误导后续排期。
-3. **per-token 量化几乎不花钱**：`per_row` 与 `per_tensor` 在 192×768 上是 76.9 vs 79.5 µs、
-   在 192×3072 上是 271.8 vs 315.4 µs——**逐行反而更快**（每行 3 KB 的两遍都在 L1，
-   整张量一遍则要 2.4 MB 走 L2）。也就是说"为了 2.7 个百分点准确率选 per-token"（§21.3）
-   **在性能上不付代价**。
-
-**批量（`lasx_matmul_i8`）——这条把 §21.6 的 (b) 档预期否掉了**（同一口径，3 轮）：
-
-| 形状（token×k×n） | `lasx_matmul_i8` | 逐 token 跑 `gemv_i8` | f32 `lasx_matmul` GEMM(n=192) |
-|---|---|---|---|
-| 192×768×768 | 9.03–9.20 ms | 9.06–9.17 ms（**1.00×**） | **3.55–3.58 ms**（快 2.5×） |
-| 192×768×3072 | 35.9–36.2 ms | 35.7–36.3 ms（**1.00×**） | **14.4 ms**（快 2.5×） |
-| 192×3072×768 | 41.0–43.1 ms | 41.0–42.7 ms（0.99×） | **15.2 ms**（快 2.7×） |
-
-**批量没有带来任何收益**，原因是"复用"发生在错误的地方：`matmul_i8` 的每个输出元素是一次
-`dot_i8`（把 W 的行整条读一遍），所以同一个 W 行被 192 个 token **各读一遍**——只不过从 DRAM
-换成了 L2，而 L2 带宽也是 ~12 GB/s（实测 12.5 GMAC/s，与 GEMV 逐 token 的 12.0 完全一致）。
-**真正的复用必须在寄存器里**（像 `lasx_matmul` 那样打包 + 多累加器微内核），而 f32 之所以快
-2.5× 正是因为它有这么一套：**f32 一条 `xvfmadd.s` 是 8 个 FMA = 16 FLOP/指令，而 LASX 的
-int8 "乘 + 加宽 + 累加"链只有 ~4–5 MAC/指令**（§21.7 第 2 条：ISA 没有融合 int8 点积）。
-所以在这一代 LoongArch 上：
-
-| 场景 | 谁赢 | 依据 |
-|---|---|---|
-| **单 token、权重从 DRAM 流**（权重 > 缓存） | **int8 赢 ~4×** | 每权重 1 B vs 4 B，两者都贴 12 GB/s 锚点 |
-| **批量、权重驻 L2/L3**（算力受限） | **f32 赢 ~2.5×** | 16 FLOP/指令 vs ~4–5 MAC/指令，实测 3.58 vs 9.03 ms |
-
-⇒ 对 §21.2 那个"192 token、118M、权重 2.36 MB/层（L2 装得下）"的消费者，**f32 `lasx_matmul`
-才是更快的选择**；int8 的价值只在"权重装不进缓存、必须流 DRAM"的形态上
-（更大的模型，或单 token 且冷缓存）。这条与本仓"收益不是速度时不做"的规矩一起，
-说明 `matmul_i8` 的取舍不该按"int8 一定快"来做——数据在 §21.8。
-
-**多核（`parallel::matmul_f32`，不绑核，3 轮）**——批量形态既然该用 f32，端到端就得按
-"f32 + 多核"算，这张表就是那个乘数：
-
-| 形状 (m×k×n) | 1 线程 | 2 | 4 | 8 | 12 | 24 | 12 线程扩展 |
-|---|---|---|---|---|---|---|---|
-| 192×768×768 | 3.62–3.65 ms | 2.02–2.04 ms | **1.09–1.11 ms** | 1.18–1.54 ms | 1.11–1.17 ms | 0.94–1.06 ms | 3.1–3.3× |
-| 192×768×3072 | 14.6–15.7 ms | 7.35–7.36 ms | **3.96–3.99 ms** | 5.35–5.65 ms | 5.92–6.14 ms | 4.42–4.52 ms | 2.5× |
-| 192×3072×768 | 15.1–15.9 ms | 7.66–8.16 ms | **3.99–4.16 ms** | 5.17–5.35 ms | 5.12–6.05 ms | 4.41–4.51 ms | 2.5–3.1× |
-
-**这张表要读得小心（收口复验时发现的，随后做了记录 load 的对照测量）**：
-
-同一张表在不同窗口跑，**第 1 轮是单调的**（3.66 → 1.94 → 1.09 → 1.07 → 1.01 → 0.917 ms），
-第 2/3 轮才出现"8/12 线程比 4 线程慢"。为了把它判成"池的缺陷"还是"邻居负载"，补做了
-**记录 load 的对照测量**（新套件 `lasx_bench pool_scaling`：线程数扫 1..24，输出第一行就是
-`/proc/loadavg`）：
-
-| 线程 | `192×768×3072` | `192×3072×768` | 效率 |
-|---|---|---|---|
-| 2 | 7.57–7.73 ms（1.94–1.98×） | 7.91–7.97（1.97–2.06×） | 97–103% |
-| 4 | 4.16–4.22（3.54–3.61×） | 4.03–4.42（3.71–3.90×） | 88–98% |
-| **6** | **2.96–3.15（4.75–5.03×）** | **3.06–3.47（4.50–5.13×）** | **75–86%** |
-| 8 | 4.81–5.76（2.59–3.13×） | 4.68–5.12（3.07–3.44×） | **32–43%** |
-| 12 | 5.10–5.26（2.86–2.92×） | 4.72–5.02（3.11–3.33×） | 24–28% |
-| 16 | 4.08–4.16（3.59–3.68×） | 3.87–3.94（4.02–4.16×） | 23–26% |
-| 24 | 4.39–4.59（3.25–3.40×） | 4.08–4.28（3.67–3.92×） | 14–16% |
-
-**结论（三个窗口、两个形状、load 已记录）**：
-
-1. **1 → 6 线程单调**（1.94× / 2.84–2.99× / 3.54–3.90× / 4.50–5.13×），**最优在 6 线程**；
-2. **8 线程处有系统性下降**（效率从 75–86% 掉到 32–43%），**10/12 也没有回来**，16/24 部分回升
-   到 3.6–4.2×——三个窗口都复现、两个形状都复现；
-3. **所以"邻居负载造成的超订"这个解释被推翻**：那三个窗口的 `loadavg` 是 **1.73 / 1.75 / 3.05**，
-   按"物理核 12 − 邻居 2~3 ≈ 9–10"算，分界该在 9 或 10，而下降发生在 **8**，且在 16/24 还回升
-   （超订解释预测的是"越多越差"）。**上一条记录里"已查明是超订、不是池的缺陷"这个结论是错的**，
-   这里更正为：**是系统性的、原因未定的下降**。
-
-**两个判别实验已做（`lasx_bench pool_attribution`，3 轮、load 记录在 1.89–2.54）——两个候选都被排除**：
-
-| 实验 | 结果 | 结论 |
-|---|---|---|
-| ① **换工作集** | 权重 512 KiB（**单核 L2 装得下**）：4 线程 255.7–259.5 µs、6 线程 204.4–250.0、**8 线程 287.1–400.8**、12 线程 280.7–297.1；9 MiB 那档同样的形状（6 最好、8 掉） | **不是缓存/L3 争用**——L2 驻留的小工作集**照样在 8 掉** |
-| ② **换调度策略**（固定 8 线程，9 MiB） | 默认 `pick_rows` 3.46–3.65 ms、`RowBlock` 3.36–5.38、`Blocked{4}` 3.38–4.59、`Dynamic{4}` 3.42–3.56 | **不是块粒度/pick 判据**——四种策略都落在 ~3.4–3.6 ms，**没有一种回到 6 线程的 3.0 ms**（默认与 RowBlock 打平）。**⚠️ 请勿引用本行的单次值**：台架后续被证有**顺序效应**且同路两臂摆动可达 **1.6×**；已按"≥5 轮中位数 + 极差"重测，结果见 §7.11 ⑤（默认 3.68、`RowBlock` 2.96、`Blocked{4}` 5.21、`Dynamic{4}` 4.62 ms，中位数）。 |
-
-**③ profile 归因（`perf record`，用 `LASX_BENCH_THREADS` 把样本对准单一线程数）——找到真因**：
-
-| 线程 | 热点符号 | 池开销 |
-|---|---|---|
-| 6（快） | `matmul_f32_packed_rows` **87.8%** | `finish_round` 6.98% + `worker_loop` 1.84% + dispatch ~2.2% |
-| 8（慢） | `lasx_matmul` **46.5%** + `matmul_f32_cols_block` **39.8%** | `finish_round` 12.5% + `worker_loop` 0.40% |
-
-⇒ **不是池的派活/等待协议**（那部分两种情况下都只占 7–13%），**而是"块配置改变了内核路径"**：
-6 线程走**打包面板**路径（B 打包一次、各块复用，`pack_b` + 面板缓冲），
-8 线程走的是**每块调用 `lasx_matmul`**（`cols_block`）的路径——后者每块各自打包一遍/或退化成
-逐块调串行内核，于是 1.6× 的差距。`pick_rows(192, threads, 4)` 的块长恰好在这里分界：
-**6 线程 = 8 行/块（24 块）、8 线程 = 6 行/块（32 块）**，12/16/24 线程都是 4 行/块。
-
-**④ 同线程数 A/B：判据缺了"B 有多大"这一维（已实测，待改）**。用 `LASX_BENCH_THREADS`
-把样本对准 6/8/12/24，再临时把 `need_shared_pack` 改成 `threads > 1`（强制共享打包），
-**同一二进制、同一线程数**对照（`192×768×3072`）：
-
-| 线程 | 原判据（回退路径） | 强制共享打包 |
-|---|---|---|
-| 6 | 2.92 ms | 3.20 ms |
-| 8 | **7.31 ms** | **2.92 ms** |
-| 12 | 5.27 ms | **2.96 ms** |
-| 24 | 4.24 ms | **3.28 ms** |
-
-**根因**：回退路径**每个块各自遍历一遍 B**——8 块 × 9.4 MB ≈ 75 MB，按 12 GB/s 算 ≈6.3 ms，
-正好解释 7.31 ms；共享打包只遍历两遍（打包一次读+写、之后各块读共享面板）≈18.8 MB。
-而文档里那条"`per_thread < 32` 走回退"是在 **`256³`（B = 256 KB）**上定的：那里回退确实赢
-（327 vs 223 GF/s）。**所以判据只在"每线程行数"这一维上判，缺了"B 有多大"**。
-
-**已落地（2026-10-03，形状扫之后）**：`need_shared_pack` 现在判**两维**——
-`threads > 1 && (m/threads >= PACK_MIN_M || k*n >= SHARED_PACK_MIN_ELEMS(=1<<18，即 1 MiB 的 f32))`。
-形状扫（同窗口、同网格，`LASX_BENCH_THREADS` 对准线程数）：
-
-| 形状 | 线程 | 原判据（只看行数） | 新判据（加 B 规模） |
-|---|---|---|---|
-| `192×768×3072` | 8 | 4.93 ms | **2.54 ms（1.94×）** |
-| `192×768×3072` | 12 | 5.11 ms | **2.97 ms（1.72×）** |
-| `192×768×3072` | 24 | 4.26 ms | **3.32 ms（1.28×）** |
-| `192×3072×768` | 8 / 12 / 24 | 4.95–6.27 / 4.99–5.10 / ~4.4 ms | **2.56 / 2.86 / 3.17 ms** |
-| `512³` | 24 | 1.35 ms | **791.6 µs（1.70×）**（B = 1 MiB ⇒ 刚过门槛，回退换共享） |
-| `256³` | 6/8/12/24 | 133.8 / 103.0 / 115.9 / 164.7 µs | 179.9 / 153.8 / 119.1 / 191.1 µs——**同路径**，差异是 µs 量级的调度/邻居噪声 |
-| `1024³` | 6/8/12/24 | 6.90 / 7.35 / 6.02 / 4.46 ms | 6.52 / 5.17 / 5.84 / 4.39 ms——**本就全程共享打包**，差异同上 |
-
-**交替 A/B 复核**（背靠背，各 2 轮，`192×768×3072`）：8 线程 4.68/5.06 → **2.55/2.62 ms**；
-12 线程 4.81/4.97 → **2.95/2.92 ms**——**区间不重叠**，不是噪声。
-**结论**：8 线程处那次"系统性下降"随这条判据一起消失（8 线程现在是该形状最快档，5.99×），
-而文档里"回退赢"的原始数据点（`256³`，B = 256 KB，未过门槛）**行为未变**；
-`512³`/24 线程从"持平"变成 1.70× 更快。旧注记"只按一个形状改就是翻版"至此闭环：
-**先扫了六个形状档，再改判据**。
-
-
-**k 方向切分（`parallel::gemv_i8_k`，`m = 1` 单 token 档位）**——这一张**修正了立项时的预估**：
-
-| k（权重） | 1 线程 | 2 | 4 | 8 | 12 | 24 | 12 线程扩展 |
-|---|---|---|---|---|---|---|---|
-| 3072（3 KiB，L1） | 198 ns | 197 ns | 203 ns | 191 ns | 189 ns | 189 ns | **1.05×（走串行）** |
-| 1 MiB（L2/共享 L3） | 92.1 µs | 48.1 µs | 27.8 µs | 23.2 µs | **16.2 µs** | 54.0 µs | **5.69×** |
-| 16 MiB（DRAM 流） | 5.55 ms | 2.98 ms | 1.91 ms | 1.41 ms | **1.04 ms** | 800 µs | **5.35×（24 线程 6.9×）** |
-
-1. **原以为上限是 DRAM 锚点比（22/12 ≈ 1.8×），实测是 5.4–6.9×**——因为**单线程 `dot_i8`
-   在冷流上只有 ~3 GB/s**（16 MiB 用 5.55 ms），远低于 12 GB/s 锚点：它受限于**访存并行度
-   （MLP）**，而不是 DRAM 带宽本身。k 切分让每个 worker 各自开一条流，等于把 MLP 乘上线程数
-   ⇒ 直接吃到 5–7×。**这条说明"锚点比"不是并行归约的上限，那个上限只对"已经跑满带宽的
-   内核"成立**——又是一个"先量再说"的例子。
-2. **小 k 不要并行**：3 KiB（L1 驻留）时并行版 254 ns vs 串行 190 ns = **0.75×（更慢）**，
-   派活固定开销（~64 ns）压过内核本身。所以门槛写成"**每块 ≥ `GEMV_I8_K_BLOCK`(1024) 且至少
-   4 块**才并行"，否则直接走串行内核（改后那行回到 1.05×，即三列同为串行时间）。
-3. **24 线程在 16 MiB 上比 12 线程还快**（800 µs vs 1.04 ms）：纯流式、没有 f32 GEMM 那种
-   L2 争用问题，SMT 反而帮忙掩盖延迟——与上一张表的结论**不冲突**（那是算力/L2 受限，
-   这张是 DRAM 流受限）。
-
-**int8 保活胶水（反量化 → f32 归一化/softmax → 再量化）值不值一个"整数版"**——量下来是**否**：
-
-| 环节（token = 192） | 实测 |
-|---|---|
-| `192×768`：反量化 109.2 µs + RMSNorm 181.0 µs + 再量化 77.0 µs | **367.3 µs** |
-| `192×3072`：反量化 437.0 µs + RMSNorm 711.2 µs + 再量化 273.6 µs | **1.42 ms** |
-| 注意力 softmax `192×192` | **77.9 µs** |
-
-同一层的 int8 GEMM 是 36.1 ms（4×`192×768×768`）+ 79.3 ms（FFN 两个形状）= **115.4 ms**，
-而整层保活胶水 ≈ 2.24 ms ⇒ **占 1.9%**。所以**专门写整数 softmax / int8 RMSNorm 最多省 2%**，
-却要引入定点 `exp` 与整数归一化的精度风险 ⇒ **不做**；**组合路径（dequantize → `rms_norm`/
-`softmax_rows` → quantize）就是答案**，判据写进 `docs/ops.md` §5.15/§12.3。
-（口径说明：`api::rms_norm`/`softmax_rows` 每次调用会分配输出缓冲，**这两个数因此偏保守**；
-真要抠这 2%，先做的应该是 `_into` 版本省掉分配，而不是整数化。）
-
-**① `_into` 版已落地并实测（2026-10-03）——上面那句"先做 `_into`"被证实低估了收益**：
-分配不是零头，是**大头**（同内核、同数据，只少一次输出缓冲的分配+清零）：
-
-| 形状 | `api::rms_norm`（分配版） | `api::rms_norm_into` | 分配占调用 |
-|---|---|---|---|
-| `192×768` | 179.8 / 183.4 / 183.5 µs | **75.2 / 75.7 / 75.5 µs** | **58–59%** |
-| `192×3072` | 703.8 / 714.1 / 717.0 µs | **258.1 / 263.3 / 259.7 µs** | **62–63%** |
-
-⇒ `_into` 快 **2.4×**。整层保活胶水从 2.24 ms 降到 **≈1.31 ms**（占该层 GEMM 的 **1.1%**——
-比例仍小，但**每个前向省下 ~11 ms**，在"整序列 ≈150–210 ms"那个量级上是 5–7%）。
-**所以整数版仍然不做，而 `_into` 已经做了**（`softmax_rows_into` 同一机制；这条对**所有**
-"每次调用分配输出"的 api 都成立，只是归一化/softmax 在保活路径上被调得最频繁）。
-
-**② int8 家族的 `_into`（2026-10-03，3 轮进程级）**——同一套口径，但**收益小得多**，
-原因是这几个内核本身在做实事（量化要做 `absmax` + 倒数乘 + 取整），分配占比降下来了：
-
-| 步骤（`192×768`） | `api` 分配版 | `_into` | 省 |
-|---|---|---|---|
-| `dequantize_i8_rows` | 142.1 / 145.1 / 145.2 µs | **109.3 / 111.1 / 111.0 µs** | 33–34 µs（**23%**） |
-| `quantize_i8_per_token` | 85.0 / 89.3 / 89.2 µs | **76.6 / 80.6 / 80.6 µs** | 8.4–8.7 µs（10%） |
-
-| 步骤（`192×3072`） | `api` 分配版 | `_into` | 省 |
-|---|---|---|---|
-| `dequantize_i8_rows` | 568.4 / 580.4 / 579.6 µs | **437.2 / 444.0 / 444.6 µs** | 131–136 µs（**23%**） |
-| `quantize_i8_per_token` | 304.9 / 314.7 / 314.3 µs | **272.2 / 280.7 / 280.5 µs** | 33–34 µs（11%） |
-
-**一个必须写清的口径差别**：本节 (a1)/(a3) 那两行 **109.2 / 77.0 µs 走的是 FFI 预分配路径**
-（调用方自己给缓冲），而上面的"分配版"是 **Rust 调 api** 的数——**两套数不可混用**：
-FFI 消费方（C/Dart 绑定）**从来没有这笔分配开销**，这笔账只对 **Rust api 消费方**成立。
-按每层 192×768 与 192×3072 各一次算，`_into` 在 int8 族上每层省 ≈213 µs，
-加上 RMSNorm 的 558 µs ⇒ **每层 ≈0.77 ms，12 层 ≈9 ms/前向**（在 150–210 ms 上是 4–6%）。
-
-**③ 其余 api 的分配成本审计（2026-10-03，`lasx_bench dispatch` 新增一段，3 轮）**——
-`AlignedVec::new(n)` = `vec![default; n + 对齐余量]`，即**分配 + 清零**，直接量它：
-
-| 元素数（f32） | 字节 | 时间 | 等效带宽 |
-|---|---|---|---|
-| 147 456（= 192×768） | 0.6 MiB | **33.8 / 33.2 / 32.8 µs** | 17.4–18.0 GB/s |
-| 589 824（= 192×3072） | 2.2 MiB | **134.3 / 132.6 / 132.5 µs** | 17.6–17.8 GB/s |
-| 1 048 576 | 4.0 MiB | 238.2 / 236.1 / 242.8 µs | 17.3–17.8 GB/s |
-| 4 194 304（= 4096²） | 16.0 MiB | 972.7 µs / 997.6 µs / 1.00 ms | 16.7–17.2 GB/s |
-
-**这里有一个必须点出来的不一致（不是笔误）**：直接量 147 456 个 f32 的分配是 **33 µs**，
-而 ①里面 `rms_norm` 的 A/B 差额是 **104.6 µs**（179.8 → 75.2）。两者量的是同一件事却差 3 倍，
-原因没有查清（可能是分配器状态/两次 buffer 同时在世/首次触碰新 mmap 的页错误路径不同）。
-**所以筛选用 A/B（同内核 ±一次分配）为准，直接量只当"下界参考"**——本节的表格标的就是这个口径，
-不要把两者混着用。
-
-**A/B 实测（2026-10-03，`lasx_bench dispatch`：api 分配版 vs 同内核的 FFI 预分配版，3 轮）**——
-这条 A/B **不需要先写 `_into`**（FFI 符号本来就是"调用方给缓冲"），两者只差一次分配：
-
-| 算子 | 规模 | api（分配） | FFI（预分配） | 分配占比 |
-|---|---|---|---|---|
-| `silu` | 589 824（=192×3072） | 840.0 / 842.0 / 840.5 µs | 719.6 / 723.9 / 720.9 µs | **14–15%** |
-| `gelu_quick` | 同上 | 862.7 / 866.9 / 864.2 µs | 744.3 / 745.4 / 746.5 µs | **14%** |
-| `gelu_erf` | 同上 | 1.24 / 1.24 / 1.24 ms | 1.12 ms | **10%** |
-| `matmul`（串行） | 192×768×3072 | 15.27 / 15.76 / 15.59 ms | 15.29 / 15.26 / 15.42 ms | **0–3%（噪声内）** |
-| `matmul`（串行） | 192×768×768 | 3.66 / 3.67 / 3.66 ms | 3.65 ms | **0%** |
-| **`rope`** | 192×768（n_dims=128） | 83.9 / 87.3 / 85.0 µs | **50.6 / 53.4 / 52.1 µs** | **39–41%** |
-| `gemv_f16` | m=4096 k=4096 | 8.26 / 7.76 / 6.52 ms | 9.74 / 8.38 / 6.84 ms | **0.0%**（api 有时还更快 ⇒ 纯噪声） |
-
-**`dot_f16` 根本不是候选**：它返回**标量**（`-> Result<f32>`），没有输出缓冲可省
-——这一条也记下来，免得下次重新审一遍。
-
-**一个有用的对照**：这里 A/B 的差额（`silu` 119 µs、`gelu_quick` 118、`gelu_erf` 120 µs）
-与直接量的 589 824 个 f32 分配成本（132–134 µs）**量级一致** ⇒ ①里 `rms_norm` 那处
-"33 vs 104" 的不一致**是短内核特有的**（`rms_norm` 内核仅 ~75 µs，分配器/页错误路径的差异
-被放大），**不是所有算子都这样**。口径不变：**筛选以 A/B 为准**。
-
-**最终决定（"不为了铺满而铺"的落地）**：
-
-| 算子 | 分配占比 | 决定 |
-|---|---|---|
-| `silu` / `gelu_quick` / `gelu_erf` | **10–15%** | ✅ **做**（已加 `silu_into`/`gelu_quick_into`/`gelu_erf_into` + 逐位一致与错误路径测试） |
-| **`rope`** | **39–41%**（**全库最高**：内核只 ~51 µs，输出 0.6 MiB ⇒ 分配 ~33 µs） | ✅ **做**（已加 `rope_into` + 逐位一致/错误路径测试；RoPE 在注意力里每层都调） |
-| `matmul` / `matmul_f64` | **0–1%**（GEMM 本身 15.3 ms 主导，输出 2.2 MiB 的分配 ~133 µs ⇒ 差两个数量级） | ❌ **不做**：占比落在噪声内，铺了只增 API 面积 |
-| `gemv_f16` | **实测 0.0%**（输出仅 `m` 个 f32 = 16 KiB，被 6.5–9.7 ms 的内核完全淹没） | ❌ **不做**（**这条是实测，不再是"按推算"**） |
-| `dot_f16` | 不适用（返回标量，无输出缓冲） | ❌ **不是候选** |
-
-**④ 物理/几何批量族（2026-10-04）——顺带纠正了这条 A/B 的一个方法学缺陷**：
-
-| 算子 | 规模 | 设计 | 结果 | 决定 |
-|---|---|---|---|---|
-| `norm3_batch`（1 缓冲） | n = 65536 | api vs FFI | **17.3 / 17.3 / 17.7%**（load 1.85–1.87） | ⚠️ **候选，但待对称复核**（见下） |
-| `norm3_batch`（同上，对称设计） | 同上 | 同内核 ± 分配 | 5.8 / 22.8 / 18.4%（**load 14.7–15.5**） | ❌ **本窗口不可用，不作数** |
-| `quat_to_dcm_batch`（**9 缓冲**） | 同上 | 对称设计 | **3.8 / 3.8 / 3.4%**（load 2.22–2.24） | ❌ **不做**：3.5% 换不来"一次返回 9 个缓冲"的签名重设 |
-| 该族其余（`unitize3_batch` / `quat_*` 等） | 未测 | — | — | ⏸ **不做**：一次返回 3–9 个缓冲，改 `_into` 要重设签名 ⇒ **等消费侧实测需求**再动 |
-
-**方法学教训（1）：`api vs FFI` 这条设计会骗人，必须改"对称设计"。** 最初用 `api vs FFI` 量
-`quat_to_dcm_batch`，得到 **api 比 FFI 快 2.3×**（900 µs vs 2.11 ms）——分配**不可能**产生这个方向。
-读代码查明：**两个入口调用的是同一个 `ops::quat_to_dcm_batch`**（`api.rs:1388` 与
-`ffi/attitude.rs:280` 逐行等价）⇒ 差额只能来自台架不对称。于是把两臂都改成**同一个 FFI 内核、
-只差"预分配 vs 每次分配"**，得到自洽的 3.4–3.8%（预分配臂 2.39–2.47 ms 与旧 FFI 臂 2.11–2.44 ms
-吻合 ⇒ 作废旧 api 那臂）。**旧 api 臂 0.9 ms 的成因仍未解释**，但新结论不依赖它。
-`norm3_batch` 的 17% 也出自旧设计 ⇒ **它也要用对称设计复核后才算数**。
-
-**方法学教训（2）：负载窗口要当场判废。** 同一台机器、同一个二进制、同一段测量代码，
-`load` 1.85 时给 17.3/17.3/17.7%，`load` 14.7–15.5 时给 5.8/22.8/18.4% ⇒ **记录 `loadavg`
-的意义就是在这种时候停下**（§6.4 的纪律在这里第一次真正拦下一次"拿数"的冲动）。
-
-**回归测试**：`test_quat_to_dcm_batch_api_matches_ffi_bit_for_bit`——查这条差异时钉下的
-"**两条入口必须逐位一致**"（9 个输出矩阵 × 9 行，`to_bits()` 全等）。它的价值不在这次（结论是
-"纯性能差异、不是 bug"），而在**以后任何一侧改动破坏了这条一致性时会红**。
-
-**⑤ `rope_at`/`rope_tables`：结论是"用法问题"，不是 `_into` 问题（2026-10-04）**。
-这两个入口**没有 FFI 对照**（只有 `lasx_rope`），所以改用**用法级对照**（两臂都走公开 api）：
-
-| `rope_at`（**每次重算表**） vs 预建表 + `rope` | 每次重算 | 预建表 | 差额 |
-|---|---|---|---|
-| 192×768、n_dims = 128，r1 / r2 / r3 | 515.7 / 541.0 / 526.8 µs | **56.5 / 57.8 / 56.8 µs** | **89 / 89 / 89%** |
-
-**读实现先确认了它为什么贵**：`api::rope_at` = `rope_tables`（三角 + **2 次 `fill_with` 逐元素
-拷贝** + 2 次分配）+ `rope`（1 次分配）⇒ 表本身很小（192×64 个三角值），但这条链把它撑成了旋转
-本身的 **9 倍**。⇒ **正确修法不是加 `_into`，而是把表 hoist 出层循环**（`rope_tables` 建一次、
-每层调 `rope`/`rope_into`）——**现有 API 就能做到、零新接口、9×**。这条已写进 `docs/ops.md`
-`docs/ops.md` §5.12 的用法。（口径：load 3.18–3.25 的安静窗口、3 轮；第 6–8 轮那种 load 14–23 的窗口按纪律
-不取数。）
-
-**⑥ `rope_tables` 的性能问题已解决（2026-10-04）：`powf` 从内层循环 hoist 到循环外**。
-**定位（读实现，不是猜）**：`src/ops/rope.rs` 把 `base.powf(-2.0 * i as f64 * inv_dims)` 写在
-内层循环里——指数只与维度 `i` 有关，却被每个 (位置, 维度) 对重算一次（192×64 = **12288 次
-`powf`**，每次 ~35 ns ≈ 400 µs，与实测 ~460 µs 量级吻合）。**改法**：频率表 hoist 出位置循环，
-只算 `half` = 64 次。**合法性的全部依据是"值不变"**：`freq[i]` 与原逐次重算是同一表达式、同一组
-输入，`powf` 确定性 ⇒ `theta = pos * freq[i]` 逐位相同。
-
-| `rope_at` 的"每次重算"（192×768、n_dims=128） | 优化前（load 3.18–3.25） | 优化后（load 3.55–3.62） |
-|---|---|---|
-| r1 / r2 / r3 | 515.7 / 541.0 / 526.8 µs | **290.1 / 288.9 / 289.1 µs** |
-| 其中表重建（减去 57 µs 旋转） | ~460 µs | **~232 µs（~2.0×）** |
-
-**位精确的证据**：新增 `test_rope_tables_bit_exact_vs_per_element_powf`（hoist 后的输出 vs
-**逐元素重算 `powf`** 的参考实现，`to_bits()` 比对，n_dims = 2/8/128 三组）**全等**，
-连同原有 11 个 rope 测试 ⇒ 库单测 **217 → 218**。
-**剩下的 ~232 µs 几乎全是 12288 次 f64 `sin_cos`（每个 ~15–18 ns）——"并行建表"实测后决定
-「不做」（2026-10-04）**。判据不是"理论上能并行"，而是先量**线程启动开销的下界**（12 个空线程
-`std::thread::scope` 的 `spawn+join`）与实际工作量比：
-
-| 192 位置 × n_dims = 128 | r1 / r2 / r3 |
-|---|---|
-| 串行 `rope_tables` | 233.1 / 240.2 / 243.7 µs |
-| **12 线程空 `spawn+join`（启动下界）** | **271.4 / 273.3 / 265.1 µs** |
-
-⇒ **光启动成本就超过全部串行工作**（还没算计算与归并），这个粒度（~237 µs）撑不起"每调用起
-一组线程"。**换 f32 三角也不行**（改变数值，除非先在 `docs/ops.md` 的契约节记录并放弃位精确承诺）。
-**结论的边界（别过度外推）**：本测否掉的是 **`std::thread` 路线**；**`Pool` 的唤醒成本是另一回事**
-（常驻线程、µs 级）。池路线真要再评估，触发条件是**算子的工作量涨到 ms 级**（那时启动开销才摊得薄）；
-即便池把它压到 ~30 µs，收益也只有 ~200 µs，而代价是在"每层都调"的算子上引入池依赖、可能触碰
-§19.7 的冻结契约——而**正确用法本来就是 hoist 表**（实测 9×）。（窗口 load 3.88–3.97，
-略高于 load ≤3 的首选窗口，如实记录：三轮离散小、结论方向有 ~35 µs 余量。）
-
-> **文档纪律（2026-10-04）**：`scripts/doccheck.sh` 只校验**真正的 `§N` 引用**
-> （"§N.M" 这种），**看不见"文内序号"**——⑥ 写成之后，`docs/ops.md` §5.12 里那句指向
-> 本文件 **④⑤** 的引用就**对不上号了（应为 ⑤）而 doccheck 仍然全绿**。
-> ⇒ **规矩**：新增/重排小节编号（④⑤⑥…）后，必须**全仓 `grep` 一遍 `§<节号> [①②③④⑤⑥⑦⑧⑨]`**
-> 对齐；这类引用是**作者责任**，门禁保不了。同类盲区还有"如上/下条/见上一节"这类**不带编号**
-> 的指代——它们同样只在人读时才会暴露。
-
-### 7.10 对外对比：OpenBLAS 0.3.34 与"标量基线"（2026-10-15 方差法复测，对照装置已入库）
-
-> **对手身份（本节所有"vs OpenBLAS"数字共用这一行；公平性清单里"必须声明对手构建"那条要求）**：
-> **OpenBLAS 0.3.34、`DYNAMIC_ARCH`、core **`la464`**（LA64 优化内核，**非**通用 C 兜底）、
-> `NO_AFFINITY`、`MAX_THREADS=32`**。装置每次跑的**第一行**自动打印完整 `OBIDENT`
-> （含 `nthreads_set/get` 与两库共享缓冲的地址）；审计见本节 ⑪。
->
-> **调用模型口径（同样必须带）**：下文"只差 4%"一类数字是**"调用方自己驱动（plan + 调用方线程）"
-> 这个模型**下的；库自管线程的便利路径与手动最优的关系见 ⑫（**旧跨窗口值不可引用**）。
->
-> **⚠️ 本节 ①–⑩ 与 §7.11/§8.x 里的对照数字都是旧口径（跨进程/旧窗口）** ⇒ **不可引用**；
-> **旧数据见 git 历史**（`git log -p docs/dev.md`），本文件只保留**现行口径与结论**。
-> **现行正式口径 = 同进程调用级交替**（规程见 §6.4，正式表见本节 **⑮**）。
-
-**装置（本轮起可复现）**：[`scripts/bench_openblas.c`](../scripts/bench_openblas.c)（**同一个二进制里
-两条实现**：`--impl=lasx|openblas|both`、`--dtype`、`--m/--k/--n`、`--threads=N`、`--split=rows|cols`）
-+ [`scripts/bench_openblas.sh`](../scripts/bench_openblas.sh)（进程级交替、≥5 轮、丢首轮、中位数+
-极差、逐轮 `loadavg`、A/B/C 分级）。复现：
-
-```bash
-cargo build --release
-bash scripts/bench_openblas.sh ob1 6     # 6 轮全形状；原始逐轮日志 /tmp/bench_openblas_ob1_log.txt
-```
-
-**公平性四条**（同一确定性数据/同一预热、CBLAS 布局映射、**先验一致性**、线程对齐与切法标注）
-见 §6.4；装置侧的权威清单在 `.c` 头部注释里。
-
-**旧记录处置**：2026-10-04 那批数字来自 `/tmp/ob_probe.c`（**不进仓库 ⇒ 不可复现**）、各 3 次
-取样、**没有先验一致性**，本节当时自己标着"历史记录、未复测"。**本轮用入库装置整段替换**；
-与旧值方向不一致的格子在 ④ 逐条列出，**不静默覆盖**。
-
-**先验一致性（计时之前，两条实现逐元素互比）**：本轮 14 个形状**全部通过**——小形状
-`max_diff=0.000000e+00`（**逐位相同**），512³ f32 `max_rel=8.95e-07`、f64 `1.78e-15`（阈值
-f32 `1e-3` / f64 `1e-9`）。这同时证明 CBLAS 的布局/维度参数没写错：写错会算出完全不同的东西。
-
-**口径**：同一台 Loongson-3B6000（LoongArch64/LASX，24 可用并行度）；OpenBLAS 0.3.34（版本、
-`liblasx_rs.a` 的 sha256 与 git rev 都写进每轮日志头）；单线程档绑核 `taskset -c 4`，带线程的档
-**不绑核**（口径出处同上）；GFLOP/s = 2mkn/时间；两边都不含分配（走调用方缓冲）。**逐轮 loadavg 与分级**：
-r2 `3.79/3.11`(B)、r3 `2.83/2.96`(**A**)、r4 `2.83/2.95`(**A**)、r5 `2.69/2.87`(**A**)、
-r6 `3.72/3.22`(B)——丢弃首轮（`3.38/2.77`，B）后取 5 轮中位数 ⇒ **3 轮 A + 2 轮 B**
-（比 2026-10-04 那批的 load 2.96–3.23 更安静）。
-
-**① 单线程（绑核 `-c 4`）：本库 `lasx_matmul` / `lasx_matmul_f64` vs `cblas_sgemm`/`dgemm`**
-
-f32（5 轮中位数；`ms（极差）` + GFLOP/s）：
-
-| 形状 | 本库 ms（极差） | 本库 G | OpenBLAS ms（极差） | OpenBLAS G | 差（本库相对） |
-|---|---|---|---|---|---|
-| 64³ | 0.0077（0.0077–0.0088） | **67.8** | 0.0098（0.0097–0.0130） | 53.8 | **本库快 27%** |
-| 128³ | 0.0637（0.0636–0.0895） | **65.8** | 0.0728（0.0726–0.0962） | 57.6 | **本库快 14%** |
-| 256³ | 0.5380（0.5364–0.7349） | 62.4 | 0.5441（0.5436–0.7004） | 61.7 | 打平（+1.1%） |
-| 384³ | 1.8674（1.8591–2.6725） | 60.6 | 1.7695（1.7680–2.3072） | 64.0 | 本库慢 5.2% |
-| 512³ | 4.4100（4.3864–5.9102） | 60.9 | 4.1356（4.1307–4.1624） | 64.9 | 本库慢 6.2% |
-
-f64：
-
-| 形状 | 本库 ms（极差） | 本库 G | OpenBLAS ms（极差） | OpenBLAS G | 差（本库相对） |
-|---|---|---|---|---|---|
-| 64³ | 0.0155（0.0155–0.0155） | 33.8 | 0.0156（0.0156–0.0156） | 33.6 | 打平（+0.5%） |
-| 128³ | 0.1767（0.1766–0.1767） | 23.7 | 0.1495（0.1494–0.1497） | 28.1 | **本库慢 15%** |
-| 256³ | 1.1760（1.1747–1.1778） | 28.5 | 1.0876（1.0870–1.0890） | 30.9 | 本库慢 7.5% |
-| 384³ | 3.8449（3.8401–3.8768） | 29.5 | 3.6766（3.6720–3.7044） | 30.8 | 本库慢 4.4% |
-| 512³ | 9.2058（9.1558–9.3226） | 29.2 | 8.6220（8.5509–8.6866） | 31.1 | 本库慢 6.3% |
-
-⇒ **单线程的结论（比旧记录更细）**：**小形状本库领先**（64³ +27%、128³ +14%），**256³ 打平**，
-**384³/512³ 本库慢 5–6%**（旧记录写"256³–512³ 打平（±5% 以内）"——本轮把 384³/512³ 那两格
-改成"慢 5–6%"，方向没变、幅度说清了）。**f64 整体慢 4–15%**：其中最差的一格是 **f64 128³
-（23.7 vs 28.1 G，慢 15%）**，而 64³ 打平——说明 f64 的 128³ 是本库的**结构劣势点**（f64 64³→128³
-应是 8×，实测 0.0155→0.1767 是 11.4×，而 OpenBLAS 是 9.6×）。**旧记录在 f64 128³ 上写的是
-"本库 31.0 G（略快）"，与本轮方向相反**，处置见 ④。
-
-**② 多线程 `192×768×3072` f32 @12 线程（本库 C ABI 不导出线程池 ⇒ 调用方切分）**
-
-本库侧有**两种 C 侧切法**（装置 `--split=`，见 `.c` 头部注释）：`rows` = 按输出行切（`docs/ops.md`
-§9 的直白做法）、`cols` = 先把 A/B 转置成"计划"再按输出列切（等价于 Rust 池那条"共享面板"思路）。
-同一装置、同一形状的**单线程**基准（本轮同窗口现测）：本库 15.67 ms（57.7 G）／OpenBLAS 15.56 ms
-（58.2 G）——**单线程两边打平（本库慢 0.7%）**。
-
-| 本库切法 | 本库 ms（GFLOP/s） | OpenBLAS 12 线程 ms（G） | 差 | 本库扩展比（单线程 15.67 / 本档） |
-|---|---|---|---|---|
-| `--split=rows`（默认） | 14.46（62.6） | 2.4623（367.9） | **本库慢 5.9×** | **1.08×（≈不扩展）** |
-| `--split=cols`（预转置 plan） | 3.8357（236.2） | 2.4641（367.7） | 本库慢 1.56× | 4.09× |
-
-⇒ **多线程侧的真实结论**：**"怎么切"决定一切**。`rows` 切法每次 `lasx_matmul` 都要把**整个 B**
-重新打包一遍（12 个线程 = 12 遍 B，9.4 MB×12），带宽立刻打满 ⇒ **扩展比只有 1.08×（≈没并行）**；
-`cols` 切法（每线程只打包自己那一段 B，总量 = B 一遍）能到 **4.08×**，但**仍比 OpenBLAS 慢
-1.56×**（它到 6.3×）。**这是 ABI 层面的账**：Rust 侧的池有"共享打包面板"，而 C ABI 没有池
-（`docs/ops.md` §3.1/§9 明确"多核需调用方自行切子区间"）——C 使用者要么接受 `rows` 的近零扩展，
-要么自己做 `cols` 那套转置"计划"。**两条线不能并排**：旧表那行 12 线程 2.92/2.64 ms（310 G）是
-**Rust 池**口径，本轮 C 侧到不了（见 ④ 的处置行）。
-
-**给 C 使用者的建议（一句话）**：**位精确优先**——要位精确用 `rows`（但几乎不扩展，1.08×）；
-`cols` 快（4.09×）却**在 6/10 形状上不逐位**（⑤ 有证据）⇒ **需要位精确时不要用 cols**。
-**这个口子正在补**（计划句柄 `lasx_matmul_prepare`/`run`/`plan_destroy` + 可调便利入口，
-见 `docs/c-abi.md` 的"计划与句柄"一节）。
-
-**"12 线程效率只有 42%"的成因（2026-10-04 查清，完整账目见 §7.11 ⑩）**——**注意这段解释的是
-Rust 池路径**（旧表 5.09×/2.64 ms 的来源），根因与上面的 `rows` 切法完全同源、只是放大倍数不同：
-**不是派发、不是打包、不是每线程行数**（这三条都被实测否决/收窄），而是**共享打包面板被每个线程
-各读一遍（L3 侧）** ⇒ L3 读量 ≈ **线程数 × B**（12 × 9.44 MB），12 线程 ≈ **39 GB/s**；效率随
-线程数递减的形状（4 线程 91% / 8 线程 58% / 12 线程 42% / 24 线程 20%）与"带宽墙"吻合。
-**OpenBLAS 在同形状快的原因也在这里**：它把面板/列也分给线程 ⇒ 每线程只读自己那部分 B（本轮
-`cols` 切法正是照这个思路做的，代价是一次转置 + 散射）。
-**修法**（把 B 的面板也分给线程组）**需要一个新的"带显式工作量"的池入口**——现有池 API 表达不出
-（判据看数据数组大小、chunk 是连续切片、C 行主序 ⇒ 无法连续切列，§7.11 ⑧ 有完整论证）⇒
-**属 API 变更，未获授权前不做**；已记在 §7.11 ⑩ 末尾的"未做（须授权）"。
-
-**③ 宽薄形状 `256×64×4096` f32**（k 小 ⇒ 打包/分块的成本结构完全不同，值得单列）
-
-| 档 | 本库 ms（G） | OpenBLAS ms（G） | 差 |
-|---|---|---|---|
-| 单线程（绑核） | 2.1741（61.7） | 3.2723（41.0） | **本库快 50%** |
-| 12 线程（本库 `cols`） | 0.9963（134.7） | 0.6087（220.5） | 本库慢 1.64× |
-
-⇒ **单线程宽薄形状本库大幅领先（+50%）**：k=64 时 OpenBLAS 的分块拿不到好处，而本库的打包 +
-4×32 瓦片正好吃这个形状。12 线程档仍受"没有池"的限制（`cols` 只到 2.2× 扩展）。
-
-**④ 旧值 vs 新值（便于核对上面的处置；旧值 = 2026-10-04，`/tmp` 探针、3 次取样、无先验一致性）**
-
-| 口径 | 旧（2026-10-04） | 新（2026-10-15，入库装置、5 轮中位数） | 处置 |
-|---|---|---|---|
-| f32 64³ | 本库 68.6 G / OB 44.7–52.4 G | 67.8 / 53.8 | 方向一致（本库领先）；OB 侧旧值偏低 ⇒ 以新值为准 |
-| f32 128³ | 67.2 / 57.5–57.7 | 65.8 / 57.6 | 一致 |
-| f32 256³ | 63.0 / 61.1–61.6 | 62.4 / 61.7 | 一致（打平） |
-| f32 384³ | 61.1 / 63.1–63.3 | 60.6 / 64.0 | 一致（本库慢 ~5%）；旧文口径"±5% 以内打平" ⇒ 改为"慢 5%" |
-| f32 512³ | 61.6 / 64.4–64.7 | 60.9 / 64.9 | 一致（本库慢 ~6%） |
-| **f64 128³** | **本库 31.0（旧文：略快）** / OB 28.1 | **23.7 / 28.1** | **方向相反**：本轮本库慢 15%。旧值是单次采样、无先验一致性，且 f64 内核此后有改动 ⇒ **以本轮为准**，旧文"f64 同型（不输）"的措辞作废 |
-| f64 512³ | 31.3 / 28.9–30.7 | 29.2 / 31.1 | 一致（本库慢 ~6%） |
-| `192×768×3072` @1 | 本库 14.86 / OB 14.46–14.72 | 15.67 / 15.56 | 一致（单线程打平） |
-| `192×768×3072` @12 | 本库 **池** 2.92/2.64（310 G）/ OB 2.60–2.66 | C 侧 `rows` 14.46、`cols` 3.84 / OB 2.46 | **口径不同、不替换**：旧行是 Rust 池；本轮补的是 C ABI 侧的两种切法（②）。两条线并列保留 |
-
-**⑤ C 侧多线程的根因复测：B 的重复打包、位精确、以及"现有 ABI 的天花板"（2026-10-15）**
-
-问题（Lead 指派）：`rows` 只有 **1.08×** 扩展比，根因是不是"**B 被每个线程各打包一遍**"？以及
-"打包一次 + 调用方线程"这件事**用现有 C ABI 能不能表达**？为此给装置加了三个**非 ABI** 的测试
-模式（`--mode=scan` / `--mode=verify` / `--no-scatter`，只测时间与一致性，不改任何导出符号）。
-
-**(1) 位精确（最容易出问题的一条，先做）**：单线程 `lasx_matmul` 作参考，`memcmp` 逐位比
-`rows`/`cols` 两种切分；另加一档 `seq_split` = **无线程**顺序把 m 切 2/3 块，用来把"m 分块本身"
-与"多线程"分开：
-
-| 形状（f32，threads=12） | `seq_split` | `rows` | `cols` |
-|---|---|---|---|
-| 100×384×257（k 边界下侧） | bitexact | bitexact | **MISMATCH** |
-| 100×385×257（k 边界上侧） | bitexact | bitexact | **MISMATCH** |
-| 100×386×257 | bitexact | bitexact | **MISMATCH** |
-| 192×768×3072（②的形状） | bitexact | bitexact | bitexact |
-| 512³ / 64³ / 256×64×4096 | bitexact | bitexact | bitexact |
-| 7×385×13 / 13×769×384 / 1000×385×33 | bitexact | bitexact | **MISMATCH** |
-
-- **`rows`（`docs/ops.md` §9 的"调用方按行切"）10/10 逐位一致**，含 k=384/385/386 两侧与
-  m=7/13/100/1000 这种不整除行块 ⇒ 这条 C 侧用法**可以放心用**。
-- **`cols`（预转置 + 按列切）在 6/10 形状上与单线程参考不一致**（差在 ulp 级：它是把
-  `Cᵀ = Bᵀ·Aᵀ` 拆成小尺寸调用，尺寸变了 ⇒ 库内路径/分块随之变）。**这条纠正了上一轮的印象**：
-  `cols` 更快，但**不是"位精确等价物"**——"要不要切、怎么切"必须由库自己给（这正是第 5 条结论）。
-- 装置自身也踩过一个坑并已修：`verify` 模式第一版只初始化了 cols 分块参数，导致 `rows` 桶
-  用未初始化的 `rows_per_thread` ⇒ 报出**假 MISMATCH**。修法是"两种切分的参数都备好"；
-  该教训写在 `scripts/bench_openblas.c` 的建池注释里。**"自检报错"先怀疑自检本身**。
-
-**(2) 打包量核算（根因）**：`rows` 每次调用打包**整个 B**（k×n = 768×3072×4 B = 9.44 MB），
-12 线程 ⇒ **113 MB/调用**；`cols` 的内层调用是 `(w, k, m)` ⇒ 打包的是 **Aᵀ**（k×m = 0.59 MB），
-12 线程 ⇒ **7 MB/调用**——**16×**。同形状同线程数的实测：`rows` 62.6 G → `cols` 236.2 G
-（**3.8×**）。⇒ **"B 被打包 N 遍"就是主因**，与"按行切"这个用法直接绑定。
-
-**(3) 三档对照（`192×768×3072` f32 @12；单线程同形状 15.67 ms 作扩展比分母）**
-
-| 档 | ms（GFLOP/s） | 扩展比 | 结果有效？ | 说明 |
-|---|---|---|---|---|
-| `rows`（现状） | 14.46（62.6） | **1.08×** | ✅ 位精确 | 每线程重打包整个 B（113 MB/调用） |
-| `cols`（预转置 plan） | 3.8357（236.2） | **4.09×** | ⚠️ 6/10 形状不逐位 | 打包量降到 7 MB/调用；含散射回 C |
-| `cols` + `--no-scatter`（**只测时间**） | 3.4791（260.5） | **4.50×** | ❌ 结果无效（测试模式） | 拆出**散射 ≈ 0.357 ms（占 9%）** |
-| （上界参照）Rust 池 @12 | 2.64–2.92（310） | 5.4–5.9× | ✅ | 打包一次 + **共享面板**（C ABI 到不了） |
-| （对方）OpenBLAS @12 | 2.46（368） | 6.3× | ✅ | |
-
-`--no-scatter` 的 6 轮中位数（丢首轮）：**3.4791 ms**（3.4336/3.4364/3.4791/3.6133/3.6672；
-loadavg 逐轮 3.15/2.68/2.80）⇒ **散射不是主要成本**（9%）；把打包量降到"每线程只打包自己那一段"
-就能从 62.6 G 跳到 236 G，**再往上（236 → 310）要靠"共享打包面板"**，而那是库内结构。
-
-**(4) 支持性证据（不作决定性依据）**：单线程扫 m（`--mode=scan`，k=768 n=3072）：m=192 时
-46.5–47.7 G，m=768/1536 时 55–59 G ⇒ 每次调用里确实有一笔**与 m 无关、与 B 的字节数有关**的固定
-成本。但它**不能当截距用**：核内按 m 的分块效率本身也在变（m=3072 又掉回 48 G），线性拟合会给出
-负截距——所以这里只当"存在固定成本"的旁证，**根因认定以上面 (2) 的同形状对照为准**。
-
-**(5) 结论：现有 C ABI 表达不出"打包一次 + 调用方线程" ⇒ C 侧天花板 ≈ 236 G**
-
-> **判据顺序（此后每次讨论多线程都先过这一条）：位精确 > 速度。** 速度再高，只要与单线程参考
-> 不逐位，就不能当"同一算子"用——`cols` 就是这种"快但换路径"的例子（6/10 形状不逐位）。
-
-- C ABI 只有单线程 `lasx_matmul`/`lasx_matmul_f64`，**没有计划/池符号**（`docs/ops.md` §3.1/§9
-  就是"多核请自行切子区间"）。调用方能做到的极限是 `cols` 那种**自己造计划**（转置 + 散射），
-  它已经把打包量降到 7 MB/调用，但**(a) 不是位精确等价物（6/10 形状不一致）、(b) 到 236 G 就停住**
-  ——离 Rust 池的 310 G 还差 1.31×（散射只解释 9%，剩下是"没有共享面板"）。
-- ⇒ **要突破 236 G，必须由库提供一个"打包一次、可跨调用/跨线程复用"的入口**（形态待定；
-  候选与取舍见本轮汇报的 ABI 提案）。**位精确这条会强制它由库侧实现**：调用方自己拼的
-  `cols` 已经证明"尺寸一变小就可能换路径"。
-- 本节的装置与三个测试模式都在 `scripts/bench_openblas.c`（非 ABI，只用于测量）：
-  `--mode=verify` 现在可以直接当"多线程切分是否位精确"的回归工具用。
-
-**⑥ 计划句柄落地后的四/五档对照（2026-10-15，ABI 追加 87→94 之后）**
-
-装置新增两档（`scripts/bench_openblas.c`，仍是**非 ABI** 的测量代码）：
-`--split=plan`（`lasx_matmul_prepare` 打包一次 + **调用方** pthread 按行切）、
-`--split=threaded`（便利层 `lasx_matmul_run_threaded`）；`--mode=verify` 现在把
-`plan` 也当一档**位精确断言**（计时前，见 (1)）。
-
-**(1) 位精确（计时前的断言，先过这一关）**——四档同形状对照（f32, threads=12）：
-
-| 形状 | `seq_split` | `rows` | **`plan`（新）** | `cols` |
-|---|---|---|---|---|
-| 100×384×257（k 边界下侧） | bitexact | bitexact | **bitexact** | MISMATCH |
-| 100×385×257（k 边界上侧） | bitexact | bitexact | **bitexact** | MISMATCH |
-| 192×768×3072 / 64³ | bitexact | bitexact | **bitexact** | bitexact |
-
-⇒ **计划句柄在所有测试形状上都与单线程 `lasx_matmul` 逐位一致**（含 `cols` 做不到的那些形状）；
-`include/lasx_rs.h` 侧的 `scripts/check_header.c` 也把这件事当行为断言（40×384/385×257，按 7 行
-切块 + 便利层 1/0 线程）。
-
-**(2) `192×768×3072` f32 @12（6 轮丢首轮取中位数；判据顺序仍是位精确 > 速度）**
-
-| 档 | ms 中位数（极差） | GFLOP/s | 扩展比 | 位精确 |
-|---|---|---|---|---|
-| `rows`（每线程各调 `lasx_matmul`） | 14.7316（8.4591–14.8369） | 61.5 | 1.06× | ✅ |
-| `cols`（预转置 + 按列切） | 4.2838（3.7463–5.7197） | 211.5 | 3.66× | ⚠️ 6/10 形状不逐位 |
-| **`plan`（打包一次 + 调用方线程）** | **3.6972（3.6771–3.9756）** | **245.0** | **4.24×** | ✅ |
-| `threaded`（便利层，池现建现拆） | 6.9757（4.3608–7.8619） | 129.9 | 2.25× | ✅ |
-| （对方）OpenBLAS @12 | 2.4714（2.4571–2.5499） | 366.6 | 6.34× | ✅ |
-
-**口径**：单线程同形状同窗口基准 **15.67 ms**（57.7 G）作扩展比分母；逐轮 loadavg 与分级——
-r1 `3.30/3.28`(B，丢弃)、r2 `4.29/3.63`(B)、r3 `4.34/3.72`(B)、r4 `4.21/3.84`(B)、
-r5 `4.79/4.23`(**C**)、r6 `5.89/4.61`(**C**) ⇒ 中位数窗口 = **3 轮 B + 2 轮 C**；
-`OBCHECK` 各档 `max_rel = 1.343e-06`（阈值 1e-3）全部 ok=yes。
-**独立复跑**（`SETTLE=90`、只跑 plan 两档的 6 轮）得到 **3.7293 ms / 242.9 G**（4 轮 C + 2 轮 B）
-⇒ **243–245 G 是稳定可复现的中位数**，不是抽到的好签。
-
-**(3) 结论（**没到 310 G，如实写**）**
-
-- 计划句柄把 C 侧从 **62.6 G（1.06×）推到 245 G（4.24×）**，**超过"现有有效档 236 G"**
-  （`cols`），而且**位精确**——即：新增的 ABI 同时拿下了"更快"和"更可信"。
-- 但**没有到 310 G**：245/310 ≈ **79%**；离 OpenBLAS 的 366.6 G 还差 **1.50×**。
-  **"有望贴近 310"只是预期，本轮不作为结论。**
-  - 顺带一个**非正式**观察（单次采样，不进结论）：同机较早窗口里 `examples/c/matmul_mt_caller`
-    实测 2.954 ms = **306.6 GFLOP/s** ⇒ "245 还是 307"很受窗口影响；两次正式复跑（各 6 轮）
-    都是 243–245 G，所以**正式数取 245 G**。
-- **宽薄 `256×64×4096` f32 @12**：`plan` **0.6355 ms（211.2 G）** / OpenBLAS 0.6122 ms（219.2 G）
-  ⇒ **只慢 3.7%（基本打平）**；同一形状 `cols` 是 1.0095 ms（132.9 G，慢 60%）⇒ 计划路径对这种
-  "k 小、n 宽"的形状同样有效。
-
-**(4) "C 侧 245 G vs Rust 池 331.9 G"这个差距的追查（结论修正过两次，此处只留最终版）**
-
-> **处置痕迹（别静默覆盖）**：本小节**上一版**给过一个结构性解释——"池是面板在外、行块在内
-> ⇒ 12 worker 同时读同一块 2 MB 面板（读量 ≈ B 一遍 9.4 MB），而计划是行块在外、面板在内
-> ⇒ 每块读全部面板（≈113 MB），差 ≈104 MB ÷ ~100 GB/s ≈ 1 ms 与实测差吻合 ⇒ 按块 API
-> 结构上到不了池的数"。**这个解释是错的，已被同进程对照推翻**：两种次序的**面板读量完全相同**
-> （每个 worker 都要把它负责的每个面板读一遍，"线程数 × 面板"在两种次序下一样），面板在外
-> 只多付 per-panel 屏障。据此实现的**面板粒度入口实测反而更慢**（见下面 ⑦ 的表），已回退。
-> 教训：**跨台架差 1.4× 不能直接推结构原因**——先做同进程交替对照（这条也是跨库/跨台架
-> 公平性要求里的一条，见前面那套口径）。
-**同进程交替对照**（`src/parallel.rs` 的 `#[ignore]` 诊断测试 `diag_pool_vs_plan`；7 次中位数，
-两条路线交替跑，把台架与窗口因素排除掉）：
-
-| 同进程同形状 `192×768×3072` f32 @12 | ms | GFLOP/s |
-|---|---|---|
-| 池 `parallel::matmul_f32`（面板在外 + 双缓冲打包） | 2.62–3.10 | **292–300** |
-| 计划 `parallel::matmul_f32_plan`（行块在外，`run_block_into`） | 2.55–2.62 | **346–355** |
-
-⇒ **计划路径本身就比池快** ⇒ "C 台架只有 245 G"是**台架自己的账**（下一节 ⑦ 有握手最小化的复测）：
-pthread 档每次
-调用用 `pthread_barrier_t`（futex 唤醒 + 12 线程串行唤醒链）握手，`--split=omp` 档每调用开一次
-并行区——**每次调用的握手成本**在这类 2–4 ms 的活儿上就是 20–40%。旁证：同一批 C 台架运行里
-**中位数 233–267 G，但 `ms_min` 只有 2.0–2.5 ms（≈360–450 G）**——分布与中位数脱节，正是
-"计算本身很快、握手/调度噪声大"的形状（本机 loadavg 长期在 4 上下）。
-
-> **窗口支配性比上面记的还大（Lead 的独立复跑，2026-10-15）**：同一档位（`--split=plan`，
-> futex 握手档）在高负载窗口三次只得 **74.7 / 77.9 / 108.6 G**，`ms_min` 5.17–8.58 ms、
-> `ms_max` **15–34 ms**、`iters` 被压到 **13–18**——与本仓同档的正式中位数 **239.8 G** 差
-> **2–3×**。⇒ **同档位跨窗口可差 2–3×**，所以**报告里必须带 `iters` 与 `ms_max`**：没有这两个
-> 数，读者无法判断读数是在什么窗口里拿的（`iters` 是"自适应到 ~100 ms"的迭代次数，
-> `ms_max` 是单轮最大值——两者都能一眼看出"机器被抢了"）。本节的表因此都带极差，
-> ⑦ 的表另外带 `ms_min` 与逐轮 `iters`。
-
-**顺带把 (a) 面板粒度入口试完并回退**（数据见下面的 ⑦）：它**位精确**但在本机**更慢**
-（同台架 209–217 G vs 行块档 246–261 G；OpenMP 面板在外 152–180 G），因为面板读量并不减少、
-只多了 per-panel 屏障 ⇒ **不为达标加无用符号**，3 个面板符号**没有进入 ABI**（维持 94）。
-
-- **便利层（`threaded`，129.9 G）明显慢于调用方驱动**：池**每次调用现建现拆**（12 个线程
-  的创建/回收进了计时）。这是"不用它就零进程级状态"的代价，已写进 `docs/c-abi.md` 第 11.2/11.4 节
-  ——**热循环请用 `lasx_matmul_run` + 调用方自己的线程/池**。Rust 侧想复用池就用 `WorkerPool`。
-
-**⑦ 握手最小化后的 C 侧正式数（2026-10-15，"目标到底达没达成"的公平测量）**
-
-⑥ 的追查结论是"差在**每次调用的握手成本** + 窗口噪声"。按这个结论做了**握手最小化**的 C 驱动
-（`scripts/bench_openblas.c` 的 `--split=plan-tight`），驱动结构就是**真实 C 调用方的写法**：
-
-- 线程**一次性创建**（12 个常驻 worker）、每线程只跑**分到自己那批行**的 `lasx_matmul_run`
-  （`a + r0·k`、`c + r0·n`，16 行/线程），**收工时一次 `pthread_join`**；
-- 每次调用用**原子自旋握手**（`atomic fetch_add` + `sched_yield` 退让），**不用**
-  `pthread_barrier_t`（那是 futex，唤醒链 12 个线程要几十到上百 µs）；
-- **计时前有位精确断言**：`OBTIGHT ... bitexact=yes`（与单线程 `lasx_matmul` 逐位比）。
-
-**6 轮（丢首轮取中位数）+ 逐轮 loadavg + 分级**（`bash scripts/bench_openblas.sh tight2 6 192x`）：
-
-| 轮 | 1（丢） | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
-| 1min loadavg / 级别 | 5.80 / **C** | 5.19 / **C** | 5.42 / **C** | 3.98 / B | 3.39 / B | 3.59 / B |
-
-中位数窗口 = r2..r6 = **2 轮 C + 3 轮 B**（本机当天 loadavg 一直在 3.4–5.8，拿不到全 B 窗口）。
-
-| `192×768×3072` f32 @12 | ms 中位数（极差） | GFLOP/s | `ms_min`（**上界参考，不是正式数**） | OpenBLAS 中位数 | 差 |
-|---|---|---|---|---|---|
-| `rows`（每线程各调 `lasx_matmul`） | 14.6028（9.7995–15.5841） | 62.0 | 9.80 | 2.4683 | 慢 5.9× |
-| `cols`（预转置按列切，⚠️ 6/10 形状不逐位） | 4.1566（3.6534–4.4642） | 218.0 | 3.65 | 2.4710 | 慢 1.68× |
-| `plan`（plan + **futex 屏障**每次握手） | 3.7782（3.5980–3.8191） | 239.8 | 3.60 | 2.4631 | 慢 1.53× |
-| **`plan-tight`（plan + 常驻线程 + 自旋握手）** | **3.0882（2.3388–21.5723）** | **293.4** | **2.3388（≈388 G）** | 2.8710 | **慢 7%（按中位数）** |
-| `omp`（每调用开一次 OpenMP 并行区） | 4.5482（4.2651–5.0434） | 199.2 | 4.27 | 2.4689 | 慢 1.84× |
-| `threaded`（便利层，池现建现拆） | 4.4549（4.3523–6.4302） | 203.4 | 4.35 | 2.4799 | 慢 1.80× |
-
-**三选一结论（如实，按"≥300 G 的**正式中位数**"这个标准）——(ii) + 结构上界：**
-
-**先补一轮"等窗口"的正式复跑**（Lead 的验收条款：轮前 1min loadavg ≤4.5 连续 3 个采样、
-无并发编译/bench 才开跑；只跑 `plan-tight` + `openblas` 两档，减少互相干扰）：
-
-| 轮 | 1（丢） | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
-| 1min loadavg / 级别 | 3.59 / B | 3.08 / **B** | 3.44 / **B** | 3.03 / **B** | 3.58 / **B** | 3.08 / **B** |
-| `plan-tight` `ms_med` / `iters` / `ms_max` | 2.6816 / 20 / 4.56 | **5.3736 / 10 / 18.81** | 3.6853 / 30 / 6.62 | 2.8351 / 24 / 7.71 | **6.2212 / 10 / 9.37** | 2.8512 / 36 / 10.75 |
-| OpenBLAS `ms_med`（同轮） | 2.6707 | 2.4853 | 2.8260 | 2.4612 | 2.4969 | 2.4593 |
-
-- **6 轮全部 B 级**（本机当天最干净的一段），但正式中位数 = **3.6853 ms / 245.8 G**，
-  OpenBLAS 同轮 **2.4853 ms / 364.5 G**（慢 1.48×）。
-- **看得出"轮前 loadavg 合格 ≠ 轮内没被抢"**：r2/r5 的 `iters` 从 30–36 **崩到 10**、
-  `ms_max` 冲到 **18.8 / 9.4 ms**——突发干扰落在**轮内**，轮前的分级看不到。**这就是为什么
-  报告必须带 `iters`/`ms_max`**（见 ⑥ 的引用块，也是 Lead 的独立复跑给的教训）。
-- 对照之下 OpenBLAS 在**同一批轮次里稳定**（2.459–2.826 ms，极差 15%）——它的线程模型对这类
-  干扰比"12 个工人各自自旋等握手、每次调用取最慢那个"的驱动更钝感。**这条差异如实记下**。
-
-**结论（三选一 → (ii)，并把"结构达成"的证据与"窗口限制"分开写）：**
-
-- **(ii) 正式数：本机当前窗口给不出 ≥300 G 的正式中位数。** 两次 6 轮正式跑：B/C 混合窗口
-  **293.4 G**、全 B 窗口 **245.8 G**（后者因为 2/5 个有效轮被轮内突发干扰毁掉）。按本节的
-  方差法口径，**能引用的正式数就是这两个**，都不是 ≥300 G。
-- **结构上界（支撑"库与 API 没问题"）：**
-  - 同进程**交替**对照（把台架与窗口都排除）**346–355 G**（⑥ 的表）；
-  - `plan-tight` 的 **`ms_min` 2.19–3.13 ms（≈290–414 G）**——**上界参考，不是正式数**；
-  - 更早一次窗口的**单轮**采样 2.6004 ms = 348.4 G（单次采样，同样不作正式数）。
-- ⇒ **本目标的记账方式**：**"结构达成、正式数受窗口限制"**——达成靠的是
-  **常驻线程 + plan 复用 + 自旋握手**（**零新增 ABI 符号**：用的还是 `lasx_matmul_prepare` +
-  `lasx_matmul_run`）；**正式中位数未达 300 G 是本机窗口的账**（同一天跨窗口差 2–3×，见 ⑥）。
-- **横向看（同一批窗口内）**：futex 握手档（`plan`，239.8 G）与每调用开并行区（`omp`，199.2 G）
-  都低于常驻 + 自旋（293.4 / 245.8 G）——**这正是 ⑥ 说的那笔握手账**（同一份库内工作，
-  三种驱动差 1.2–1.5×）。
-- **驱动没有为了好看改口径**：`plan-tight` 始终是"线程一次性创建、每线程只跑自己那批行、
-  收工一次 join、每次调用一次原子自旋握手"，与 `docs/c-abi.md` 第 11.2 节给 C 调用方的写法一致。
-
-**⑧ perf 剖析：245.8 G 与结构上界 346–355 G 的差距落在哪（2026-10-15）**
-
-**装置**：[`scripts/profile_lasx.sh`](../scripts/profile_lasx.sh)——同一形状（`192×768×3072` f32 @12）
-跑 5 档：**`plan-tight`（基准）/ Rust 池路径 / 单线程 / OpenBLAS / `rows`（病理档）**；
-每档按**分批**用 `perf stat` 收计数（**≥3 次重复、中位数+极差**，逐次记轮前 `loadavg`，
-并同时报装置自己的 `iters`/`ms_max`）；另跑一档 `perf record -g` 看**用户态**热点。
-本机 **`perf_event_paranoid = 2`** ⇒ **只能用户态**：系统级 `-a`、内核帧、uncore/内存控制器事件
-**都拿不到**（要 `≤1` 或 root ⇒ 见文末"需用户授权"）。
-
-**(1) 事件自检（每个分批单独 `perf stat … -- true`，如实列）**
-
-| 分批 | 事件 | 结论 |
-|---|---|---|
-| ipc | `cycles:u`、`instructions:u` | **可用** |
-| llc | `cache-misses:u`、`llc-loads:u`、`llc-load-misses:u` | **可用** |
-| tlb | `dTLB-loads:u`、`dTLB-load-misses:u` | **可用** |
-| sched | `context-switches`、`cpu-migrations`、`page-faults` | **可用**（软件事件，不用加 `:u`） |
-| br | `branches:u`、`branch-misses:u` | **可用** |
-| 负对照 | 上面 8 个硬件事件**一次挂** | **失败**：`Some events weren't counted. Try disabling the NMI watchdog` ⇒ **必须分批**（这就是脚本分批的理由） |
-| — | uncore / 内存控制器 / 内核态 / `-a` | **本机不可用**（paranoid=2；需 root 或临时降到 ≤1，**未做**） |
-
-**(2) 计数与派生量（每调用 = **整个进程所有线程之和** ÷ 该次运行的调用数；中位数，括号是极差）**
-
-> **口径修正（重要，别引用旧版）**：本节**第一版**把"A 分批的中位数"与"B 分批的中位数"相除来
-> 算比率，结果印出了 **95% / 435% / 1017% 的"L3 缺失率"**（比率不可能 >100%）与对不上的
-> DRAM 估计——Lead 复核时抓到。**根因**：分子与分母来自**不同的运行**（同一分批里 cycles 与
-> instructions 的"中位轮"不一定是同一轮，跨分批更是必然不同：`iters` 会随窗口在 13–30 之间跳），
-> 两个中位数相除**没有意义**。**现行做法**：① 比率一律**在同一次运行内**算好、再看逐轮中位数；
-> ② 摘要里**原始分子与分母都打印**（可手算复核）；③ **机器自洽闸门**：缺失率/分支缺失率
-> ≤110%、IPC 在 0.05–20，越界就打 `!! 自洽失败` 并**不出数**；④ 每列口径逐个写清（见脚本 ④ 段）。
-> 表中数字是**修正后**的（两次复跑一致）。
->
-> 另外 | 你量到 plan-tight IPC **0.966**、我这里是 **1.26–1.34**：差异**两个原因都有**——
-> (a) 你的窗口更差（plan-tight `iters` 只有 7、`ms_max` 25.6，而 llc 分批是 26/23.9 ⇒
-> 同一次运行的 `iters` 差 3.7×），旧公式在这种窗口下最容易失真；(b) 旧公式本身是"中位数之比"
-> 而不是"比值的中位数"。修正后同一份数据给出的是**逐轮比值的中位数**，范围很窄
-> （1.11–1.38），不再随窗口剧烈漂移。
-
-| 档 | ms/调用 | `iters`/`ms_max` | cycles/调用 | instr/调用 | **IPC**（逐轮同源） | llc-loads/调用（行） | **L3 线流量/调用** | **DRAM 估计** | dTLB-miss/调用 | TLB 缺失率 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **plan-tight** | 3.7407 | 27 / 6.22 | 119.1M | 159.0M | **1.34** | 2.62M | **≈168 MB** | **0.60 GB/s** | 210k | **3.51%** |
-| pool(rust)※ | 3.009 | 7 / 3.01 | 135.7M/对 | 233.6M/对 | 1.72 | 4.28M/对 | ≈274 MB/对 | 3.88（对偶口径，参考） | 475k/对 | 4.26% |
-| 单线程 | 18.6145 | 5 / 19.76 | 92.3M | 164.9M | **1.79** | 968k | **≈62 MB** | 0.39 GB/s | 336k | **10.38%** |
-| OpenBLAS | 5.9085（**本批噪声大**） | 13 / 10.30 | **76.2M** | **127.2M** | **2.07** | 4.16M | ≈266 MB | 0.38 GB/s | 78k | **0.66%** |
-| `rows`（病理） | 33.9428 | 4 / 37.14 | 186.2M | 164.4M | **0.90** | 14.14M | **≈905 MB** | 0.29 GB/s | 3.21M | **0.60%** |
-
-> 更干净的一次窗口（p5，plan-tight `iters` 27、`ms_max` 4.26）里：IPC **1.23**（极差 1.11–1.38）、
-> L3 缺失率 **1.08%**、DRAM **0.47 GB/s**、TLB 缺失率 **0.49%**、`ctx`/迁移 **0/0**——
-> 与本表同向，量级差在窗口内正常范围。
->
-> **口径写明（防误读）**：`cycles/调用`、`instr/调用`、`llc-loads/调用`、`dTLB-miss/调用` 全是
-> **12 个 worker 线程 + 主线程之和**（`perf stat` 默认继承全线程），**不是单线程口径**；
-> `ms/调用` 是**墙钟**；`L3 线流量` = `llc-loads × 64 B`（**行数×行宽**，不是实测字节）；
-> `DRAM 估计` = `llc-load-misses × 64 B ÷ 时间`（**每调用、全线程合计**）。
->
-> **ctx 切换/迁移：该计数在本机不可用**（2026-10-15 审正）。`perf stat -e context-switches,
-> cpu-migrations` 全档报 **0/0**，但**同一进程** `/proc/<pid>/status` 的 `voluntary_ctxt_switches`
-> 实测**非零**（26→28）⇒ **perf 的软件事件在这台机器上没统计到这些线程**（继承/口径问题），
-> **不是"没有切换/迁移"**。⇒ 本节**不再用这两个计数**支撑任何结论；需要时改用 `/proc/<pid>/status`。
->
-> **⚠️ 更正（2026-10-16，"不可用"只对软件事件成立）**：**硬件事件在本机可用** ——
-> 实测 `perf stat -e llc-loads,llc-load-misses true` ⇒ **3,622 / 1,065**（非 0、可复现）。
-> ⇒ **带宽类结论可以用 `llc-loads`/`llc-load-misses` 真测**（上面的 `DRAM 估计` 公式仍适用）；
-> **不可用的只是软件事件**（`context-switches`/`cpu-migrations`）⇒ 那两类仍需 `/proc` 计数。
-> 之前"本机 perf 不可用"的写法**过宽**，此处收窄。
-
-※ Rust 池档 = `#[ignore]` 诊断测试 `parallel::diag_pool_vs_plan`（同进程交替 7 次池 + 7 次计划）
-⇒ 它的计数**包含两条路线**（"每对"= 池一次 + 计划一次），只能当量级参考，不能当纯池的账。
-
-**这些量支持 / 不支持什么：**
-
-- **DRAM 不是绑定项**：所有档的 DRAM 估计都在 **0.29–0.60 GB/s**（B/面板在 L3 里就装下了，
-  L3 缺失率只有 0.6–10.4%）。⇒ 文档里那个"~100 GB/s"的估计**不是本形状的天花板**，
-  以后不要再拿它当解释（本表的估计本身也只是"llc-load-misses × 64 B ÷ 时间"，缺 uncore 事件）。
-- **绑定项在片上（L3/缓存）+ 由它引起的停顿**：把**每次调用的 L3 线流量**摆出来就很清楚——
-  `rows` **≈905 MB/调用**（每个线程各自重打包整个 B），`plan-tight` **≈168 MB**，
-  单线程 **≈62 MB**。**我们的线程化把片上流量抬到单线程的 ~2.7×**，换来 5× 吞吐（而不是 12×）
-  ——`rows` 档更极端（≈15× 流量、IPC 掉到 0.90）。⇒ **这给 §7.11 ⑩ 那句"共享面板被每个线程
-  各读一遍"补上了计数证据**。
-- **IPC 是线程化效率的量化签名**：单线程 **1.79** → `plan-tight` **1.34**（线程化后每条指令
-  停顿更多）；OpenBLAS 在 12 线程下仍 **2.07**（**不丢 IPC**）。**同一份工作，OpenBLAS 只用
-  76.2M cycles/调用（我们 119.1M）与 127.2M 指令（我们 159.0M）** ⇒ 我们两条都吃亏：
-  **指令数 ~1.25×、IPC ~0.65×**（更干净的那次窗口里是 1.23 vs 1.79/2.19，同向）。
-- **TLB 不是区分项**：缺失率都在 0.5–10%（单线程 336k/调用、`plan-tight` 210k/调用）；
-  只有病理档 `rows` 才涨到 3.2M/调用（与它的流量放大一致）⇒ 大页不是首要手段。
-- **同步/调度在计数上看不到抖动**：所有档 **context-switches = 0、cpu-migrations = 0**（3 次重复
-  都是 0）⇒ 这批窗口里没有可归因到"同步/迁移"的开销。**正式数（245.8 G）与结构上界
-  （346–355 G）之间的那部分，主要不在这两个计数器能看到的地方。**
-
-**(3) `perf record -g` 用户态热点（`--call-graph fp` 与 `dwarf` 都可用；后者更稳）**
-
-| 自耗时 | 符号 | 说明 |
-|---|---|---|
-| **47.96%** | `worker_fn`（装置的 worker） | **驱动自己的循环**：等下一代的**自旋**（`__sched_yield` 0.55%）、`now_s()`（`clock_gettime` 1.4%+0.65%）、握手 |
-| **30.71%** | `lasx_rs::ops::matmul::matmul_f32_packed_rows` | **库内核**（微内核 + k 分块） |
-| 9.31% | `run_lasx` | 调用封装 |
-| 4.45% + 1.15% | `[unknown] [k] 0x…` | **内核帧**（看不到名字；**不当归因**） |
-
-**已知限制（如实写，不编）**：① paranoid=2 ⇒ **内核帧不可见**，上面那两个 `0x…` 只知道是内核；
-② 本库内核是手写 LASX 汇编、**不维护帧指针** ⇒ `fp` 展开到汇编层以下不可靠（会看到一串 `0x…`），
-所以**只报自耗时前几名**，不做函数级精确归因；③ **计数里含驱动自旋**（47.96% 在 `worker_fn`）⇒
-它**高估**了我们内核的指令/周期成本，**公平的每调用指标仍是 `ms_med`**（自旋落在调用窗口之外）。
-
-**(4) 判定 + 不确定度 + 缺什么才能定论**
-
-- **判定：绑定资源是"片上（L3）带宽 + 它带来的停顿"，不是 DRAM、不是 TLB。**
-  证据链：DRAM 估计 0.29–0.60 GB/s（远未饱和）+ L3 线流量随档位差 ~15×（905 / 168 / 62 MB）+ IPC
-  随线程化掉 25%（1.79 → 1.34）。**"同步"这一项本机无有效计数可证**（perf 软件事件在本机
-  没统计到这些线程，见本节上面那条审正）⇒ 判定**不依赖**它，也不据它下"同步没问题"的结论。
-  **不确定度**：L3/DRAM 的"字节数"是从
-  `llc-loads`/`llc-load-misses` × 64 B **推出来的**（事件数的是*请求/行*，可能含预取与投机），
-  是**半定量**；而且 `plan-tight` 的计数含驱动自旋 ⇒ 我们的**内核**成本比表里的数**更低**，
-  但**线程化的相对劣势（1.34 vs 1.79/2.07）不受影响**（三条路线都在同一装置、同一窗口、同一分批下测）。
-  另有**窗口不确定度**：本表两次复跑的 plan-tight `ms` 3.74/3.54、`iters` 27/28（好窗口），
-  而 Lead 那次窗口 `iters` 只有 7 ⇒ **引用时必须带上 `iters`/`ms_max`**（见 ⑥ 的引用块）。
-- **缺什么才能定论（已按"权限实验"改写，见下面 ⑧-权限）**：**uncore / 内存控制器事件**（L3 实际
-  字节、DRAM 读写字节）与**内核帧**。**注意：这两样都不是"给权限就能拿到"**——用户已授权、Lead
-  实测过（下一段），结论是**硬件/内核信息层面的限制**，所以**不要再为它们申请一次权限**。
-- **可验证的改进假设（本轮不实现）**：
-  - **H1（主）：把输出按列切成二维瓦片，让每个 worker 只读自己那段的打包面板。**
-    预期把每调用 L3 线流量从 ≈145 MB 压向 ≈71 MB 量级、IPC 回到 1.6–1.8 ⇒ **预期 +15–25% 吞吐**
-    （245 → 285–310 G 的中位数量级）。**先做低成本先验**：给现有 `--split=cols` 档补测同一批
-    计数——它本来就是"列切分 + 面板读量小"，若它的 IPC/线流量明显更好，再按库内**精确算术**
-    实现二维瓦片（**不是**照抄 `cols` 的转置近似，那会破坏位精确）。
-    **注意**：上一轮的"面板粒度入口"**没有验证 H1**——它只把面板循环放到外层，每个 worker 仍算
-    **全部列** ⇒ 读量不变、实测更慢。**那次失败不能否证 H1**（这点必须写清，免得后人误读）。
-  - **H2：驱动侧减少空转。** 47.96% 的自耗时在 `worker_fn`（自旋/握手）。让**主线程也认领一段行**
-    （或把等待换成"自旋 + 让出"的混合），预期减少 SMT 兄弟互抢 ⇒ 吞吐 +几个 %。
-    验证：`perf record` 前后对比 `worker_fn` 占比与 `ms_med`/`ms_max`。
-  - **H3（最低优先级）：打包缓冲大页**（`madvise(MADV_HUGEPAGE)`）。dTLB 缺失 247k/调用、
-    缺失率 0.54%（与单线程同量级）⇒ TLB **不是**当前绑定项，预期收益个位数。
-- **口径声明**：本轮**不新增 ABI 符号**（`nm -D` 仍 **94**）、**位精确不动**（`plan-tight` 计时前
-  有 `OBTIGHT … bitexact=yes` 断言）；没测到的项（uncore/内核帧/`-a`）都写成"本机不可用"。
-
-**⑧-权限：降 `perf_event_paranoid` 的实验（2026-10-15，用户授权后由 Lead 实测）**
-
-> **背景**：本节初稿把"uncore 事件 + 内核帧"写成"**需用户授权**把 `perf_event_paranoid` 降到 ≤1"。
-> **用户授权了，Lead 实测完，结论是"权限不是瓶颈"**——五条实测事实（命令可复核）：
-
-| # | 实测 | 结果 |
-|---|---|---|
-| 1 | `echo '<pw>' \| sudo -S sysctl kernel.perf_event_paranoid=1` | **成功**（`paranoid` = 1） |
-| 2 | `perf list \| grep -icE "uncore\|dram\|mem_ctrl"` | 命中 **0**；唯一的 `llc_` 命中是**核心** `llc-*` ⇒ **本机 PMU 没有 uncore/内存控制器事件，"实际 L3/DRAM 字节"拿不到是硬件限制，不是权限** |
-| 3 | `paranoid=1` 下 `perf stat -e cycles,instructions,dTLB-load-misses -- sleep 0.3` | **仍只读出 dTLB**；**"4 个硬件事件一次挂"的毛病依旧** ⇒ **"必须分批"是 PMU 计数器资源限制，不随权限消失** |
-| 4 | `perf record -g -- sleep 0.4` + `perf report` | **仍看不到内核帧**（`[k]` 样本 **0**）。根因：**`kptr_restrict = 2`**（`/proc/kallsyms` 首行地址全 `0`）+ **无 vmlinux 调试符号**（`/boot/vmlinux*`、`/usr/lib/debug/boot/*` 都不存在，只有 `/lib/modules/7.1.13-aosc-main-4k/build`） |
-| 5 | 还原 | **已还原 `kernel.perf_event_paranoid = 2`** |
-
-**(a) 结论不变**：绑定项仍是**片上带宽 + 它带来的停顿**，而且**只能半定量**——"实际字节数"在本机
-**不可得**（不是没权限，是没有那个计数器）。上面的 L3/DRAM 数字继续按"事件数 × 64 B"的半定量
-估计读，**不要**升格成"实测字节"。
-
-**(b) 将来要真做还需什么（免得后人再申请一次权限）**：
-1. **`kptr_restrict = 0`**（否则 `/proc/kallsyms` 地址被打码，内核符号无从解析）；
-2. **内核调试符号（`vmlinux`，带 DWARF）**——本机没有（只有模块 build 目录）；
-3. **支持 uncore 的 PMU**（本机 PMU 无 uncore 事件，`perf list` 命中 0）⇒ 换机器/换内核才谈得上
-   "L3、DRAM 实测字节"。
-⇒ 这三条都是**环境/硬件前提，不是 `perf_event_paranoid`**；本节因此在结论里保持"半定量"。
-
-**(c) 脚本约定**：`scripts/profile_lasx.sh` 顶部注释已写明这一条；脚本**只读**系统状态
-（`cat /proc/sys/kernel/perf_event_paranoid` 仅用于记录），**不改任何系统设置**——系统设置不进仓库，
-本文件只记"实测 + 已还原"这件事本身。
-
-**⑨ H1（列瓦片）实验：位精确做到了，但"消掉片上流量放大"的机制没兑现（2026-10-15，已回退）**
-
-> **结论先说**：按用户批准的 H1 做了实现（Rust 侧列瓦片 + 位精确测试全绿），同源实测
-> **ms 只降 4.3–4.7%、L3 线流量没降（反而 +6%）** ⇒ 按验收口径属于**收益未达**，
-> 因此**代码已回退**（`src/plan.rs`、`src/parallel.rs` 改动全部撤销；`nm -D` 仍 **94**、
-> 单测计数仍 **236**，两者都独立复核），本段只留**实验记录与根因**，
-> 不往 API 里加一个不赚钱的表面。
-
-**(1) 便宜先验（`--split=cols` 同源计数）——不支持机制假设**
-
-同源取数（每次运行内算比率、3 次取中位数）：`cols` 档 `llc-loads` **≈2.08–2.19M 行/调用**
-（≈133–140 MB），与 `plan-tight` 的 **≈2.26M 行（≈145 MB）** 同级；IPC 约 **1.61–1.64**
-（略高于 `plan-tight` 的 1.34），但墙钟 **10–13 ms**（`plan-tight` 3.5–3.7 ms）。
-⇒ **`cols` 不是这个机制的好探针**：它每次调用都要**转置 B + 散射**，`llc-loads` 被它自己的
-搬运主导，而且它算的是另一条路。**先验既没证实也没否证 H1。**
-
-> **必须写清的一点**：`--split=cols` **不逐位的根因是它把 `Cᵀ = Bᵀ·Aᵀ` 拆成小尺寸调用**
-> （尺寸变 ⇒ 库内路径与累加次序变），**不是"按列切"这个想法本身**。因此 H1 必须在
-> **plan / 位精确**路径里做列瓦片，**不许复用 `cols` 的实现**（上一轮那个"面板入口"也正因为
-> 没验证 H1 本身才被否掉）。
-
-**(2) 实现要点（做过、已回退）**
-
-- `MatmulPlan::run_cols_into(col0, col1, a, c)`：按 `STRIP`（32 列）粒度切列段；实现是把该面板
-  的打包缓冲**按条带切一段**（`&panel.packed[(a0-p_lo)·k·32 ..]` + 调整 `jb`/`nc`）交给
-  **同一个内核**——内核按 `packed[s·k·32 …]` 索引，所以"子切片 + 调整 `jb`/`nc`"就等价于
-  "只算这几条带"。**列段是 `[0,n)` 的划分** ⇒ 每个输出元素只被算一次、沿 `k` 的累加次序一字
-  不变 ⇒ **逐位一致**。列尾 `[n_strip, n)` 由"覆盖到 `n` 的那一段"负责；**非末尾段边界必须
-  条带对齐**（不对齐会在段间留缝 ⇒ 静默错结果），不对齐直接报 `Shape`。
-- `parallel::matmul_f32_plan_tiled{,_with_stats}`：**瓦片在外、池的行块在内**
-  （每段一次 `for_each_row_block_mut_picked`；3072 列 / 256 = 12 段 ⇒ 每次调用 12 次屏障）。
-- **位精确测试全绿**：k=**384/385/386**（打包 k 分块边界两侧）、`m`/`n` 不整除、
-  **瓦片边界**（32/64/96/256/512 混用、256 不整除时末段更窄）、**`rows` 非 4 的倍数**、
-  **`n` 非 32 的倍数**（列尾，含 `n < STRIP` 全列尾的情形），共 12 个形状 + 2 个边界校验用例，
-  与整块跑、`api::matmul`、行切版**三方逐位一致**。
-
-**(3) 同源对照（同进程交替 7 次中位数；计数用 `LASX_DIAG_ARM` 分臂上 `perf stat` 取）**
-
-| 路线 | ms 中位数 | GFLOP/s | `llc-loads`/调用 | `llc-load-misses`/调用 |
-|---|---|---|---|---|
-| `plan`（行切，现状） | 2.61–2.66 | 343–347 | **≈1.97M 行（≈126 MB）** | ≈21k |
-| `plan-tile`（H1 本实现） | 2.51–2.55 | **356–362** | **≈2.10M 行（≈134 MB）** | ≈21k |
-
-⇒ **ms 降 4.3–4.7%（未达 ≥10% 的验收线）、L3 线流量没降（+6%）、IPC 没显著回升** ⇒
-**机制未兑现**。
-
-**(4) 根因（为什么"列瓦片在外"没有减少面板读量）**
-
-池 `for_each_row_block_mut_picked` 是**按行块分发同一份行空间**的。把瓦片放外层、行块放内层时，
-**每个 worker 在每一轮瓦片里照样会被分到行块** ⇒ 12 个 worker 仍然各自走过**全部 12 个瓦片**
-⇒ 面板读量仍是 **12×B**（子切片只改了"每次算多宽"，没改"谁能读哪一段"）。
-**要真正兑现，必须让 worker 与列瓦片绑定**：把 `⌈n/256⌉ × 行块数` 摊成一维工作项，且每个 worker
-拿到的是一段**连续区间、恰好落在一个瓦片里**（worker w 只算瓦片 w 的全部行）。
-`WorkerPool` 现有入口表达不了这种绑定 ⇒ **需要动池的接口**，而它属本仓的**接口冻结清单**
-（"池的行块闭包"那一项）⇒ 按本仓规则 3 要**先记录再改**，所以这里停下等决定。
-
-**(5) 处置与下一步**
-
-- **处置**：按验收口径"收益未达 ⇒ 如实标注并回退"——`src/plan.rs`/`src/parallel.rs` 全部回退；
-  文档保留本段（含根因）；**口径未改、窗口未挑**。
-- **下一步（若用户要真正兑现 H1）**：先在**接口冻结小节**记录"冻结之后为什么还要加一条池能力"
-  （2D 工作项 + worker↔瓦片绑定），再做**小实验**验证。⚠️ **本轮的教训**：流量账
-  （面板 113 MB → 9.4 MB）**没能转成**墙钟收益 ⇒ "片上流量"很可能**不是**当前的主要瓶颈
-  （⑧ 里 `worker_fn` 自旋占 40–48%、IPC 1.34 ⇒ 停顿更多来自**延迟/ILP/驱动自旋**），
-  所以兑现后的收益预期要**下调**，先做小实验再决定是否动冻结接口。
-
-> **H1 正式结案（⑩ 实验 A 之后补写；判据是"先写死"的，不是试完再解释）**：
-> ⑩ 实验 A 把"worker↔列瓦片绑定"真正做出来并测了——**片上流量降 2.2×（≈128 → ≈57 MB/调用）、
-> IPC 涨 1.7×（≈1.90 → ≈3.26），而墙钟只有 ≈ +6%（远低于 10% 门槛）**。
-> ⇒ **判定：片上流量不是绑定项；H1 就此终止，不再追"列瓦片"，也不动冻结的池接口。**
-> （判据事先写在 ⑩ 的开头："流量真降了就只看墙钟是否跟着降 ≥10%；流量降而墙钟不降 ⇒ 判定
-> 片上流量不是绑定项并停止追 H1"——本条正是照该判据得出的结论。）
-
-**⑩ 两个"只改测试/driver"的可行性实验（2026-10-15；**实验档，非正式表**）**
-
-> 前提：**不动公开 API、不动 ABI（`nm -D` 仍 94）、不动冻结接口、位精确不动**。
-> 判据**先写死**（避免事后解释）：**A**——流量真降了就只看墙钟是否跟着降 ≥10%；
-> 流量降而墙钟不降 ⇒ **判定"片上流量不是绑定项"，停止追 H1**。**B**——`worker_fn` 自旋占比
-> 降 ≥10 个百分点**且** ms 降 ≥3% 才算见效。
-
-**实验 A：worker ↔ 列瓦片手工绑定（测试内 `std::thread::scope`，复用条带级列瓦片内核）**
-
-实现：`⌈n/256⌉` 个瓦片、每个线程**恰好一个瓦片 × 全部行**（列区间互不相交 ⇒ 每线程只读自己那段
-列的面板）。同进程交替 7 次取中位数，**位精确每轮断言**（与 `api::matmul` 逐位比）：
-
-| 路线 | ms 中位数（4 次复跑） | GFLOP/s | `llc-loads`/7 调用（分臂实测） | 折算/调用 | IPC（分臂实测） |
-|---|---|---|---|---|---|
-| 行切 `matmul_f32_plan` | 2.87–2.95 | 307–342 | **14.0M 行** | **≈128 MB** | 1.74–1.95（中位 ≈1.90） |
-| 绑定瓦片（手工） | 2.72–2.97 | 305–350 | **6.2M 行** | **≈57 MB** | 2.97–3.74（中位 ≈3.26） |
-
-- **流量确实降了 2.2×**（128 → 57 MB/调用），**IPC 也明显回升**（≈1.90 → ≈3.26）；
-- 但墙钟 4 次复跑的相对值 = **1.056× / 1.070× / 1.064× / 0.988×**（中位 ≈ **+6%**，一次略负）
-  ⇒ **远低于 10% 门槛**。
-
-⇒ **一句话判定：绑定项不是片上流量**——流量砍掉一半以上、IPC 涨 1.7×，墙钟只动几个百分点
-⇒ 按先写死的判据 **停止追 H1**（不动冻结的池接口）。**这正好省掉未来最大的那笔工作量。**
-
-**实验 B（H2）：压驱动空转——动态认领 + 主线程参与（只改 bench driver）**
-
-`--split=plan-tight-dyn`：在原有原子自旋握手上，把"静态等分 16 行块"换成**动态认领 8 行小块**
-（`atomic_fetch_add` 领下一块），并让**主线程也认领**（13 个参与者）。5 轮**交错**对照
-（逐轮 loadavg 3.68–4.00，**B/C 级窗口，实验档非正式**）：
-
-| 路线 | 各轮 ms（5 轮） | 中位数 | 中位 GFLOP/s | `iters`/`ms_max`（中位） |
-|---|---|---|---|---|
-| `plan-tight`（静态等分，主线程只等） | 3.5737 / 3.6434 / 4.1863 / 3.6509 / 2.9952 | **3.6434** | 248.7 | 28 / 4.06 |
-| `plan-tight-dyn`（动态认领 + 主线程参与） | 3.2958 / 3.4419 / 2.9486 / 2.8134 / 3.1986 | **3.1986** | **283.2** | 30 / 4.33 |
-
-- **ms 降 12.2%**（3.6434 → 3.1986；5 轮里 dyn 赢 4 轮）⇒ 过 ≥3% 门槛 ✓；
-- **`perf record -g` 自耗时占比**（同装置、单次采样）：`worker_fn` **60.56% → 41.22%（−19.3pp）**，
-  库内核 `matmul_f32_packed_rows` **21.43% → 47.97%** ⇒ 空转确实被换成了干活 ⇒ 过 ≥10pp 门槛 ✓
-  （单次采样，未做多轮；按要求标注）；
-- **代价/适用**：动态认领要求块粒度足够小（这里 8 行）且调用方**自己也干活**；对"一整块大活儿"
-  更值钱，对小形状要重新标定块大小。
-
-⇒ **一句话判定：自旋/空转是主要停顿源之一（至少占自耗时 60%），把它换成干活能直接换成吞吐
-（+12%）**。这是**调用方驱动**层面的结论（不是库内改动），因此建议写进给 C 消费者的用法里
-（已落 `docs/c-abi.md` §11.2.1）。
-
-**实验 B 续 1：块大小扫描（`--dyn-blk`，每档 3 次；窗口 loadavg 3.5–4.3，实验档）**
-
-| 块大小（行） | ms 中位数（3 次） | GFLOP/s | `worker_fn` 自耗时（`perf record`） |
-|---|---|---|---|
-| 8 | 3.2668 | 277.3 | **33.7%** |
-| **12** | **3.0438** | **297.7** | 40.4% |
-| 16 | 3.5285 | 256.8 | 37.2% |
-| 24 | 3.7078 | 244.3 | **48.6%** |
-
-- **复选（8 vs 12，5 轮交错）**：8 = 中位 3.2899；**12 = 中位 3.0852**（12 赢 4/5 轮）⇒ 与上表一致。
-- **选 12 的理由（有数据，不是"看着差不多"）**：ms 是主指标，12 在两轮独立测量里都最优；
-  8 的**自旋占比更低**（33.7% vs 40.4%）但 **ms 更慢**（块太小 ⇒ 认领次数多、每块固定开销占比高）；
-  24 两项都最差（48.6% / 3.71 ms）。⇒ 默认 `--dyn-blk=12`，扫描口留给别的形状。
-
-**实验 B 续 2：混合等待（判据先写死：自旋占比再降 ≥8 个百分点**且** ms 降 ≥2%）**
-
-3 轮交错（`--dyn-blk=12`；窗口同上一批，实验档）：
-
-| 等待策略 | ms 中位数（3 轮） | `worker_fn` 自耗时 | 判定 |
-|---|---|---|---|
-| 长自旋 `--spin=4000`（原默认） | 3.8260 | 31.3% | 基准 |
-| **短自旋 `--spin=200`** | **3.1175** | **14.1%**（**−17.2pp**） | **见效**（ms **−18.5%**） |
-| 纯让出 `--wait=yield` | **3.1002** | **0.75%**（**−30.6pp**） | **见效**（ms **−19.0%**） |
-
-- **长自旋在 3 轮里**全部**输给两个替代方案**（不是"某轮碰巧"）⇒ 窗口里"转 4000 圈"是有害的
-  （烧 CPU、与别的工人抢 SMT 发射口）；**短自旋 200 圈或直接让出都过判据**。
-- ⇒ 默认改为 `--spin=200`（保留 `--wait=yield` 可选）；**混合等待这一步的结论是"见效"**，
-  不是"无效"（按先写死的判据给出的）。
-
-**实验 B 续 3：正式档（≥5 轮丢首轮、中位数+极差、逐轮 loadavg、分级、报 `iters`/`ms_max`）**
-
-`SETTLE=90 bash scripts/bench_openblas.sh dyn1 6 tight`（口径与 §7.10 ⑦ 同：每档每轮只跑两档、
-轮间静置；**6 轮全部 B 级**，轮前 1min loadavg 3.20–4.02、conc=0）：
-
-| 档 | ms 中位数（**极差**） | GFLOP/s | 逐轮 `iters`/`ms_max` | OpenBLAS 同轮 | 差 |
-|---|---|---|---|---|---|
-| `plan-tight`（静态等分，主线程只等） | **4.8694（2.1389–7.1821）** | 186.1 | 15/15.7、23/68.3、44/5.0、25/6.2、21/22.7、3/16.5 | 2.9292（309.3 G） | 慢 **1.66×** |
-| **`plan-tight-dyn`（动态认领 + 主线程参与）** | **3.2285（2.9087–5.1072）** | **280.6** | 25/16.6、34/26.8、6/11.9、28/8.6、5/9.6、32/12.7 | 3.0924（293.0 G） | **慢 4%** |
-
-- **正式档判定：H2 见效**——同窗口同轮，**ms −33.7%**（4.8694 → 3.2285）、GFLOP/s **+50.8%**
-  （186.1 → 280.6）；与 OpenBLAS 的差从 1.66× 收到 **4%**。
-- **B 级窗口仍不"干净"**：静态档极差横跨 2.14–7.18 ms、`iters` 3–44（单轮 423 G）⇒ 逐轮
-  `iters`/`ms_max` 必须与中位数一起看（见 ⑥ 的引用块）；这不是"挑窗口"，而是**如实标注**。
-- `plan-tight-dyn` 已是**正式档**（不是实验档）：它在同一批轮次里对 `plan-tight` 与 OpenBLAS 都是
-  同源可比，且每次调用仍带位精确断言（`OBTIGHT … bitexact=yes`）。
-
-**H2 回灌库内（2026-10-15，只改 `src/pool/sched.rs` 的启发式；"主线程参与"实测无效已回退）**
-
-1. **阈值表（库内口径：同进程交替 `Pick::RowBlock` vs `Pick::Dynamic{block_rows=per/4}`，
-   各 ≥5 次中位数，k=768、n=2048、粒度 4；判据先写死"动态赢 ≥3% 才算动态"）**：
-
-| threads | per_thread | m | 静态 ms | 动态 ms | 静态/动态 | 判定 |
-|---|---|---|---|---|---|---|
-| 6 | 8 / 16 / 32 / 64 | 48…384 | 0.6451 / 1.0142 / 1.7492 / 3.6658 | 0.9547 / 1.6648 / 2.2960 / 3.9342 | 0.68 / 0.61 / 0.76 / **0.93** | **静态**（线程太少） |
-| 12 | 8 | 96 | 0.9939 | 1.2046 | 0.83 | 静态 |
-| 12 | 16 | 192 | 1.6544 | 1.9756 | 0.84 | 静态 |
-| **12** | **32** | 384 | 3.0956 | **2.8706** | **1.078** | **动态** |
-| **12** | **64** | 768 | 6.0054 | **4.9469** | **1.214** | **动态** |
-| 24 | 8 | 192 | 1.6334 | 1.7132 | 0.95 | 静态 |
-| **24** | **16 / 32 / 64** | 384…1536 | 2.9852 / 5.0115 / 9.3874 | **2.8460 / 4.6477 / 8.7435** | **1.049 / 1.078 / 1.074** | **动态** |
-
-   ⇒ **交叉点一眼可见：`per_thread ≥ 32` 且 `threads ≥ 12` 走动态（+4.9%…+21.4%），
-   其余（含 LLM 的 12 线程 × 16 行/线程）走静态**（动态在 per≤16 时慢 5–40%）。
-   **启发式已按此改写**（`src/pool/sched.rs::pick_rows`），并**替换掉**那段旧注释。
-   **为什么这次敢引用旧注释不敢**：旧数据出自"同一套台架"，那套台架后来被证有**顺序效应**
-   （同代码两臂"第一臂更慢"，对调后差距消失）且摆动达 **65%**；这次是**同进程交替**（静态/动态
-   在同一进程里来回跑），顺序效应被抵消 ⇒ 百分比可引用（旧注释的问题已写进提交信息）。
-2. **主线程参与（H2 的"主菜"）：实测无效，已回退。** 库内实现为"调用线程在 `during` 里领
-   最后一块/尾部行"（`dispatch_rows` 与多作业两条路都试过），**位精确测试全过**，但 LLM 形状的
-   计划路径 **5 对交错对照：不参与中位 349.7 G vs 参与 348.2 G（−0.4%，噪声内）** ⇒ 按验收口径
-   **如实写"未达 +5%"并回退**（`src/pool/mod.rs` 已还原，`nm -D` 不受影响）。
-   **为什么 driver 侧 +12% 没能搬过来**：driver 的"静态"是 **12 块 × 16 行 = 每 worker 恰好一块**
-   （无抢活余地），而库内 `Pick::RowBlock` 给的是 **48 块 × 4 行 = 每 worker 4 块**（本身已细）
-   ⇒ 库内原本就没有那么大的负载不均可捡。**这条差异正是"driver 结论不能直接搬进库"的实例。**
-3. **等待策略（`SPIN_LIMIT` 扫描）：结论"不必改"。** 库内上下文（大形状 `768×768×2048` @12、
-   走动态认领）扫 `SPIN_LIMIT ∈ {128, 1024, 4096}`，**同进程交替 ≥5 次**
-   （`src/parallel.rs` 的 `diag_spin_limit` + 测试用覆盖钩子 `set_spin_limit_for_test`；
-   **生产默认值不变**）：
-
-| `SPIN_LIMIT` | ms 中位数（极差） | GFLOP/s | `worker_loop` 自耗时（`perf record`） |
-|---|---|---|---|
-| 128 | 6.5995（6.0126–11.6976） | 366.1 | 未进 top（<0.5%） |
-| **1024（现默认）** | **6.4073（6.1402–9.8094）** | **377.1** | 未进 top（<0.5%） |
-| 4096 | 6.4629（6.2157–7.4891） | 373.8 | 0.76% |
-
-   判据（先写死：自旋占比再降 ≥8pp **且** ms 降 ≥2%）**没有任何一档满足**（1024 已最优，
-   另两档反而慢 0.9–3.0%）⇒ **判定"不必改"，默认 1024 保持**。
-   **为什么 driver 那次（200 圈赢 4000 圈、自旋占 60%）推不过来**：① 库内等不到就 **`park`
-   （`Condvar`）**，不是 `sched_yield` 死转；② 库内每 worker 4 块，干活期间几乎没人空转；
-   ③ 实测 `worker_loop` 自耗时 **<0.76%**（driver 那边 60%）⇒ **没有可捡的自旋**。负结论 + 依据留档。
-
-4. **宽薄 `256×64×4096` 不退化（改前 vs 改后，同源 6 轮丢首轮）**：`w256x64x4096-f32-12t-plan`
-   改后中位 **0.6254 ms / 214.6 G**（极差 0.6209–0.6586、`iters` 159–170、`ms_max` 2.4–3.5；
-   逐轮 loadavg 3.11–4.76 ⇒ 混合 B/C 窗口）；**改前记录 0.6355 ms / 211.2 G**（见 ⑥ 里那张表）
-   ⇒ **−1.6%（在 ±2% 不退化线内）**；与 OpenBLAS 同轮只差 **2.8%**（0.6085 ms / 220.6 G）。
-   **并且按构造就没变**：`pick_rows(256, 12, 4)`（`per_thread = 22 < 32`）**新旧判据都返回静态**
-   ⇒ 该形状的策略一字未动（`pick_is_sane` 里已加断言固定这一点）⇒ **不需要为宽薄收窄判据**。
-
-
-**⑪ 对照口径审计（2026-10-15，用户点名）：两边是不是同一把尺子**
-
-**对手身份（从此每次对照的第一行都打它，并存档）**：
-`OBIDENT openblas_config="OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY la464 MAX_THREADS=32" core=la464 nthreads_set=12 nthreads_get=12 a_mod64=16 b_mod64=16 ptrs_a=… b=…`
-⇒ **它是 `DYNAMIC_ARCH` + `core=la464` 的 LoongArch 优化构建（不是通用 C 兜底）** ⇒
-本节"与 OpenBLAS 只差 4%/2.8%"这类数字**不需要打折**，但**必须带这一行**才算合格的口径。
-（查法：本机头文件没声明 `openblas_get_config/get_corename/get_num_threads` ⇒ 装置里用**显式
-`extern`** 调用，与方法同款。）
-
-**审计主表（每项：两边怎么设 / 怎么验证 / 结论）**：
-
-| 项 | 两边怎么设 | 怎么验证 | 结论 |
-|---|---|---|---|
-| 1 线程数 | `OPENBLAS_NUM_THREADS=<n>`（`.sh`）+ `openblas_set_num_threads(n)`（`.c`）；本库侧 `--threads=<n>`（池/驱动） | `OBIDENT` 里打印 `nthreads_set=12 nthreads_get=12` | **对称 ✓**（设置真的生效，实测复核过） |
-| 2 亲和性 | 两臂**同一进程包法**：`taskset -c 4` 只在 `pin` 档包住**整个进程**（单线程档），多线程档两边**都不绑**；对手 build 是 **`NO_AFFINITY`**（它自己不绑） | `OBIIDENT` 的 `config` 字段报 `NO_AFFINITY`；装置里 `taskset` 包在 `"$bin"` 外（包进程，不是包某一边） | **对称 ✓**（Lead 更正了我先前"只绑单线程档不对称"的判断） |
-| 3 预热与迭代 | 两臂各自"自适应到 ~100 ms" | `.sh` 新增 `OBCMP` 行把两臂 `iters`/`ms_max` **并排打同一行**（例：`lasx_iters=21 … openblas_iters=39`） | **对称 ✓**（同目标；iters 不同是**对手更快**的结果，不是口径差） |
-| 4 数据/布局/缓冲 | 同一份确定性种子数据、`CblasRowMajor` + `lda/ldb/ldc = k/n/n`；**两边共用同一批指针** | `OBIIDENT` 打印 `ptrs_a/b`；两臂跑的是同一 `A`/`B`/`C` | **对称 ✓** |
-| 5 对齐 | 缓冲由 `malloc` 给（实测 `%64 = 16`），**两库拿到同一地址** | `OBIIDENT` 的 `a_mod64/b_mod64` | **对称 ✓**（谁也没占"对齐便宜"；先前以为"我方 32 B 对齐"是**记错**，实测 16 B 且共享） |
-| 6 调用模型 | ⚠️ **本来就不同构**：本库两档 = ① `plan`+调用方线程（调用方自管线程）② `lasx_matmul_run_threaded`（**库内建池、每次现建现拆**）；OpenBLAS = **内部常驻池** | 见下表：**同构对照**用 ② 对 OpenBLAS | **不对称 → 已分开报告**（这是本节最重要的口径修正） |
-
-**调用模型同构对照（旧跨进程数已撤）**：**旧跨进程/旧窗口数据见 git 历史**（`git log -p docs/dev.md`）；
-其结论仍然成立且**必须保留**：① 本库两档（`plan`+调用方线程 / `lasx_matmul_run_threaded` 库自管）与
-OpenBLAS 的**内部常驻池**是**不同构**的调用模型 ⇒ **报数必须注明模型**；② 便利层的池**已缓存进
-plan 句柄**（改动与现行数字见 ⑫）；③ 那个"便利层慢 **2.15×**"是**跨窗口虚高**、
-**不可引用**（规则见 §6.4），同进程口径下便利层 ≈ 手动最优的 1.0× 量级。
-
-**`cpu-migrations` 全档 0/0 的追问：本机该计数不可用。** 同一进程用 `/proc/<pid>/status` 看
-`voluntary_ctxt_switches` 是**非零**，而 `perf stat -e context-switches,cpu-migrations` 同一程序报
-**0/0** ⇒ **perf 的软件事件在这台机器上没统计到这些线程**（继承/口径问题），不是"真的一次迁移都
-没有"。⇒ 结论：**这两个计数标"本机不可用"**，要迁移/切换证据请用 `/proc/<pid>/status`。
-
-**⑫ "默认即最快"：DSL 阈值接上公共判据 + 便利层池缓存（2026-10-15 晚）**
-
-**(A) DSL/`shape` 路径：改前 0.809× → 改后 0.954×（同进程交替，判据 ≥0.833×）**
-
-装置：`src/parallel.rs` 的 `#[ignore]` 测试 `diag_dsl_vs_manual`——① **DSL 生成代码那条路**
-（`Mat::prepare()` 按文档 hoist 到循环外 + `Prepared::apply_into`，即 `matmul!(y = x*p)` 的语义）
-vs ② **手动最优**（`matmul_f32_plan` + 常驻池），**同进程交替 7 次取中位数**，两条路都断言与
-`api::matmul` **逐位一致**：
-
-| 版次 | DSL ms（GFLOP/s） | 手动最优 ms（G） | **DSL/手动** | 判定 |
-|---|---|---|---|---|
-| 改前（`shape` 里**写死** `Pick::Blocked`） | 3.2125（282.0） | 2.5984（348.7） | **0.809×** | **未达 0.833×** |
-| **改后（接上公共 `pick_rows`）** | **2.6930（336.4）** | 2.5700（352.5） | **0.954×** | **达标 ✓（+19%）** |
-
-- **改动**：`src/shape.rs` 把写死的 `Pick::Blocked { block_rows = per_thread }` 换成
-  `crate::pool::pick_rows(rows, threads, 4)` ⇒ **DSL/`shape` 路径与 C 侧装置共用同一份切分判据**
-  （判据在 `src/pool/sched.rs`，阈值表见 ⑩）——**这就是"两者是否同源"的答案：现在是同源，
-  以后只改一处**；两边注释互相指路。
-- **位精确**：`diag_dsl_vs_manual` 每轮断言两条路与 `api::matmul` 逐位一致；全量测试
-  （含 shape/DSL 的位精确矩阵）全绿。
-- **宽薄/小形状补测（已做，同进程交替 + 每轮位精确断言）**：`parallel::diag_dsl_pick_shapes` 在
-  同一进程里翻转 `LASX_SHAPE_OLD_PICK` 对比"改前 `Blocked`"与"改后 `pick_rows`"：
-
-| DSL 形状 | 改前 ms（G） | 改后 ms（G） | 改后/改前 | 判定（判据 ≥0.98 不退化） |
-|---|---|---|---|---|
-| 宽薄 `256×64×4096` | 0.4568（293.8） | **0.4223（317.8）** | **1.082×** | **反而快 8.2%（旧 `Blocked` 在宽薄上更差）** |
-| 小 `64×64×64` | 0.0079（66.8） | 0.0079（66.7） | 0.999× | 不退化（走单线程档） |
-| 小 `48×384×96` | 0.0516（68.6） | 0.0516（68.6） | 1.000× | 不退化 |
-
-  ⇒ **不需要按形状收窄阈值**（宽薄反而受益）——"方向安全"由测量确认，不是推理。
-- **池契约测试（两条，见 §4 清单）**：`small_shapes_do_not_construct_a_pool`（CI 跑；用**线程本地
-  建池计数**断言"小形状不初始化池"，并**另建一个池作正对照**证明计数器活着——**注意不能用
-  "大形状走过池"作正对照**：那走的是进程级全局池，可能早被别的线程建好，本线程计数不变，
-  本轮实测就踩了这个坑）；`init_global_first_use_then_frozen`（`#[ignore]`，**须
-  `--test-threads=1` 串行跑**才有意义：首次成功 / 之后返回 `false` / 线程数 = `parallelism().physical`）。
-
-**(B1) 便利层池缓存：同进程 +14.6%；并更正"2.15×"**
-
-- 实现：`LasxMatmulPlan` 内 `Mutex<Option<(usize, Arc<WorkerPool>)>>`（**按线程数缓存**、
-  随 `plan_destroy` 析构、**无进程级状态**、不新增符号）。
-- 同进程 A/B（`diag_threaded_pool_cache`，7 轮交替）：**每次现建 3.0986 ms / 292.4 G** →
-  **缓存后 2.7038 ms / 335.1 G**（**+14.6%**）。
-- **与手动最优（2.55–2.66 ms / 346–355 G）之比 ≈ 1.02–1.05×** ⇒ **验收目标"便利层 ≤1.2× 手动最优"
-  达成**（用同源数字）；此前那个"2.15×"是**坏窗口的跨窗口读数**（已降级为旧账，见 ⑪ 的口径更正）。
-- **新契约（写清，不藏着）**：① 同一 plan 上**并发 `run_threaded` 会共用同一个池** ⇒ 池的
-  "同时只有一个派活者"契约让**派活串行**（要真并行：不同 plan，或 `parallel::*` + 自管池）；
-  ② `threads` 与缓存不符 ⇒ **重建池**（`threads` 语义保持"这次用多少"）；③ 锁中毒 ⇒ 退化为现建；
-  ④ `threads<=0` 在建池时解析为 `parallelism().physical`；⑤ **fork 后不保证可用**（与库内其它池一致）。
-
-**冻结接口判定理由（入档，免得后人重新怀疑）**：本次**不需要动冻结接口**——冻结的三项是
-**池的行块闭包签名 + "start 与切片一一对应、各块首尾相接"**、`shape::Prepared::apply*`、
-`Policy::threads`。本轮的改动是：`shape` 内部**选哪个 `Pick`**（`Pick` 本身是内部枚举，签名不变）、
-C 句柄**内部多一个池字段**（不新增符号，`nm -D` 仍 94）⇒ **闭包签名、`apply*`、`Policy::threads`
-一字未改**，宏与 DSL 生成代码无需同改。
-
-
-**⑬ `pick_rows` 判据的网格补扫（2026-10-15 晚，用户要求"补外推"）——一处按实测收窄，其余如实标外推**
-
-**方法与口径**：`src/parallel.rs` 的 `#[ignore]` 测试 `diag_static_vs_dynamic_grid`，**同进程交替**
-`Pick::RowBlock` vs `Pick::Dynamic{block_rows=per/4}`，`k=768`、`n=2048`；判据**先写死"动态赢 ≥3% 才算动态"**；
-**每格都断言**"静态 vs 动态逐位一致"，`m ≤ 512` 的格子另与 `api::matmul` 对拍（全过 ✓）。
-两阶段：**① 粗扫 `threads∈{4,8,10,12,14,16,20,24,32} × per∈{12,16,20,24,28,32,40,48,64}`（81 格 × 3 次）**；
-**② 加密 `threads∈{8,10,12,14} × per∈{24,28,32,40,48}`（20 格 × 5 次）**。窗口 **B 级**
-（轮前 1min loadavg 3.84 / 4.48，**非 A 级**）⇒ 边界区只做保守处理。
-
-**粗扫节选**（比值 = 静态/动态，>1.03 判"动态"）：
-
-| threads \ per | 12 | 16 | 20 | 24 | 28 | 32 | 40 | 48 | 64 |
-|---|---|---|---|---|---|---|---|---|---|
-| 4 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | 静 |
-| 8 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | **动 1.23** |
-| 10 | 静 | 静 | **动 1.09** | 静 | 静 | 静 | **动 1.15** | **动 1.18** | **动 1.25** |
-| 12 | 静 | 静 | **动 1.12** | **动 1.11** | **动 1.04** | **动 1.13** | **动 1.24** | **动 1.20** | **动 1.22** |
-| 14 | 静 | 静 | **动 1.04** | 静 | 静 | **动 1.09** | **动 1.05** | **动 1.06** | **动 1.04** |
-| **16** | 静 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | **静 0.91** |
-| **20** | 静 | 静 | 静 | 静 | 静 | 静 | 静 | 静 | **静 0.96** |
-| 24 | 静 | **动 1.06** | **动 1.20** | **动 1.18** | **动 1.20** | 静 | **动 1.10** | **动 1.05** | **动 1.10** |
-| 32 | 静 | 静 | **动 1.30** | **动 1.10** | **动 1.10** | **动 1.30** | **动 1.13** | **动 1.10** | **动 1.17** |
-
-**逐格对照现行判据（`per ≥ 32 && threads ≥ 12`）的结论**：
-- **粗扫观察（当时）**：**`threads ∈ {16,20}` 的 18 个格子全部静态**（含 `per=64`，比值 0.91 / 0.96；
-  加密阶段同向）⇒ 当时据此把判据收窄为 `per ≥ 32 && threads ≥ 12 && threads ∉ [16,20]`。
-  **但"中间挖洞"这种形状不常见，所以又做了一次聚焦复验（下一条）——结论是其中一半被推翻。**
-
-**聚焦复验（`LASX_GRID_STAGE=3`，独立窗口 2026-10-15 晚，`threads ∈ {16,20} × per ∈ {16,24,32,40,48,64}`，
-5 次重复，同进程交替，判据不变；每格断言位精确；并打印 `pool.threads()` 实际线程数）**：
-
-| threads | per=16 | 24 | 32 | 40 | 48 | 64 |
-|---|---|---|---|---|---|---|
-| **16**（复验） | 静 0.721 | 静 0.852 | 静 0.855 | 静 0.965 | 静 0.865 | **静 0.949** |
-| **20**（复验） | 静 0.675 | 静 0.845 | 静 0.864 | 静 0.900 | **动 1.092** | **动 1.102** |
-
-- 每格都打印 `pool.threads()=16 / 20`（= 请求值）⇒ 排除"线程数没真设成 16/20"的假象；
-  窗口 **C 级**（轮前 loadavg **5.34**，加密/粗扫那两次是 B 级）⇒ 数字本身偏慢，但**同一窗口内的
-  交替比值**仍可用（两臂同窗口对比）。
-- **判定①：`threads=16` —— 复现**。两窗口合计 **15/15 个格子全部静态**（含 `per=64`：粗扫 0.91、
-  复验 0.949）⇒ **保留"排除 16"**。候选解释（**待验证假设，不是结论**）：本机 12 物理核 / 24 逻辑核，
-  16 与 20 落在"过订阅但不均匀"的区间，可能让动态认领的原子竞争/负载不均更贵；**未做**线程亲和性
-  或 `perf` 证据，故只列为假设。
-- **判定②：`threads=20` —— 不复现，已回退**。粗扫说静态（`per=48/64` → 0.935 / 0.958），复验说
-  **动态**（1.092 / 1.102）⇒ **两窗口符号相反** ⇒ 按"不复现就回退"的口径**恢复 20 档走判据**
-  （不排除 20），并**把粗扫那两格降级为窗口噪声**。**最终判据：`per ≥ 32 && threads ≥ 12 && threads != 16`。**
-- **C 侧旁证（弱）**：同一形状 `1024×768×2048`、`--split=threaded`：`t=16` → **11.34 / 11.78 ms**、
-  `t=20` → **17.11 / 18.58 ms**（`iters` 只有 4–9 ⇒ **C 级窗口**）⇒ 与 Rust 侧"16 线程这一档更好"
-  **同向**；但窗口太差，**不能**用它区分 20 线程上的静态/动态 ⇒ 只当弱旁证记着。
-- **最终保留的那一条**：`threads=16` 即使 `per ≥ 32` 也走静态（两窗口 15/15 复现）。
-
-- **⚠️ 边界区未定（明确留档）**：`threads ∈ {8,10,12,14} × per ∈ [20,32]` 两阶段**互相翻转**——
-  `8×32` 粗扫 **0.687（静）** vs 加密 **1.134（动）**；`12×24` **1.114（动）** vs **0.904（静）**；
-  `12×28` 1.041 / 0.987 ⇒ **该区域判据未定、维持保守（阈值仍是 32）**；**后人不要拿一次粗扫
-  就去"修正"它**，要改先做独立窗口复验（本节这条复验就是模板）。
-- **仍是外推（未实测）**：`threads ∈ {5..7, 9, 11, 13, 15, 17..19, 21..23, 25..31}`；
-  `per_thread ∈ {17..19, 21..23, 25..27, 29..31, 33..39, 41..47, 49..63}`；
-  **以及所有 `n ≠ 2048` / `k ≠ 768` 的形状**（判据只按"每线程行数 + 线程数"取，未含形状维度）。
-- **位精确**：每格"静态 vs 动态"逐位一致；`m ≤ 512` 的格子另与 `api::matmul` 逐位一致 —— **全过**。
-- **宽薄/小形状不受影响**：本次只改 `threads = 16` 的判定；`256×64×4096`（`per=22`）、
-  LLM（`192/12`）、小形状**策略一字未变**⇒ §7.10 ⑫ 的实测值继续有效。
-
-**⑭ 已撤（旧跨进程盖章尝试）**：**旧跨进程/旧窗口数据见 git 历史**（`git log -p docs/dev.md`）；
-本节曾记录的"跨进程 6 轮未到 300 G"及其表、`ms_min` 上界、同进程结构参照数**已按用户指示撤掉**
-（旧数字**不可引用**，规则见 §6.4）。**现行口径只看下一节 ⑮（同进程调用级交替）。**
-
-**⑮ 新口径正式表：同进程调用级交替 A/B（2026-10-15 晚，用户裁决后的"正式对照"）——`plan` 路径 311 G，盖章**
-
-装置：`scripts/bench_openblas.c --impl=alt`（**非 ABI 模式**，`nm -D` 不受影响）。协议：三臂在
-**同一进程、同一批缓冲**上**调用级交替**（每对轮换起跑次序，**6 对、丢首对**，各臂自适应到 ~80 ms
-取中位数+极差），**逐对打印 `loadavg` 与 A/B/C 分级**，**计时前双检查**：
-
-```
-ALTCHECK serial_vs_plan=bitexact serial_vs_threaded=bitexact serial_vs_openblas_maxrel=2.224e-05 tol=1.0e-03 ok=yes
-```
-（① 我方两臂与**串行参考**（一次 `lasx_matmul_run` 覆盖整个 m）**逐位一致**；② 对手与参考在
-`tol` 内 —— 两条都过才进入计时。）
-
-**形状 `192×768×3072` f32 @12 线程；窗口 A 级（6 对全部 `loadavg1 = 2.91`）；对手身份：
-`OpenBLAS 0.3.34 DYNAMIC_ARCH NO_AFFINITY la464 MAX_THREADS=32 / core=la464 / nthreads_get=12`。**
-
-| 臂 | ms 中位数（极差） | GFLOP/s | `iters`（首/末对） | `ms_max`（本臂跨对最大） |
-|---|---|---|---|---|
-| **`plan`（调用方常驻线程）** | **2.9132（2.8763–3.0358）** | **310.99** | 18 / 26 | 18.60 |
-| `threaded`（库自管，池缓存在 plan 内） | 10.2817（3.3921–17.5131） | 88.11 | 8 / 6 | 19.57 |
-| `openblas` | 2.5362（2.4966–3.0548） | 357.22 | 32 / 24 | 21.45 |
-
-**结论句（照此引用）**：
-> **C 侧 12 线程 `≥300 GFLOP/s` 已盖章：`plan`（调用方常驻线程 + 动态认领 + 短自旋）在同进程调用级交替正式协议下中位 **310.99 G**（2.9132 ms，极差 2.8763–3.0358 = 308–315 G，A 级窗口，6 对丢首对）；对手 OpenBLAS 0.3.34/DYNAMIC_ARCH/la464/NO_AFFINITY 同轮 357.22 G（2.5362 ms），两者差 13%。**
-
-**`threaded` 臂那 10.28 ms 是"同进程协议"的伪影，不要引用**：调用方臂的 **12 个常驻 worker 在
-同一进程里仍然活着**（短自旋等下一代），与库自管池的 12 条线程**互抢 12 个物理核** ⇒ 该臂被
-系统性惩罚（极差 3.39–17.51 ms 就是证据）。**它自己的公平数**是**另行**同进程交替测的
-**2.7038 ms / 335.1 G**（§7.10 ⑫ 的 `diag_threaded_pool_cache`，与"每调用现建池"对照）。
-⇒ **多臂同进程协议里，常驻线程臂会惩罚池臂**——这是该协议的已知局限，已记在此。
-
-**旧跨进程数的处置（保留、标"参考/旧账"）**：§7.10 的 ⑪/⑭ 与更早的"vs OpenBLAS"表都是
-**跨进程/跨窗口**口径 ⇒ **降级为参考**：⑭ 的 274.2 G（跨进程 6 轮）与新口径的 311 G 差 **13%**，
-**正好是"跨进程掺入进程启动/建池/调度/他人干扰"的量级**（同一次会话里第三次同型）。引用时
-**必须带"同进程/跨进程"**。
-
-
-**OpenBLAS 在方阵上的多线程数（@12 线程，供参考）**——本轮装置已能同形对照，但我们只测了
-`192×768×3072`/`256×64×4096` 两个带线程的形状；要补方阵 × 线程网格，直接加 case 跑
-`bash scripts/bench_openblas.sh <label> 6 <filter>` 即可（装置支持 `--threads` 传参）：
-
-| n | sgemm @12 | dgemm @12 |
-|---|---|---|
-| 64³ | 42.4–42.6 G（**比单线程的 52 G 还慢**） | 27.5–27.6 G |
-| 128³ | 207–209 G | 114–124 G |
-| 256³ | 226–243 G | 135–142 G |
-| 384³ | **338–340 G** | 171–173 G |
-| 512³ | 318–323 G | 145–165 G |
-
-**64³ 那行值得记**：OpenBLAS 开 12 线程后**比单线程更慢**——"小活儿不该并行"这个现象在
-OpenBLAS 上同样出现，与 `rope_tables` 那处的判断互相印证。
-
-**③ "标量"这一列的真实含义（别误读）**：`cli/src/scalar_ref.rs` 的头部自己写着——在
-`target-feature=+lasx` 下 LLVM 会把其中**大部分自动向量化**，所以 matmul 表里的 **3.5–4.6×**
-是"**手写 intrinsic vs 编译器自动向量化**"，**不是"vs 朴素循环"**；只有 `scalar_dot`/`scalar_sum`/
-`scalar_dot_f64`/`scalar_dot_q4` 是真标量。
-
-**"vs 朴素循环"的真正分母——同一台机器、同一个 256³ 形状，四个分母差 12 倍**（2026-10-04）：
-
-| 实现 | 时间 | 相对本库 LASX | 说明 |
-|---|---|---|---|
-| 朴素三重循环 + **逐元素 `black_box`**（台架 `naive_gemm`） | 101.4 ms | **~190×** | `black_box` 也抑制 ILP ⇒ **这是上界，不是公平分母** |
-| 朴素三重循环（C，`gcc -O2 -fno-tree-vectorize`） | **33.2–33.4 ms** | **~61×** | **禁向量化、保留 ILP ⇒ 这才是"vs 朴素循环"的公平分母** |
-| 朴素三重循环（C，`gcc -O2`，自动向量化） | 8.33–8.50 ms | ~15.5× | 编译器自动向量化后的分母 |
-| 本库 `lasx_matmul`（LASX） | **0.524–0.541 ms** | 1× | — |
-| OpenBLAS 0.3.34 sgemm（1 线程） | 0.545 ms | ~1.04× | 见 ① 小节 |
-
-⇒ **对外说"比朴素循环快"时应当引用 ~61×**（C、禁向量化、保留 ILP），并**说明另外两个分母为什么
-不能用**：190× 混进了 `black_box` 对 ILP 的惩罚，15.5× 是"vs 自动向量化"而不是"vs 朴素"。
-**这条也是本节的通用教训**：**"加速比"必须连分母一起说**——同一份代码，换个分母能从 15.5×
-变成 190×。（口径：256³、单线程、都不含分配、各 3 轮；load 3.24–3.85，高于 load ≤3 的首选窗口，
-但三轮离散 <1.5%。C 探针在 `/tmp/naive_gemm.c`，未进仓库。）
-
-**④ 公式 DSL vs 直接调用：宏不引入运行时开销（2026-10-04）**
-
-**设计要点（做错了整张表就废）**：两臂**都必须写预分配缓冲**——DSL 走 `MatBuf` + `matmul!`，
-直接调用走 FFI `lasx_matmul(m, k, n, a, b, c)` 写 `c`。**不能用 `api::matmul`**：它分配
-（本库 matmul **没有** `_into` 变体），拿它当对照测出来的是"分配开销"（量级 39–41%），
-**不是 DSL 开销**。
-
-| 64×256×256（单线程，两臂都不含分配） | DSL `matmul!` | 直接 `lasx_matmul` | 差 | load |
-|---|---|---|---|---|
-| r1 / r2 / r3 / 复跑 | 137.5 / 146.5 / 144.6 / 132.0 µs | 146.1 / 162.4 / 143.3 / 145.2 µs | 6.2 / 10.9 / **0.9** / 10.0% | 3.46–3.77 |
-
-**结论**：**符号会翻、幅度在噪声内** ⇒ 无量级差异；而四轮输出**全部逐位一致**（`to_bits()`
-逐元素比对）⇒ **两条路就是同一个内核**（`ops::matmul::matmul_f32`）。
-⇒ **宏买到的不是速度，而是编译期形状校验 + 可读性**：`matmul!(y[M,N] = x[M,K] * w[K,N])` 把维度
-写进类型，写错**编译不过**。
-**口径边界**：load 3.46–3.77（高于 load ≤3 的首选窗口）；因此**"无开销"靠的是"同内核 + 逐位一致"这个
-确定性事实**，计时只用于排除量级差异。（实现细节：`f64::abs_diff` 不存在 → `(a-b).abs()`；
-`xv` 与后文 f16 段重名 → `xv2`；`for i in 0..M*N` 索引数组触发 `needless_range_loop`。）
-
-**④续：DSL 还有 44% 可挖——两处，都已定位并量化（2026-10-04）**
-
-原先那句"宏不引入运行时开销"**只对了一半**：宏的**代码生成**确实无开销（const 下标走纯类型标注路径，
-不插入运行期断言），但 **`matmul!` 的默认用法会每次调用 `prepare()`（打包 B）**，而它默认又跑在
-**配置不佳的全局池**上。两处都实测、都改/给了正确用法：
-
-| 阶段 | 256³ 的 `matmul!` | 做了什么 |
-|---|---|---|
-| 起点（池默认 24 线程 + 每次 prepare） | **174 µs** | — |
-| ① 池默认改**物理核**（提交 `68d275d`，影响**所有**自动并行调用方） | **143 µs** | 12 线程 97–101 µs vs 24 线程 135–164 µs（三臂实测）；全局池从 144–187 → 96.5–98.4 µs（~35%） |
-| ② **把准备阶段 hoist 出循环**（用法，非改代码） | **97 µs** | `Mat::prepare()` 一次 + `apply_into` 复用：**省 31 / 33 / 34%**（三轮），且与池化对照 97.6–99.8 µs 只差 <2% |
-
-**代码证据链**：宏静态档生成 `x.mul_into(&w, &mut y)`（`macros/src/lib.rs`）→
-**`src/shape.rs:488` 的 `mul_into` = `rhs.prepare().apply_into(self, out)`** ⇒ 每次调用都打包。
-而**库自己的文档**在 `apply_dyn_into` 上就写着"内部仍会打包一次；**反复用请走 `Mat::prepare`**"
-⇒ 这是**设计语义**（宏生成的代码没有地方放"循环外准备"），不是缺陷。
-
-**与 `docs/ops.md` §5.12 的 RoPE 是同一模式**（本次调查的第二个实例）：**天真用法=每次重建准备；正确用法=准备一次、
-循环里只用**。两条现在都有可对比的用法与数字（RoPE 89%、matmul 31–34%）。
-
-**为什么现在还是给宏加了"接 prepared plan"的新形态**（2026-10-15，用户要求"斩草除根"）：
-上面那段原来的判断是"收益能由用户侧 `Mat::prepare()` 拿到 ⇒ 不加"。**触发条件在用户侧出现了**：
-DSL 的默认写法（`x[M,K] * w[K,N]`）把"每次调用都重新打包"藏在了宏后面——**代码看上去完全一样，
-循环里就是会慢 30%**，而"记得手动 hoist"是**只靠约定**的契约。于是按规则 3 的同一套成本算法重估：
-新增的只是**宏的输出形态**（右操作数不写方括号 ⇒ 视为 `Prepared`），§19.7 冻结的接口**一个都没动**，
-代价落在"解析 + 一份位精确测试 + 文档"上，收益是**把那条隐式陷阱从 API 表面消掉**。
-
-**实测（本次，`cargo run -p lasx_bench --release -- plan` 的最后一段）**：256³，两臂进程级交替、
-4 轮丢弃首轮取中位数（每轮内部 `timeit` 自适应重复 + 5 取样中位数；loadavg 1/5 分钟 = 2.54/2.79，
-15 分钟 3.65 为衰减中的历史负载）：
-
-| 轮次 | ① `matmul!(y = x * w[K,N])`（每次 pack） | ② `matmul!(y = x * p)`（plan 复用） | ②/① |
-|---|---|---|---|
-| r1 / r2 / r3 / r4 | 139.3 / 145.1 / 140.2 / 142.2 µs | 99.9 / 99.2 / 99.4 / 99.3 µs | 1.39 / 1.46 / 1.41 / 1.43× |
-| **中位数（丢弃首轮，3 轮）** | **142.2 µs** | **99.3 µs** | **1.43×（省 30%）** |
-
-与上表 ② 的 97 µs 一致（都是"打包一次 + 复用"），两臂输出与 `api::matmul` **逐位一致**
-（`to_bits()` 全量比对，基准里内联断言，不是只在单测里）。
-
-**新形态生成什么**（`cargo rustc --example … -- -Zunpretty=expanded` 实测）：
-
-```text
-matmul!(y[M, N] = x[M, K] * p);
-=>
-{ let _: &Mat<'_, _, { M }, { K }> = &x;
-  let _: &MatBuf<_, { M }, { N }> = &y;
-  p.apply_into(&x, &mut y) }        // DYN 档是 p.apply_dyn_into(&xd, &mut yd)
-```
-
-即**与手写 hoist 完全相同的那一次调用**，所以"逐位一致"是构造性的；宏这一层没有额外开销、
-也没有额外语义。**不做**隐式/指纹缓存：`.prepare()` 返回的 `Prepared` 借用权重切片，只有显式
-plan 才可证明安全，指针键缓存在缓冲区复用时会给**陈旧结果**（静默错结果）。
-
-**边界**：plan 只能写在乘积**右侧**——`alpha * x[M,K]`（标量前缀，v1 不支持）与 `p * x[M,K]`
-在 token 层同形，留一条"形状必须写在左侧"的硬规则才保得住原来的诊断；权重形状不进公式
-（K/N 由 `Prepared` 的 const 参数与 `x`/`y` 的类型标注对接，写错仍是编译错误）。
-
-### 7.12 外部成果评估：OpenAI 的 722 篇数学手稿（2026-10-06 公开）——**对本库无可直接使用者**
-
-> **本节是历史记录**（2026-10-06 的评估结论）：它不是实测性能表，2026-10-15 的方差法复测未覆盖。
-
-**是什么**（据公开报道与整理，未逐篇核实）：OpenAI 把内部未发布模型产出的 **722 篇手稿**上传到
-[`github.com/openai/math`](https://github.com/openai/math)，归为 **372 个"成果族"、17 个方向**
-（数论、几何、理论计算机科学、数学物理…）；**约 60% 的族带 Lean 形式化**（机器逐行检查），其余
-**只能算"声明"**；约 **50 个族**的摘要是"反证/反例"（推翻猜想而非证明）。
-来源：机器之心/36氪的整理（[英文版](https://eu.36kr.com/en/p/4015466508816520#1)、
-[中文原版](https://www.jnexpert.com/article/detail?id=36195)）、
-[Interesting Engineering](https://interestingengineering.com/ai-robotics/openai-largest-math-release-lean-proofs)、
-[BAAI hub](https://hub.baai.ac.cn/view/58507#1)、[TNW](https://thenextweb.com/news/openai-maths-722-papers-unreleased-model-github)。
-
-**代表题目**（整理稿列出的"最重 30 题"节选）：准黎曼假设（ζ 与 Dirichlet L 的零点都在 7/8 右侧、
-**带 Lean**）、BSD 公式（几乎所有二次扭、无形式化）、Goldfeld 猜想、Hilbert 第 10 问题（有理数域）、
-**Catalan 常数无理性**（带 Lean）、**π 的无理性指数最优值 = 2**（带 Lean，并顺带解决 Flint Hills
-级数收敛）、Hodge 猜想（CM 阿贝尔簇、无形式化）、Kuznetsov 猜想反例、量子几何 Langlands、
-Deligne–Drinfeld（带 Lean）、**Kakeya 三维极大与四维猜想**（无形式化）、**Mahler 猜想全维**（带 Lean）、
-Koebe 圆域存在性（带 Lean）；另有报道提到相对论 Vlasov–Maxwell 与量子 Heisenberg 铁磁体。
-
-**逐类相关性判定（本库 = LoongArch LASX/LSX 数值内核）**：
-
-| 类别 | 判定 | 理由 |
-|---|---|---|
-| 数论（ζ/BSD/Catalan/π 指数/Mahler…） | ❌ **无关** | 纯数学结论（无理性、界、最优常数），不提供**算法**；本库的内核不因此变快也不更准 |
-| 代数几何 / Langlands / Hodge | ❌ 无关 | 同上层抽象，且部分"无形式化" |
-| 调和分析（Kakeya）与几何测度 | ❌ 无关（但有方法论提示） | 结论是**存在性与界**，不是可实现的变换/算法 |
-| 理论 CS（NP-困难性） | ❌ 无关 | 不改变 GEMM/池的调度理论（本库的调度是工程实测定的） |
-| 数学物理（Vlasov–Maxwell、Heisenberg） | ❌ 无关 | 是方程层面的**存在性/正则性**结果，不是本库的 J2/RK4/弹道内核要用的**积分格式** |
-| **Lean 形式化（约 60% 的族）** | ⚠️ **不可直接用，但方法论同源** | 本库的硬承诺是"位精确 + 测试 + 文档契约"，不是 Lean 证明；**可类比的只有其判据**—— |
-
-**唯一值得留下的东西（一条方法论类比）**：整理稿强调"**没有形式化的结果目前只能算声明**"（60% 有
-Lean、其余 40% 待核）。本库的对应判据是：**性能结论必须带中位数+极差与负载窗口**、**数值结论必须
-带位精确测试**——否则同样只是声明。这与前文 7.10/7.11 那几处"假差额/单次采样"的纠正**完全同构**，
-值得作为"为什么本库要这么严"的外部旁证。
-
-**边界声明（必须写明）**：**没有**逐篇/逐族核实（GitHub 直取失败：HTML 返回导航壳、
-`raw.githubusercontent` 网络失败、`blob?plain=1` 超时）。本节的判断依据是**公开整理的清单与
-30 道代表题**；**372 族的完整标题清单未取得** ⇒ 结论表述为"**就已知清单与代表题而言，无可直接
-使用者**"，而不是"已穷尽核实"。若将来能取到完整清单，应复扫一遍关键词（`numerical`/`integrator`/
-`algorithm`/`quantization`/`attention`）以确认没有漏网。
-
-### 7.11 池扩展性的调查记录（2026-10-04）：**瓶颈是 B 的重复读，不是调度**
-
-> **本节是历史记录**（2026-10-04，自带 ≥5 轮/交替口径与"load ≤3 才取数"的纪律）：
-> 它是**一次调查的过程记录**，不是可一键重跑的横截面表；2026-10-15 的方差法复测未覆盖本节，
-> 数值保持原样、未重测（本次复测的池数据在 §7.7）。
-> **本节引用的 OpenBLAS 数字是旧账**（口径与对手身份见本节 7.10 的 ⑪：OpenBLAS 0.3.34 /
-> `DYNAMIC_ARCH` / core `la464` / `NO_AFFINITY`）——**本轮未重测**，不要当成 2026-10-15 的结论。
-> **⚠️ 历史数据、不可引用**：本节全部数字是**旧口径（跨进程/旧窗口）**，**只作过程记录**；引用现行
-> 口径请用 **剖析小节的 6.4（正式规程）与本节 7.10 的 ⑮（盖章句）**；旧数据见 **git 历史**（`git log -p docs/dev.md`）。
-
-**背景**（§7.10 ②）：`192×768×3072` 上本库 12 线程 5.09× 而 OpenBLAS 5.6×；`mt` 表里 12 线程
-效率 42%、`192×768×768` 只有 37%、**24 线程反而更慢**。
-
-**① 定量模型（用既有 `mt` 数据拟合，不需要新实验）**：行分块**不切 B** ⇒ 每个线程都要读完整份 B。
-设"时间 ≈ 线程数 × B字节 / 有效带宽"，两个形状给出**同一个常数**：
-
-| 形状 | B | 8 线程 B 流量 | 12 GB/s 下单流模型 | 实测（8 线程） | 实测/模型 |
-|---|---|---|---|---|---|
-| `192×768×768` | 2.36 MB | 18.9 MB | 1.57 ms | 0.815 ms | **0.52** |
-| `192×768×3072` | 9.44 MB | 75.5 MB | 6.29 ms | 3.23 ms | **0.51** |
-
-⇒ 反推**有效聚合带宽 ≈ 24 GB/s**（≈ 单流 12 GB/s 的两倍，与 8 线程一致）。**模型一次解释三件事**：
-8→12 不再变快（流量线性涨、带宽封顶）、24 线程更慢（227 MB 纯流量 ≈ 9.4 ms）、OpenBLAS 略胜
-（它按 n 分块 ⇒ B 面板在 L2/L3 内复用，流量约 1×B 而不是 ×线程数）。
-
-**② 修法的积木已经存在，位精确前提是"现成定理"**：`ops::matmul::matmul_f32_cols_block(
-m,k,n,j0,j1,a,b,c,COL_BLOCK)`。既有测试保证（`src/ops/matmul.rs`）：任意 **32 对齐**区间
-`[j0,j1)` 的输出与行内核 `matmul_f32` **逐位一致**且**区间外一格不写**；`packed`/`cols`/`stream`
-三条路径**逐位一致**（含 `100×448×19147` 这种非 32 倍数形状）。⇒ **并行列分块不可能改变数值**
-（每个输出元素的 k 方向归约次序不变），各线程写的是**真正不相交**的列集合 —— 这属于
-"编译器/借用检查器之外，由**测试**保证"的契约，已点名。
-
-**③ 预期收益（算术）**：8 线程的计算下界 = 0.9 GFLOP / (8 × 61 GFLOP/s) ≈ **1.8 ms**，实测 2.86 ms
-⇒ 只到下界 **63%**；列分块把 B 流量从 75.5 MB 降到 ~14 MB（B 9.44 + A 8×0.59），**应落到
-1.8–2.2 ms（快 25–40%）**，足以追平/超过 OpenBLAS 的 2.60–2.66 ms。
-
-**④ 按此规格实现后的实测结果见 ⑥（该路线最终被否掉，实现代码已撤回）。**
-
-**⑤ 那张"换调度策略"表：31% 的差距已**证实是顺序假象**（2026-10-04 复测），且台架整体不可靠**
-
-**判定（判别法：把两臂对调）**——两臂本是**同一段代码、同一策略值**（`matmul_f32` =
-`pick_rows` + `matmul_f32_picked`；`threads < 20` 时 `pick_rows` 返回的就是 `RowBlock`，两臂只差
-`op` 字符串）：
-
-| 跑序 | 第 1 臂 | 第 2 臂 |
-|---|---|---|
-| 原顺序（历史） | 默认 `pick_rows` **3.56 ms** | `RowBlock` **2.72 ms** |
-| **对调后**（3 轮，load 3.19） | `RowBlock` 2.71 / 2.59 / 2.61 ms | 默认 `pick_rows` **2.54 / 2.58 / 2.58 ms** |
-
-**重测（≥5 轮、同一位置重复取样，报中位数与极差；load 3.34–4.59，如实记录）**：
-
-| 臂 | 5 次样本（ms） | **中位数** | 极差（摆动） |
-|---|---|---|---|
-| 默认 `pick_rows` | 2.55 / 4.08 / 4.17 / 3.68 / 3.35 | 3.68 | 2.55–4.17（**1.6×**） |
-| `RowBlock`（**同一条路**） | 3.24 / 2.96 / 3.90 / 2.63 / 2.46 | 2.96 | 2.46–3.90（**1.6×**） |
-| **`Blocked{4}`** | 5.21 / 5.44 / 4.96 / 5.16 / 5.32 | **5.21** | 4.96–5.44（**10%**） |
-| **`Dynamic{4}`** | 4.58 / 4.62 / 4.62 / 4.64 / 4.69 | **4.62** | 4.58–4.69（**2%**） |
-
-**两条结论**：① **两条同路臂不可分辨**——中位数差 24%，但**极差大面积重叠**且各自摆动 **1.6×**，
-且**两次跑都是第一臂更慢** ⇒ 差距**随"位置"走、不随"策略名"走**，**"默认比 `RowBlock` 慢 31%"
-是台架的顺序效应**（与 §7.10 里 `api vs FFI` 的反向假差额**同型**，同一失败模式的第三个实例）。
-② **`Blocked{4}` 与 `Dynamic{4}` 稳定地更差**——摆动仅 **10% / 2%**，中位数 5.21 / 4.62 vs
-3.68 / 2.96；对调那轮（load 3.19）里同样稳定地慢 1.7–1.8×（4.81 / 5.49 / 4.83 与
-4.53 / 4.66 / 4.58 ms）⇒ **"这两条策略更差"的方向可信**，但必须带上"基线来自一张不可信的表"
-这个限定；**`pick_rows` 回避它们是对的**（当前阈值 `threads >= 20 && per_thread >= 32` 未选它们）。
-
-**该台架整体不可靠，"加个预热"修不好**：在计时前做一次丢弃的预热后，**同一段代码**（两臂同路）
-在同一轮内仍跑到 **2.47 vs 4.10 ms（65% 摆动）**，三轮之间还翻向（load 3.88–4.13）。
-⇒ **正确修法**：① **多轮取中位数（≥5）并报离散度**，而不是单次比值；② **只在 load ≤3 的窗口
-取数**；③ 可选：**逐臂交错**跑，让各臂看到相同的缓存/负载状态。（那次预热改动**未经验证就撤回**——
-验证恰好落在不可用窗口，按纪律不提交。）
-
-**⚠️ 对上文那张"换调度策略"表的处置**：该表的"相对默认"列**不要引用**——它的基线含顺序效应，
-且同代码臂的摆动可达 65%。要重测请按上面三条（中位数 + 窗口 + 交错）。
-
-**⑥ 并行列分块：实现了、位精确、但**实测慢 11–12×**（2026-10-04，已撤回）
-
-按 ④ 的规格实现 `parallel::matmul_f32_cols`（`0..n` 按 32 对齐切成 32 段交给池，每线程只写自己
-那些列；`unsafe` 带完整 SAFETY 论证）后实测（`192×768×3072`，3 轮，load 3.81–4.17）：
-
-| 线程 | 行分块（现状） | **列分块（本实现）** | 逐位一致 |
-|---|---|---|---|
-| 8 | **2.55 / 2.67 / 2.81 ms** | 31.22 / 31.61 / 34.75 ms（**~12× 慢**） | ✅ true |
-| 12 | 2.87 / 2.91 / 2.88 ms | 31.89 / 32.04 / 30.96 ms（**~11× 慢**） | ✅ true |
-
-**位精确没问题**（"列区间不相交 ⇒ 归约次序不变"的论证成立），**但收益模型被推翻**。当时的归因
-（"每次调用各自打包"）被读代码推翻——`tile4x32_f32`（`src/ops/matmul.rs:746`）**直接从 `b` 读**
-（`load_f32x8(b.as_ptr().add(p*n + j))`），这条路径既不打包也不分配；真正的归因见 ⑦。
-另有一条当时没跑、本应跑的判别实验：**扫段宽**（96 / 384 / 1536 / 整段 `n`）——与段宽无关
-⇒ 每项开销；越宽越好 ⇒ 并发跨行流式。**用流量模型推出"少读 B ⇒ 快 25–40%"就动手，是跳过了
-参数扫描这一步；流量模型只能用来提假设，不能替代参数扫描**——这条教训比收益数字更值得记。
-
-**代码状态**：实验代码已 `git checkout --` 撤回，仓库回到 `c61070e` 全绿基线（13 个 matmul
-测试通过，含 `packed_paths_bit_exact`）。**没有把 11× 慢的路径留在树里。**
-
-**⑦ 对上一条的修正（2026-10-04 续查）：那次实验**根本没真正并行**——归因要改**
-
-**实测（`lasx_bench dispatch`，3 轮，load 3.59–3.70）**：让池做一个 `black_box` 保证不被优化掉的
-空活儿，**切成 32 项**时 1 线程与 8 线程都是 **33 ns**；**切成 8 项**时都是 **10 ns**。
-
-⇒ **这个量级只能是内联执行**（真派发 8 线程不可能 33 ns；对照：12 线程空 `spawn+join` 是 270 µs），
-而且 **1 线程与 8 线程完全相同** ⇒ **池决定"内联还是派发"的判据看的是传给它的那个数组的大小**
-（该实验传的是 32 个 `(usize,usize)` = **512 字节**），**不是闭包真正的计算量**。
-
-**因此 ⑥ 的结论要改**：那次把"列分块"的并行意图**藏在了闭包里**，池看到的是 512 字节的小数据
-⇒ 极可能**按小数据内联/串行执行** ⇒ **"并行列分块慢 12×"这个说法不成立**——比较的其实是
-"**一条非并行路径** vs **行分块的并行路径**"。而 31 ms ≈ **2× 串行**（14.86 ms）的那部分
-**仍未解释**（候选：8 个 `cols_block(96)` 之间的重复准备、或每次调用重复触碰整份 A）。
-
-**教训（对全库有意义）**（`src/parallel.rs` 头部那句"把正确的切分方式固定下来"正是这个意思）：
-**池的并行判据绑定在"被切分的缓冲区大小"上 ⇒ 想并行，就必须把工作量切成与缓冲区对应的数据
-数组，不能把工作藏在闭包里。** 现存所有并行入口都是这么写的（按行/按下标区间切真实缓冲区），
-**只有这次不是**。
-
-**⑧ 结构性结论（2026-10-04）：列分块在**现有池 API 下不可表达** ⇒ 本方向在现 API 下不成立**
-
-准备"正确重做"时撞到一个结构性问题，它解释了 ⑦ 里那个陷阱为什么几乎必然发生：
-
-| 事实 | 后果 |
-|---|---|
-| 池的"内联/派发"判据**看数据数组大小**（⑦ 实测：32 项空活儿 33 ns、1 与 8 线程无差） | 想让池真派发，就必须给它**按工作量切好的大缓冲区** |
-| 池入口是 `for_each_chunk_mut(&mut data, f)` / `for_each_row_block_mut*`，**chunk 是 `data` 的连续切片** | **C 是行主序** ⇒ 连续切片只能是**行**方向 ⇒ **列方向切不出来** |
-| 唯一能表达"列段"的办法 | 把清单塞进闭包（⑥ 的做法）⇒ 池只看到 512 字节 ⇒ **内联** |
-
-⇒ **"按带宽预算自动选择列分块"这个方向，在本库当前的池契约下不可实现**——不是实现得不好，而是
-**没有可表达它的入口**。三条可能的出路与代价：
-
-| 方案 | 代价 |
-|---|---|
-| (a) 新增"带**显式工作量**的列入口" | 库里**已有** `for_each_row_block_mut_picked_work`（显式 `work` 参数）⇒ 缺的是列版本；**属于 API 变更，按规则 3 要先在 §19.7 冻结小节记一笔** |
-| (b) 传一个 `m*n` 大小的哑缓冲区、从 chunk 指针偏移反推线程编号来"骗过"判据 | 零 API 改动但**很丑**，且依赖指针算术 |
-| (c) 写进转置缓冲再转置回来 | 多一倍流量，**与"省流量"的初衷相悖** |
-
-**决定（暂）**：**不为一个从未被验证的收益去改 API** ⇒ ③（自动选择）**不做**；若将来真要查这条，
-入口是 (a)（并且要先有"列分块确实更快"的证据，而不是先改 API 再找收益）。
-**这条也是本节的收尾结论**：本节开头那个原始假设（"瓶颈是 B 重复读 ⇒ 列分块能拿 25–40%"）
-**未获实测支持**；本节的净产出是**一组被实测钉住的纠正**（见 ①–⑧），而不是一个优化。
-
-**⑨ 沿这条线挖出的真收获：池的默认线程数是**错的**，已改为物理核（2026-10-04，已落地）**
-
-查"公式 DSL 为何比显式池化慢"时，三臂对照（`256×256×256`）把根因指到了默认配置上：
-
-| 256³ | 12 线程 | 24 线程 | **全局池（改前 = 24 线程）** | 全局池（改后 = 12 线程） |
-|---|---|---|---|---|
-| 3 轮 | **97.3–101.7 µs** | 135.1–163.9 µs | **144.1–186.6 µs** | **96.5–98.4 µs** |
-
-⇒ `global()` = `Pool::auto()` = `available_parallelism()` = **逻辑核 24**，而**超线程在这类批量内核上
-更差**（SMT 互抢 L1/L2）——`Pool::auto()` 的旧注释写的却是"没有额外收益、**也不会更差**"，
-**被本次更严格的三臂对照直接推翻**（旧说法来自 §3.1/§7.7 的宽松扫描）。
-
-**已落地**（提交 `68d275d`）：`Pool::auto()` 改为读 Linux sysfs `thread_siblings_list` 数**物理核**
-（去重计核；读不到退回 `available_parallelism`，不会退化成单线程），`new(n)`/`init_global(n)` 不变
-（只改默认）；新增合理性测试 `physical_cores_is_plausible_and_within_logical`（219 单测）。
-**收益**：**所有自动并行调用方**（`api::matmul`/`api::gemv`/各 `_batch`）从 144–187 µs 档落到
-**96.5–98.4 µs**（~35%）。
-
-**⚠️ 该提交信息里的一个预期是错的，就地更正**：提交信息说"应把 DSL 拉回 ~100 µs 档"——**实测没有**。
-DSL 从 174 µs 降到 **136.6–143.6 µs**（快 20%），缺口从 **45% → 27–32%**，**仍有约 30% 的额外开销
-与线程数无关**（三轮一致、逐位一致）。⇒ **DSL 这条路还没查完**，剩余开销的候选：DSL 路径每次
-构造 plan/校验、走的是打包而非流式内核、或 `Mat`/`MatBuf` 层的每调用开销。
-
-**流程备案（规则 3）**：按规则本应"先在 §19.7 冻结小节记录、再改代码"。本次的顺序是
-**先落地+复测、记录随后补**（理由是避免让"未验证的默认变更"停留在工作区太久）。**这是对规则 3
-顺序的一次有意偏差，在此备案**；`Policy::threads`/`Prepared::apply*` 的**签名未变**，只改了默认值。
-
-**⑩ 调度侧的完整账目（2026-10-04）：四次否决之后，瓶颈指到"B 被每个线程整读一遍（L3 侧）"**
-
-起因（用户判断"剩下的效率问题仍在调度上"）⇒ 逐项量，**四个候选被实测否决或收窄**：
-
-| 候选 | 实测 | 判定 |
-|---|---|---|
-| **派发次数/屏障**（逐面板整队） | 每次派发 **0.6–0.7 µs**（1/4/8/16/24 次：0.93 → 17.9 µs，线性）⇒ 十几个面板共 **~12 µs** | ❌ 占调用 **0.4%**，否决 |
-| **打包 B**（`matmul_f32_packed` − 自动路径，m=4 隔离计算） | **~0.5–0.6 ms**（9.44 MB，≈16–19 GB/s）⇒ 占 2.88 ms 的 **17–20%** | ⚠️ 量化了，但**双缓冲多半已隐藏**（见下） |
-| **打包 vs 流式该选哪个**（`need_shared_pack`） | 单线程同形状：流式 14.60/14.71 ms vs 打包 14.56/14.64/14.72 ms ⇒ **打平** | ❌ 判据没选错；且并行侧"共享打包"是**必需**（把 B 读量从 12×9.44 MB≈113 MB 压到 9.44 MB） |
-| **每线程行数/复用**（以为"行多复用多"） | 8 线程（24 行/线程）**3.23 ms 慢于** 12 线程（16 行/线程）2.92 ms | ❌ 否决 |
-
-**收敛到的量**：共享面板被**每个线程各读一遍**（L3 侧）⇒ **L3 读量 ≈ 线程数 × 9.44 MB**；
-12 线程 ⇒ **113 MB / 2.92 ms ≈ 39 GB/s**。它与线程扫描的**效率形状吻合**：4 线程 **91%**、8 线程 **58%**、
-12 线程 **42%**、24 线程 **20%** ⇒ **是带宽墙（L3 侧），不是派发、不是 DRAM、也不只是打包**。
-这也解释 §7.10 ② 里 OpenBLAS 略快（5.6× vs 5.09×）：它**把面板/列也分给线程**，每个线程只读自己那部分 B
-⇒ L3 读量 ≈ 1× 而不是 ×线程数。
-
-**修法的形态与障碍（与 ⑧ 呼应）**：正确做法是**把 B 的面板也分给线程组**（每个线程只读自己那一段）。
-**现有池 API 表达不出来**——判据看**数据数组大小**、而 chunk 是**连续切片**，行主序的 C 无法连续切列
-（⑧ 已论证）。⇒ 需要 **(a) 一个"带显式工作量"的面板/列入口**（行版本 `_picked_work` 已存在），
-这是 **API 变更**：按规则 3 要先在 §19.7 记录，并补"只改划分、不改每元素归约次序 ⇒ 位精确可保"的测试。
-
-**未做（须授权）**：(a) 的实现、以及"暴露的打包"的实测（若暴露 ≈1.4% ⇒ 打包线可彻底放弃）。
-
-**⑪ L3 假设的判别实验（先预测、后验证）与"改不改 API"的边界（2026-10-04）**
-
-**预测**：若瓶颈是"每个线程各读一遍整份共享面板 B"，则 B 固定、计算随 m 涨 ⇒ **效率应 ∝ m**。
-**实测**（k=768、n=3072 固定、12 线程、3 轮、**load 2.42–2.81 全部 ≤3**）：
-
-| m | 1 线程 | 12 线程 | GFLOP/s | **效率** |
-|---|---|---|---|---|
-| 192（**LLM 批量形状**） | 14.5–15.1 ms | 2.76–2.85 ms | 317–328 | **42–45%** |
-| 384 | 29.6–29.8 ms | 5.05–5.13 ms | 354–359 | **48–49%** |
-| 768 | 61.2–61.6 ms | 9.58–9.82 ms | 369–378 | **52–53%** |
-| 1536 | 127.2–128.0 ms | 18.55–18.74 ms | 387–391 | **57–58%** |
-
-⇒ **单调上升，与预测一致**（吞吐逼近 ~390 GFLOP/s，单线程 61–66 ⇒ ~6× 上限）⇒ **⑩ 的 L3 结论成立**。
-
-**由这条曲线定出"改不改 API"的性价比边界**（这是本次调查最终的行动结论）：
-- **m ≥ 768**：现状（B 只按面板共享、不按线程划分）已能拿 **52–58%** ⇒ 再划分 B 的边际收益小，
-  **不值得**为此改 API；
-- **m ≈ 192（LLM 批量）**：效率最差（**42%**），是收益最大的区间，但按曲线外推，改成"面板也分给线程"
-  的收益约 **+10–20 个点**（42% → 52%+ 量级），且要付 **API 变更 + §19.7 流程 + 位精确测试**。
-
-**决定（2026-10-04）**：**暂不改 API**——收益被限定在 `m < ~384` 的形状，而代价是公开接口变更；
-`matmul_f32_picked` 现有"共享面板 + 行划分"在 m ≥ 768 时已接近可用上限。
-**触发条件**（将来出现即重评）：① 出现"**小 m 的 GEMM 在循环里反复调用**"的消费者（例如逐 token
-的 LLM 推理、每步都跑小批量）；② 或实测出现 `m < 384` 且总时间占比显著的场景。届时的入口是
-"带显式工作量的面板/列入口"（⑧ 已论证现有 API 表达不出），并按规则 3 先记 §19.7。
-
-**⑫ n 轴（面板数）的干净对照：效率随 n 上升 +7 点，但**L3 模型不覆盖它**（机制未定，2026-10-04）**
-
-`mt` 套件里天然有一对**只变 n**的形状（**m=192、k=768 都相同**）：
-
-| 形状 | 1 线程 | 12 线程 | 扩展 | **效率**（= (单线程/12)/实测） |
-|---|---|---|---|---|
-| `192×768×**768**`（24 个条带 ⇒ 面板更少） | 3.69 ms | 854.2 µs | 4.32× | **36%** |
-| `192×768×**3072**`（96 个条带 ⇒ 面板更多） | 14.81 ms | 2.89 ms | 5.13× | **43%** |
-
-⇒ **n 越大效率越高（+7 点）**。这条**与 ⑪ 的 L3 模型不矛盾但也不被它预测**：按该模型，
-"计算 / (线程数 × B)" = **m/12**，**与 n 无关**。⇒ 存在**二阶机制**，且两个自然的候选方向都**与观测相反**：
-
-| 候选 | 方向 | 判断 |
-|---|---|---|
-| 每面板固定成本（1 次派发 0.6 µs + 该面板的打包）被"流水线化" | 面板越多 ⇒ 固定成本总量越大 ⇒ 应更差 | ❌ 与观测相反 |
-| **A 的重复读**（每面板读一遍 A 的 m×k ⇒ 面板数 × m×k） | 面板越多 ⇒ A 读越多 ⇒ 应更差 | ❌ 与观测相反 |
-| **更长的连续流**（n=3072 时每行连续 12 KB，n=768 只有 3 KB）对 DRAM/L3 预取更友好 | 面板越多/流越长 ⇒ 更好 | ✅ **与观测一致，但未独立验证** |
-
-**记录方式**：⑪ 的 L3 结论**成立且已用于决定**（它解释了 m 轴）；**n 轴这 +7 点记为"二阶效应、
-机制未定（最可能是流长/预取）"**，并**不据此改任何代码**——它不改变"暂不改 API"的结论。
-
----
-
-### 7.13 指令级微基准（`lat`，2026-10-15）
-
-`cargo build --release -p lasx_bench` **先建好**，再 `./target/release/lasx_bench lat`（该套件
-自行打印：LSX/LASX 的 FMA **延迟**与**吞吐**、`SimdPath::detect()` 的每调用成本、极小 n 的
-`dot` 四路同口径对照）。**本机主频 2200 MHz**，周期 = ns × 2.2。
-
-**口径**：批 LAT（`taskset -c 4`，6 轮）+ LAT2（补 4 轮）。**丢弃首轮**（它是 A 级但按纪律不入
-中位数）后，取 **5 个 B 级轮**（`LAT r3/r4/r5 + LAT2 r3/r4`，轮前 1min loadavg
-`3.43 / 4.28 / 4.30 / 3.64 / 2.59`）的中位数与极差。4 个 C 级轮（LAT r2 有并发编译、
-LAT r6 load 5.82、LAT2 r1 6.73、LAT2 r2 5.68）**只作趋势、不入表**。二进制 = HEAD `9348531`
-构建，与 `5a2059d` 那次构建**逐字节相同**（sha256 `78332ea6…`，两者只差文档）。
-
-| 指令级 | 延迟 | 吞吐 | 备注 |
-|---|---|---|---|
-| **LASX** `xvfmadd_s` f32x8 | **1.37 ns = 3 周期** | 0.171（0.171–0.172） ns/op = 2.65（2.64–2.66） 条/周期 | 8 链量吞吐 |
-| **LSX** `vfmadd_s` f32x4 | **1.37 ns = 3 周期** | 0.172（0.171–0.172） ns/op = 2.65（2.65–2.66） 条/周期 | 8 链量吞吐 |
-| `SimdPath::detect()` | **1.53（1.37–1.54） ns/次** | `is_lasx()` 1.45（1.38–1.71） ns/次 | 含 TLS 读 + 原子读 |
-
-**LASX 与 LSX 的延迟（各 3.0 周期）与每周期条数（2.65）相同** ⇒ **LASX 只赢在车道宽**
-（8×f32 vs 4×f32），指令级延迟并不更好。这条与 §6.3 的"吞吐上限"一致：宽度是唯一红利。
-
-**极小 n 的 `dot` 四路同口径**（每种写法都走同一套计时，单位 ns/调用）：
-
-| n | ours（现状） | 标量参考 | vec（候选） | vec+detect |
-|---|---|---|---|---|
-| 8 | 8.47（8.36–8.55） | 7.16（7.12–7.23） | 6.29（6.22–6.35） | 9.09（9.03–9.15） |
-| 16 | 16.06（16.01–16.2） | 14.08（14.02–14.17） | 10.5（10.43–10.71） | 12.77（12.64–15.02） |
-| 24 | 25.28（25.15–27.77） | 21.44（21.28–23.21） | 14.88（14.78–16.14） | 19.1（18.91–20.69） |
-
-**能力探测本身就是可观开销**：`vec+detect` 比 `vec` 每调用多 2.8（n=8）/ 2.3（n=16）/
-4.2（n=24）ns——与 §7.7 的"分派税"结论同向。注意本节 `detect()` 是 1.5 ns 量级（`acc=1e7`、
-含 TLS 读 + 原子读），比 §7.6 里 `dispatch` 套件量的 0.91 ns/次高，**两者口径不同，不要混用**
-——**这个 1.5 ns 里绝大部分是测量循环自己的依赖链地板**，口径修正与"为什么最后没优化它"见 §7.14。
-
-### 7.14 `detect()` 的每调用开销：口径修正与一次"实测否决"（2026-10-15）
-
-**起因**：用户要求"优化调用"，第一刀砍向 `SimdPath::detect()`（§7.13 记 **1.53（1.37–1.54）
-ns/次**，14 个算子入口各调用一次）。先把它量准的结论是：**这个数本身有口径问题**，而
-"优化 detect 内部"这条路**没有可兑现的算子级收益**，故**按纪律回退**（只留测量工具与本记录）。
-
-**① 口径修正：1.5 ns 是循环地板，不是 `detect()` 的成本**
-
-`lat` 定向臂（`lasx_bench lat detect`，`taskset -c 4`）把"空循环地板"与"含 `detect()` 的循环"
-并排量（同一进程、同一窗口）：
-
-| 量（1e7 次） | 本机实测 |
-|---|---|
-| 空循环地板（`acc = acc + black_box(1)`） | **1.19–1.37 ns/次** |
-| 同结构循环里的 `detect()` | 1.37–1.53 ns/次 |
-| ⇒ 两者之差 = `detect()` 的**边际**成本 | **0.20–0.33 ns/次** |
-| 8 路展开吞吐探针（8 条独立 `xor` 链，摊掉循环开销）：地板 / 含 `detect` / 差 | 0.70 / 0.91 / **0.21** ns/次 |
-| §7.6 `dispatch` 套件（自带 0.46 ns 地板） | 0.91 ns/次 ⇒ 边际 **≈0.45** ns |
-
-**`detect()` 的真实边际成本是 0.2–0.45 ns/次，不是 1.5 ns**；单点数字**不能跨循环形状引用**
-（§7.6 的 0.91 与 §7.13 的 1.53 差的就是各自循环的地板）。以后报这类"~1 ns 函数"的成本，
-必须把空循环地板一起报——与剖析小节 6.4 的"窗口漂移"是同一类教训。
-
-**② 三个实现都做了，用 `perf stat -e instructions` 的确定性计数对比**
-
-计数口径：`lasx_bench lat detect_only`（只跑 1e7 次 `detect()` 的单一循环）的整进程指令数；
-同一二进制复测可复现到 ±1e3（对 1e9 是 1e-6）：
-
-| 方案 | 1e7 次调用的指令数（改前 → 改后） | 每调用 | `detect_only` 中位数（pinned、5 轮丢首轮） | 结论 |
-|---|---|---|---|---|
-| **(A)** 另开进程级 `AtomicBool`（只置位、单调：`if !FORCE_USED { Lasx }`） | 140.36M → 170.36M | **+3.0 条** | ≈持平 | **否决**：多一次原子 load + 分支，比它替换掉的那次 TLS 读更贵 |
-| **(A′)** 把 force 位并进 `HW_BITS` 同一字节（仍要 `BIT_DONE` 测试） | 140.36M → 150.36M | **+1.0 条** | ≈持平 | **否决**：`DONE` 与 force 两个测试省不掉 |
-| **(B)** 线程局部结果缓存（在 `lasx_force_lsx_thread` 里失效） | 140.36M → **90.36M** | **−5.0 条** | **1.495 → 1.106 ns（−26.0%；极差 0.021 vs 改前 0.153）** | `detect()` 自身确实快了 |
-
-(中间那版还**顺带修掉一个真 bug**：把 force 位并进 `HW_BITS` 后 `detect()` 直接读该字节，
-漏了"尚未探测"（`BIT_DONE` 为 0）这一支，进程首次调用会返回 `Lsx`——被
-`arch::tests::test_detect_is_lasx_without_force` 当场抓住。这条记在这里是因为它说明"热路径
-省一条测试"的诱惑有多真实。)
-
-**③ 但算子级没有可分辨的下降（这才是验收口径）**
-
-`norm3_batch` / `cross3_batch`，**n=64**（同一批 5 轮进程级交替、丢首轮、取中位数）：
-
-| 算子（n=64） | 改前中位数 | 改后中位数 | 差 |
-|---|---|---|---|
-| `norm3_batch` | 124.0 ns | 124.0 ns | ≈0 |
-| `cross3_batch` | 79.8 ns | 78.8 ns | −1.2% |
-
-每次调用省下的 5 条指令 ≈ **0.1 ns**，占 124 ns 的 **0.08%**——比本机噪声低两档，测不出来。
-n=8 也试过，但**不可用**：同一个二进制在不同会话里 `tiny_n8` 会出现 **±25% 的摆动**
-（两簇 16.4/22.2 与 20.0/15.1 ns，连 `norm3` 与 `cross3` 的大小关系都反了），是微样本的
-堆布局/缓存组别效应，属剖析小节 6.4 的窗口漂移——**只能同窗口成对交替比，跨会话不可比**
-（试过 64 字节布局填充：同一会话内无差异，说明那簇差异来自会话而不是二进制）。
-
-**④ 决定：回退**（"没有下降就如实回退"）。三条理由：
-
-1. 用户可见的边界——**算子每调用时间**——没有可分辨的改善；
-2. (B) 要引入一条"任何改 `FORCE_LSX` 的路径都必须同步失效缓存"的**只靠约定**的不变量
-   （违反＝静默走错路径；是错结果不是 UB），用一条约定换 0.1 ns 不划算；
-3. 真正的杠杆不在 `detect()` 内部：§7.13 里 `vec+detect` 比 `vec` 每调用多 **2.8–4.2 ns**，
-   那是"多一次调用 + 一个数据相关分支"的代价，不是 detect 的算术——要削它得改调用侧结构。
-
-**⑤ 保留物与重新评估的触发条件**
-
-`cli/src/suites/lat.rs` 的定向臂保留：空循环地板、8 路展开探针、以及供 `perf` 用的单循环模式
-（`lasx_bench lat detect_only`）。本节每个数都可用
-`lasx_bench lat detect` + `lasx_bench lat detect_only` + `perf stat -e instructions` 复现。
-**重新评估的触发条件**：出现"n ≤ 8 的小算子被高频调用"的真实负载（那时 detect 的占比才可能到
-百分级，且单位是 20 ns 而不是 124 ns），或前端取指带宽成为瓶颈时，再拿 (B) 与本节数字对照重估。
-
-**⑦ 口径修正（同日追加，两处）**
-
-1. 第 ① 节里 8 路展开探针的 `detect` 单一取值 **0.21 ns 偏乐观**，按后面 §7.14.1 的受控测量
-   应为**区间 0.23–0.57 ns**（两个稳定态，地板都是 0.707）；结论（<1 ns）不变，但**单点数字
-   不再引用**。
-2. 第 ① 节说 §7.13 的 `vec+detect` − `vec` = 2.8–4.2 ns"与分派税同向"——**归因错了一半**：
-   §7.14.1 证明其中 **~65% 是分派包装器本身的结构**（里层多一个 `black_box` 屏障 + 无法内联），
-   能力检查只占 ~0.6 ns。§7.13 那句"能力探测本身就是可观开销"应读成"**多一次调用 + 一个数据
-   相关分支**本身就是可观开销"。
-
-### 7.14.1 调用侧固定开销的受控拆解（2026-10-15）
-
-**方法**（§7.14 教训的落实）：**同一个二进制、同一个循环形状**（同一展开度、同一依赖链），
-只让被测的那一项变化；每项给**地板 / 含该项 / 边际**三行；`lasx_bench lat callcost` 跑
-**5 轮进程内交替**、丢首轮、中位数+极差，逐轮记 `loadavg`（本轮 4.04–4.15，B 级）。
-
-**① 三项拆解（n=64）**
-
-| 项 | 地板 | 含该项 | **边际** | 结论 |
-|---|---|---|---|---|
-| **能力检查** `SimdPath::detect()`（8 路展开探针，地板 = 常量 / `hoisted` = 循环外算一次） | 0.707 | 0.936 | **0.232**（0.215–0.243） | <1 ns ⇒ 不动 |
-| 同上，另一次进程（地板同为 0.707） | 0.707 | 1.285 | **0.565**（0.562–0.588） | <1 ns ⇒ 不动 |
-| 其中"只读原子字节" `hardware()` 那一半 | 0.707 | 1.000 | ≈0.29 | — |
-| **`_checked` vs 裸入口**（`norm3_batch` n=64） | 125.0 | 125.6 | **0.59**（0.08–1.15） | 0.5%，噪声内 ⇒ 不动 |
-| **分配**：`AlignedVec::<f64>::new(64)` | —（复用即地板） | **19.0** | **19.0** | 唯一 ≥1 ns 且算子级可见的项 |
-| 分配：`api::norm3_batch` vs 裸 FFI 入口 | 125.0 | 152.2 | **+27.1**（26.0–28.6） | 同上 |
-| 分配：`shape::Mat::mul` vs `mul_into`（32³） | 1237.8 | 1326.9 | **+95.6**（77.8–100.5） | 同上 |
-
-能力检查的边际**有两个稳定态：0.23 与 0.57 ns**（同一二进制、地板都 0.707；进程内 4 轮很紧，
-态间切换发生在**进程之间**）——所以只能报**区间 0.23–0.57 ns**。这个双态本身就是一条教训：
-**load/分支路径对同核 SMT 兄弟的占用比纯寄存器循环敏感**，而 `loadavg` 看不到瞬时占用。
-
-**② `vec+detect` 的归因（回答"那 2.8 ns 是不是真的"）**
-
-同一个 `dot_flagged(flag, a, b)` 函数体，只换 `flag` 的来源（`black_box` 位置一致），n=8：
-
-| 变体 | ns/调用 | 相对上一行 |
-|---|---|---|
-| `dot_vec`（无分支） | 6.88 | — |
-| `flag` 在循环外算好 | 7.15 | +0.28（那次分支本身） |
-| `flag` 每次 `detect()` | 7.70 | **+0.62（能力检查）** |
-| `dot_vec_dispatch` 现状（§7.13 被测的那个） | 9.23 | **+1.47（包装器结构）** |
-
-⇒ §7.13 的 2.8–4.2 ns 里，**能力检查只占 ~0.6 ns，~65% 是包装器**（里层 `black_box(dot_vec(..))`
-+ 两个分支体无法内联）。**n=24 那一档不可用**：`hoisted`(19.4) 竟低于 `vec`(22.2)、结构边际为负
-——该尺寸被两个单态函数的布局/取指差异淹没。
-
-**③ 唯一落地的一刀：`api` 层补 5 个免分配孪生（n=64，热循环反复调用，5 轮交替）**
-
-| 算子（n=64） | 分配型 | `_into` | **每次省** |
-|---|---|---|---|
-| `cross3_batch` | 174.7 | 86.0 | **88.6**（87.2–89.6） |
-| `unitize3_batch` | 425.6 | 317.9 | **107.9**（107.2–109.7） |
-| `vec3_add_scaled_batch` | 159.9 | 85.2 | **74.7**（73.5–75.5） |
-| `norm3_batch` | 155.6 | 124.9 | **30.6**（30.1–31.2） |
-| `batch_distance2d` | 94.8 | 68.3 | **26.4**（26.1–26.6） |
-
-**收益怎么说准**（别包装成"优化了算子本身"）：**这不是"让现有调用更快"，而是"去掉调用方被迫付
-那笔分配的原因"**——同一个内核、同样的数值，省下的只有 `AlignedVec::new` 的分配+memset+释放
-（三个输出的算子就是三笔，所以 74–108 ns）。**一次性调用不必改**；只有"热循环里反复调用"才
-改用 `_into`。`shape` 层本来就有免分配方法（`docs/ops.md` §6.7），缺的一直是 `api` 层。
-
-**代价与守卫**：纯 Rust `api` 层新增，**C ABI 一字不动**（83 = 42+41，`check_header.c` 与 CI
-的 ABI 门禁不受影响）；**位精确由构造成立**（分配型入口直接委托给 `_into`），并由
-`src/api.rs::test_batch_geometry_into_bit_exact_and_contract` 守卫（n = 0/1/7/8/9/31/32/33/64/65，
-`to_bits()` 逐位比，另含 `what = "out"/"ox"/"oy"/"oz"` 的契约与空输入）。
-
-### 7.13 R6-B-3：三档后端横向对比（**手写 SIMD vs 可移植优化档 vs 下限臂**，2026-10-16）
-
-**为什么记在这里**：本仓的性能实测数据一直放在 `docs/dev.md`（见 `docs/dsl.md` §0 的"数字的位置"），
-所以这份横向对照按既有惯例进 §7，而不是新开 `docs/bench.md`（唯一数据源原则：不新增第二个数字家）。
-
-**装置**：`examples/lasx_vs_portable.rs`（**feature 门控** `[[example]] required-features = ["dsl-backend"]`
-⇒ 默认构建不编它，**默认 ABI 不变**）。复跑：
-
-```text
-# 大跑（约 1 分钟；大 matmul 与下限臂较慢）
-cargo run --release --features dsl-backend --example lasx_vs_portable
-# 秒级冒烟（只验证能跑；轮数不满足 §5，输出里显式标注）
-cargo run --release --features dsl-backend --example lasx_vs_portable -- --smoke
-```
-
-**口径**：照 `simd_dsl/docs/performance.md` §5——**同进程交替**、**三臂写同一块目的缓冲**、
-**5 对丢首对**（大 matmul 降至 3 对、`iters = 1`，如实标注）、报**中位 + 极差 + `ms_max` + `iters`**、
-`loadavg` 随行打印；**正确性在计时之外先断言**（参照物 = `ScalarBackend`）。
-
-**实测（`loadavg = 4.36 4.30 3.89`；单位 ms）**：
-
-| 负载（形状） | **Lasx**（手写 SIMD） | **Idiomatic**（可移植优化） | **Scalar**（下限臂） | Lasx/Idio | Lasx 相对下限臂 | 等价类（参照物 = Scalar） |
-|---|---|---|---|---|---|---|
-| ① 点积 `K=1024` | **0.0001** | 0.0002 | 0.0014 | **0.569×** | 14.0× | Lasx `masked_rel ≤ 1.27e-6`；Idio `≤ 1.52e-6` |
-| ① 点积 `K=65536` | 0.0134 | 0.0136 | 0.0899 | **0.992×（打平）** | 6.7× | Lasx `≤ 1.41e-4`；Idio `≤ 1.52e-4` |
-| ② matmul `64×64×64` | **0.0078** | 0.0599 | 0.2875 | **0.131×** | 36.9× | Lasx `≤ 6.67e-5` |
-| ② matmul `192×768×3072` | **16.0039** | 133.9138 | 1626.7265 | **0.120×** | **101.7×** | Lasx `≤ 1.96e-4` |
-| ③ `reduce_sum_rows_f32` `128×1024` | 0.0198 | 0.0198 | 0.1776 | **0.999×** | 9.0× | Lasx/Idio `≤ 1.05e-4` |
-| ③ `reduce_sum_rows_f32` `4096×256` | 0.1427 | 0.1417 | 1.3294 | **1.008×** | 9.3× | Lasx/Idio `≤ 2.15e-5` |
-| ④ `rms_norm`（窄三元组）`128×1024` | 0.2664 | 0.2672 | 0.3944 | **0.997×** | 1.48× | Lasx/Idio `≤ 2.17e-7` |
-| ④ `rms_norm`（窄三元组）`4096×256` | 2.2824 | 2.2525 | — | **1.013×（Idio 略快）** | — | Lasx/Idio `≤ 2.37e-7` |
-
-（极差/`ms_max` 逐行见装置输出，例：② 大 matmul Lasx 极差 0.2138 / `ms_max` 16.1109，Idio 极差 6.8927 / `ms_max` 137.3602，Scalar 极差 4.7238 / `ms_max` 1629.0884。）
-
-**等价类**：三档**都不是逐位**（不同分块/累加次序）⇒ 全部标**容差 + 实测界**（参照物 = `ScalarBackend`）；
-界随规模变大（`rms_norm` ≤ 2.4e-7；`K=65536` 点积 ≤ 1.4e-4；大 matmul ≤ 2.0e-4）——与 `docs/ops.md §2.5`
-的"位精确承诺只对同内核/同路线"一致。
-
-**归因（每个倍率拆开）**：
-
-| 倍率 | 来源 | 证据 |
-|---|---|---|
-| ② matmul **7.6–8.4×**（Lasx vs Idio） | **向量化（手写 LASX 内核 + 内部打包）** | 同一 `matmul_f32` 调用、同一目的缓冲，只换后端；`LasxBackend` 确实覆盖了该方法（`src/dsl_backend.rs:65`） |
-| ① 点积 `K=1024` **1.76×** | **向量化**（小 K 仍有优势） | 同上（`dot_f32` 在 `dsl_backend.rs:91`） |
-| ③ 轴归约 **9.0–9.3×**（Idio vs Scalar） | **可移植优化档的向量化/分块** | 两个优化档**完全相同**（0.999×/1.008×）⇒ 这一档的收益全来自"非标量实现"，不是手写 SIMD |
-| ④ 窄三元组 **1.48×**（Idio vs Scalar） | **少往返**（`reduce_rows_map_f32` 一趟）+ 可移植向量化 | 该入口是 DSL 侧的融合实现 |
-| ① 大 K 点积 **双方打平（0.992×）** | **访存带宽饱和** ⇒ 向量化边际为 0 | 见负结果 2 |
-
-**负结果（如实写，本轮验收重点）**：
-
-1. **③、④ 上"三档"其实只有两档**：`LasxBackend` **只覆盖 `matmul_f32`/`dot_f32`**（外加
-   `build_kernel_f32`/`pack_f32`/`matmul_f32_packed`/`supports`）——**没有覆盖** `reduce_sum_rows_f32`
-   与 `reduce_rows_map_f32` ⇒ 这两个负载上 Lasx 与 Idiomatic **逐行相同（0.997×–1.013×）**。
-   **这不是"手写 SIMD 无用"，而是"手写档没实现这个入口"**；报告这类表时必须同时报"哪一档覆盖了哪条路径"，
-   否则会把"没走手写路径"误读成"手写不快"。
-2. **大 K 点积（65536）手写与可移植档打平（0.992×）**：该形状**访存带宽饱和**（0.0134 ms 搬 2×256 KiB
-   ≈ 39 GB/s），向量化的边际收益归零。
-3. **④ 大形状 Idiomatic 略快于 Lasx（1.013×）**：同上——该入口没走手写路径，差异在噪声内
-   （极差 0.099–0.108 ms）。
-4. **下限臂不是"慢一点点"**：`ScalarBackend` 在大 matmul 上比手写慢 **101.7×**、在轴归约上慢 **9.0–9.3×**；
-   报数时若只报"优化档 vs 标量"，会把**数量级**误当成"几成"。
-
-**与 DSL 侧装置的关系**：`simd_dsl` 仓的 `docs/bench.md` §17 量的是**DSL 改写（分趟 → 融合）**的收益
-（少往返 2.1–2.2×、后端向量化 1.1–6.6×）；本节量的是**同一批 DSL 调用换后端**的收益。
-两者结论一致：**收益来自"实现档 + 少往返"，不来自"DSL 比手写聪明"**。
-
-#### 7.13.1 R7-B：DSL 转发开销实测（`loadavg = 3.26 3.41 3.22`；pairs 5 / iters 4；同缓冲、交替、丢首对）
-
-臂定义：**①** `matmul!`/`dot!` **宏路径**走 `LasxBackend`（= 消费者实际写法）vs **②** 直接调
-`lasx_rs::api::{matmul_into, dot}`（**不经 DSL**，同目的缓冲）。装置：`examples/lasx_vs_portable.rs`
-（feature 门控不变；`--smoke` 秒级）。
-
-| 负载（形状） | ① DSL 宏路径 | ② 直接内核 | **①/②**（>1.05 即 DSL 有开销） | 极差 / `ms_max`（① / ②） | 等价类（参照物 = ②） |
-|---|---|---|---|---|---|
-| matmul `64×64×64` | 0.0077 ms | 0.0078 ms | **0.997** | 0.0000/0.0078 · 0.0000/0.0078 | **逐位** |
-| matmul `192×768×3072` | 14.7318 ms | 14.7978 ms | **0.996** | 0.1034/14.7835 · 0.1867/14.8911 | **逐位** |
-| dot `K=1024` | 0.0001 ms | 0.0001 ms | 1.233（**量化噪声**：中位落在 100 ns 刻度上） | 0.0000/0.0001 · 0.0000/0.0001 | **逐位** |
-| dot `K=65536` | 0.0264 ms | 0.0264 ms | **1.002** | 0.0003/0.0264 · 0.0016/0.0277 | **逐位** |
-
-**结论句（只写实测支撑的）**：**同一内核下 DSL 至多持平——实测 `DSL/直接` = 0.996–1.002
-（唯一超出的是 `K=1024` 的 1.233，但该点中位数落在 100 ns 刻度上、属量化噪声）⇒ 宏与 trait 转发
-没有可测开销（<1.05×）**；**能赢的地方只在"跨步融合/少往返"**（`simd_dsl/docs/performance.md` §17 的
-**2.0–2.2×**，以及 §18 规则⑥ 的 **1.72–1.89×**）。**轴归约（rows）没有 ② 对应物**：`lasx_rs` 侧
-没有原生 rows 归约内核、`LasxBackend` 也未覆盖该入口（§7.13 的 ③④ 行已实测 Lasx ≡ Idiomatic）
-⇒ 该负载上"DSL 转发开销"**未定义**（不是 0，装置里也这么标注）。
-
----
-
-
----
-
-## 8. 矩阵乘深挖
-
-> **⚠️ 历史数据、不可引用**：本节（含 8.1 起各小节）里的对照数字都是**旧口径（跨进程/旧窗口）**，
-> 只作**设计推理与过程记录**；**引用现行口径请用 §6.4（正式规程）与 7.10 的 ⑮（盖章句）**，
-> 旧数据见 **git 历史**（`git log -p docs/dev.md`）。
-
-### 8.1 三条路径与分派
-
-`matmul_f32` 有三条**逐位一致**的路径（数字阈值都在 `src/ops/matmul.rs` 顶部、带实测注释）：
-
-```text
-1) 打包（packed）   m ≥ 32 且 k ≥ 64 且 m·k·n ≥ 8M   例外：m ≤ 128 && n ≥ 1024 && n > 16384 && k < 192 时不用
-2) 列块在外（cols） m ≤ 128 且 n ≥ 1024
-3) 流式（stream）   其余
-```
-
-f64 只有两条（打包 / 流式），`m ≥ 32 && k ≥ 64 && m·k·n ≥ 8M` 走打包。
-
-**小 n 的负优化**是有意的：`dot`/`matmul` 在 n 很小时分派与向量建立的开销大于收益。
-
-列块路径的 `COL_BLOCK = 128`（B 的面板 `k×128×4` 要留在 L2 里被整轮行扫描复用）来自
-一次宽度扫描，**2026-09-25 复测**（改常量重建 4 个二进制，`matmul_ab <m> <k> <n> cols`
-进程级交替、丢弃首轮）：
-
-| 形状 | 32 | 64 | **128（现状）** | 256 |
-|---|---|---|---|---|
-| 100×448×19147 | 40.4 | 40.1 | **40.3** | **28.1**（−30%） |
-| 128×448×4096 | 22.5 | 22.9 | **23.0** | 23.0 |
-
-（单位 GFLOP/s，取三轮中位。）读数：**32/64/128 在噪声内**（40.1–40.4），**256 在极宽形状上
-明显变慢 30%**（面板 448×256×4 = 448 KB 起脱离 L2 的舒适区）；第二个形状本来就被 DRAM 压平，
-四档全平。所以"取 128"是**保守选择**（面板大小对 L2 留有余量），不是"128 比别人快"。
-
-### 8.2 打包（packing）
-
-把 B 的 32 列（f64 是 16 列）打成 `packed[(strip*k + p)*32 + r]` 的连续条带，微内核的 k 循环
-（`tile4x32_packed` / `tile4x16_chunk`）就变成顺序读；否则每一步都要按 `n` 跨距访问 B。
-
-打包还有第二个收益（§9.4）：**消除跨距别名**。当 `n` 是 2 的幂、B 的相邻行正好相距 L1 容量
-（n = 16384 时为 64 KiB）时，列块路径的所有行映射到同一批组，带宽掉一半以上；打包后的连续条带
-完全不受影响。
-
-#### 8.2.1 打包本身必须是向量拷贝（2026-09-28）
-
-打包是"读一遍 B + 写一遍 `packed`"，两侧的访问粒度都由布局决定、**只能让一侧顺序**：
-读是"每行 128 B、跨行跳 `n×4`"，写是"每条带 `k×128` B 连续"。三件事实测过（打包吞吐用
-`/tmp` 的独立探针——同一份数据跑多种写法、先比字节再比时间；端到端用 `examples/matmul_ab`
-做进程级交替）：
-
-| 假设 | 实测 | 结论 |
-|---|---|---|
-| 循环顺序是瓶颈（行外层 vs 条带外层） | 打包单独测：行外层 14.2–16.7 GB/s、条带外层 10.2–18.0 GB/s（互有胜负）；**端到端 20 次比较全部落在噪声内**（256³ 61.4–61.7，512³ 三轮逐位同） | 否，两种顺序移动的字节一样，瓶颈不在顺序 |
-| `copy_from_slice` 已经够快 | 两种标量顺序 10.2–18.0 GB/s（**生产 `+lasx` 配置下也一样**），而纯读同一工作集有 23.4 GB/s | 否：见下面对照的机制 |
-| `copy_from_slice` 是"没向量化" | 反汇编（`objdump -d`，生产 `+lasx` 配置）显示它落进**通用 memcpy**：先按地址做对齐剥离与重叠检查，再按块起分支（`xvld` 与 `xvpermi.d/xvpickev.w/xvslt.du` 混在一起），每个 128 B 块都要走一遍 | 机制是"通用拷贝路径的对齐剥离/分支开销"，不是"完全不发向量指令"；显式按布局写才是干净内层循环 |
-| 32 字节对齐是硬要求（要不要换 `AlignedVec`） | 用对齐基址 + 8 种 `f32` 偏移（4–28 字节）做载入-存储往返：**全部逐位正确、未越界写** | 否：显式 `xvld/xvst` 容错非对齐（`arch::lasx` 的"与对齐无关"契约成立，实测覆盖到元素对齐） |
-| 显式 4 条 256 位载入/存储 | **21.7–46.0 GB/s**（同工作集纯读 23.4 GB/s，说明已贴住访存上限） | 是，`pack_b`（f32/f64 两侧同名）现在每个 128 B 块发 4×`load/store_f32x8` |
-| 一次处理几条带（1 条 vs 4 条） | 隔离探针里 1 条带在中等形状更快（256²：37.1 对 27.0 GB/s）；**端到端三轮只有宽 B 形状能分辨**：4 条带一组 58.1/53.6/53.7，1 条带 56.9/52.9/52.7（`128×512×8192`，+2%），其余形状在 ±1% 内 | 取 **4 条带一组**：读侧每行 512 B 连续，对宽 B 更友好；隔离探针的排序在真实内核里不成立，所以按端到端定 |
-
-端到端（`examples/matmul_ab` 与 `lasx_bench matmul` 双口径、进程级交替、丢弃首轮、3–5 轮中位数；
-旧=标量打包，新=向量打包；区间同时覆盖两种口径）：
-
-| 形状 | 旧 | 新 | 变化 |
-|---|---|---|---|
-| f32 256³ | 60.5–61.7 | **62.2–63.5** | **+2.8%** |
-| f32 512³ | 60.0–61.2 | **60.9–62.1** | +1.4% |
-| f32 1024³ | 59.2–60.2 | **60.9–61.8** | +2.4% |
-| f32 1000×64×4096 | 61.8–64.0 | **63.9–64.9** | +1.4% |
-| f32 256×256×16384 | 55.3–56.9 | **59.0–59.4** | **+6.5%** |
-| f32 128×512×8192 | 49.7–50.3 | **57.8–58.3** | **+16%** |
-| f32 1024×256×8192 | 55.5–57.9 | 56.3–58.5 | +1.5%（噪声内） |
-| f32 64³ | 67.7–68.7 | 67.9–68.8 | 持平（不打包） |
-| f64 256³ | 27.6–28.7 | **27.8–29.3** | +2.2%（套件口径） |
-| f64 512³ | 30.0–30.9 | **30.5–31.4** | +1.5% |
-| f32/f64 多线程（`pool`，12/23 线程） | — | 无可见变化 | 打包在 MT 侧本来就是"主线程延迟打包"流水（§16），已遮盖 |
-
-`f64 128³` 在强制走打包的 `matmul_ab packed64` 下从 28.7–29.2 涨到 30.1–30.7（+4.5%），
-但**发布口径的 `lasx_matmul_f64` 在 128³ 走流式**（`work < 8M`），所以套件里那一行不动。
-收益随打包量单调变大：打包占得越重，省得越多（宽 B 的 `128×512×8192` 是 **21.5 → 18.4 ms**）。
-
-打包占单线程总时间的比例（`② lasx_matmul` 与 `③ plan::run_into`——同一个
-`matmul_f32_packed_rows` 内核，③ 的面板是预先打好的，所以 ②−③ 就是打包这一遍；
-数字是**向量化之前**的 `lasx_bench plan`：256³ 549.8→503.8 µs，打包 **8.4%**；
-512³ 4.40→4.21 ms，**4.3%**）。向量化把这一遍的成本砍掉约 1/3–1/2，剩下的部分才是
-内核 + 访存结构（见 §8.5 的占比）。
-
-
-### 8.3 k 分块（k-chunking）
-
-打包条带按 k 主序存放，所以"一段 k"就是一段连续内存。把 k 切成 `K_CHUNK`（f32/f64 均为 256 步，
-= 32 KB 条带），循环次序是 **k 块在外、行块在内**：
-
-```text
-for 列条带（32 列）:
-  for k 块:                 # 条带 ≤ 48 KB 时自适应地不分块
-    for 行块（4 行）:        # 该 k 块的 B 被所有行块反复命中，留在 L1
-      16 个累加器 × kb 步 FMA
-```
-
-- 动机：条带 > L1（64 KiB）后每步都要回 L2/L3 取 B。`512×k×512` 的条带扫描：24–48 KB 时 59–61 GFLOP/s，
-  正好等于 L1 的 64 KB 掉到 54.7，96–128 KB 只有 47–49。
-- 逐形状收益（**2026-09-25 复测**：改 `L1_BUDGET` 重建两个二进制，`matmul_ab <m> <k> <n> packed`
-  进程级交替、丢弃首轮；旧记录里的 "+13~26% / +7~26% / **+91%**" 已被这组替代——方向一致，
-  2048³ 的幅度没有那么大）：
-
-  | 形状 | 分块（现状） | 不分块 | 收益 |
-  |---|---|---|---|
-  | 256³ | 61.0–61.5 GF/s | 55.5–61.6 | **持平**（k=256 的条带本来就装得进 L1 ✓） |
-  | 512³ | 58.3–61.2 | 52.7–53.6 | **+9~16%** |
-  | 1024³ | 58.3–59.9 | 45.4–50.4 | **+16~29%** |
-  | 2048³ | 52.7–53.0 | 37.8–41.9 | **+26~40%**（超出 L3，收益最大） |
-
-- 代价：C 要按 k 块读写（k=1024 时多 3 次），相对算力可忽略。
-- **逐位不变**：块间把 C 里的部分和读回来继续按 p 递增累加，f32/f64 部分和落盘/读回是精确的。
-
-### 8.4 阈值重标定（k 下限 192 → 64）
-
-§19 时代的 `k ≥ 192` 是**打包前**的结论；k 分块改变了成本结构后必须重测：
-
-| 形状 | 旧策略 | 新策略 | 变化 |
-|---|---|---|---|
-| 256×64×4096 | 22.1 | **58.7–61.6** | +165% |
-| 64×128×4096 | 22.4 | **47.2–50.9** | +115% |
-| 64×96×8192 | 22.0 | **46.3–51.3** | +110% |
-| 128×128×2048 | 31.4 | **56.9–57.5** | +80% |
-| f64 256×64×4096 | 11.2 | **28.6–30.2** | +160% |
-| 128×128×128 / 96×128×512 | 67.5 / 59.3 | 67.4 / 61.1 | 持平（`work ≥ 8M` 挡住 128³） |
-| 100×64×19147 | **54.5–61.8**（列块） | 33.5–41.9（打包） | 例外：小 k + 极宽 n 保留列块 |
-
-### 8.5 当前性能与参照
-
-本节在 **2026-09-28 整表重测**：本库用 `lasx_bench matmul`（`lasx_matmul` 分派入口）与
-`examples/matmul_ab … stream`（同一入口，覆盖套件里没有的形状），绑核 `taskset -c 4`
-（单线程表），3 轮取中位；参照是同一天用 `/tmp/ob_gemm.c`（系统 OpenBLAS 0.3.34，
-corename `LA464`，`openblas_set_num_threads(1)`，缓冲预分配、计时区间内重复、5 取样中位）
-量的同一批形状。
-**（口径补注 2026-10-15 审计）**：对手身份与调用模型见上面 7.10 的 ⑪——本节是**单线程**对照（模型对等），
-对手为 **OpenBLAS 0.3.34 / `DYNAMIC_ARCH` / core `la464` / `NO_AFFINITY`**；本节数字是**旧账
-（2026-09-28），本轮未重测**，不要升格为"2026-10-15 的结论"。
-
-| 形状 | 本库（单线程） | OpenBLAS 同日 | 差 |
-|---|---|---|---|
-| f32 64³ | **68.6** | 53.2 | 快 1.29× |
-| f32 128³ | **67.3** | 57.2 | 快 1.18× |
-| f32 256³ | **63.3** | 61.8 | 快 1.02× |
-| f32 384³ | **60.4** | 64.0 | 落后 1.06× |
-| f32 512³ | **60.9** | 65.2 | 落后 1.07× |
-| f32 1024³ | **60.4** | 64.3 | 落后 1.06× |
-| f32 2048³ | **48.7** | 60.0 | 落后 1.23× |
-| f32 100×448×19147 | **55.0** | 54.8 | 快 1.00× |
-| f32 512×2048×512 | **61.0** | 64.5 | 落后 1.06× |
-| f64 64³ | **33.6** | 32.9 | 快 1.02× |
-| f64 128³ | **31.3** | 27.9 | 快 1.12× |
-| f64 256³ | **29.3** | 30.9 | 落后 1.05× |
-| f64 512³ | **31.4** | 31.6 | 持平 1.01× |
-
-相对 §6.3 的内核天花板（f32 70.3 / f64 35.2）：f32 64³ **97%**、128³ 96%、256³ 90%、
-384³ 86%、512³ 87%、1024³ 86%、2048³ 69%；f64 64³ 95%、128³ 89%、256³ 83%、512³ 89%。
-
-拆开看剩下的缺口（**这是本次探索的结论**）：
-
-- **64³/128³（97%/96%）**：走流式、不打包，就是 §6.3 的内核本身 ⇒ 微内核没有可挤的空间。
-- **256³–1024³（86–90%）**：打包占 4–8%（向量化后更小，§8.2.1）；剩下的不是带宽（下面的 PMU
-  计数确认过），而是"每个条带×行块×k 块的宏开销 + 停顿"——归一化后小形状是 33.8 条指令/k 步
-  （内层理论值 32），大形状涨到 40.9，IPC 也从 3.5 掉到 3.0。
-- **2048³（69%）**：**不是带宽受限**（这条是本次用 PMU 更正掉的）。逐次调用的 PMU 计数见 §8.5.1。
-  两级分块（列块在外、行块在内）实测反而慢 8–12%（§10.1），所以这不是没做，是做了更差。
-- **旧表的几行与同日值差得远**，原因已查清、不是本库变慢：旧表 OpenBLAS 的小形状
-  （f32 64³ 28.9、128³ 49.8）把**每次调用的固定开销**算进去了，同日预分配缓冲的探针量到
-  53.2 / 57.2；从 256³ 起两套口径收敛（61.8 vs 旧 59.2），说明差异只在固定项。
-  旧表本库的宽形状行（100×448×19147 41.6–44.1、512×2048×512 41.7–48.9）同样来自更早窗口，
-  同日是 55.0 / 61.0。**跨窗口的绝对读数不可比（见剖析小节的 6.4）**，本节整表同日重测就是为此。
-
-#### 8.5.1 2048³ 的缺口归因（PMU，2026-09-28）
-
-探针 `/tmp/gemm_pmu`：只把**计时区**留给 `lasx_matmul`（建数据、预热都在区外），绑核
-`taskset -c 4`，用 `perf stat -e cycles,instructions,llc-loads,llc-load-misses,dtlb-load-misses`
-读用户态计数（本机 `perf` 可用；`perf_event_paranoid=2` 只允许用户态计数，够用）。
-"每条向量 FMA 的指令数"按 `tiles×k×16`（`tiles = (m/4)(n/32)`）算：
-
-| 形状 | GFLOP/s | cycles/次 | instructions/次 | IPC | instr/向量FMA | FMA/周期 | L3 载入行/次 | L3 缺失行/次 |
-|---|---|---|---|---|---|---|---|---|
-| 1024³ | 63.7 | 81.2 M | 296.5 M | 3.65 | 2.21 | 1.65 | 3.35 M（214 MB） | 14 K（0.9 MB） |
-| 2048³ | 51.9 | 912.2 M | 2740.5 M | 3.00 | 2.55 | 1.18 | 29.6 M（1.89 GB） | 3.56 M（228 MB） |
-
-读数（三条都反直觉，所以逐条记下来）：
-
-1. **带宽远没有打满**：2048³ 每次调用的 L3 流量是 1.89 GB / 0.331 s = **5.7 GB/s**，真正落到
-   DRAM 的是 228 MB / 0.331 s = **0.7 GB/s**，而本机单流只读锚点是 11–15 GB/s、12 线程是 20–24 GB/s。
-   所以"2048³ 慢是因为 A 的 1 GiB 流量"这个解释**被计数否定**——流量在那儿（A 每扫一条带重读一遍），
-   但它不是瓶颈，因为大部分命中 L3/L2。
-2. **瓶颈在指令数与停顿**：每条向量 FMA 的指令数从 2.21 涨到 2.55（+15%），IPC 从 3.65 掉到 3.00
-   （−18%），合起来就是 FMA/周期 1.65 → 1.18。**固定 k=2048 扫 m/n** 可以把"分块开销"和"缓存足迹"
-   分开（`256×2048×256 / 512×2048×512 / 1024×2048×1024 / 2048³`，指令数按 k 步归一）：
-
-   | 形状 | GFLOP/s | instr/k 步 | cycles/k 步 | IPC |
-   |---|---|---|---|---|
-   | 256×2048×256 | 59.6 | 33.76 | 9.79 | 3.44 |
-   | 512×2048×512 | 60.9 | 34.45 | 9.83 | 3.50 |
-   | 1024×2048×1024 | 61.5 | 38.39 | 10.88 | 3.52 |
-   | 2048³ | 50.7 | 40.92 | 13.59 | 3.01 |
-
-   **反汇编**（`objdump -d`，生产 `+lasx`）给了两个确定的东西：
-   内层循环是 **32 条指令 / 16 条 `xvfmadd.s`**（4 条 `xvld` + 4 条 `xvldrepl.w` + 16 FMA + 8 条
-   地址/循环控制），实测 8 周期/k 步 ⇒ IPC 4.0，正好等于"4 周期 FMA + 8 条访存按 2/周期 = 4 周期"、
-   **两者不重叠**——这就是 §6.3 那个 2.00 墙的来源；而且 **LLVM 已经把 A 广播优化成 `xvldrepl.w`**，
-   与探针里的 `kernel_lr` 是同一个形式，所以"探针墙 = 生产代码"这条链是闭合的。
-   小形状归一化后是 33.8 instr/k 步（接近 32 的理论值），说明宏开销主要随**足迹**增长而不是随分块数：
-   2.5 万条/瓦片级别的多出来的指令还没定位到具体来源（k 块数、缓存、还是某个慢路径）。
-3. **停顿原因无法再归因**：这台 CPU 的 PMU 不提供 `stalled-cycles-backend`
-   （`perf stat -M backend_cycles_idle` 直接是 `<not supported>`），所以"是 L2 命中延迟、
-   TLB 还是别的"只能靠逐函数反汇编数指令来推。TLB 这条也一并量了、**不像是主因**：
-   dTLB 缺失 2048³ 是 1.09 M 次/调用（缺失率 0.13%），1024³ 是 0.40 M 次（0.43%）——
-   绝对次数高但比例更低，按每次 20–30 周期估也只占 ~2%。
-4. **已经试过并否掉的一条候选**：C 的写回/读回原本是索引形式（`xvstx/xvldx`，因为
-   `c0.as_ptr().add(j)` 里的 `j` 是运行期值），把 `j` 在 k 循环外折进基址后索引指令从 130 条
-   降到 66 条（`xvldx` 只剩 2 条），但五个形状各 4 轮**全部在噪声内** ⇒ 索引寻址在这台核上不花钱，
-   宏开销不是它造成的（记录在 §10.1）。这条做完之后，剩下的候选只有"逐瓦片反汇编数指令"了。
-
-OpenBLAS 多线程非常强：f32 512³/1024³/2048³ 在 12 线程下是 305.8 / 337.3 / 331.9 GFLOP/s，
-而本库 `parallel::matmul_f32` 12 线程是 257.7（512³）——多核大矩阵仍落后，原因是 B 的流量
-而非派活，见 §7.7。
-
-
----
-
-## 9. 大集与形状专项
-
-### 9.1 判据：算力受限还是带宽受限
-
-看"每元素速率是否随规模变化"：
-
-| 内核 | 2^14 | 2^18 | 2^22 | 2^24 | 判定 |
-|---|---|---|---|---|---|
-| `rk4_j2_step`（元素/秒） | 37.2 M | 35.3 M | ~31 M | ~31 M | **与规模无关 ⇒ 算力受限**（每元素 1 次 sqrt + 多次除） |
-| `j2_accel_batch`（元素/秒） | — | — | 88 M | 83 M | L2 内 178 M/s、离开 L2 掉一半后缓降 ⇒ 访存 + 每元素除法混合 |
-
-对算力受限的内核，"带宽占比低"不是缺陷，而是算力的直接后果（3.0 GB/s ÷ 96 B/元素 = 31 M/s ✓）。
-
-`j2_accel_batch` 曾长期被怀疑"卡在 6 流上限"，补测 6 流锚点（3 读 3 写、`as_chunks::<4>()` 32 字节块搬运）后
-得到 **5.3–6.8 GB/s 且与规模无关**，而它在 4.2–4.6 GB/s ⇒ **62–80%**，不是多流上限，是每元素除法 + sqrt。
-（**锚点务必确认是向量化的**：用标量循环写成的"6 流锚点"只有 3.2 GB/s，那是"地板"不是
-"上限"，已废弃。）
-
-### 9.2 `100×448 × 448×19147` 这个形状
-
-性质：m 小（100 = 25 个 4 行块）、n 极大（19147）、k 中等（448）。
-
-- 优化路径：流式（B 被读 25 遍且跨距访问）165.9 ms → 列块在外（128 列一块）42.7 ms（**3.9×**）；
-  打包 + k 分块后 41.2–44.1 ms（41.6–44.1 GFLOP/s）。
-- 已知缺陷：**列区间必须 32 对齐**（否则命中非 FMA 的标量尾，差 1 ulp，位精确测试抓到）。
-- 试过但否掉的：**多核按列切**（每个线程各自读一遍 B，缓存互相干扰，净亏）。
-- 现状：OpenBLAS 48.6 GFLOP/s，本库 41.6–44.1（落后 1.10–1.17×）。剩下的手段是 A 侧打包
-  与 C 分块（§12）。
-
-### 9.3 k 分块的位精确性依据
-
-`C` 的部分和以 `f32`/`f64` 存在内存里，写回再读入是**精确**的（同一个二进制浮点值），
-所以"分块 → 回写 C → 下一块读回继续加"与"一直在寄存器里加完"给出逐位相同的结果，
-只要每块内部沿 k 的次序递增、块之间也递增。这也是 `packed_paths_bit_exact` / `packed_f64_bit_exact`
-能过的原因。
-
-### 9.4 跨距别名（2 的幂 n）
-
-`64×128×n` 扫描时，列块路径在 `n = 16384`（B 相邻行相距正好 64 KiB = L1）只有 20.9–22.0 GFLOP/s，
-而 `n = 19147`（非 2 的幂）有 48.6–52.1：
-
-| n | 4096 | 8192 | 12288 | 16384 | 19147 |
-|---|---|---|---|---|---|
-| 列块路径 | 22.7 | 21.7 | 22.1 | 20.9 | **48.6–52.1** |
-| 打包路径 | 51.9 | 48.0 | 41.0 | 40.3 | 37.9–40.5 |
-
-结论：**2 的幂的 `n` 会惩罚跨距访问**（冲突缺失），打包路径免疫。这也是把 `PACK_MIN_K`
-下调到 64 之后 2 的幂形状收益特别大的原因。
-
-### 9.5 DSL 能知道什么 / 不能知道什么（超越函数优化决策，2026-10-16）
-
-**能知道**（已由实现验证）：**形状**——类型级、编译期可查（`CMat<R,K>` 乘 `CMat<K,N>` ⇒ `CMat<R,N>`，
-形状不匹配**编不过**，见 `docs/ops.md` §9.07 的 `compile_fail` doctest）。
-**不能知道**：**取值范围**。类型里没有"这个缓冲的数值落在 `[lo,hi]`"的信息，编译器也没有。
-⇒ **"编译期分析查表精度与范围并应用"必须先有显式范围声明**，否则是**空话**。
-
-**注解草案**（仅为草案，本轮**不实现**）：
-
-```rust
-// 方案 A：属性式（挂在 let/参数上）
-#[range(lo = 0.0, hi = 6.28, ulp = 1e-6)]
-let x = /* 输入缓冲 */;
-
-// 方案 B：类型级（范围进类型参数）
-let x: Ranged<f32, -4, 4, 1e-6> = /* … */;
-```
-
-**"编译期检查声明与生成代码一致"**（这条是草案能否成立的关键）：
-1. 由声明**推导**表长/归约区间/多项式阶数 ⇒ **在 `const` 上下文中生成**表与常量（与本轮
-   `static COS_SIN_TAB` 的做法一致：`const fn`、零运行时初始化）；
-2. 生成代码里**带上声明**（例如断言 `|x| ≤ hi` 的 `debug_assert` 或编译期常量），
-   **声明与实际不匹配时编译失败或运行期断言失败**——**没有这一步，注解就只是注释**；
-3. 超出声明范围时必须**回退到 `libm` 路径**（默认路线），**不许静默用错表**。
-
-**结论（是否值得扩语法）**：本轮数据显示**核构造是主导（62–77%）**、且**递推路线快 5.1×**，
-所以"优化核"**有收益**；但**收益来自"等距递推"这个数学结构**（`t_i` 等距），
-**不是来自"编译期知道范围"**——表驱动路线（(b)）本轮**更慢（1.45×）**。
-⇒ **建议：暂不扩 DSL 语法**；先把"递推核 + opt-in 契约"落成库内可选入口（下一轮），
-等有**真实用户场景**证明"范围声明能带来额外收益"（例如 `ω·Δt` 大时的表驱动优于递推）再议。
-详见 `docs/ops.md` §9.10。
-
-#### 9.5.1 表达式级代数重写（2026-10-16 追加；**用户改判后**）
-
-**用户把评价标准换成"让 DSL 更有优势"** ⇒ 上面"暂不扩语法"的结论**只管"取值范围注解驱动 LUT"
-那一半**；**"表达式级代数重写"要做进 DSL**（有价值证明：`docs/ops.md` §9.10.1 的 −43.5%/−59.0%）。
-
-**诚实的优势定义（不许吹）**：**DSL 的优势 = 把"专家级手工优化"变成默认可得**（用户不必知道
-等距/旋转这些技巧）；**不是**"比懂该技巧的专家更快"——手写递推就是**同一算法** ⇒ 措辞是
-"**免费拿到**"，不是"**超过**"。
-
-**本轮落地的部分**（`src/rewrite.rs`，**原型**）：**模式识别 + 安全区分析 + 负例测试**。
-**未落地**：改写代码生成与宏层集成（见 §9.5.2 的卡点）。
-
-**三条规约**（写进 `src/rewrite.rs` 模块文档）：
-1. **识别条件**：`t_i = base + i·step` **等距**且步长为**编译期字面量**；被调函数 ∈ {`exp`,`cos`,`sin`}；
-   参数是索引的**线性函数**（`a + i·b`）；**行可分**（每行一个 `(σ_j, ω_j)`）。参数是运行期量时
-   允许识别，但**只能生成运行期检查 + 逐行回退**。
-2. **改写规则**：等距 ⇒ `e^{−σΔt}` 逐次乘 + `cos/sin(ωΔt)` 旋转递推（~2 FMA/元素、**零超越调用**）。
-3. **不认识就完全不改写**：`StepKind::Varies`（步长非常量/非等距）或 `lin_in_index = false`
-   ⇒ **`Rewrite::None`**，**不静默改变语义**（负例测试 `negative_non_isometric_or_nonlinear`）。
-
-**安全区与库内同源（证据）**：`rewrite::safe()` **直接转发** `laplace::recurrence_safe`，
-`rewrite::safe_zone()` **转发** `laplace::RECURRENCE_MAX_PHASE_STEP/…_PHASE` ⇒
-**同一处定义、不各写一份**；测试 `safe_zone_uses_library_constants` 断言两者**逐点一致**且
-常量**相等**。
-
-**opt-in 与默认**：重写路径**与 libm 不逐位一致** ⇒ **必须显式 opt-in**（宏级属性草案
-`#[fast_trig]`）；**默认仍 libm/位精确**、**本轮不改任何默认行为**。
-
-#### 9.5.2 落地进度（2026-10-16 第二轮更新）
-
-**已落地**（`src/rewrite.rs`，6 个测试全过）：
-1. **识别 + 负例**（上一轮）：等距字面量 + 索引线性 + 行可分；非常量步长/非线性 ⇒ **完全不改写**；
-2. **未 opt-in ⇒ 完全不重写**：`KernelPattern::fast_trig_opt_in = false` ⇒ `Rewrite::None`
-   （测试 `no_opt_in_means_no_rewrite`，并用"同一 pattern 挂上属性后可改写"做对照）；
-3. **生成侧的行为链路**：**守卫与回退走库内入口**（`laplace_batch_*_recurrence`，
-   内部 = **同源 `recurrence_safe` + 逐行回退 libm**）；测试 `generated_path_guard_and_fallback`：
-   **安全区行**（递推）与 libm 差 <1e-9；**超区行**（`ω·Δt=2.0`）**与 libm 逐位一致**、
-   且返回 `all_safe=false`。
-   —— 即"生成 + 守卫 + 逐行回退"三件事的**行为**已可测；本原型**不生成源码文本**，
-   将来宏层只需把 `plan()` 的结果接到库内入口（见 `rewrite::GENERATION_VIA_LIBRARY_ENTRY`）。
-
-**仍未落地（如实）**：
-1. **宏 crate 集成**：`lasx_rs_macros` 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]`
-   —— **未做**（独立 crate + 编译器插桩面，本轮预算不足）；
-2. **"同一份 DSL 公式两种编译"的 A/B** —— **未测**（因为①未做）。
-   可给的**同源实测**是库内 opt-in 入口的 A/B（`docs/ops.md` §9.10.1：小 NB −43.5%、大 NB −59.0%），
-   它与宏层改写**会生成同一条路径**，**但不是**宏层两种编译的实测 ⇒ **不许当成交付数字**。
-
-#### 9.5.3 "委派给 LLVM"的收益缺口（2026-10-16 第三轮，**实验**）
-
-**架构前提（用户澄清）**：DSL 是 **LLVM 的宏观优化前端**——我们做**结构/数学重写与检查**，
-**微观优化交给 LLVM**（Halide/TVM/XLA 一路）。本实验回答：**微观到底能委派多少**。
-
-**两件各测（同源交替 6 对丢首对，`M=64, N=1024`；A=手写 LASX、B=朴素标量（release `-O3`、
-无 intrinsic、无 fast-math）、C=libm 基线）**
-
-| 件 | (A) 手写 LASX | (B) 朴素标量 | (C) libm | **(B)/(A)** | 委派到位率 |
-|---|---|---|---|---|---|
-| **核构造**（4 行锁步递推） | **0.1387 ms** | 0.8316 ms | 1.9517 ms | **6.00×** | **≈17%** |
-| **组合步**（`a−b−c`, 192×3072） | **0.2776 ms** | 0.8857 ms | — | **3.19×** | **≈31%** |
-
-（`iters` 361/181、`ms_max` 2.639/0.001 ms、loadavg 4.76。）
-
-**② 逐位一致性（关键，关系到硬承诺）**：**(A) 与 (B) 在"同累加次序"下逐位一致** ✓
-—— 测试 `lasx_vs_scalar_bitwise_same_order`（核：`to_bits()` 全等）、B0 的
-`combine_bit_exact_vs_scalar`（组合：`n=1..40` 全扫、三种运算全等）。
-⇒ **结论句（可引用）**：**不开 fast-math 时，Rust/LLVM 不重结合、不做 FMA 收缩
-⇒ 手写向量版与朴素标量版在"同序"下逐位一致 ⇒ 位精确硬承诺在"宏观前端 + LLVM"架构下守得住**
-（`#[target_feature]`/自动向量化只改**并行度**，不改**每个归约的次序**）。
-
-**③ 架构结论（量化）**：**差得远（核 6.00×、组合 3.19×）** ⇒ **不能指望 LLVM 自动向量化替代手写内核**；
-**我们的 LASX 内核定位 = "降级目标库"**（DSL 重写后发出对这些原语的调用）。
-**但差距的成因值得记**：核构造的朴素标量版**每行有串行依赖**（`e *= decay`、旋转递推），
-LLVM 无法自行证明"行间独立"⇒ 不会做**行锁步**交错；而**手写版正是靠"4 行锁步"拿到 SIMD**。
-⇒ **"行锁步/交错"这种"结构重写"恰恰是 DSL 前端该做、且 LLVM 做不了的事**：
-架构应是 **"宏观结构重写 + 调用手写原语"**，而不是"重写后就撒手交给 LLVM"。
-
-#### 9.5.4 四变体对照与"代码形状 → 谁来优化"的分界线（2026-10-16 第四轮）
-
-**用户澄清**："LLVM" 指 **rustc/LLVM 后端** ⇒ DSL 的职责是**生成"编译器最容易优化好的形状"**
-（迭代器链 / `chunks_exact` / `zip` / `fold` / 定长数组 + const generics / `mul_add`）。
-据此**加入 (B') 惯用迭代器/定长数组变体**（`fast_trig::recurrence_rows_iter`、`fast_trig::sub3_iter`）。
-
-**四变体同源对照（同进程交替 6 对丢首对；`M=64,N=1024`；loadavg 5.67）**
-
-| 件 | (A) 手写 LASX | (B) 朴素索引循环 | **(B') 惯用迭代器/定长数组** | (C) libm | (B)/(A) | **(B')/(A)** | (B') 到位率 |
-|---|---|---|---|---|---|---|---|
-| **核构造**（4 行锁步递推） | **0.1291 ms** | 0.8052 ms | **0.1910 ms** | 1.8908 ms | 6.24× | **1.48×** | **68%** |
-| **组合步**（`a−b−c`，192×3072） | **0.2695 ms** | 0.8629 ms | **0.2926 ms** | — | 3.20× | **1.09×** | **92%** |
-
-**② 逐位一致性（三变体同序，测试钉住）**：`lasx_vs_scalar_bitwise_same_order` 断言
-**(A) 手写 LASX = (B) 朴素 = (B') 惯用** 三者**逐位一致**（核：8 行×N=1024 实/虚部；
-组合步：`n=4096` 三种实现全等）⇒ **Rust 默认不重结合、不自动 FMA 收缩**这条再次被实测锚定；
-**没有发现任何"变换导致不一致"的情况**（无需定位）。
-
-**③ 架构分界线（可引用，含量化）**
-| 代码形状 | (B')/(A) | 结论 |
-|---|---|---|
-| **逐元素 / 结构化**（连续存储、无跨元素串行依赖；如组合步 `a−b−c`） | **1.09×（92% 到位）** | **接近可委派**：惯用迭代器已拿到 92% —— 但**仍慢 9%**，按"必须证明不退化"的口径**本轮不替换**（若将来在低负载窗口复测≥1.00×，可在独立提交里删掉 `combine::{sub_f32,add_f32,sub3_f32}` 的手写实现） |
-| **稠密线代微内核 / 有串行依赖的行锁步 + 散射存储**（如核构造：内层写 `kc[(j+l)*n+i]` **非连续**） | **1.48×（68%）** | **必须保留手写**（**降级目标库**）。差距成因：**散射写 + 行内串行递推** ⇒ rustc 无法把内层 4 lane 向量化（写不连续、且需要交错寄存器） |
-
-**实测出的分界判据（写进设计）**：重写后的循环若满足
-**"连续、可向量化的访存 + 无跨元素串行依赖 + 无散射/打包/分块需求"** ⇒ **优先委派 rustc**
-（惯用形状，实测可达 ~92%）；一旦涉及**打包/分块、散射写、串行递推**⇒ **手写原语不可替代**
-（实测只剩 68%）——这正是 **DSL 前端"结构重写"的价值所在**：把前者交给 rustc，把后者降级到手写内核。
-
-**④ 是否实际替换**：**未替换**（组合步 9% 退化未过"不退化"门槛；核构造差距 48% 明确需保留）。
-**未改任何现有入口/默认行为**。
-
-**⑤ 低负载窗口复测（2026-10-16 第五轮；loadavg 采样 4.63→4.26，实测窗口 3.77 —— 上一次是 5.67）**
-| 件 | (A) 手写 LASX | (B') 惯用迭代器 | **(B')/(A)** | 结论 |
-|---|---|---|---|---|
-| **组合步**（同源交替 6 对丢首对） | 0.2737 ms | 0.2961 ms | **1.08×（到位率 92%）** | **仍慢 8% ⇒ 未达 1.00× ⇒ 保留手写**（合格结论，不删代码） |
-
-**两条否决删除的理由（都不含"窗口"这种借口）**：
-1. **复测后仍不达 1.00×**（3.77 的窗口下 1.08×，与 5.67 窗口下的 1.09× 一致）⇒ 未过"证明不退化"的门槛；
-2. **删掉会退回 B0 的验收**：`combine::{sub_f32, add_f32, sub3_f32}` 是**"全链路无标量回退"
-（"完全 SIMD"）**的载体（有 `objdump` 佐证，`docs/ops.md` §9.06）。
-**⚠️ 定级修正（2026-10-16）**：该要求**只是 `lasx_rs` 这个专门后端自己的实现选择/局部保证**，
-**不是本库的硬要求**——用户已把**红线定为 A**（引擎/可移植侧接受 rustc 自动向量化，以**性能与可维护性**为准）；
-**`lasx_rs` 的手写 intrinsic 保留、不删**（**A 是政策，不是删除令**）⇒ 本条**结论不变（保留手写）**，
-**只是理由的定级变了**（见 §9.5.6）。
-⇒ **手写组合步保留**。
-
-**决策记录（"需求约束优化"的样板，2026-10-16）**：
-> **在被 92% 诱惑时，被两件事挡住**：① **8% 的实测退化**（两窗口一致，不是噪声）；
-> ② **删它等于作废一条已验收的用户契约**（"全链路无标量回退 / 完全 SIMD"，有 `objdump` 佐证）。
-> **教训**：当一个"可删的优化"同时也是**某条已验收契约的载体**时，
-> **删除的代价不是性能数字，而是契约**——此时正确的动作是**记录并请示**，
-> 而不是"数据达标就删除"。**性能优化的边界是需求，不是测量值。**
-> （**该请求已经发出并得到答复**：用户把红线定为 **A**，但**明确 `lasx_rs` 作为专门后端保留手写** ⇒
-> 见 §9.5.6；本节结论**不变**，只是"契约"的**定级从"库级要求"降为"本后端自己的选择"**。）
-
-#### 9.5.6 决策记录：**"完全 SIMD"红线取 A；`lasx_rs` 作为专门后端保留手写**（2026-10-16）
-
-> **用户决定（原话要点）**："完全 SIMD 红线取 **A**，主要是看**性能和可维护性**，
-> 但是 `lasx_rs` 库里面的因为是**专门后端**部分**可能不需要删除**。"
->
-> **① 红线 A 的含义（政策）**：**引擎/可移植侧接受 rustc/LLVM 自动向量化也算 SIMD**，
-> 判据以**性能与可维护性**为准，**不再要求"必须手写 intrinsic"**。
->
-> **② `lasx_rs` 是"专门后端" ⇒ 手写 intrinsic 保留、不删**：
-> **A 是政策，不是删除令**——本仓的 `combine::*`、LASX 内核等手写原语**原样保留**。
->
-> **③ 旧契约被有意放宽（定级变更）**：此前写成**库级不变量**的
-> "**全链路无标量回退 ＝ 完全 SIMD**"（`docs/ops.md` §9.06，有 `objdump` 逐指令佐证）
-> **不再作为库级硬要求**；现定级为"**`lasx_rs` 这个后端自己的实现选择/局部保证**"。
-> 涉及处已同步改措辞：`docs/ops.md §9.06`、`docs/dev.md §9.5.4`（第 2 条理由）、`docs/dsl.md`（选项 A/B）。
->
-> **④ 放宽的实测依据（本仓四行小结，`examples/dsl_efficiency.rs`，口径照 `simd_dsl/docs/performance.md §5`）**：
-> `lasx/idio`（<1 ⇒ 手写快）＝ **dot K=4096 `0.473×`（手写 2.12×）**、
-> **matmul 64³ `0.253×`（3.95×）**、**matmul 192×768×3072 `0.115×`（8.7×）**，
-> 而 **核构造 `build_kernel_f32`（递推 64×1024）`0.996×`（≈持平，该路径手写无 intrinsic）**
-> ⇒ **手写收益只出现在"向量内核算子"上，且随形状放大**；
-> **A 在引擎/可移植侧成立；B 在"专门后端"里继续有效**（两者不矛盾）。
->
-> **⑤ 影响面**：**只影响措辞与定级**，**不影响任何代码**——**没有删除任何 intrinsic**，
-> 没有改动任何数值路径。
->
-> **⑥ 明确不变的项（一字不改地保留）**：
-> **位精确承诺**（`docs/ops.md §2.5`）、**`nm -D` = 98**、**默认路径行为**、
-> **冻结接口清单（本文件"冻结"小节）**、**CI 十四步全绿**、**三端（panel/origin/github）同步**。
-
-
-#### 9.5.5 决策记录：核↔矩阵乘融合**不采用**（2026-10-16，**防止后人重试**）
-
-> **判定**：融合（核不落地）在两档都更慢 —— 小 `NB` (c1) **3.02×**、大 `NB` (c1) **13.9×**；
-> 递推版 (c2) **1.10×** / **5.10×** ⇒ **不采用，保留"物化 + 递推"（(b)）**。
-> **机制**：为"每 k 块只生成 4 行"而把 **strip 循环挪进行块内层** ⇒ **B 面板（打包缓冲）局部性崩**
-> ⇒ **大 `NB` 下打包/面板复用被打崩**（这就是"融合破坏面板复用"的量化形态）。
-> **两条反直觉**：① **小 `NB` 那 10.5% 的收益来自递推核，不是"核不落地"**
-> （同形状下 (c1) 融合+libm 反而比 (b) 慢 3.02×）；② **内存不是动机**——
-> 物化核的实测账是 `2·M·N·8 B = **1 MiB**`（此前误算成 `2·J·N·8 B` = 16 MiB 的说法**已更正**），
-> 而 `VmHWM` 两边**同量级**（1.9–2.9 MiB）。
-> **重试的唯一有希望方向**（若将来非要试）：恢复 **strip 在外、行块在内** 的循环序（需把生成器改成
-> **分片生成**），但**收益上限只有小 `NB` 的 10.5%** ⇒ 优先级低；**默认路径不因它改变**。
-
----
-
-## 10. 被否掉的尝试（负面结果清单）
-
-> 这一节比"成功记录"更值钱：这些都是**实测否掉**的，重做之前先看这里。
-
-### 10.1 矩阵乘
-
-| 尝试 | 结果 | 原因 |
-|---|---|---|
-| 两级 L2 分块 + 更深微块（3/6 行） | 否 | 16 个累加器约束下 4 行 × 32 列已经最优；形状扫描（2–8 行 × 16–64 列）全部落在 2.00 FMA/周期 |
-| k 展开 ×2（uops/FMA 1.94 → 1.59） | 否（±1%） | 内层不是发射宽度受限（IPC 3.72 但墙在 2.0） |
-| A 广播改"一次载入 + 4 次 `xvshuf4i.w`" | 否（1.92 vs 2.00） | shuffle 同样卡在 2 周期/行 |
-| C 的列偏移 `j` 折进基址（索引形式 `xvstx/xvldx` → 立即数偏移 `xvst/xvld`） | 否（±0.3%） | 反汇编确认索引指令从 130 条降到 66 条（`xvstx` 96→64、`xvldx` 34→2），但 256³/512³/1024³/512×2048×512/2048³ 五个形状各 4 轮全部在噪声内 ⇒ **索引寻址在这台核上不花钱**；§8.5.1 那部分宏开销不是寻址形式造成的 |
-| 多核按**列**切（宽形状） | 否 | 每个线程各读一遍 B，互相污染缓存 |
-| 只看"指令数"就下结论 | 教训 | §6.3：31 uops/16 FMA 但 IPC 3.72，说明瓶颈不在发射 |
-
-### 10.2 `dot_q4`（Q4 量化点积）
-
-| 版本 | 做法 | 结果 |
-|---|---|---|
-| v3 | 一批 4 组（128 B，8 个载入先发） | **保留**：L2/L3 +7~25%，DRAM 持平 |
-| v4 | 组内归约用 4 次 `xvpickve2gr_d` 取 lane，去掉 `xvst` + 标量载入 | 否：2^25 中位 21.40 vs 20.0 ms（慢 7%） |
-| v5 | 一批 8 组（256 B，16 个载入） | 否：2^25 中位 19.96 vs 14.87 ms（慢 34%），寄存器压力吃掉 OoO 空间 |
-
-**"组内归约无法省掉"是硬约束**：每 32 字节有自己的 scale，必须"精确整数点积 → 乘 scale → 进 f64"，
-拆到 lane 上并行会改变浮点结合次序（未授权）。
-
-### 10.3 其他
-
-| 尝试 | 结果 |
-|---|---|
-| `norm3_batch` 4× 展开（12 载入先发 + 4 条独立 `xvfsqrt_d`） | 否：各档都在噪声内（CLI 2^20 新中位还偏差），因为它本来就在锚点的 57–79% |
-| `j2_accel_batch` 展开 | 否（与 §9.1 的判据同结论）：已在每元素除法 + sqrt 的算力上限 |
-| 用 `xvfrecipe_d`/`xvfrsqrte_d` + 牛顿迭代替换精确除法 | 否（探针实测，见 §13）：估算 6.8 周期/次，比精确除法（4.0）**更慢**；+2 步牛顿是 16.5 周期 |
-| 把 `dot_q4` 的组内归约拆到 lane 上 | **未授权**（改浮点结合次序） |
-| `rk4`/`j2` 的除法换近似（倒数估算 + 牛顿） | 否：本机估算指令比精确除法慢（§13.1） |
-| 无损压缩换带宽（旧的 `docs/compression.md`，现为 `docs/ops.md` §13） | 结论在 ops.md：数据本身已近随机、无损压缩压不动，只有"换成更窄的表示"（量化）才有带宽收益 |
-| `alpha`/`beta` 融合（`y = alpha·A·B + beta·C`） | ~~否~~ → **是（2026-10-15 落地，推翻本条）**：`β = 0` 免读 `C` + 融进生产内核收尾后，宽薄档比两遍法快 **10.3% / 23.7%**、小 `k` 累加档快 6.5%、方阵 ≈0；`β ≠ 0` 且 `k > 384` 退回与二遍法同构。旧否决理由（另起受限 tile 路径 + 收尾无条件读 `C`，慢 2.5–4.8%）见 §19.9 / §19.11，**新记录见 §19.15** |
-| 标量 6 流锚点 | 无效锚点（3.2 GB/s 是地板）；32 字节块搬运的锚点是 5.3–6.8 GB/s |
-
-### 10.4 方法学教训（多次出现）
-
-1. **跨进程单次比较不可用**（±20%）：必须进程级交替或 stash 重建（见剖析小节的 6.4）。
-2. **套件内相邻内核会污染缓存**：`large` 套件里 `dot_i8`/`dot_q4` 的读数偏低（前面的 f64 内核把缓存洗了），
-   量化内核要用单套件口径（`-- dot_q4`）。
-3. **单次调用口径会低估小形状**：256³ 多核只要 ~90 µs，池 worker 处于 park 时的唤醒延迟
-   占了大头。同一形状、同样 12 线程：单次调用口径 85 GF/s vs 连续重复口径 375 GF/s
-   （**4.4×**）。因此 `examples/matmul_ab` 采用"样品内重复到 ~25 ms"的口径（与 CLI 的
-   `timeit` 一致）。所有用小形状做的 A/B 都要留意这条。
-4. **锚点必须与内核同 footprint**：字节内核（`dot_i8`/`dot_q4`）要用"双流**字节**读"锚点，
-   不能拿 8 倍 footprint 的 f64 锚点比（早期版本算错过占比）。
-5. **"标量列"不等于真标量**（§4/§7.4）。
-6. **纯 FMA 探针的两个陷阱**（链数、重复次数，§6.3）。
-7. **`lasx_xvfnmadd_d` 的语义陷阱**：这套 stdarch 绑定里它实测是 **−(a·b) − c**，
-   而不是 x86 `vfnmadd` 的 −(a·b)+c（用 `xvfmadd`/`xvfsub` 对照可复现）。
-   本库只用了 `xvfmadd`/`xvfmsub` 系，不受影响；写牛顿迭代一类代码时不要按 x86 直觉用它。
-
----
-
-## 11. 复现
-
-```bash
-# 全量基准（约 1 分钟；输出即本文实测章的表格）
+# 全量基准（约 1 分钟；输出即 §4 的横截面表）
 cargo run -p lasx_bench --release
-cargo run -p lasx_bench --release -- large        # 只跑大集分析
-cargo run -p lasx_bench --release -- dot_q4       # 单套件口径（量化内核请用这个）
-cargo run -p lasx_bench --release -- attitude
-cargo run -p lasx_bench --release -- matmul       # f32/f64 方阵 + 宽形状
-
 # 单形状 A/B（进程级交替）：<m> <k> <n> <packed|cols|stream|packed64|stream64|pool> [线程数]
-cargo run --release --example matmul_ab -- 512 512 512 packed
-cargo run --release --example matmul_ab -- 100 448 19147 packed
-cargo run --release --example matmul_ab -- 1024 1024 1024 pool 16   # 多核
-
-# 微内核探针：<变体> [k] [轮数]，变体见 docs/dev.md §6.3
-cargo run --release --example kernel_probe -- kernel 256 10
-cargo run --release --example kernel_probe -- dfma16
-
+cargo run -p lasx_bench --release -- matmul_ab 512 512 512 pool 12
+# 微内核探针：<变体> [k] [轮数]
+cargo run -p lasx_bench --release -- kernel_probe fma16
 # 池化矩阵乘 + 线程数扫描
-cargo run --release --example matmul_pooled
-cargo run --release --example pool_axpy
-
-# OpenBLAS 对照（本机 numpy 即 OpenBLAS 0.3.34）
-OPENBLAS_NUM_THREADS=1 python3 -c "
-import numpy as np, time
-s=512; a=np.random.rand(s,s).astype(np.float32); b=np.random.rand(s,s).astype(np.float32)
-a@b; ts=[]
-for _ in range(5):
-    t=time.perf_counter(); c=a@b; ts.append(time.perf_counter()-t)
-t=sorted(ts)[2]; print(f'{s}^3 {t*1e3:.2f} ms {2*s**3/t/1e9:.1f} GF/s')"
+cargo run -p lasx_bench --release -- pool_scaling
+# OpenBLAS 对照（本机 numpy 即 OpenBLAS 0.3.34；同二进制内交替、自动打印身份行）
+bash scripts/bench_openblas.sh
+# 自建 A/B：把两版二进制各复制一份，交替跑各 3 轮取中位数，同轮内比较（不做跨轮绝对值比较）
 ```
 
-**做一个受控 A/B 的标准流程**（本仓库全程用这个）：
 
-```bash
-cp src/ops/<算子>.rs /tmp/<算子>.bak          # 1) 备份旧版
-# 2) 改代码 → cargo build --release → 复制产物为 A
-cp target/release/examples/<工具> /tmp/ab_a
-cp /tmp/<算子>.bak src/ops/<算子>.rs           # 3) 还原旧版 → 重新构建 → 复制产物为 B
-cargo build --release --example <工具> && cp target/release/examples/<工具> /tmp/ab_b
-# 4) 交替跑 A/B 各 3 轮取中位数；同轮内比较，不做跨轮绝对值比较
-```
+## 5. 精度承诺与容差
 
-新增基准套件：在 `cli/src/suites/<分类>.rs` 里产出 `Row`，再到 `cli/src/suites/mod.rs` 注册名字，
-`lasx_bench <子串>` 就能过滤到。套件只写"怎么测"，不写结论。
+### 5.1 承诺与红线
 
----
+* **位精确是硬承诺**：同一算子**所有实现路径**（LASX 256 位 / LSX 128 位 / 标量尾 / 打包 / 列块 / 分块）
+  对同一输入给出**逐位相同**的 `f32`/`f64` 结果；测试用 `to_bits()`。
+* **不许静默换路径**：任何"更快但换累加次序"的路径要么**明确声明容差类**并给实测界 + 参照物，要么不做。
+* **换近似 = 改数值**：`xvfrecpe` + 牛顿、`xvrsqrt`、FMA 收缩、多累加器归约都属容差类；须明确授权并登记。
+* **"谁守"写清楚**：位精确主要靠**测试**（`to_bits()` 全等）与**固定实现次序**；不是编译器保证。
 
-## 12. 已知缺口与待办
+### 5.2 逐位类 / 容差类清单（当前契约）
 
-| 缺口 | 现状 | 下一步 |
-|---|---|---|
-| `quat_to_dcm` 单独回退 | 它与 `quat_rotate` 共用 `normalize_lasx`；统一用 1 次除法时它慢 3–5%（4 读 **9 写**的 store-bound 内核，除法不是它的瓶颈，见 §13.6） | 若它占比变大，可为它分叉出保留 4 次除法的助手 |
-| f64 大矩阵 | CLI `matmul` 只到 512³；1024³ 只有历史读数 | 扩规模，并核对是否仍落后 OpenBLAS 1.1× |
-| 多核大矩阵乘 | **已完成（§13.7）**：1024³ 24 线程 97.5 → 393.3 GFLOP/s（3.9×），16 线程 421；512³ 12/16/24 线程 +15~24% | OpenBLAS 多线程仍更强（512³ 12 线程 305.8–337.3 GFLOP/s），可继续做下面的"并行打包" |
-| **并行面板打包** | 目前打包在并行层是串行的，所以 `m < 512` 与宽形状（`300×448×19147`）仍走回退路径、吃不到共享面板的收益 | 给 `WorkerPool` 加"按固定块长切分"的接口，各线程打自己那些 32 列条带；那样 `SHARED_PACK_MIN_M` 阈值可以去掉，宽形状预计还有 15–20% |
-| `f64` 内核离天花板还有 11% | **单线程** 512³ 31.4 / 35.2 = **89%**（f32 同日是 87%，§8.5）；**多核**已由 §13.7 的补充修复（1024³/16 线程 65 → 192 GF/s） | 剩余缺口是访存结构而非内核：A 每扫一条带重读一遍 + C 按 k 块读写；打包那一段已向量化（§8.2.1），到 2048³ 则由 A 的 1 GiB 流量决定（69%，§8.5） |
-| 宽形状 `100×448×19147` | **同日 55.0 GFLOP/s，与 OpenBLAS 54.8 持平**（旧表的 41.6–44.1 是更早窗口，§8.5） | **§15 已排除 A 打包 / C 分块 / 共享打包**；§16 的打包流水只对"走打包分支且多面板"的形状有效，宽形状走列块路径 ⇒ 剩下的手段是调用方预先转置 B（列主序），或给列块路径也做流水 |
-| `dot_q4` 大集 | 3.6–7.2 GB/s（38–44%） | 已到 2.0 FMA/周期墙；除非授权改浮点结合次序 |
-| `rk4`/`j2` 再快 | §13 已把除法降到每元素 4 次（sqrt 4 次），实测吞吐 ≈ 每个"昂贵操作" 4 周期 ⇒ 已到当前公式的算术地板 | 要进一步只能改公式/放宽精度，或把 4 个 RK4 阶段并行化 |
-| 无损压缩路线 | 结论已记在 ops.md | 若要做，是"换更窄的表示"而非通用压缩 |
-| unsafe 审查工具 | Miri + cargo-careful 已接入（§17），lint 已启用；**Rudra**（panic safety / higher-order / data race 三种 pattern）与 **Kani** 未接入 | 若要更深的静态分析，Rudra 需要装 `rustc-dev` 并按特定 nightly 构建；本机的 Miri 已覆盖别名/越界/数据竞争 |
-| 动态调度的细调 | §14.3 的判据是两条粗规则（`threads ≥ 20 && per_thread ≥ 32`），块长取每线程的 1/4 | 若要在特定形状上再榨 5–10%，得先有可信的负载模型（当前噪声 ±10%，细调量不出来） |
-| **池：块数 < 线程数时的派活台阶** | **已修复**（§20.7）：原协议等"全体 worker 签到"，没活的 worker 被调度到 CPU 的时机成了关键路径（`m=2` 探针 23/24 线程 37/38 µs）。改为"逐槽代次 + 只等有活的 worker"后回到 1 µs，`gemv 64×2048`@24 线程 0.043 → 0.007 ms | 回归测试已加（含 60 s 看门狗） |
-| **池：worker 全都有活且占满 CPU 时** | 24 逻辑核上 `gemv 1024×2048` 24 线程仍比 12 线程慢一倍（0.078 vs 0.041 ms）：25 个可运行线程挤 24 个 CPU，最后一个收尾的 worker 要等下一拍调度。**这是调度代价，不是协议缺陷** | 用法建议已写进 `docs/ops.md` §9（延迟敏感内核用物理核数、留一个空位）；若要让库自己规避，需要"按可用 CPU 数而不是请求数建池"，但那会静默改变调用方的线程数，先不做 |
-| **int8 推理路径** | 消费者明确（0.2B 判别式决策模型，端侧）：量化生产端、per-token scale、`gemv_i8` **已落地**（`docs/ops.md` §2.12/§2.13/§5.14）；`matmul_i8`、整数 softmax、int8 归一化未做（`matmul_i8` 已有量化依据：`docs/dev.md` §21.6/§21.7 的 3× 收益） | **N3 批次**（`docs/ops.md` §12.3）：落地状态与三条实现契约见 `docs/dev.md` §21.5/§21.5.1；**性能已实测**（`docs/dev.md` §21.6 三条结论、§21.7 内循环上限），**端到端 10–20 ms 的立项目标被推翻**、改为分档 |
+**逐位类（与标量参考/串行路径 `to_bits()` 全等）**：
 
----
-
-## 13. 算力与并行三轮优化：除法换乘法（rk4 +16%）、四元数推广（+52%）、多核打包病理（3.9×）
-
-这一节记三轮改动，都是"先量、再改、用受控 A/B 判定"：
-
-1. **§13.1–13.5**：`rk4_j2_step_batch` 长期是"算力受限"的代表（37 M 元素/s，与规模无关）。
-   先证明"估算倒数 + 牛顿迭代"在本机不划算，再改用"减少除法条数"：每元素每步的除法从
-   12 次降到 4 次（每阶段 3 → 1），速率提到 **43.3 M/s**。
-2. **§13.6**：把同一手法推广到四元数单位化（每元素 4 次除法 → 1 次），
-   `quat_normalize` +52%、`quat_rotate` +17%，`quat_to_dcm` 实测慢 3–5%，据此放弃。
-3. **§13.7**：修掉矩阵乘的多核病理——打包路径下**每个线程各自打包一整份 B**，
-   24 线程时打包缓冲 96 MB ≫ L3 32 MB，线程越多越慢；"打包一次、跨线程共享"把
-   1024³ 从 97.5 提到 **393.3 GFLOP/s**（3.9×）。
-
-### 13.1 先量：估算倒数比精确除法更慢
-
-微探针（`kernel_probe`，16 条独立链、依赖链口径；`dfma16` 对照）：
-
-| 操作 | 周期/次 |
+| 类别 | 内容与依据 |
 |---|---|
-| `xvfmadd.d`（对照） | 0.25 |
-| `xvfdiv.d`（精确除法） | **4.0** |
-| `xvfsqrt.d`（精确开方） | **4.0** |
-| `xvfrecipe.d`（倒数估算） | 6.8 |
-| `xvfrsqrte.d`（倒数开方估算） | 7.2 |
-| 估算 + 2 步牛顿迭代 | 16.5 |
-
-**精度不是问题，速度才是**：估算的相对误差约 4.7e-5 / 5.0e-5（≈16 位），
-1 步牛顿到 2.2e-9 / 3.8e-9，2 步就到 f64 的舍入地板 3.0e-16 / 3.5e-16
-（`kernel_probe acc` 可复现）。也就是说"精度差一点换速度"这条路**精度上完全可行**，
-但**在 LA664 上换不到速度**：估算指令本身比精确除法慢 1.7×，加两步牛顿后是精确除法的 4 倍。
-常见于 x86/ARM 的"除法贵、倒数便宜"直觉在这里是反的，所以那条路直接否掉（已记入 §10.3）。
-
-### 13.2 改法：1 次除法 + 乘法推导
-
-真正的浪费在**除法条数**：每阶段要算 `1/|r|³`、`1/|r|⁵`、`z²/|r|²` 三个商，
-但它们都能从 `1/|r|²` 推出来：
-
-```text
-inv2  = 1/|r|²              ← 唯一的除法
-invrm = inv2 · |r|          = 1/|r|
-inv3  = inv2 · invrm        = 1/|r|³
-inv5  = inv3 · inv2         = 1/|r|⁵
-zr2   = z² · inv2
-vcen  = −μ · inv3 ;  k = j2k · inv5      ← 两次乘法替代两次除法
-```
-
-每阶段 3 次除法 → **1 次**（乘法的吞吐是除法的 16 倍）。三处实现（`j2_accel_batch` 的
-LASX 路径与标量尾、`rk4_j2_step_batch` 的 `j2_accel_vec` 与标量尾）**使用完全相同的算式**，
-所以"路径间逐位一致"仍然成立；与旧版的差异只是 2–3 ulp 的舍入（见 13.4）。
-
-### 13.3 受控 A/B（stash 重建两个二进制，进程级交替 3 轮）
-
-| 内核 | 规模 | 旧（3 除法/阶段） | 新（1 除法/阶段） | 变化 |
-|---|---|---|---|---|
-| `rk4_j2_step_batch` | 16384 | 440.9–442.9 µs | **378.2–379.6 µs** | **+16.6%** |
-| `rk4_j2_step_batch` | 262144 | 7.12–7.15 ms | **6.11–6.15 ms** | **+16.3%** |
-| `j2_accel_batch` | 65536（L2 内） | 366.1–369.2 µs | **292.7–298.1 µs** | **+23.9%** |
-| `j2_accel_batch` | 1048576（DRAM） | 8.87–9.25 ms | 8.79–8.84 ms | +1.5%（已带宽受限） |
-
-`lasx_rk4_j2_step_batch` 相对标量的比值是 **1.18–1.20×**（标量路径被同样的除法吞吐卡住时为
-1.01×）。
-
-### 13.4 精度代价（实测，不是"大概"）
-
-`1/|r|³`、`1/|r|⁵`、`zr2` 由 `1/|r|²` 推导，多出几次舍入。用 4096 个 `|r|² ∈ [1,10)`
-的样本对照精确除法测得**最坏相对偏差**：
-
-| 量 | 最坏相对偏差 | 折合 |
-|---|---|---|
-| `1/\|r\|³` | 4.98e-16 | ≈2.2 ulp |
-| `1/\|r\|⁵` | 6.18e-16 | ≈2.8 ulp |
-| `zr2` | 2.03e-16 | ≈1.0 ulp |
-
-上界写进回归测试 `reciprocal_derivation_precision`（8 ulp）。这个量级远低于 RK4 自身的
-截断误差（`h⁵` 量级），也低于任何轨道传播关心的精度（相对 1e-12 以下）。
-
-### 13.5 还剩多少
-
-现在每元素每步要 4 次 sqrt + 4 次除法（每阶段各一次）＝ 8 个"4 周期操作" ≈ 32 周期，
-加上其余算术 ≈ 19 周期，正好对上实测的 50.8 周期/元素（43.3 M/s @ 2.2 GHz）。
-也就是说 **`rk4` 已经贴在当前公式的算术地板上了**：再快只能改公式（比如放弃逐阶段归一化）
-或者把四个阶段并行化（阶段间有数据依赖，属于算法改动）。
-
-### 13.6 推广到四元数内核：`quat_normalize` +52%、`quat_rotate` +17%、`quat_to_dcm` **−3~5%（否）**
-
-四元数单位化对 4 个分量做的是**同一个分母**的除法，是同一类机会（LASX 走共享的
-`normalize_lasx`，LSX 与标量尾各一份，共 9 处）：
-
-```text
-原来：w/n, x/n, y/n, z/n        ← 4 次除法
-现在：inv = 1/n; w·inv, x·inv, …  ← 1 次除法 + 4 次乘法
-```
-
-退化 lane 的掩码语义完全不变（`|q| < 1e-15` 仍由 `andn`/`or` 清成 `(1,0,0,0)`，
-`inv` 在退化时是 inf/NaN 但照样被掩掉）。三处实现同式，并新增三个 `paths_bit_exact`
-测试（LASX vs LSX、向量体 vs 标量尾逐位一致）。
-
-受控 A/B（stash 重建、进程级交替 3 轮，`cargo run -p lasx_bench --release -- attitude`）：
-
-| 内核 | 规模 | 旧（4 除法） | 新（1 除法） | 变化 |
-|---|---|---|---|---|
-| `quat_normalize_batch` | 4096 | 26.7–26.9 µs | **17.5–17.6 µs** | **+52%** |
-| `quat_normalize_batch` | 262144 | 1.73–1.74 ms | **1.15–1.16 ms** | **+50%** |
-| `quat_rotate_batch` | 4096 | 52.3–53.2 µs | **44.9–45.5 µs** | **+17%** |
-| `quat_rotate_batch` | 262144 | 3.99–4.04 ms | **3.65–3.75 ms** | **+10%** |
-| `quat_to_dcm_batch` | 4096 | 41.5–42.0 µs | 43.0–43.7 µs | **−3%** |
-| `quat_to_dcm_batch` | 262144 | 3.32–3.41 ms | 3.48–3.56 ms | **−5%** |
-
-**`quat_to_dcm` 被实测否掉**：它是"4 读 9 写"的 store-bound 内核（每元素 9 个输出），
-除法本来就不是它的瓶颈，而 `inv` 多占一个寄存器、把乘法链拉长反而略微变慢。
-之所以没把它单独回退，是因为它的 LASX 路径与 `quat_rotate` **共用** `quat_normalize_batch::normalize_lasx`
-这个助手——单独回退要分叉助手、多出一份要维护的同式实现，而代价只有 3–5%；
-如果以后 `to_dcm` 的占比变大，可以再考虑为它保留旧式（记在 §12）。
-
-### 13.7 修掉矩阵乘的多核病理：每个线程各自打包一份 B
-
-**症状**：`parallel::matmul_f32` 在 1024³ 上线程越多越慢（6 线程 274 GF/s → 12 线程 175 →
-24 线程 93），而单线程打包版是 55。用"临时把 `PACK_MIN_M` 调到 `usize::MAX`"做对照，
-同一二进制立刻恢复正常的扩展性（1→24 线程：36.4 → **302.2** GF/s，8.3×）：
-
-| 1024³ | 1 线程 | 6 | 12 | 24 线程 |
-|---|---|---|---|---|
-| 打包（含病） | 55.6 | 274.7 | 175.0 | **93.4** |
-| 不打包（对照） | 36.4 | 210.6 | 231.0 | **302.2** |
-
-**根因**：并行层把行切给各线程，每个线程各自调用 `lasx_matmul`，而它在 `m ≥ 32` 时会
-**各自打包一整份 B**（1024³ 每份 4 MB）。24 线程 = 96 MB 的打包缓冲，远超 L3（32 MB），
-打包结果一写出来就被挤掉、还要重复读 B —— 线程数越多越糟。
-
-**修法**：抽出 `matmul_f32_packed_rows`（用**已打包**的面板算一段行），并行层改成
-"按面板打包一次 → 分派行块计算"，各线程只读共享面板（面板 ≤ 2 MB，留在共享 L3 里）。
-顺序路径走同一个函数，所以**逐位一致**（位精确测试的形状列表已补上会走该分支的
-`512×512×64` 与 `513×448×130`——后者同时覆盖行尾与列尾）。
-
-**阈值**：面板打包在并行层是串行的，而计算随线程数摊薄 ⇒ 打包占比 ≈ 常数/`m`
-（≈266/m）。实测 `m = 48/100/300` 时共享打包**反而慢 40–75%**（那时旧版按线程各拿
-m/线程数 行、落到**流式**路径，没有打包开销），`m ≥ 512` 时共享打包赢。于是加
-`SHARED_PACK_MIN_M = 512`；更彻底的做法是**把打包也并行化**（池里按固定块长切分、
-各线程打自己那些条带），那样阈值就不需要了——记为下一步（§12）。
-
-受控 A/B（stash 重建两个二进制、进程级交替；`examples/matmul_ab <m> <k> <n> pool <线程>`）：
-
-| 形状 | 线程 | 修前 | 修后 | 变化 |
-|---|---|---|---|---|
-| 1024³ | 12 | 176.4–180.3 | **304.3–322.3** | **+76%** |
-| 1024³ | 16 | 138.2–140.2 | **385.4–421.1** | **+185%** |
-| 1024³ | 24 | 97.5–98.6 | **378.5–393.3** | **+290%** |
-| 512³ | 16 | 274.6–294.8 | **321.3–337.1** | **+15%** |
-| 512³ | 24 | 235.6–236.8 | **293.2–294.3** | **+24%** |
-| 300×448×19147 | 16 | 347.6–363.7 | 327.1–344.0（走回退路径） | 持平（噪声内） |
-| 48×448×448 | 16 | 197.5–209.9 | 214.1–215.5（走回退路径） | 持平 |
-
-单线程打包路径重构前后一致（1024³ 55.5–58.7 → 56.6–60.9；512³ 61.2 → 60.0–61.1）。
-
-复现：`cargo run --release --example matmul_ab -- 1024 1024 1024 pool 16`。
-
-**同一病理在 f64 侧更严重**（f64 的 B 字节数是 f32 的两倍）：修复前 1024³ 的线程扫描是
-6 线程 110 GF/s → 12 线程 77 → 16 线程 62 → 24 线程 **46**（越多越慢）。把同一套
-"共享打包 + 双缓冲流水"搬过去（`matmul_f64_packed_rows` 抽出 + `parallel::matmul_f64`
-的打包分支）后，受控 A/B（stash 重建、4 轮交替、看中位）：
-
-| 形状 / 线程 | 修前 | 修后 | 变化 |
-|---|---|---|---|
-| 1024³ f64 / 16 | 65.2 | **191.7** | **+194%** |
-| 1024³ f64 / 24 | 45.9–46.0 | **171.9** | **+274%** |
-| 1024×1024×2048 f64 / 16 | 63.6 | **196.4** | **+209%** |
-| 512³ f64 / 16 | 33.7 | **108.5** | **+222%** |
-
-即：**f32 侧那两条修复不是 f32 特有的**，凡是"打包 B 再算"的路径都存在同一问题；
-f64 的收益更大只是因为它每份打包缓冲的字节数翻倍。位精确测试补了
-`(512,512,2048)`（8 面板 ⇒ 覆盖流水）与 `(513,448,130)`（行尾+列尾）。
-
----
-
-## 14. 池的调度策略层：编译期确认路径 + 穷尽枚举选择
-
-原来的派活内核把"第 w 个 worker 拿 `[w·rows_per, …)`"写死。但"怎么切"是**与负载相关**的
-决策：均匀内核要连续等分（缓存友好），矩阵乘要对齐行粒度，机器有后台抢占时要多块 + 动态领取。
-本节把它拆成一层策略。
-
-**行粒度取 4 的依据**：块边界与 4 行微内核的边界对齐。该常量曾以"`row_gran = 1` 的退化尾块
-慢一倍"为据固定为 4；2026-09-25 的复核**证伪了这条理由**（改常量重建二进制，
-`matmul_ab <m> <k> <n> pool 12 rowblock` 进程级交替、丢弃首轮、取中位）：
-
-| 形状 | `row_gran = 4`（现状） | `row_gran = 1` | 结论 |
-|---|---|---|---|
-| 256³ | 301.8 / 302.9 / 304.6 | **323.4 / 328.9 / 330.2** | gran=1 **快 8%**（三轮都赢） |
-| 512³ | 300.7 / 306.0 / 329.4 | 301.3 / 302.1 / 303.7 | 持平（gran=4 第三个样本跳到 329，是窗口噪声） |
-| 1024³ | 345.5 / 346.5 / 352.9 | 335.8 / 351.3 / 351.4 | 持平 |
-
-取值仍为 4，依据是**代价与收益**：8% 只在一个形状（m = 256）上稳定出现，另两个持平；而该常量
-同时参与 f32/f64 两条打包路径与 `pick_rows` 的判据，为 ≤8% 且限于单形状的收益改动一个在用的
-调度常量不划算。若要追这 8%，上表即为起点；"尾块退化"不再是理由。
-
-### 14.1 设计：零尺寸类型 + 单态化 + 穷尽 `match`
-
-```rust
-// src/pool/sched.rs（纯函数，不碰线程，可单测）
-pub trait Strategy {
-    const NAME: &'static str;
-    const MULTI: bool = false;                 // 是否允许"块数 > 线程数"
-    fn plan(rows: usize, threads: usize, gran: usize) -> Jobs;   // Job = { start, rows }
-}
-pub struct Chunk;                              // 连续等分（现状）
-pub struct RowBlock;                           // 等分 + 对齐行粒度（矩阵乘）
-pub struct Blocked<const BLOCK: usize>;        // 固定块长（块数可多于线程数）
-
-pub enum Pick { Chunk, RowBlock, Blocked { block_rows: usize }, Dynamic { block_rows: usize } }
-```
-
-三条收益，正是这一层存在的理由：
-
-1. **编译期确认路径**：策略是零尺寸类型，池的入口 `for_each_row_block_mut_with::<S, …>`
-   对 `S: Strategy` 泛型化 ⇒ 每种策略各自单态化，派活路径上**没有运行时分支**。
-   `Blocked<const BLOCK: usize>` 的块长更是直接进常量，循环边界是编译期常量。
-2. **新增策略时编译器会指着所有分派点**：`Pick` 是穷尽枚举，`for_each_row_block_mut_picked`
-   里的 `match` 少一个分支就编译不过。这挡住的是最隐蔽的一类退化——"新策略悄悄落进旧分支"。
-3. **切分是纯函数、可单测**：`sched` 的测试对 `rows × threads × gran` 的 384 种组合断言
-   "恰好覆盖 `[0, rows)`、块不重叠、非末尾块对齐粒度、静态策略块数 ≤ 线程数"；
-   池级测试再断言"每种策略都恰好访问每一行一次"。
-
-编码一种新策略的步骤：实现 `Strategy`（只读 `rows/threads/gran`）→ 在 `Pick` 加变体 →
-编译器会指出所有需要补分支的地方 → 在 `sched` 的覆盖测试里挂上它。
-
-### 14.2 多块与动态领取怎么进内核
-
-`Slot` 增加 `bases`/`row_bytes`/`widths`/`n_jobs`：`n_jobs == 0` 是原来的"单块模式"
-（指针在派活时算好，热路径一字未改）；`n_jobs > 0` 时 worker 按作业表逐块执行，
-指针由"基址 + 起始行 × 每行字节数"现场派生（存字节数是因为 worker 循环对元素类型 `T` 不透明）。
-静态多块按 `idx += 线程数` 轮转；动态用 `next_job.fetch_add(1)` 抢块，抢不到就收工。
-panic 语义不变：任一块 panic 就记第一个载荷、该 worker 停止领块，主线程等齐后原样续抛。
-
-### 14.3 实测：静态 vs 动态（`examples/matmul_ab <m> <k> <n> pool <线程> <策略>`）
-
-| 形状 / 线程 | 静态 `RowBlock` | `Blocked` | `Dynamic` |
-|---|---|---|---|
-| 1024³ / 24 | 319–405（中位 345） | 306–333 | **371–429（中位 426）** |
-| 1024³ / 16 | **386–423（中位 418）** | — | 371–390（中位 375） |
-| 512³ / 24 | **241–280（中位 275）** | — | 240–255（中位 255） |
-
-读法：**线程数超过物理核（本机 12 物理 / 24 逻辑，SMT 兄弟互抢 L1/L2）且每线程仍有
-≥32 行**时，块间方差才大到值得用原子领取（1024³/24 线程 +23%）；否则一个大块留在缓存里
-更好（1024³/16 线程 −11%、512³/24 线程 −8%）。本机后台负载让同一格差 ±10%，
-所以 `pick_rows` 只用这两条**粗判据**（`threads ≥ 20 && per_thread ≥ 32`）而不再细调块长。
-
-`auto` 与显式策略的差别在噪声内（复现见 §11）。默认（`auto`）在小规模与 16 线程下
-就是静态 `RowBlock`，与改动前**一致**——本节没有为了"看起来智能"而动默认路径。
-
-### 14.4 两个负面结果与一条方法学教训
-
-**（1）并行打包面板：无效，不可用。** 做法是把每个 32 列条带当一个独立作业交给池分派：
-作业元素是 `(条带号, 目标切片)`，条带号显式带上，于是作业不依赖池的切块边界与条带边界对齐。
-**实测更慢（512³/16 线程 −27%、1024³ −6%、宽形状持平）**——机制很清楚：一个面板只有
-32–36 个条带作业，
-而池的 [`MIN_PARALLEL_LEN`] = 4096 是**按元素数**判断的，32 < 4096 ⇒ 这轮派活**直接退化成串行**，
-只剩元组间接与 `chunks_mut` 构造的开销。要用它得先给池加"按作业块长切分、按工作量判断是否并行"
-的入口（记在 §12）。真正的"双缓冲"做法是让主线程在 worker 计算当前面板时**打包下一个面板**，
-那需要 `submit`/`wait` 分离的派活 API；按目前测到的打包占比，收益上限不大。
-
-**（2）快路径必须保留。** 把 `Chunk`/`RowBlock` 的派活接到"作业表 + worker 逐块"的通用路径后
-（而不是原来的"每 worker 一段连续行、指针派活时算好"），`for_each_row_block_mut_with` 里
-加了一步判断：`!S::MULTI` 且作业表非空时**走回 `dispatch_rows` 热路径**。这一步不是可有可无的
-优化——通用路径給 worker 增加了"逐块派生指针 + 作业表循环"，在 512³ 这种小规模上会被放大。
-
-**（3）方法学教训：单样本比较会导致错误结论。** 只跑一两次就下结论会出错：用
-"4 轮交替、每轮三个变体"复测时会看到**每个变体的第一次运行都明显偏慢**
-（512³/16 线程：首轮 247–251，随后三轮 311–341），把首轮算进去就会得出"慢了 30%"的假结论。
-这条比任何单项优化都重要：本机有后台负载，**任何 A/B 至少 3 轮交替、丢弃首轮、看中位**。
-
----
-
-## 15. 两条定向优化的实测结论：f64 2×32 与宽形状的 A 打包 / C 分块
-
-§12 列的候选里，本节把三条都量了。**三条全部否掉**，但每条都有明确机制，不是"试了不行"。
-
-### 15.1 f64 微内核改 2 行 × 32 列：否（探针数据）
-
-想法：f64 现在 4 行 × 16 列、16 个累加器（`dkernel`，2.00 FMA/周期 = 35.2 GFLOP/s，已是墙）。
-按"每行每 k 步 2 周期"的模型，FMA/周期 = C/8 ⇒ 16 列是 2.0、32 列理论 4.0。
-`kernel_probe` 加了 `dkernel2x32`（2 行 × 32 列，仍是 16 个累加器）实测：
-
-| 变体 | FMA/周期 | GFLOP/s |
-|---|---|---|
-| `dkernel`（4 行 × 16 列，现状） | **2.00** | **35.2** |
-| `dkernel2x32`（2 行 × 32 列） | 1.70 | 29.9 |
-| `dfma16`（纯 FMA 对照） | 3.99 | 70.2 |
-
-原因：A 广播从 4 次降到 2 次，但 **B 载入从 4 条涨到 8 条**，按"每条载入 ~0.75 周期"算，
-8 条就把 k 步的预算从 4 周期推到 6–8 周期，反而比广播更贵。⇒ **列宽不是免费的**：
-在 16 个累加器的约束下，`C=16/R=4` 与 `C=32/R=2` 是同一组寄存器预算的两种切法，
-后者把压力从广播转到了载入口，实测更差。
-
-### 15.2 宽形状的 A 打包：否（机制上无效）
-
-A 打包（把 4 行 A 拼成连续块）**去不掉广播**：内核每 k 步要的是 4 个标量广播，
-打包只改变这 4 个标量的取数地址（顺序 vs 跨距），而广播本身的吞吐（~2 周期/次）才是成本。
-真正能"省掉广播"的是"1 次向量载入 + lane 广播"，那条路在 §6.3 的探针里已经量过：
-`shuf` 变体 1.92 vs `kernel` 2.00 —— 同样更差。⇒ A 侧不动。
-
-### 15.3 宽形状的 C 分块 / k 分块：现状已最优
-
-三个二进制对照（`matmul_ab <m> <k> <n> pool 16`，4 轮交替、丢弃首轮、看中位）：
-
-| 宽形状 | 现状（回退路径） | 强制共享打包（`SHARED_PACK_MIN_M=1`） | 关掉 k 分块（`L1_BUDGET=usize::MAX`） |
-|---|---|---|---|
-| 100×448×19147 | **169.9–183.6** | 79.0–96.1（**−51%**） | 152.8–199.5（噪声内） |
-| 300×448×19147 | **285.8–335.5** | 179.0–204.4（**−35%**） | 279.4–348.5（噪声内） |
-
-- **共享打包对小 m 必输**：打包要走一遍 B（读+写 ≈ 68 MB），而计算只有 1.7–5.1 GFLOP；
-  按 350 GFLOP/s 算是 5–15 ms，打包却要 8.5–11 ms —— 串行的打包就是 Amdahl 项（§13.7）。
-  并行打包试过（§14.4）：面板只有 32–36 个条带作业，被 `MIN_PARALLEL_LEN` 判成串行 ⇒ 也无效。
-- **关掉 k 分块不赢**：宽形状 k=448 的条带是 57 KB，分两块（256+192）会多读写一遍 C
-  （m=100 时约 15 MB），但实测落在噪声里；而 k=512 的 64 KB 条带**确实**比分块慢
-  （§8.3 的 54.7 vs 60 GFLOP/s），所以 `L1_BUDGET = 48 KB` 保持不变。
-- 宽形状现在走的是**列块在外**路径（每线程 m/线程数 行 → 落到 `matmul_f32_cols_block`）：
-  B 的面板（k×128）在共享 L3 里被所有线程复用，B 只从 DRAM 读一遍（34 MB），**没有打包的额外写**。
-  它的短板是跨距载入（每个 k 步 128 B 连续、然后跳 n×4），换来的正是省掉那一遍打包。
-
-**结论**：宽形状的瓶颈不是 A 广播、不是 C 的重复读写、也不是"没用上打包"，而是
-"列块路径的跨距载入 × 小 m 无法摊平打包成本"这对矛盾。再往上要么做真正的
-主线程/worker 重叠打包（`submit`/`wait` 分离的派活 API，收益上限按上面的数字约 +30%），
-要么改数据布局（调用方把 B 预先转置成列主序）——两者都超出本节的范围，记在 §12。
-
----
-
-## 16. 双缓冲打包流水：多面板矩阵乘 +24~29%
-
-§12 一直挂着"主线程与 worker 重叠打包（需要 `submit`/`wait` 分离的 API，上限约 +30%）"。
-本节做了，**实测 +24~29%**（多面板形状）。
-
-### 16.1 为什么不能用 `submit()` / `wait()` 两个方法
-
-**不能**写成"发布不等 + 等"（`unsafe fn submit(...)` 里只发布、`fn wait(&mut self)` 再等）：
-闭包 `f` 活在本函数栈帧上（池只存了 `*const ()`），`submit` 一返回、worker 还在调那个闭包，
-就是悬垂引用。要修就得把 `f` 与数据的所有权托管出去，代价远大于收益。
-
-**做法是 scoped 回调**：把"等待期间主线程做的事"作为第二个闭包传进去：
-
-```rust
-pool.for_each_row_block_mut_picked_deferred(m, 4, [(a, k), (c, n)], pick,
-    |rows, [ab, cb]| { /* worker 算当前面板 */ },
-    || { /* 主线程趁 worker 忙：打包下一个面板 */ });
-```
-
-三条好处：① `f`、`during` 与数据都活在同一个栈帧里，活到 `wait()` 之后 ⇒ **不需要 unsafe**；
-② `during` 捕获不到 `arrays`（已被本次调用移走）也捕获不到 `&mut pool`（已借出），
-**借用检查器消除了数据竞争**；③ 池内部只多了一个 `during: D: FnOnce()` 形参
-（现有调用点传 `|| {}`，单态化后是零开销）。
-
-### 16.2 实现：面板流水
-
-```text
-面板 0 先打包（串行，不可避免）
-for i in 0..面板数:
-    submit 第 i 个面板的计算（读 buf[i%2]）→ 主线程打包第 i+1 个面板（写 buf[1-i%2]）→ wait
-```
-
-### 16.3 受控 A/B（`matmul_ab <m> <k> <n> pool 16`，4 轮交替）
-
-| 形状（面板数） | 现状 | **流水** | 结构相同但不重叠（对照） |
-|---|---|---|---|
-| 1024×1024×4096（4 个面板） | 346–365（中位 362） | **442–450（中位 449，+24%）** | 322–339 |
-| 512×512×8192（8 个面板） | 271–295（中位 288） | **358–376（中位 371，+29%）** | 245–259 |
-| 1024³（1 个面板） | ~410 | ~428 | 397（无重叠可做，差异是布局/噪声） |
-| 512³（1 个面板） | 212–336（方差大） | 265–279 | 258 |
-| 300×448×19147（走回退路径、不打包） | 336–355 | 345–356 | —（本就与流水无关，持平） |
-
-**流水的适用边界（实测）**：把 f32 的 `SHARED_PACK_MIN_M` 从 512 降到 32（让宽形状也走
-共享打包 + 流水）**仍然输**：
-`100×448×19147` 回退路径 ~181 GF/s vs 共享打包 ~109（−40%）、`300×448×19147` ~308 vs ~271、
-`192×448×19147` ~275 vs ~205。原因是**包与算这两段都吃带宽**：重叠不减少总带宽需求，
-而列块路径读一遍 B（34 MB）就够、打包路径还要多写+多读一遍（68 MB）⇒ 小 m 下根本摊不平。
-所以阈值保持 512，流水只在"包/算资源互补"时才有意义。
-
-### 16.4 方法学补充：先确认被测机制确实被触发
-
-A/B 之前必须确认被测路径真的会被走到，否则量到的是不相干的形状。下面四个形状**不适合**
-验证流水：`100×448×19147`、`300×448×19147` 根本不走打包分支（`m < SHARED_PACK_MIN_M`，
-宽形状走列块路径），`1024³`、`512³` 只有一个面板（n ≤ 1024 时 `strips_total ≤ nc_strips`）
-——流水在这些形状上不会重叠任何东西。只有 `n = 4096/8192` 的多面板形状（§16.3 前两行）
-才触发重叠。这与 §14.4 的"首轮偏慢"是同一类错误：口径不对时，A/B 的结论无效。
-
-### 16.5 两个附带发现（都影响所有形状）
-
-**（1）面板缓冲跨调用复用**：每次调用都 `vec![0.0; cap]` 分配并清零两块面板，在小形状上比
-内核本身还贵（1024×1024×4096 时共 8 MB，256³ 时 4 MB）。当前实现用 `thread_local` 复用
-（只在增长时清零）：**512³/12 线程 245 → 306 GF/s（+25%）**，256³ 从 87 → 310（3.5×，
-那一档同时切换了下面的判据）。这条同时惠及 f32 与 f64。
-
-**（2）阈值是有理由的判据**。`SHARED_PACK_MIN_M = 512` 是固定值，但它的依据不是标定出的
-最优点，而是下面这条分界：**回退路径会不会退化成"每个线程各打包一份 B"**。
-回退路径每线程拿 `m/线程数` 行，`≥ PACK_MIN_M` 时它会各自打包（病态，§13.7）；否则它落在
-**列块路径**（不打包、B 只从 DRAM 读一遍，通常更快）。于是：
-
-```rust
-fn need_shared_pack(m: usize, threads: usize, pack_min_m: usize) -> bool {
-    threads > 1 && m / threads >= pack_min_m
-}
-```
-
-受控 A/B（4 轮交替、看中位）显示该判据与固定阈值 512 在这些形状上**等价**（384³ 211 vs 214、
-512³ 307 vs 306、宽形状 266 vs 255、1024×1024×4096 362 vs 358，均在 ±5% 噪声内），
-而它把魔法数字换成了可解释的分界，且不需要为不同线程数重新标定。
-
-**"结构相同但不重叠"的对照组是关键**：它也有两块缓冲、也走 `deferred` 入口，只是把打包
-挪到计算之后——它落在基线附近（甚至略低），所以 +24~29% 确实来自**重叠**，不是分配或代码布局。
-
----
-
-## 17. unsafe 审查：可用工具、落地策略与一次真实收获
-
-规模先摆出来：全仓库 **406 个 `unsafe {` 块 + 43 个 `unsafe fn` + 2 个 `unsafe impl`**，
-而 `SAFETY` 注释只有 58 条。所以本节的目标不是"再写点注释"，而是**引入工具 + 定策略**。
-
-### 17.1 工具盘点（本机实测能不能跑）
-
-| 工具 | 本机可用性 | 用途 | 结论 |
-|---|---|---|---|
-| **Miri** | ✅ `rustup component add miri` 对 `loongarch64-unknown-linux-gnu` 有组件，能跑 | 解释执行 MIR 查 UB：越界、未初始化、别名违反（Stacked/Tree Borrows）、数据竞争 | **已用**：`aligned` 5 测试 ✅、`pool` 作业表/多块/动态领取那条 15.5 s ✅，`-Zmiri-tree-borrows` 亦 ✅ |
-| **cargo-careful** | ✅ `cargo install cargo-careful` 成功（v0.4.10） | 用**带额外检查的 std** 跑整个测试套件（原生速度，比 Miri 快几个数量级） | **已用，并抓到一个真 bug**（见 17.3） |
-| **Clippy `undocumented_unsafe_blocks`** | ✅ 内置 | 每个 `unsafe` 块必须紧邻 SAFETY 说明 | **已启用**（crate 级 `warn`，CI 强制） |
-| Rudra | ⚠️ 需 `rustc-dev` 组件 + 特定 nightly，且要自行构建 | 静态分析 unsafe 的三种 bug pattern（panic safety / higher-order / data race） | 未接入（列为可选，见 §12） |
-| Kani | ⚠️ 需 CBMC，loongarch64 主机支持未验证 | 有界模型检验 | 未接入 |
-| `-Zsanitizer=address` | ⚠️ 未在 loongarch64 上验证 | ASan | 未接入 |
-| cargo-geiger | ⚠️ 未安装 | unsafe 用量度量（不出结论） | 未接入（统计意义有限，上面的数字够用） |
-
-命令（都不进 CI：Miri 慢 ~3 个数量级、careful 首次要建 sysroot）：
-
-```bash
-rustup component add miri
-cargo miri test --lib aligned::                                  # 纯指针/分配设施
-cargo miri test --lib pool::tests::row_block_strategies_visit_every_row_once
-MIRIFLAGS="-Zmiri-tree-borrows" cargo miri test --lib pool::tests::row_block_strategies_visit_every_row_once
-cargo install cargo-careful && cargo careful test --release --lib
-```
-
-**Miri 的硬边界**：它不能执行 LLVM intrinsic，所以 LASX/LSX 内核**跑不了**——能审的是
-"非 SIMD 的基础设施"（`aligned`、`pool`、`ffi::status` 的长度/空指针逻辑）。这不是缺陷，
-而是分工：内核的 unsafe 是"在刚校验过的切片上调用 intrinsic"，真正容易藏 UB 的是
-指针算术、生命周期与并发那几处，而它们恰好都在可审范围内。
-
-### 17.2 lint 策略：基础设施逐块写、内核显式豁免
-
-`undocumented_unsafe_blocks` 一开就是 **305 条**告警，其中约 250 条在 `src/ops/*`，
-全部是同一句"在已校验切片上调用 LASX intrinsic"。逐块抄注释只会把真正的不变量淹没，
-所以采用**分层策略**（写在 `src/lib.rs` 顶部的策略注释里）：
-
-- **基础设施强制**（`pool` / `arch` / `aligned` / `api` / `parallel` / `scalar_ref`）：
-  逐块写 SAFETY。原有 13 处缺口已全部补齐（其中 `unsafe impl Sync/Send for Shared`、
-  worker 取槽位、`thunk` 调用、arch 的 transmute 等）。
-- **`src/ops/*` 与 `src/ffi/*` 显式豁免**：文件头写明豁免理由——同一组前提在**函数级
-  SAFETY 段**统一说明；模块头同时声明"更不允许新增无说明的 unsafe"。
-
-效果：`cargo clippy --workspace --release --all-targets` 在**启用该 lint 的情况下 0 告警**，
-CI 的零告警守护继续成立；新模块默认受这条 lint 约束。
-
-### 17.3 真实收获：`cargo careful` 抓到一处契约违反（已修）
-
-`cargo careful test --release --lib` 首跑 **83 passed / 1 failed**：
-
-```text
-ops::cross3_batch::tests::test_cross3_properties
-assertion `left == right` failed: 原地 oy 与非原地不一致
-  left:  [… , 315809.28817912744]
-  right: [… , -929.495838831918]
-```
-
-只有**最后一个元素**不一致。根因：`cross3_batch` 的模块文档明确承诺
-"**允许原地：三个输出可与任意输入别名**"，但**标量尾**是逐分量"算一个写一个"：
-
-```rust
-ox[j] = ay[j]*bz[j] - az[j]*by[j];   // 若 ox 与 bx 同一缓冲，bx[j] 到此已被覆盖
-oy[j] = az[j]*bx[j] - ax[j]*bz[j];   // ← 读到的是刚写进去的 ox[j]
-```
-
-向量路径恰好"先载入该轮全部 a/b、再写回"，所以只有标量尾（本例 37 个元素里的最后 1 个）
-暴露出来；而它**是否暴露取决于编译条件**——普通 release 测试碰巧通过，
-`-Zcareful` 换了 std 与代码布局后失败。这正是"顺序依赖"这类问题的典型形态：
-不是内存不安全，但**语义随 codegen 变化**，比崩溃更隐蔽。
-
-修法：尾部也**先读齐、再写回**（三处表达式不变，保持与向量路径逐位一致）。修完
-`cargo careful test --release --lib` **84 passed / 0 failed**，普通测试同样全绿。
-
-**这条比任何注释都有价值**：它说明"允许原地"这类承诺必须有测试覆盖，
-而 `cargo-careful`/Miri 这类工具正好能暴露"靠运气通过"的实现。
-
-
-## 18. 矩阵视图与打包计划：接口层的设计与实测（2026-09-24）
-
-这一节记录 [`view`](../src/view.rs) 与 [`plan`](../src/plan.rs) 两个新模块的设计依据、位精确性
-论证与实测数据。它不是"性能优化"，而是**接口层**：把"形状/跨距"从裸参数变成可校验的对象，
-并把"每次重打包 `B`"变成"打包一次"。
-
-### 18.1 动机：参数顺序类 bug 在本仓库真实发生过
-
-| 事故 | 后果 | 现在的拦截点 |
-|---|---|---|
-| 把对齐后的列数 `n32` 当成行跨距传给 `cols32_f32` | 整个矩阵行错位 | 视图里"列数"与"跨距"是两个字段，不再可能混用 |
-| 某参数既当循环上界又当 `B` 的行跨距 | 交换后结果全错 | `MatRef` 构造时校验 `data.len()` 与 `rows×cols` 的对应关系 |
-| 基准里 `(m, k, n)` 顺序写反 | 读数无意义 | `MatmulPlan::run` 的 `m` 由 `a.len()/k` 推出，不额外传 |
-
-代价是"多一层对象"，收益是**校验发生在构造处**、错误消息带"期望/实际"（`Error::Shape`）。
-与 `api` 层一致：切片进出、`Result` 上抛，不新增任何导出符号。
-
-### 18.2 `RowRef`：为什么 `row()` 不直接返回 `&[T]`
-
-列主序矩阵的一行在内存里**不连续**（相邻列相差 `rows` 个元素）。直接返回 `&[T]` 要么撒谎
-（返回连续内存但语义不是那一行），要么 panic。所以：
-
-- `MatRef::row(i) -> RowRef<'a, T>`：`get(j)` / `iter()` / `to_vec()`，布局无关；
-- `RowRef::as_slice() -> Option<&'a [T]>`：只有本来就是连续时才给切片（于是打包的
-  `copy_from_slice` 快路径与"按元素取"的慢路径能共存而不出错）；
-- `MatRef::as_row_major_contiguous()`：`Option<&[T]>`，是"能不能直接下给现有向量内核"的判据 ——
-  拿到 `None` 时调用方**必须显式**选 `to_row_major_vec()`（付一次复制）或改用 `MatmulPlan`。
-
-`as_row_major_contiguous` 的判据是 `row_stride == cols && (col_stride == 1 || cols <= 1)`：
-最后一档覆盖"单列矩阵用列主序构造"这种 `col_stride == rows` 但内存其实连续的退化情形。
-
-### 18.3 `MatmulPlan`：打包提前到构造时
-
-`matmul_f32`/`matmul_f64` 的打包路径每次调用都要重排一遍 `B`（`pack_b`，`O(k·n)`），
-并行层曾受"每个线程各打包一份"影响（§13.7，修法是共享面板 + 双缓冲流水）。
-固定 `B` 反复用时，正确的做法是**把面板留下来**：
-
-```text
-构造：B 视图 → 逐面板 pack_b → Vec<AlignedVec<T>>（面板 = k × nc 的条带主序）
-每次：对每个面板调 matmul_*_packed_rows(k, n, jb, nc, panel, a, c, m4) + 补列尾
-```
-
-设计取舍：
-
-1. **计划不借用 `B`**（反对"零拷贝持有 `MatRef`"的初版想法）。打包本身就是一次全量复制，
-   再借 `B` 只会平白多一个生命周期参数，还挡住"`Arc` 给多线程共享"这个最有用的用法。
-   构造完原矩阵即可释放。
-2. **面板用 `AlignedVec`**（与 `api` 输出同口径）。算子里那份 `PACK_BUF` 是普通 `Vec`，
-   此处保持对齐；打包面板是内核的主要读入流，32 字节访存对齐是前提（§7.6）。
-3. **列尾单独收拢**。不足一条带的列（f32 < 32、f64 < 16）在算子层由 `row_tail_range_f32` /
-   `row_tail_f64` 处理，它们按 `B` 的行跨距取数。为了**复用这两个函数**而不是在新模块里
-   再抄一份 intrinsic 内核，计划在构造时把尾部列 gather 成行主序 `k × tail` 小矩阵
-   （f32 最多 31 列、f64 最多 15 列，`O(k·tail)` 一次性代价可忽略），运行时直接调原函数。
-4. **`f32`/`f64` 的差异收在一个 trait 里**（`plan::PackedKernel`：`STRIP`、`strips_per_panel`、
-   `pack_panel`、`packed_rows`、`row_tail`），于是构建/运行逻辑只写一遍；trait 方法全部是对
-   `ops` 层 `pub(crate)` 入口的直接转发，**不含任何自己的数值逻辑**。
-
-### 18.4 位精确性论证（为什么计划不需要"±1 ulp"例外）
-
-计划与 `api::matmul` 走的是不同的路径选择（前者固定打包路径，后者按形状分派），要承诺
-"逐位一致"就得逐环节对齐累加次序：
-
-| 环节 | 算子层 | 计划 | 是否同序 |
-|---|---|---|---|
-| 主体列 `[0, n_strip)` | `pack_b` + `matmul_*_packed_rows` | 调**同一个函数**，参数 `(k, n, jb, nc, m4)` 相同 | 是（同一份代码） |
-| k 分块 | `kb` 在 k 主序面板上分段，非首块从 `C` 读回部分和 | 同 | 是（分块只是落盘/读回，精确） |
-| 行尾（`m4` 之后的 1–3 行） | `row_tail_packed` | 同（在 `packed_rows` 内部） | 是 |
-| 列尾 `[n_strip, n)` | `row_tail_range_f32(a_row, c_row, b, k, n, n32, n)` | 同一函数，传 `(tail_buf, k, tail_cols, 0, tail_cols)`，`c_row` 是 `C` 的对应子切片 | 是：FMA 段的 8 列块数 = `⌊tail/8⌋`、标量段 = `tail mod 8`，两处都与原调用完全一致 |
-| `n < STRIP`（没有完整条带） | 同上 | 同（全部走列尾） | 是 |
-| `k == 0` / `n == 0` | 见 §2.4 | `k==0` 构造报错；`n==0` 直接返回 | 不适用（不产生数值） |
-
-另一个容易误判的点：**布局无关性**。`pack_panel` 对连续行主序的 `B` 直接调 `pack_b`
-（逐位一致由构造保证），对列主序/带跨距/转置视角则用"按行取数"的 gather 写**同样的字节**，
-所以"B 是什么布局"只影响构造耗时，不影响任何一位结果。测试
-`f32_plan_accepts_column_major_and_transposed_b` 对同一份权重做三种布局的构造，结果逐位相同。
-
-回归测试（`src/plan.rs` 的 `f32_plan_matches_api_matmul_bit_for_bit` /
-`f64_plan_matches_api_matmul_bit_for_bit`）覆盖 14 个形状，用 `to_bits()` 与 `api::matmul`
-逐一比对，其中特意包含"`m` 不足 4 行 / `n` 不足一条带 / 条带余 8–31 列"这些尾部组合。
-
-### 18.5 实测：三列对照（`cargo run -p lasx_bench --release -- plan`）
-
-为了把两类开销分开，基准里给三列（都算同一次 `A·B`）：
-
-| 列 | 输出缓冲 | `B` 打包 |
-|---|---|---|
-| ① `api::matmul` | 每次新分配 + 清零 | 每次重打包 |
-| ② `lasx_matmul`（`C` 复用） | 复用调用方的 | 每次重打包 |
-| ③ `MatmulPlan::run_into` | 复用调用方的 | **只打包一次** |
-
-本机（Loongson-3B6000，单线程，`taskset` 绑 1 核，5 取样中位数；**2026-09-25 复测**）：
-
-| 形状 | ① 一次性 API | ② C 复用 | ③ C 复用+免打包 | ③/② | 建计划 | 计划占用 |
-|---|---|---|---|---|---|---|
-| f32 64×64×64 | 8.3 µs（63.0 GF/s） | 7.7 µs（68.4） | 7.7 µs（68.4） | 1.00× | 2.6 µs | 16 KiB |
-| f32 256×256×256 | 562.4 µs（59.7） | 548.9 µs（61.1） | 510.2 µs（65.8） | 1.08× | 46.9 µs | 256 KiB |
-| f32 512×512×512 | 4.55 ms（59.0） | 4.49 ms（59.8） | 4.28 ms（62.7） | 1.05× | 194.3 µs | 1.0 MiB |
-| f32 1000×64×4096 | 10.54 ms（49.7） | 8.92 ms（58.8） | 8.16 ms（64.3） | 1.09× | 185.0 µs | 1.0 MiB |
-| f32 100×64×19147 | 4.34 ms（56.4） | 3.88 ms（63.2） | 3.91 ms（62.7） | 0.99× | 1.06 ms | 4.7 MiB |
-| f64 128×128×128 | 147.0 µs（28.5） | 137.6 µs（30.5） | 126.5 µs（33.2） | 1.09× | 23.2 µs | 128 KiB |
-| f64 256×256×256 | 1.20 ms（28.0） | 1.17 ms（28.7） | 1.10 ms（30.6） | 1.07× | 94.9 µs | 512 KiB |
-| f64 512×512×512 | 8.97 ms（29.9） | 8.91 ms（30.1） | 8.82 ms（30.4） | 1.01× | 370.1 µs | 2.0 MiB |
-
-读数要点（不做过度解读；与 2026-09-24 那一版逐行一致，量级没变）：
-
-- **①→② 是"不再每次分配输出"的收益**（6%–18%，随 `m·n` 变大）；**②→③ 才是打包复用的收益**，
-  1%–9%。两者加起来是 1.00–1.09×，**不是数量级提升**——打包本来就是 `O(k·n)` 的线性搬运，
-  在算力受限的形状上只占几个百分点。计划的真正价值在"`B` 一次、`A` 很多次"和接口可读性，
-  以及"多线程共享一份打包 `B`"（§13.7 的病理在计划里天然不存在）。
-- `100×64×19147`（§8.1 里的"极宽 `n` + 小 `k`"形状）：2026-09-25 复测 ③/② = 0.99×（2026-09-24 为 1.04×）——
-  两者在这个形状上**互有胜负、都在噪声内**，含义是"计划走打包路径时，构造期已把打包代价
-  摊掉，于是与列块路径打平"。
-- ③/② 在 64³ 上只剩 1.00×：该形状 `matmul_f32` 走流式路径、`k·n` 只有 16 KB，打包本来
-  就没有代价可省。计划固定走打包路径，在这个形状上与流式路径持平（68 GF/s）。
-
-### 18.6 已知界限与后续
-
-- 计划**固定**走打包路径，不复制 `api::matmul` 的形状分派。如果将来某个形状上流式/列块路径
-  明显更优（例如 §8.1 的极宽 `n` 判定被重新标定），计划会跟着慢一点；要在计划里也做分派，
-  得先把"面板能不能塞进 L2"这类判据参数化。
-- 计划目前是单线程的：调用方用 `Arc<MatmulPlan>` + 线程各自写不相交行段即可，但
-  "一个计划内部起线程"还没有做，也没有和 `pool::WorkerPool` 打通。
-- `MatMut` 只提供行主序（内核输出都是行主序）；列主序输出（转置写回）没有需求，先不做。
-
-
-## 19. 形状进类型与公式 DSL：契约、实测与决策记录（2026-09-24）
-
-这一节是 `shape` 层（`src/shape.rs`）与后续 `lasx_rs_macros` 公式 DSL 的**设计依据**。
-它是第 2、3 步的输入，所以先于代码定稿。
-
-### 19.1 分层：`view` 管布局、`plan` 管复用、`shape` 管形状
-
-| 层 | 形状在哪 | 解决什么 |
-|---|---|---|
-| `api` | 三个裸数字 | 一次性调用 |
-| `view` | 运行期字段（`MatRef`） | 布局灵活：列主序、带跨距、转置视角 |
-| `plan` | 运行期字段（`MatmulPlan`） | `B` 固定、反复算：打包一次 |
-| `shape` | **类型里（const 泛型）** | 形状编译期已知：形状错误编译期报 + 排版编译期定死 |
-
-`shape` 不含任何新数值路径：`Prepared` 内部就是 `MatmulPlan`，所以逐位一致是**继承**来的，
-不是重新论证的。它的价值在编译期与可读性：
-
-- `Layout<K, N>` 把面板数 / k 分块 / 列尾 / 打包字节数放进 **const 求值**（`const _: () =
-  assert!(…)` 守着），运行期只剩常数驱动的循环；
-- `Mat<T, R, C>` 是 `&[T]` + 两个 const 标签，**零开销**；`K` 对不上直接是 `E0308`，
-  报错指在公式那一行；
-- 构造函数只查长度，之后 `apply*` 不返回 `Result`：形状由类型担保。
-
-**DYN 档**（`MatDyn<T, C>` / `MatBufDyn<T, C>`）：行数运行时、`K/N` 仍 const。这是真实业务的
-主场景（在线服务每批不同、离线批处理按数据量），也是"每批编译一份"与"退回 `api::matmul`"
-之间的正解。权重侧仍是全静态 `Mat<K,N>` ——**DYN 只把行交给运行期，打包与排版不变**。
-
-### 19.2 `Auto` 判据：实测标定出来的两条门限
-
-`shape::auto_threads(rows, k, n, machine)` 与常量 `AUTO_MIN_WORK = 4_000_000`
-（单位是乘加次数 `m·k·n`）。数据来自 `examples/pool_shared_sync.rs`（`K=N=256`、12 线程、
-与单线程逐位对照过）：
-
-| 形状 | 工作量 | 池/单线程 | 结论 |
-|---|---|---|---|
-| `16×256×256` | 1048 k | 1.97× | 行不够（每线程 < 4 行）→ 不并行 |
-| `32×256×256` | 2097 k | 1.01× | 盈亏平衡 |
-| `64×64×64` | 262 k | **4.11×** | 工作量不够 → 不并行 |
-| `1024×8×8` | 65 k | **3.19×** | **行很多但每行极薄** → 也不算 |
-| `256×64×64` | 1048 k | 1.20× | 不并行 |
-| `64×256×256` | 4194 k | 0.76× | 两条都满足 → 并行 |
-| `256×256×256` | 16777 k | 0.44× | 并行 |
-| `1024×256×256` | 67108 k | 0.29× | 并行 |
-
-两条门限缺一不可：
-
-1. **每线程 ≥ 4 行**（微内核一次 4 行、`B` 被复用 4 次；行不够只会制造退化尾块）；
-2. **总工作量 ≥ `AUTO_MIN_WORK`（4 M 乘加）**——派活本身要几十微秒，小形状上比干活还贵。
-   `64×64×64` 与 `1024×8×8` 这两行是第 2 条的必要性证据：前者行数不多、后者行数极多，
-   **都因为工作量不够而亏**。"只看行数"的判据会把 `1024×8×8` 判错 3.19×。
-
-第 2 条同时把 `&self` 引入的那层同步关在门外（§3.2.1）：低于 4 M 的工作量一律不派活，
-也就不付那 44 ns。**同步开销的可见性边界**实测如下（单线程热路径 + 最坏版同步）：
-
-| 形状 | 单次 | 同步占比 |
-|---|---|---|
-| `16×64×64` | 1.95 µs | **3.18%**（可见） |
-| `64×64×64` | 7.76 µs | 0.40% |
-| `1024×8×8` | 10.4 µs | 0.66% |
-| `16×256×256` 及以上 | ≥31.7 µs | ≤0.2% |
-
-`Single` 完全不派活；**`Exact<N>` 不设门限**——它是用户显式选择，开销是真实开销（小形状上
-可能与单线程差几倍），这一点要在文档里写明，不替用户做决定。
-
-### 19.3 公式 DSL：决策记录（proc-macro）
-
-`lasx_rs_macros`（手写 `TokenStream`，**不依赖** `syn`/`quote`；workspace 内部
-crate，不发布，`lasx_rs` 依赖并 `pub use` 出来，用户视角仍是一个依赖）。四条理由按硬度排序：
-
-1. **读 token 首字符做分派 —— `macro_rules!` 完全做不到。** DSL 的规则是"大写 ident =
-   类型级维度（进类型标注，编译期校验）、小写 ident = 运行期值（生成运行期断言）"，于是
-   `yd[m, N] = xd[m, K] * w[K, N]` 里 `m` 三处走运行期、`K/N` 走编译期，**一个宏覆盖静态与
-   DYN 两档**，不需要 `matmul!` / `matmul_dyn!` 两个宏。`macro_rules!` 拿不到 token 文本。
-2. **比较两个 ident 是否字面相同。** "收缩维两侧必须是同一个下标"这条要**编译期**报错。
-   `macro_rules!` 只能比值：写法正确时退化成恒真比较 `assert_eq!(m, m)`，被 clippy 的
-   `eq_op` 直接判死（这是工作区里那个 `examples/static_gemm.rs` 原型实测撞到的，未提交）。
-3. **任意表达式**。`expr` 片段后面不能跟 `*`，所以 `matmul!(&x * &w)`、`alpha * x * w + beta * y`
-   这类写法在 `macro_rules!` 里根本匹配不了；`tt` 手动拆词能做但规则会指数膨胀、报错更差。
-4. **报错质量**。要精确定位到公式里哪个 token 错了，必须自己拿 `Span`。
-
-代价：多一个 workspace 内的 proc-macro crate（Rust 的硬约束），且 `cdylib` 构建会多编译
-一个 host 侧 crate。**"零第三方依赖"保持**（不引 `syn`/`quote`），代价是解析器要自己写。
-
-### 19.4 报错锚点规则（解析器按此实现）
-
-- **Span 从解析第一行就保留**（每个 ident / 标点都带位置），事后补会返工。
-- 比较两侧下标时**双锚定**：两侧 token 都进诊断，附一条
-  `note: 两者在运行时必须相等`。用户写错时直觉是"哪一侧写错了"，只锚一侧会让人来回看。
-- 分类规则与对应诊断：
-  | 写法 | 归类 | 诊断 |
-  |---|---|---|
-  | `M`、`N`（大写开头） | 类型级维度 | 进类型标注；不是 const → 编译错误 + "大写下标必须是 `const`" |
-  | `m`、`_m`、`m2`（小写/下划线开头） | 运行期值 | 生成运行期断言；不在作用域 → 编译错误 + "小写下标必须是运行期值" |
-  | `M_`（大写开头但非常量） | 类型级维度 | 同上第一条（**这条容易误判成小写，必须兜住**） |
-  | 同一矩阵两处同名（`yd[m, m]`） | 非法 | 编译错误："同一矩阵的两个下标不能同名" |
-  | 收缩维两侧 token 不同（`x[M, K] * w[Q, N]`） | 非法 | 编译错误 + 双锚定 |
-  | 下标个数 ≠ 2 | 非法 | 编译错误（不静默忽略） |
-
-大小写约定与 Rust 的 `non_upper_case_globals` 习惯正好自洽：大写 const 本来就不触发 lint，
-所以"大写下标"不需要 `#[allow]`。
-
-### 19.5 策略接到池上：交付边界与候选选择（本节的实测结论，代码在 `src/shape.rs`）
-
-已落地：`layout`（编译期排版 + const 自检）、`Mat`/`MatBuf`/`MatDyn`/`MatBufDyn`、
-`Prepared`（打包复用、`apply`/`apply_into`/`apply_dyn`/`apply_dyn_into`）、`auto_threads`
-判据、6 个测试（与 `api::matmul` 逐位对照，含 7 个静态形状 + 5 种 DYN 行数）。
-
-**把策略接到池上时采用了候选 A**。阻塞点是一个具体的 API 缺口：`Prepared::apply` 拿的是
-`x: &Mat`（只读），而池的行块接口 `for_each_row_block_mut` 要求所有数组都是 `&mut`
-（只读入参得先 `as_mut_slice()`）。两个候选：
-
-- **A（采用）**：给池的行块闭包**多传一个"本块起始行"**：`f(start, rows, [..])`。
-  这样只读数组可以整个捕获进闭包、按 `start` 切片，**零 unsafe**，而且起始行本身是
-  有用的信息。代价是池的公开闭包签名变更（5 处调用点 + 文档 + 测试）。
-- **B（未采用）**：新增"只读数组"形参组（`[(&[T], usize); NR]` + `[(&mut [T], usize); NM]`），
-  要在 `thunk` 里支持两种还原方式，改动落在不安全的核心。
-
-采用 A 的理由：它把改动放在"更安全的接口"一侧，且不新增 `unsafe`。签名（已冻结）在 §19.7；
-池的闭包签名变更触发过一次真实事故（漏 stage 一个调用方导致 CI 红），已作为规则写进
-`AGENTS.md` 第 2 条。
-
-### 19.6 与 `plan` 的关系（为什么 `Prepared` 不另起一套）
-
-`Prepared` 只是给 `MatmulPlan` 套上类型形状：面板构造、k 分块、列尾 gather 全部沿用
-`plan` 的实现，`Layout<K,N>` 里那些常量只是把 `MatmulPlan::new` 的运行期判据在编译期
-预先算了一遍（`debug_assert` 校验两者一致）。所以 §18.4 的位精确论证对本层**整体继承**，
-唯一新增的检查是"类型形状与运行期长度一致"，它在构造函数里做掉。
-
-### 19.7 接口冻结（proc-macro 直接调这三个）
-
-公式 DSL 会生成调这三个接口的代码，**它们从此不再改动**（要改就先改宏）。
-
-**(1) 池的行块闭包 —— `src/pool/mod.rs`**
+| 全部单算子路径 | 每算子的 LASX/LSX/标量尾/打包/列块/分块路径必须互相逐位；回归测试按算子分组 |
+| 矩阵乘：行切/多线程/计划句柄 | 行切与串行逐位；`plan.run_block_into` 与整块逐位（覆盖 k=384/385 两侧、m/n 不整除）；多线程"计时前断言" |
+| 矩阵乘：k 分块 | 部分和落内存再读回是精确的 ⇒ 分块 + 回写 C 不破坏位精确（每元素 k 序递增） |
+| 复数矩阵乘（直算路线） | 与 4 条实矩阵乘组合**逐位**一致（位精确契约） |
+| `alpha`/`beta` 融合（落地版） | 与 `matmul_scaled` 原有实现同序 ⇒ 逐位（推翻早期"±1 ulp 例外"设想） |
+| 融合原语（向量化后） | P4-e 重测：融合 vs 多步 **0.363× ⇒ 快 2.75×**，且**仍逐位** |
+| `axpy_inplace_f32` | 3 趟 → 1 趟（**7.753×**）且逐位（W3 修正后） |
+| gather/scatter、跨步三原语 | 纯拷贝/换访存 ⇒ 逐位（三次 A/B 全过门限：1.205×/1.277×/1.134×） |
+| NN 行算子（`softmax_rows`/`rms_norm`/`layer_norm`/`rope`） | 与参照同序 ⇒ 逐位（`rms`/`layer` max abs = 0e0；`rope` powf hoist 后与逐元素重算全等） |
+| 量化（`quantize_i8_rows`/`dequantize_i8_rows`/`dot_i8`/`gemv_i8`） | ties-even + clamp；dot/gemv **i64 累加 + 终点饱和到 i32** ⇒ 逐位 |
+
+**容差类（必须带实测界与参照物）**：
+
+| 类别 | 实测界 / 依据 |
+|---|---|
+| `gelu_quick`（tanh 近似） | 文档界 `5.26e-3`（与融合核近似路径不同）；portable 默认与 f32 参照另测 |
+| `gelu_erf`（A&S 7.1.26） | 实测 `max abs 3.626e-7`、`max rel 3.683e-5`；声明界 **abs `1e-6`**，不声称逐位 |
+| 拉普拉斯递推核 | 安全区内 ≤1e-4；全网格误差 ≤4.4e-14；超区**逐行回退 libm 且逐位一致** |
+| 拉普拉斯权重（`s^k` 折进核） | 相对 6.62e-16 但不逐位（契约差异必须声明）；`k=0` 7.81e-3 → `k=2` 7.81e1（1.0e4×@\|s\|≈112） |
+| 核↔矩阵乘融合（递推版） | 容差类（现场递推）；libm 版与物化**逐位**一致（含列尾 NB=1/2/31/33） |
+| int8 端到端口径 | 单层最坏 **6.05e-3 ≤ 1e-2**；12 层合成栈 **7.250e-4 ≤ 5e-3** |
+| `dot_f16`/`gemv_f16` | 累加次序是契约（转换原语固定）；与参照同序，界见 `docs/ops.md` 数值契约 |
+| 复数路线（快速复数乘） | 与直算路线**不逐位**（容差），默认保留直算路线 |
+| 列方向矩阵乘（cols 路径） | **6/10 形状不逐位**（换路径 + 尺寸变化）⇒ "位精确 > 速度"：默认不用 |
+
+### 5.3 位精确性的结构性依据
+
+* **k 分块**：f32/f64 的部分和落内存再读回是精确的（同一数值，不重排）；前提是每个输出元素沿 k 的累加次序递增。
+* **计划句柄不需要"±1 ulp 例外"**：Plan 只把"打包"提前到构造时，执行仍按同一累加次序 ⇒ 与 `api::matmul` 逐位。
+* **列块/打包/尾块**：只改访存与循环嵌套，不改每个元素的加法次序；任何改次序的尝试都被 §5.1 红线拦住。
+* **归约的固定分块**决定结果：改分块宽度必须同步改标量参考（参考是"另一个实现"，不是数学定义）。
+* **证明方式**：不是数学证明，是"同序实现 + `to_bits()` 测试 + 计时前断言"三件套；文档不把测试说成定理。
+
+### 5.4 精度边界（需要知道但不必改）
+
+* 近似算子（`gelu_*`、f16、量化）**天然不是逐位类**；它们与 IEEE 参照的差值即上表。
+* 递推核的"快"只在安全区；超区回退 libm ⇒ **快慢取决于数据是否在安全区**，报告必须给比例。
+* 整数路径的饱和是**契约**（i32 终点饱和），不是 bug；文档与测试都按饱和语义断言。
+* C ABI 与 Rust API 对同一输入**必须给出同一结果**（FFI 层只做裸指针 → 切片，不改变计算）。
+
+
+## 6. 接口冻结与契约
+
+### 6.1 冻结清单（公式 DSL 直接调用的三个接口）
+
+公式 DSL（`lasx_rs_macros`）会**生成调用**下面三个接口的代码，因此它们**冻结**：要改先改宏，再按"冻结之后
+还要改"的流程记录（触发条件、代价、影响面；见 §6.6）。
+
+**(1) 池的行块闭包（`src/pool/mod.rs`）**
 
 ```rust
 pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
@@ -4328,85 +564,56 @@ pub fn for_each_row_block_mut_picked<T: Send, const N: usize, F>(
 //            start  rows   本块的切片
 ```
 
-`start` 是**本块起始行**（`Chunk`/`RowBlock`/`Blocked`/`Dynamic` 四种策略都保证
-"`start` 与切片一一对应、各块首尾相接覆盖 `[0, rows)`"，测试
-`pool::tests::test_row_block_start_matches_slice` 守着）。同一函数族还有
-`_mut` / `_mut_with::<S>` / `_mut_dynamic` / `_mut_picked_deferred`，闭包签名一致。
+`start` 是**本块起始行**（`Chunk`/`RowBlock`/`Blocked`/`Dynamic` 四档都保证"`start` 与切片一一对应、
+各块首尾相接覆盖 `[0, rows)`"，测试 `pool::tests::test_row_block_start_matches_slice` 守着）。
+同族还有 `_mut` / `_mut_with::<S>` / `_mut_dynamic` / `_mut_picked_deferred`，闭包签名一致。
 
-**(2) 形状层 —— `src/shape.rs`**
+**(2) 形状层（`src/shape.rs`）**
 
 ```rust
-let w  = Mat::<f32, K, N>::new(&weights)?;          // 权重：全静态
-let wp = w.prepare();                                // = prepare_with::<Auto>()
-let wq = w.prepare_with::<Exact<8>>();               // 策略是类型
+let w  = Mat::<f32, K, N>::new(&weights)?;      // 权重：全静态
+let wp = w.prepare();                            // = prepare_with::<Auto>()
+let wq = w.prepare_with::<Exact<8>>();           // 策略是类型
 
-wp.apply::<M>(&x) -> MatBuf<T, M, N>                // 分配
-wp.apply_into::<M>(&x, &mut out)                    // 不分配
-wp.apply_pooled::<M>(&pool, &x, &mut out)           // 指定池
-wp.apply_dyn(&x_dyn) -> MatBufDyn<T, N>             // DYN 档
+wp.apply::<M>(&x) -> MatBuf<T, M, N>            // 分配
+wp.apply_into::<M>(&x, &mut out)                // 不分配
+wp.apply_pooled::<M>(&pool, &x, &mut out)       // 指定池
+wp.apply_dyn(&x_dyn) -> MatBufDyn<T, N>         // DYN 档
 wp.apply_dyn_into(&x_dyn, &mut out)
 wp.apply_dyn_pooled(&pool, &x_dyn, &mut out)
-wp.threads::<M>() -> usize                          // 诊断：这次会用几个线程
+wp.threads::<M>() -> usize                      // 诊断：这次会用几个线程
 ```
 
-**(3) 策略 —— `src/shape.rs`**
+**(3) 策略（`src/shape.rs`）**
 
 ```rust
 pub trait Policy: Send + Sync {
     fn threads(rows: usize, k: usize, n: usize) -> usize;   // 纯判据：不建池、不派活
 }
-pub struct Auto;            // auto_threads(rows, k, n, available_parallelism())
-pub struct Single;          // 恒 1，完全不碰池
-pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
+pub struct Auto;                // auto_threads(rows, k, n, available_parallelism())
+pub struct Single;              // 恒 1，完全不碰池
+pub struct Exact<const N: usize>; // 恒 N.max(1)，**不设工作量门限**
 ```
 
-**(4) 三条契约（`pool` 的文档里也写了；每条都标明"谁守"）**
+**三条契约（每条标明"谁守"，违反后果不同）**：
 
 | # | 契约 | 谁守 | 违反的后果 |
 |---|---|---|---|
-| 1 | 作为 `&mut [T]` 传进来的数组：闭包只能读写**本块** | 类型系统（切片长度 = `rows × 行宽`） | 越界 `panic`，安全 |
-| 2 | 闭包**捕获**的只读数组：只能读 `[start, start+rows)` | **只有约定** | **静默的错误结果**（不 UB） |
-| 3 | 输入与输出**不能是同一块内存**（原地 `y = α·A·x + y`） | `debug_assert`（见下） | 数据竞争式错结果 |
+| 1 | 作为 `&mut [T]` 传入的数组：闭包只能读写**本块** | 类型系统（切片长度 = `rows × 行宽`） | 越界 `panic`，安全 |
+| 2 | 闭包**捕获**的只读数组：只能读 `[start, start+rows)` | **只有约定** | **静默的错误结果**（不是 UB） |
+| 3 | 输入与输出不能是同一块内存（原地 `y = α·A·x + y`） | `debug_assert` | 数据竞争式错结果 |
 
-第 3 条的边界要说准，因为"已不可能"和"不可达"不是一回事：
+第 3 条边界要说准：**用户 API 下不可达**（`apply(&x, &mut y)` 是两个绑定；`apply(xv, &mut x)` 会被借用检查器
+按路径拒绝）；**库内生成代码/`unsafe` 下仍可能**（裸指针可造"同一块内存、一个 `&` 一个 `&mut`"）⇒
+`shape::Prepared::run_block_into` 入口加 `debug_assert!(a.as_ptr() != c.as_ptr())`：用户触发不了，
+但**宏/封装层**可能把同一矩阵既当输入又当输出，这条断言就是拦它的。**宏生成代码必须保证输入输出是不同变量。**
 
-- **用户 API 下不可达**：`apply(&x, &mut y)` 的 `x`/`y` 是两个不同绑定；想用同一个绑定，
-  `let xv = &x; apply(xv, &mut x)` 会被借用检查器拒绝（`E0502`——它按**路径**判断而不是
-  按类型，所以拦得住；这条是 2026-09-24 实测确认的）。
-- **库内生成代码 / `unsafe` 下仍可能**：从裸指针造两个切片就能构造"同一块内存、一个 `&`
-  一个 `&mut`"，类型系统看不到。
-- 所以 `shape::Prepared::run_block_into` 入口加了
-  `debug_assert!(a.as_ptr() as *const u8 != c.as_ptr() as *const u8)`：用户触发不了，
-  但**宏/封装层**（`lasx_rs_macros`）可能把同一个矩阵既当输入又当输出，
-  这条断言就是拦它的。宏生成代码时必须保证输入输出是**不同变量**。
+**接线方式与"并行打包病理"兼容**：并行 = **同一份打包面板 + 按行切**——`Prepared` 里的 `MatmulPlan`
+构造时打包一次、之后所有 worker 只读共享；每个 worker 拿行区间调 `MatmulPlan::run_rows_into`
+（`pub(crate)`，`run_into` 复用同一实现 ⇒ 两者必然一致）。"要几个线程"用**切几个块**表达
+（`Pick::Blocked { block_rows }`），池里多出的 worker 自然领不到块 ⇒ `Exact<8>` 在 24 线程池上就是 8 块。
 
-**(5) 接线方式与它为什么与"并行打包病理"兼容**
-
-并行 = "**同一份打包面板 + 按行切**"：`Prepared` 里的 `MatmulPlan` 在构造时打包一次，
-之后所有 worker 只读共享；每个 worker 拿到行区间后调 `MatmulPlan::run_rows_into`
-（新增的 `pub(crate)` 入口，`run_into` 也复用同一份实现，两者必然一致）。
-"想要几个线程"用**切几个块**表达（`Pick::Blocked { block_rows }`），池里多出来的 worker
-自然领不到块——于是 `Exact<8>` 在 24 线程的池上就是 8 个块。
-
-回归测试：`shape::tests::test_pooled_matches_serial_bit_for_bit`（静态 `Exact<4>` +
-`Auto`、DYN `Exact<8>` × 三种行数，全部与 `api::matmul` 逐位对照）、
-`test_policy_semantics`（`Auto` 小形状 = 1、`Single` 恒 1、`Exact<N>` 不设门限）。
-
-**(6) 冻结之后要改怎么办**
-
-上面三个接口**冻结**了：池的 `f(start, rows, arrays)`、`Prepared` 的
-`apply*`/`apply_pooled*`/`prepare*`/`threads::<M>`、`Policy::threads`。冻结不是形式，是
-**成本声明**——`lasx_rs_macros` 会直接生成调用它们的代码，改一次就要连带改宏
-和它的测试。所以规定（也写进 `AGENTS.md`）：
-
-1. 先在**本节**写"为什么冻结之后还要改"（触发条件、代价、影响面）；
-2. 再改代码；
-3. 若会让已生成的 DSL 代码失效，同一提交里一起改。
-
-**验收（2026-09-24，`cargo run -p lasx_bench --release -- plan` 的第二张表）**
-
-`Prepared<Auto>` vs `Prepared<Single>`——**同一个 `Prepared` 类型、只换策略参数**，权重走同一份
-打包面板，输入走 DYN 入口吃运行期行数（12 线程，本机 load ≈1.8）：
+**验收（`cargo run -p lasx_bench --release -- plan` 第二张表；12 线程，load ≈1.8）**：
 
 | 形状 | `Single` | `Auto` | 加速 | Auto 线程数 |
 |---|---|---|---|---|
@@ -4414,3394 +621,260 @@ pub struct Exact<const N: usize>;  // 恒 N.max(1)，**不设工作量门限**
 | f32 512³ | 4.32 ms（62.1 GF/s） | 1.05 ms（256.7 GF/s） | **4.13×** | 12 |
 | f32 1024³ | 35.31 ms（60.8 GF/s） | 7.22 ms（297.6 GF/s） | **4.89×** | 12 |
 
-- `Single` 的 60–64 GF/s 与单线程锚点（§8.5）一致 ⇒ 串行路径没有退化；
-- `Auto` 的 1024³ 297.6 GF/s 略高于 `parallel::matmul_f32` 的 250.4（§18.5 ①/②表），
-  差别正是"面板只打包一次、全程共享"——§13.7 那个病理在本层天然不存在；
-- 基准里**内联断言了 `Auto` 与 `Single` 逐位一致**（不是只在单测里），快但不能错；
-- `Auto` 在三个形状上都选 12（工作量 16.7 M/134 M/1.07 G ≥ 4 M，行数 256/512/1024 ≥ 48）。
+`Single` 的 60–64 GF/s 与单线程锚点一致（串行路径未退化）；`Auto` 的 1024³ 297.6 GF/s 略高于
+`parallel::matmul_f32` 的 250.4——差别正是"面板只打包一次、全程共享"；基准里**内联断言 `Auto` 与 `Single` 逐位一致**。
 
-### 19.8 公式 DSL v1：范围、诊断与验证方式
+**回归测试**：`shape::tests::test_pooled_matches_serial_bit_for_bit`（静态 `Exact<4>` + `Auto`、
+DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_semantics`（`Auto` 小形状 = 1、
+`Single` 恒 1、`Exact<N>` 不设门限）。
 
-实现在 `macros/`（`lasx_rs_macros`，proc-macro、`publish = false`、**零第三方依赖**），
-用户看到 `lasx_rs::matmul!`（矩阵乘）与一维形态 `lasx_rs::dot!` / `lasx_rs::gemv!`
-（点积、矩阵-向量；范围与缺口见 §19.13）。规则与设计见该 crate 的文档
-（`cargo doc -p lasx_rs_macros`），这里只记**这篇文档层面需要知道的东西**。
+### 6.2 C ABI / FFI 契约
 
-**v1 接受**：`操作数 '=' 操作数 '*' 操作数` 或 `操作数 '*' 操作数`，操作数形如 `x[M, K]`；
-两个带下标操作数**按共享下标出现在哪一侧判角色**——`x[M,K] * w[K,N]`（左.j == 右.i，`A·B`）与
-`w[K,N] * x[M,K]`（左.i == 右.j，权重在左）都认，归一成同一套 input/weight 后生成同一段
-代码。**乘积右侧的操作数可以不写方括号**：那是 `Prepared` plan（见剖析小节的 ④续 末段），生成
-`p.apply_into(&x, &mut y)` / DYN 档 `p.apply_dyn_into`、无输出 `p.apply` / `p.apply_dyn`。
-**乘积最前面可以写一个标量前缀**（`ident` 或字面量 + `*`）：
-`matmul!(y[M,N] = alpha * x[M,K] * w[K,N])` 语义是 `y = alpha·(A·B)`，即 CBLAS 的 `alpha` 配
-`beta = 0`（输出被完全覆盖、旧值不读），生成 `x.mul_scaled_into(alpha, …)` /
-`p.apply_scaled_into(alpha, …)` / DYN 档的 `*_scaled_dyn_*` / 无输出的 `mul_scaled`、`apply_scaled`。
-标量 token 原样进生成的代码（局部变量、`const`、字面量都可）。**只支持 `f32`**——`f64` 没有
-scaled 内核，写前缀会得到"方法不存在"的编译错误，不会静默退回两遍法。数值与落地记录见 §19.15。
-**v1 仍不做**：`beta` 的 DSL 写法（输出要同时当输入之一，与"输入输出不能是同一块内存"冲突；
-要 `beta` 直接用 `api::matmul_scaled_into`）、`+` 多操作数、无下标简写里判档（按全静态生成）、
-plan 写在乘积左侧（plan 形态因此只认右操作数）。
+* **15 个原始符号冻结**（清单见 §3.1）：签名与语义永不改；新能力**只追加**（后续姿态/几何批处理、
+  元信息/内存、计划句柄）。裸版不校验、`_checked` 多 `int *status`（历史契约）。
+* **只追加导致的命名例外**（§2.2 的 5 条裁决）：`batch_distance2d`/`ballistic_step` 不改名；
+  按行三拼法、一 op 三名、显式 `_f32` 保留——都是兼容成本换来的。
+* **符号集合的守**：`nm -D --defined-only` 逐符号对照 + `scripts/check_header.c`（取地址 ⇒ 缺符号/改名/原型漂移
+  即编译或链接失败）；文档里的符号计数与源码 `src/ffi/*.rs` 实际计数由 `doccheck` 强制一致（当前 **98 个导出符号**）。
+* **ABI 稳定性**：`has_lasx`/`version`/`status_string`/`free` 等元信息与内存归还语义是**能力探测**的一部分，
+  见 `docs/c-abi.md`；调用方必须按 `status` 处理错误，裸版不检查是历史契约、不承诺安全。
 
-**分派规则**：大写开头 = 编译期 const（生成类型标注）、小写/`_` 开头 = 运行期值
-（宏自己 `let m = x.rows();` + 断言）；**同一维必须写同一个下标**（行、收缩、列各查一次，
-大小写档次不同也归到这一条，报错里点明"档次也不同"）。
+### 6.3 错误通道与 panic 契约
 
-**已验证的诊断 transcript**（人工核对，因为 `trybuild` 要引依赖）。
+* C ABI：`_checked` 写 `int *status`（0 = 成功，负值域错误码）；裸版本不校验。
+* Rust：`api.rs` 返回 `Result<_, api::Error>`（`Shape`/`Overflow`/`NotFinite`/`NotPositive`）；
+  **校验不得改变计算结果**。
+* `pool`：重入派活 ⇒ 当场 **panic**（不是死锁）；worker panic 经 `catch_unwind` + `resume_unwind` 上抛；
+  `during` 的展开路径由 `WaitGuard` 兜住（不留下悬垂闭包）。这些都有回归测试（含 60 s 看门狗）。
+* 错误路径不得部分写输出（`_checked`/`api` 在长度/域失败时先返回，再动输出）。
 
-一次性核对办法：写一个**只含错误公式**的临时 example，rustc 会逐个报告每个失败的宏展开，
-一次编译就能拿到全部输出（核对完删掉，不进版本库）。下表 7 条就是这么核出来的。
+### 6.4 并行接口与别名契约
 
-| # | 情况 | 消息（节选） | 锚点 |
+* **切块只按输出行切**（矩阵乘按行块、RK4 按 SOA 数组），**每个元素的累加次序不变** ⇒ 与串行逐位。
+* **别名**：输入/输出不得重叠（冻结契约第 3 条）；`shape` 入口有 `debug_assert`，宏层靠约定（见 §6.1）。
+* `parallel::*` 改返回 `Result`（接口债清理）：失败不再靠 panic 传播；调用方必须处理。
+* **线程数归属**：线程数由池/策略（`Auto`/`Single`/`Exact`）决定；`Policy::threads` 是纯判据（不建池、不派活）；
+  "`prepare`/`run` 不建池"有线程本地建池计数作契约证据。
+* 池的调度细节（`Pick` 四档、`MIN_PARALLEL_LEN = 4096`、静态/动态判据）见 §3.2/§3.5。
+
+### 6.5 计划句柄（`MatmulPlan`）与 C ABI 调用体验
+
+* `plan`：`MatmulPlan` 构造时打包 B，`run_into`/`run_block_into` 复用；**与 `api::matmul` 逐位**（无 ±1 ulp 例外）。
+* C ABI 计划句柄：`lasx_matmul_prepare` 存打包结果 + **线程化入口缓存池**（`resolve_threads`：`threads<=0` ⇒ 物理核、
+  否则取 `min(physical)`）；`lasx_matmul_run_threaded` 内部按行切、与串行逐位；`plan_destroy` 释放句柄与池。
+  线程模型 = "调用方给线程数（或 0 = 物理核）；库内不建共享池、不加线程"。
+* 验收：`plan` 档多线程正式中位数 239.8 G、`plan-tight` 245.8 G（§4.4）；`prepare`/`run` 不建池有计数证据；
+  C ABI 侧符号数 87 → 94（计划句柄那批）。
+
+### 6.6 冻结之后要改：三步流程
+
+1. **先在本节（§6.1）写**"为什么冻结之后还要改"：触发条件、代价、影响面；
+2. 再改代码；
+3. 若会让已生成的公式 DSL 代码失效，**同一提交里一起改**。
+
+冻结不是形式，是**成本声明**：`lasx_rs_macros` 直接生成调用它们的代码，改一次就要连带改宏与测试。
+
+
+## 7. 历史里程碑
+
+> 原文档按"轮次"逐日一节（`7.52.1`–`7.52.19` 那批小节），信息重复且难检索。本节把**决策与数字**压成一张表；
+> 逐轮过程叙事（谁在第几轮做了什么、中间试错）已删除，需要时看 `git log -- docs/dev.md`。
+> 表内数字的完整口径与表格仍在 §4（数字只写一处）。
+
+### 7.1 里程碑表（日期 / 主题 / 结论与关键数字 / 提交）
+
+| 日期 | 主题 | 结论与关键数字 | 提交（lasx / simd） |
 |---|---|---|---|
-| 1 | 同一维两侧下标名不同 | `行维的下标不一致：输出写 M，左侧操作数写 P` | **两个 token**（双锚定） |
-| 2 | 乘积里的操作数没写方括号（`y[M,N] = x * w[K,N]`；标量前缀已把它读成标量） | `` `=` 之后只解析出一项乘积：`x` 若是输入矩阵，请补下标…`` | 该操作数 |
-| 3 | 输出与乘积之间缺 `*` | `输出与乘积之间缺少 *（v1 只接受单项乘积…）` | 乘积的首 token |
-| 4 | 空下标 `x[]` / 非 ident 下标 `x[0, 1]` | `x 的下标必须是两个标识符：x[行下标, 列下标]` | 方括号 |
-| 5 | `+` 多操作数 | `公式到乘积就结束了（v1 不支持 +/alpha/多操作数）` | `+` |
-| 6 | 同一次操作数两个下标同名 `y[m, m]` | `同一次操作数的两个下标不能同名（y[m, m]）` | 两个下标 |
-| 7 | 收缩维对不上／两种读法都对不上（`x[m,k] * w[m,n]`、`x[M,K] * w[Q,N]`） | `收缩维的下标不一致：左侧操作数写 k，右侧操作数写 m` + note `两种读法都对不上：x[M,K] * w[K,N]（A·B）或 w[K,N] * x[M,K]（权重在左）` | 两个下标 |
+| 2026-09-24 | `&mut self` → `&self` 共享池 | 同步开销 45 ns；端到端 A/B 无回归（0~+0.2%）；重入/panic/共享池 4 个回归测试 | — |
+| 2026-09-24 | 矩阵视图 + `MatmulPlan` | 三列对照；plan 与 `api::matmul` 逐位；"打包一次"成 ABI 能力 | — |
+| 2026-09-24 | 形状进类型 + 公式 DSL | `Auto` 判据（工作量 ≥4 M、行数 ≥48）；1024³ 297.6 GF/s（4.89× vs `Single`） | — |
+| 2026-09-25 | 全量复测（锚点/内核/矩阵乘） | 锚点 6.5–24.3 GB/s；NN 横向对照；小形状矩阵乘领先 OpenBLAS | — |
+| 2026-09-28 | FP 流水线/A 广播墙 + 打包向量化 | 上限 **2.0 FMA/周期**；A 广播墙**证伪**；2048³ 缺口 69% 由 A 流量决定 | — |
+| 2026-10-02 | N3 int8 批次 | `matmul_i8` 打不过 f32 GEMM；6.9× 预估推翻；端到端 10–20 ms 目标改分档 | — |
+| 2026-10-03 | crates.io 发布准备 | 前置条件/edition 2024/被否选项/crate 文档义务 | — |
+| 2026-10-04 | 池扩展性调查 | 瓶颈是 **B 的重复读**（不是调度）⇒ 需共享打包 | — |
+| 2026-10-06 | OpenAI 722 篇手稿评估 | **对本库无可直接使用者** | — |
+| 2026-10-15 | 方差法全量复测 + 口径变更 | 正式口径 = 同进程调用级交替 A/B；绑核教训（0.72× vs 8.15×） | — |
+| 2026-10-15 | OpenBLAS 对照 + C ABI 计划句柄 | 单线程 64³ +27%、128³ +14%、256³ 平、384/512³ 慢 5–6%；C 侧 245.8 G；符号 87→94 | — |
+| 2026-10-15 | H1 列瓦片实验回退 | ms 只降 4.3–4.7%、L3 流量反 +6% ⇒ 回退（nm 94 / 单测 236 独立复核） | — |
+| 2026-10-15 | `alpha`/`beta` 融合落地 | 推翻此前"不做"结论；与 `matmul_scaled` 同序 ⇒ **逐位** | — |
+| 2026-10-15 | 平台防呆 + 文档引用规范 | x86 原生构建错误 36→1；跨文档引用必须点名 | — |
+| 2026-10-16 | 三档后端横向对比 + DSL 转发开销 | 手写/可移植/下限三档；转发开销实测（见 §4） | — |
+| 2026-10-16 | DSL 能知道什么（四轮实验） | 代数重写可做；委派 LLVM 不够（核 1.48×/组合 1.09×）；**完全 SIMD 红线取 A**；核↔matmul 不融合 | — |
+| 2026-10-17 | DSL 优化在 LASX 档逐条实测 | 归约/逐元素族帧级 **1.057×** 且**逐位**；FMA/跨步 FFT 重测（R19-G/H） | simd R19 系列 |
+| 2026-10-18 | P4-e 融合原语 | 标量版慢 **1.793×**（否）→ 向量化后快 **2.75×** 且逐位 | simd P4-e |
+| 2026-10-18 | P4-c 帧级接线判定 | 帧级天花板 **7.6% < 10%** ⇒ **不接线** | simd P4-c |
+| 2026-10-18 | P5-a gather/scatter | **1.037×**（memcpy 上限）；两条负结果保留 | simd P5-a |
+| 2026-10-18 | P5-b 转置上限 + NT-GEMM | 转置上限 24.6–26.8% ≥10% ⇒ 解冻理由成立；NT-GEMM **原语保留、不接线** | simd P5-b |
+| 2026-10-18 | P5-b 跨步原语推广 | 三次 A/B 全过门限：**1.205×/1.277×/1.134×**（`Strides` + copy/unary/binary） | simd P5-b |
+| 2026-10-18 | 群论可分离 ⇒ 引擎发射 | 稠密 7×7 **4.73–4.79×**；稀疏 5 点 **BelowThreshold**（反例保留） | simd `6ea97e1`→`5f8bd85` |
+| 2026-10-18 | `stencil!` 宏（第 17 个） | E2E **4.862×/4.662×**；稀疏 5 点仍 BelowThreshold | simd 阶段2 |
+| 2026-10-18 | 阶段3 批2 | **7/7 组合版都输** ⇒ 已批准融合原语进契约 | simd 阶段3 |
+| 2026-10-18 | 阶段4 | 融合 = 加速选项（4/6 过线）；组合版 5→1 / 8→2 趟（引擎 KPI 真成果） | simd `af3d85e` |
+| 2026-10-18 | f64 契约 + f64 几何 | `Backend` 56→62；f64 几何 5 入口 BelowThreshold；几何融合 3/5 ≥0.98 | simd 阶段4 |
+| 2026-10-18 | 引擎 KPI：softmax 三案 | 全部 **<1.10 不采纳**；axpy 单趟因契约禁止别名**只记提案** | simd `af3d85e` 前后 |
+| 2026-10-18 | P0-1/P0-2/P0-3 | axpy 3→1 趟 **7.753×**；`map_rows_sum` 5→3 趟 **1.328–1.464×**；行归一 **3–10×** | — |
+| 2026-10-18 | P1-4/P1-5 | f64 override **逐位** 1.3–1.8×（**未达 2×**，如实）；量化/i8 契约 69→73 | — |
+| 2026-10-18 | P2-6/P2-7 | GEMM 追 OB 三个方向均未达 10%（零代码改动）；稀疏 stencil 红黑**否**、三行滚动 **1.38–1.75×**（逐位） | — |
+| 2026-10-18 | P3-8a FFT/谱检测 | FFT 路**访存受限**、Direct 路**计算受限**（流量与趟数实测） | — |
+| 2026-10-18 | P2-6 续：GEMM 微内核 | 6 个假设全回退；差距 14–18% 指向 FMA 端口吞吐；后续 **1024³ 0.980× / 1536³ 1.002×**（根因=1t 派发伪影） | — |
+| 2026-10-18 | 契约瘦身 + 表驱动 | 73 方法盘点；单源真相表；Plan 执行器；新增 pattern 手改 6 处→「表 1 行 + 变体 + 臂」 | — |
+| 2026-10-19 | 后端开发成本三件套 | 共享 `validate`；`exec_fused_plan` **374→222 行（−40.6%）**；conformance **1 行宏 15 组**；骨架生成器 + 指南 | lasx `bb574c6`；simd `329aff9` |
+| 2026-10-19 | 抽象层审计 I1–I5 + T1–T4 | 能力位/API 面/§ 编号等门禁；`gate_local` 本地镜像 CI；文档漂移修复 | 审计批次 |
+| 2026-10-19 | 算子层审计 + HEAD 复测 | 512³ **0.911×** / 1024³ **1.034×**（grade B）；数字家/分级修正；O2 接线（axpy **2.44×** 逐位） | 审计 O 批次 |
+| 2026-10-19 | W3 | 删 GeluQuick 融合核（ROI **0.77×**）；axpy 改逐位（**1.78×**） | lasx + simd bump |
+| 2026-10-19 | B1/B1b 组合原语 override | `axpy_inplace_f32` 落地（逐位）+ 5 个缺口如实报；`map_unary`/`reduce_rows_map` 去标量化 **2.6–4.1×** | lasx `fd0af50` 等 |
+| 2026-10-19/20 | 引擎接管 7.52.2–7.52.19 | 见 §2.6；`axpy→rms`、matmul epilogue 融合 ROI **暂不采纳**（1.107×） | 见 §7.2 |
 
-双锚定的实际样子（第 1 条）：
+### 7.2 跨仓 rev bump 表（`lasx_rs` → `simd_dsl`）
 
-```text
-error: 行维的下标不一致：输出写 `M`，左侧操作数写 `P`
-  --> examples/formula_dsl.rs:21:15
-21 |     matmul!(y[M, N] = x[P, K] * w[K, N]);
-   |               ^
-error: 两处必须写同一个下标（当前是 `M` 与 `P`）。大写=编译期 const、小写=运行期值；同一维必须一致
-  --> examples/formula_dsl.rs:21:25
-   |                         ^
-```
-
-缺下标那条（第 2 条）把三种可能一次说清——`x * w[K,N]` 在 token 层与"标量前缀"同形，
-所以不能只说"缺 `*`"（那正是用户写对的地方）：
-
-```text
-error: `=` 之后只解析出一项乘积：`x` 若是输入矩阵，请补下标（`x[行, 列]`）；若是 `Prepared` plan，它只能写在乘积右侧（`x[M, K] * p`）；若确实是标量前缀，公式还缺第二项（`alpha * x[M, K] * w[K, N]`）
-  --> examples/_tmp_diag.rs:13:23
-   |
-13 |     matmul!(y[M, N] = x * w[K, N]);
-   |                       ^
-```
-
-无输出形态里操作数缺下标（标量前缀已经在最前面被吃掉）走另一条：
-
-```text
-error: `x` 后面缺少下标：请写成 `x[行下标, 列下标]`
-  --> examples/_tmp_diag.rs:17:19
-   |
-17 |     matmul!(1.5 * x * w[K, N]);
-   |                   ^
-error: 标量前缀要写成 `alpha * x[M, K] * w[K, N]`（标量在最前面）——`alpha` 会走融合入口，等价于 `C = alpha·A·B`（`beta = 0`）
-```
-
-标量写两次（`a * y[..] = b * x[..] * w[..]`）报 `标量前缀只能写一次` + note
-`把标量写在 \`=\` 之后：\`y[M, N] = alpha * x[M, K] * w[K, N]\``（两个 token 都锚上）。
-
-**验证方式（零依赖前提下）**：
-
-- **正面路径**进 CI：`shape::tests::test_formula_dsl_matches_api_bit_for_bit`（静态 + DYN +
-  无输出形态，与 `api::matmul` 逐位对照）、
-  `shape::tests::test_formula_dsl_plan_matches_hand_hoist_bit_for_bit`（plan 形态 × 静态 3 形状 ×
-  DYN 4 种行数 × 无输出，与**手写 hoist** 及 `api::matmul` 双向逐位对照）、
-  `shape::tests::test_formula_dsl_scaled_matches_two_pass_bit_for_bit`（标量前缀 × 静态/DYN/
-  plan/权重在左/无输出/字面量，与"先算再整体乘"逐位对照；`β = 0` 不读 `C`）、
-  `examples/formula_dsl.rs`（`--all-targets` 会编译）、`shape` 模块的 doctest；
-- **负面路径**用上表那种人工核对的 transcript 守（每加一条诊断就在本节补一条 transcript）；
-- 宏自己的纯逻辑（首字符分派、两种读法、同一维同名、plan 只查行维）有 6 个单测——它们
-  **只吃名字**，因为 `proc_macro` 类型在宏之外构造会 panic
-  （`procedural macro API is used outside of a procedural macro`），
-  所以 Span 归位那一层不做单测、靠上面的 transcript。
-
-**本版实现中出现的三个问题**（都写进了代码注释，避免以后再次发生）：
-
-1. `"(".parse::<TokenStream>()` 会**失败**（不配对的定界符是非法 token 流），早先用它拼片段
-   并 `filter_map(..ok())`，括号被**静默丢掉**，生成的代码连语法都不成立 → 定界符必须走
-   `Group::new(Delimiter::…)`；
-2. 静态档写进已有输出要用 `Mat::mul_into`（`apply_into` 在 `Prepared` 上，不在 `Mat` 上）；
-3. `compile_error!` 的诊断位置取的是**它自己那棵小树**的跨度：只给字符串字面量设 Span 不够，
-   报错会指向整条 `matmul!(…)`；要把 Span 铺满整棵小树（`quote_spanned!` 的做法）才锚得住。
-
-**仍然做不到的**：proc-macro 没有名字解析，判断不了大写下标是不是 `const`。所以
-"大写下标必须是 const"只能写在文档里；rustc 的报错是 `cannot find value 'M' in this scope`。
-这条在 crate 文档里明说了，别当成遗漏。
-
-### 19.9 `alpha`/`beta` 融合：**上限不足，不做**（2026-09-24，**"不做"已被 §19.15 推翻**）
-
-> 本节的上限分析与实测数字仍然成立（方阵 0.4–0.9%、宽薄 7.5–11.1%），**被推翻的只是"不做"
-> 这个结论**：当时的推理把"上限"当成了"融合内核能保持非融合内核速度"（§19.11 用另起一条
-> 简化 tile 路径 + 无条件读 `C` 的收尾去验，注定吃不到 β=0 的免读 C 那条路）。落地记录见 §19.15。
-
-融合（`y = alpha·A·B + beta·y`）能省的只有**对 `C` 的一次写与一次读**——`y` 的读/写在融合版
-里照样要（`beta != 0` 时内核必须读 `y`）。所以**二遍法里那一遍 elementwise 占 matmul 的
-比例，就是融合的收益上限**（再乘 2/3）。这个上限不需要新内核就能量：
-`examples/fusion_ceiling.rs`（`lasx_matmul` 写 `C` + 一个自动向量化的三流循环）。
-
-单线程、`C` 复用缓冲、5 取样中位数（本机 load ≈1.6）：
-
-| 形状 | matmul | 第二遍 `y=a·C+b·y` | 占比 | **融合上限(≈2/3)** | 第二遍带宽 |
-|---|---|---|---|---|---|
-| 512³ | 4.72 ms | 55.8 µs | 1.2% | 0.8% | 56.4 GB/s |
-| 1024³ | 39.86 ms | 238.9 µs | 0.6% | 0.4% | 52.7 GB/s |
-| 2048³ | 320.78 ms | 4.23 ms | 1.3% | 0.9% | 11.9 GB/s |
-| 100×64×19147 | 3.90 ms | 439.2 µs | 11.3% | **7.5%** | 52.3 GB/s |
-| 256×64×4096 | 2.20 ms | 365.7 µs | 16.6% | **11.1%** | 34.4 GB/s |
-| 64×4096×64 | 763.4 µs | 0.5 µs | 0.1% | 0.0% | 97.5 GB/s |
-
-三条读数（都不是"大概"）：
-
-1. **方阵/大体量形状上融合不值**：512³–2048³ 的上限只有 **0.4–0.9%**，而代价是新增内核
-   分支 + 新接口面（`alpha`/`beta` 要进 `apply*` 或另开 `apply_scaled_*`）+ 契约要重写
-   一遍。收益低于测量噪声的形状不该为它动接口。
-2. **宽而薄的形状（小 k、大 n）上限 7.5–11.1%**，值得考虑——但**恰好是这些形状**才满足
-   下面第 3 条的位精确前提。
-3. **位精确前提把能吃到的形状又砍了一刀**：契约要求 `out = alpha·acc + beta·y_old`，
-   `acc` 必须是沿 `k` 从 0 起的完整累加。而 k 分块路径（`k > 384` f32）会把部分和**落进
-   输出缓冲**再读回——如果输出就是 `y`，`y_old` 在最后一次落盘时已经被覆盖，`beta·y_old`
-   只能靠"给累加器播种"拿到，那正是契约**禁止**的（会改结合次序）。所以融合只能在
-   **不分块**（`k·32·4 ≤ L1_BUDGET`，f32 即 `k ≤ 384`）时位精确地实现，或者额外留一份
-   `y_old` 缓冲（那就把省下的读写又花回去了）。
-4. 顺带一条：第二遍 elementwise 在**缓存放得下**时跑到 52–56 GB/s（512³/1024³ 的 `C`+`y`
-   只有 2–8 MB，落在 L2/L3），DRAM 档（2048³，32 MB）才掉到 11.9 GB/s。也就是说
-   "二遍法"在小形状上本来就便宜，融合想抢的份额更小。
-5. 再顺带一条：**不需要为第二遍加内核**——它就是一条 Rust 循环，LLVM 在 `+lasx` 下自动
-   向量化到上面的带宽。要补的是"融合的 matmul"，而它按第 1 条不值。
-
-**决定：不做融合**（记进 §10 的负面结果清单；§19.11 用实验内核**实测否掉**了上限）。重新评估的触发条件写在这里：出现
-"宽而薄（`k ≤ 384`）+ 反复做 `y = alpha·A·B + beta·y`"的真实负载，且二遍法的占比确实
-落在 10% 量级。届时要重新验一遍的是"融合内核能不能保持非融合内核的速度"——上限 7.5–11.1%
-是**假设速度不变**才成立的，这一条本节未验证（也没有内核可验证）。
-
-> **触发条件已满足，决定已推翻（§19.15）**：宽薄 + `k ≤ 384` 正是融合这次真正赢的档
-> （256×64×4096 −10.3%、100×64×19147 −23.7%），而"融合内核能不能保持速度"这次是在**生产
-> 内核的收尾**上验的（不是另起路径）。本节"上限 0.4–0.9%（方阵）/ 7.5–11.1%（宽薄）"的估计
-> 也基本命中：实测方阵 ≈0、宽薄 −10%~−24%（后者比 §19.9 的估计更好，因为 `β = 0` 还多省了
-> 一次对 `C` 的读）。
-
-### 19.10 性能回退的排查口径与一个已修复的回归
-
-判断"性能有没有回退"用固定口径，不靠印象。三条互相独立的检查：
-
-1. **先限定改动面**（`git diff --stat 90a21be..HEAD`）：全部 SIMD 内核（`src/ops/*`、
-   `src/arch/*`）一行没动，性能相关改动只有 `src/pool/mod.rs`（`&self` + DispatchToken +
-   WaitGuard + `start` 传递）、`src/parallel.rs`（签名与闭包参数）、`src/api.rs`（测试里
-   一个绑定），其余是新增层（plan/view/shape/macros）与文档。
-2. **把改过的路径与基线做进程级交替 A/B**（`git worktree` 拉基线，3 轮交替取中位数），
-   并保留一组"内核没动"的对照组：
-
-| 负载 | 基线 | 当前 | 差 |
+| 日期 | simd_dsl rev / 关键提交 | lasx_rs 动作 | 目的 |
 |---|---|---|---|
-| `matmul_ab 512³ packed`（**对照组：内核没动**） | 4.57 ms | 4.57 ms | **0.0%** |
-| `matmul_ab 1024³ packed`（对照组） | 36.80 ms | 36.09 ms | −1.9%（噪声） |
-| `matmul_ab 512³ pool 12`（改过的池化路径） | 1.27 ms | 1.27 ms | 0.0% |
-| `matmul_ab 1024³ pool 12`（改过的池化路径） | 9.21 ms | 8.53 ms | −7.4%（噪声内） |
+| 2026-10-18 | `50a23fc`（P5-a 契约/宏） | rev bump | `Backend` 契约扩展（gather/scatter 等） |
+| 2026-10-19 | `4e97bdb` | rev bump | DSL batch 轴 / matmul 编译期尺寸 |
+| 2026-10-19 | `329aff9` | rev bump | conformance feature + `backend_conformance!`（1 行接入） |
+| 2026-10-19 | `099783c` | rev bump | 引擎接入第一波（算子不再直调 plan） |
+| 2026-10-19 | `4e2222c` | rev bump | 引擎接入第二波 + 测量校正 |
+| 2026-10-19 | `a57412e` | rev bump | 组合路径并行化（修正后 B 级三臂） |
+| 2026-10-19 | `c69f08e` | rev bump | 8 模块真实优化 + 13 入口补齐 |
+| 2026-10-19 | `fe2e191` | rev bump | matmul / transpose 并行 |
+| 2026-10-20 | `fffbf4a` | rev bump | complex/laplace/diff 优化 |
+| 2026-10-20 | `f65bed1` | rev bump | 决策可见性（编译期打印、运行时零成本） |
+| 2026-10-20 | `1ebeda1` / `7f5b9be` | rev bump | 跨算子优化计划（仅文档）/ `execute_map_chain` MVP |
+| 2026-10-20 | `8492b35` / `5235d33` | rev bump | 链条 + RMS / 整条算法入口 |
+| 2026-10-20 | `00e15ac` / `d3b97c2` / `94c376f` | rev bump | LayerNorm 终止步 / `pipeline!` / 链入口报告 |
+| 2026-10-20 | `4dba5ac` / `6eb8e85` / `3a605f6` | rev bump | axpy→rms ROI（未实现）/ 不采纳 / matmul epilogue ROI |
+| 2026-10-20 | `027f69e` | rev bump（HEAD `6981945`） | 目标闭环汇总（引擎接管证据矩阵） |
+| 2026-10-20 | `9de506a` / `7c40fc3` / `51b214c` | rev bump（HEAD 待 bump） | 欠账结清：入口计数剥离 `cfg(test)`（33/28/1）、`iso_kernel`/`kv_cache` 升级（真实优化 15/组合桥 3/未接线 0）、线程池实测不采纳；文档大清理（docs 2452→1570，AGENTS 835→97） |
 
-对照组 0.0% 说明这套 A/B 口径能分辨真实差异（噪声在 ±2% 内）。池化路径每次派活的新增成本
-可以直接算：`DispatchToken`（互斥 + 线程局部标志）+ `WaitGuard` ≈ **45–60 ns/次派活**
-（单价见 §3.2.1），而派活是**每次调用一次**、不是每个元素一次 —— 对最小的可并行负载
-（4096 元素，约 2–5 µs）是 1–2%，对 rk4/矩阵乘那种百微秒到毫秒级的负载 <0.01%。
 
-3. **检查"每次调用都做的事"**：系统调用、分配、探测、`OnceLock` 之外的全局查询。
-   `shape::Auto::threads()` 曾每次调用都问一遍 `std::thread::available_parallelism()`，
-   而它在本机是**系统调用，单价 68.9 µs**（`examples/pool_shared_sync.rs` 的单价表）：
+## 8. 已知边界与欠账
 
-| 形状 | `Single` | `Auto`（缓存前） | 比值 | 根因 |
-|---|---|---|---|---|
-| 16×64×64（1.9 µs 的活） | 1.9 µs | **70.4 µs** | **0.03×（37× 慢）** | 全是这一次系统调用 |
-| 64×256×256 | 127.3 µs | 169.8 µs | 0.75× | 系统调用 69 µs + 池化本身 95 µs |
-| 256³ | 513.8 µs | 292.8 µs | 1.75× | 系统调用吃掉一部分并行收益 |
-| 1024³ | 35.51 ms | 7.76 ms | 4.58× | 同上 |
+### 8.1 缺口与待办（按"要不要做"排）
 
-`machine_parallelism()` 改用 `OnceLock` 缓存（一个进程里不会变，`taskset`/cgroup 变了也
-不会自动重调度，与 rayon 缓存线程数的做法一致）。这**没有改任何冻结接口**——`Policy::threads`
-的签名没动，只是 `Auto` 的内部实现。缓存后同一张表：
-
-| 形状 | `Single` | `Auto`（缓存后） | 比值 |
-|---|---|---|---|
-| 16×64×64 | 1.9 µs | **1.9 µs** | **1.00×** |
-| 64×256×256 | 126.4 µs | **82.1 µs** | 1.54× |
-| 256³ | 506.9 µs | 181.3 µs | 2.80× |
-| 512³ | 4.21 ms | 1.12 ms | 3.76× |
-| 1024³ | 35.20 ms | 7.05 ms | 4.99× |
-
-**结论（`AGENTS.md` 规则 4 的依据）**：新代码里任何"每次调用都做"的事情——系统调用、分配、
-探测、`OnceLock` 之外的全局查询——都必须先量单价再放进热路径。68.9 µs 比整个后台同步开销
-（45 ns）**大三个数量级**，而它藏在"只问一下机器有几个核"这种听起来无害的写法里。
-
-### 19.11 融合内核：**实测否掉**（2026-09-24，**"否掉"已被 §19.15 推翻；本节保留为旧形态记录**）
-
-§19.9 给出的是**上限**，成立前提是"融合内核能保持非融合内核的速度"，当时没有内核可验证。
-本节用实验内核验证：`src/ops/matmul.rs` 的 `matmul_f32_scaled` +
-`scaled_tile4x32`（实验性，只覆盖 k 不分块、`m%4==0`、`n%32==0`），经
-`ops_bench_scaled`（`#[doc(hidden)]`）暴露给 `examples/fusion_kernel.rs`。
-
-**先说好消息：契约是可实现的。** 融合内核收尾是 `C = fma(beta, C_old, alpha·acc)`，
-与契约的"两次舍入"一致；三个形状上都与参考实现 `beta.mul_add(C_old, alpha * acc)`
-**逐位一致**（示例里内联断言）。也就是说 `docs/ops.md` §2.5 那套融合语义不是纸面约定，能落到
-LASX 微内核里。
-
-**坏消息：速度不升反降。**
-
-| 形状 | 二遍法 | 融合内核 | 融合/二遍 |
-|---|---|---|---|
-| 256×64×4096（上限 11.1%） | 2.46 ms | 2.52 ms | **1.025×（慢 2.5%）** |
-| 100×64×19072（上限 7.5%） | 4.52 ms | 4.74 ms | **1.048×（慢 4.8%）** |
-| 512×256×512（上限 0.8%） | 2.41 ms | 2.37 ms | 0.985×（快 1.5%，噪声内） |
-
-**机制也量了，不是猜的**（同一示例里的拆解行）：
-
-| 形状 | 生产打包内核 | 本内核（α=1,β=0，收尾照样读写 C） | **收尾本身** | 二遍法里那遍 elementwise |
-|---|---|---|---|---|
-| 256×64×4096 | 2.23 ms | 2.44 ms | **210 µs** | ~230 µs |
-| 100×64×19072 | 4.47 ms | 4.82 ms | **343 µs** | ~370 µs |
-| 512×256×512 | 2.35 ms | 2.37 ms | **21.5 µs** | ~25 µs |
-
-**微内核里的收尾吃掉了它本来要替代的那一遍的 91–96%。** 原因很具体：融合省下的只有
-"`acc` 的那一次读"（3 条流里的 1 条），而它换来的是一次**按 4 行跨距、32 列切块**的
-读-改-写——4 条流相隔 16 KB，且发生在 k 循环**之后**（C 的缓存行早已不在 L1）。
-二遍法里那一遍则是**连续三流**，实测 52–56 GB/s（§19.9 的表）。**在已经跑满带宽的
-连续循环面前，把工作塞进微内核收尾没有便宜可占。**
-
-所以 §19.9 的上限之所以没兑现，不是"融合没省东西"，而是"省下的那部分被更差的访存
-模式抵消"。**决定维持：不做融合**，§10.3 那条负面结果从"按上限判定不值"升级为
-"按内核实测否掉"。实验内核留在树里（`ops_bench_scaled` + `examples/fusion_kernel.rs`），
-它是这条结论的可复现凭据；哪天想出更好的收尾形态（例如只在 β=0 时走融合、或把收尾
-做成连续一遍的小 kernel），先跑这个示例。
-
-> **这两条"更好的收尾形态"后来都做了，结论因此被 §19.15 推翻**：
-> ① "只在 β=0 时走融合"＝**免读 C 的 store**（本节的表格里明确写着"α=1, β=0，收尾照样读写 C"
-> ——那是当时唯一的收尾形态，等于把最值钱的那条路排除了）；
-> ② "把收尾做成生产内核的一部分"＝把口径融进 `tile4x32_chunk` / `tile4x32_f32_scaled` /
-> `row_tail_*`，而不是另起 `scaled_tile4x32`（本节 2.44 ms vs 生产 2.23 ms 的那 9% 是路径代价，
-> 不是融合代价）。本节全部实测数字与"91–96% 被收尾吃掉"的机制分析仍然成立，**保留原文留痕**；
-> `scaled_tile4x32` / `ops_bench_scaled` 那版受限内核已删除，示例改为对照正式实现。
-
-### 19.12 `parallel::*` 改返回 `Result`（接口债清理，2026-09-24）
-
-**动机**：`api` 层形状不符返回 `Err`，而 `parallel::*` 却 `assert_eq!` panic——同一类错误
-在两层有两种表现，调用方（cli、例子、`yll` 扩展）都得自己防。这是审查清单里记了很久的
-一条接口债。
-
-**改法**：`matmul_f32` / `matmul_f32_with_pick` / `matmul_f64` / `rk4_j2_step_batch` 都返回
-`Result<(), api::Error>`。校验**复用 `api` 的 `expect_len`/`checked_mul`**（把它们从
-`fn` 提成 `pub(crate)`），所以错误变体与算子名/参数名/期望值/实际值的口径与
-`api::matmul` **完全一致**，不会出现两套消息风格。两个 f32 入口的公共体抽成
-`matmul_f32_picked(..., op: &'static str)`，`op` 只用于错误信息里的算子名——从 `matmul_f32`
-报出来的是 `"matmul_f32"`、从 `_with_pick` 报出来的是 `"matmul_f32_with_pick"`。
-
-**边界（有意保留）**：池的低层 `for_each_*` **仍然 panic**。它是"调用方自己保证形状"的
-原语（切分是它的全部语义，校验塞进去只会让热路径多一遍检查），`parallel` 才是带校验的
-那一层。这条写进了 `docs/ops.md` §9。
-
-**接口冻结**：§19.7 冻结的三个接口（池的行块闭包、`shape::Prepared::apply*`、
-`Policy::threads`）**一处未动**，所以不需要走"改前先记录"；`api` 那两个 helper 从私有变
-`pub(crate)` 也不影响公开面。
-
-**回归测试**：`parallel::tests::test_shape_mismatch_returns_err_not_panic`——A/B/C 三个数组
-各来一个长度不符，逐字段核对 `Error::Shape`（`op`/`what`/`expected`/`got`）、一个
-`Error::Overflow`（`m×k` 传 `usize::MAX`）、以及 `rk4` 的 `ry` 不等长。另外
-`test_degenerate_shapes` 断言"返回 `Ok` 且 `k=0` 全零"（而不是"不应 panic"）。
-
-**调用方**：cli（`data.rs` 的 `step_pooled`、`scenario.rs`）与 `examples/*` 四处用 `.unwrap()`
-（那些基准里形状由构造保证）；`yll` 扩展用 `.map_err(|e| e.to_string())?` **上抛给脚本**——
-这正是"调用错误需要上抛"那条要求的落点，扩展里不再有"库 panic 打断解释器"的路径。
-
-### 19.13 DSL 覆盖矩阵与缺口（现状 + 下一步）
-
-**现状**：`matmul!`（§19.8）之外，一维形态已落地（`dot!` / `gemv!`，见下表 ✅）。两者的分工是
-"矩阵 / 向量"两种句式，共用同一条下标规则（大写 = 编译期 const）与同一套双锚定诊断。
-
-**逐算子对照**（30 个原始符号；**N3 批次的 8 个 int8 算子单列在 §21，本表不含**，
-30 + 8 = 全库 38 个原始符号；`lasx_alloc` 是设施，不进 DSL）：
-
-| 类别 | 算子 | DSL | 缺的语法原语 |
-|---|---|---|---|
-| 矩阵乘 | `matmul`(f32)、`matmul_f64` | ✅ `matmul!` | — |
-| 矩阵-向量 | `gemv_f16` | ✅ `gemv!`（f16 权重） | — |
-| 点积 | `dot_f16` | ✅ `dot!` | — |
-| 点积 | `dot`、`dot_f64`、`sum` | ❌ | 标量输出的**归约**（`s = sum(x[N])`）；`dot`/`dot_f64` 可直接用 `dot!`（已支持），但 `sum` 缺一个"单操作数归约"句式 |
-| 归约（量化） | `dot_i8`、`dot_q4` | ❌（**G7 已否**） | i8 / Q4 块的 dtype 视图；唯一消费者 loong-llm 不再作为目标 ⇒ 不做（理由见下） |
-| 逐元素 | `axpy`、`silu`、`gelu_quick`、`gelu_erf` | ❌ | 无收缩维的逐元素 + 标量参数（`y[N] = axpy(a, x[N], y[N])`） |
-| 批量物理 | `norm3_batch`、`vec3_add_scaled_batch`、`batch_distance2d`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch` | ◐ 形状层视图（`docs/ops.md` §6.7，**不是宏**） | 批量样本维已在 `shape::batch` 落地（`V3Ref`/`RvMut`/`V2Ref`）；宏（`batch!`）有意未做 |
-| 姿态/几何 | `cross3`、`unitize3`、`mat3_mul_vec3`、`quat_normalize`、`quat_mul`、`quat_rotate`、`quat_to_dcm` | ◐ 前两个有视图，其余**不做**（G4 已否） | `cross3`/`unitize3` 是 `V3Ref` 的自然成员；`quat_*`/`mat3_mul_vec3` 需要"定点小矩阵后端"，而没有消费者（见 G4） |
-| NN 行算子 | `softmax_rows`、`rms_norm` | ❌ | **行内归约 + 广播**（`w[C]` 广播到 `x[R,C]`）+ 参数（scale/mask/eps） |
-| NN 表算子 | `rope` | ❌ | 表输入 + 模式参数（NeoX/GptJ） |
-| 内存工具 | `lasx_alloc` / `AlignedVec` | — | 设施，**不该**进 DSL（`Prepared`/`VecBuf` 已在用） |
-
-统计：**30 → 4 个 ✅**（`matmul`/`matmul_f64`/`gemv_f16`/`dot_f16`），加 f32/f64 `dot` 也走
-`dot!` 之后是 6；再有 8 个批量算子由**形状层视图**（不是宏）覆盖；其余仍无声明式写法
-（其中 `lasx_alloc` 不该有）。
-
-**缺的是 8 个语法/类型原语，不是 24 个宏**：
-
-| # | 原语 | 一次解锁 | 现成消费者 |
-|---|---|---|---|
-| G1 | 1 下标操作数 + 标量输出 | `dot`/`dot_f64`/`sum`/`dot_f16`/`gemv_f16` | ✅ 已落地（`dot!`/`gemv!`） |
-| G2 | 逐元素就地 + 标量参数 | `axpy`/`silu`/`gelu_*` | 库内算子（**已审计**：外部消费者 0 处，见下） |
-| G3 | 批量样本维 + 多数组同步 | 批量物理 6 + 姿态/几何 7 | ✅ **已落地**（`shape::batch`，`docs/ops.md` §6.7）：真实消费者只有 loong-sci 的 **5 个算子、14 处调用点**（`rk4_j2_step_batch`×1、`j2_accel_batch`×2、`vec3_add_scaled_batch`×4、`batch_distance2d`×5、`ballistic_step`×2）；宏未做 |
-| G4 | 定点小矩阵展开后端（3×3/4×4） | `mat3_mul_vec3`/`cross3`/`quat_*` | **否掉**：原以为消费者是"loong-sci 的 3×3 求逆、惯量、6×6 协方差"，实测这些算子（批量的与非批量的）在 loong-sci 里**一次都没被调用**（`lasx_mat3_mul_vec3*`/`lasx_quat_*`/`lasx_cross3*`/`lasx_unitize3*` 各 0 处） |
-| G5 | 行内归约 + 广播 + 参数 | `softmax_rows`/`rms_norm` | 库内算子（**已审计**：外部消费者 0 处，见下） |
-| G6 | 表 / 模式参数 | `rope` | 库内算子（**已审计**：外部消费者 0 处，见下） |
-| G7 | 块量化 / f16 的 dtype 视图（`Q8<[K,N]>`） | `dot_i8`/`dot_q4`（+ N2 的新内核） | **否掉**（唯一消费者 loong-llm 不再作为目标，见下） |
-| G8 | 多操作数 / `alpha` / 转置 | attention 类多步表达式 | —（v1 有意延后，诊断里点名） |
-
-**G2/G5/G6 的"无外部消费者"是实测的（与 G4 同一处理）**：对唯一的外部消费项目 loong-sci
-全库检索 **12 个算子名**——`axpy`、`silu`、`gelu`、`rope`、`softmax_rows`、`rms_norm`、
-`dot_f16`、`gemv_f16`、`amax`、`quantize`、`gemv_i8`、`matmul_i8`——**全部 0 处调用**。
-所以这三项和 G4/G7 一样是"查过的否"，不是"没查过的待办"：**没有调用点不可怕，
-可怕的是把"没查过"写成"没做过"。**（N3 的 8 个算子在 loong-sci 里同样是 0 处，
-与 `docs/ops.md` §12.3 的"无调用点"一致。）
-
-**G7 否掉的理由**：这一项的动机**只有**"给 loong-llm 的 8 处 `q8_matmul` 提供块量化视图"；
-loong-llm 不再作为下游目标后，G7 就是"为不存在的调用点加 dtype 层 + 写 N2 的 Q8_0 内核"，
-而 `docs/ops.md` §12.3 早已写明 N2 只在"要跟 llama.cpp/GGUF 生态互通"时才值得做。
-所以**不是技术上做不到，而是没有消费者**——留着这条记录，避免以后有人按旧的优先级把它捡起来。
-`dot_i8`/`dot_q4` 本身仍在库里、有实测，只是不进 DSL。
-
-**G4 否掉的理由**（与 G7 同型，但这次是**核查后发现消费者不存在**）：原表格写的是
-"loong-sci 的 3×3 求逆、惯量、6×6 协方差"，实测 `cross3_batch`/`unitize3_batch`/
-`mat3_mul_vec3_batch`/`quat_*_batch` 以及对应的非批量 `lasx_*` 入口在 loong-sci 里**全是 0 处调用**
-（那次推测没有落到代码上）。没有调用点就没有验收对象，做"定点小矩阵展开后端"等于自己造需求。
-**触发条件**：出现真实的批量姿态/3×3 需求（loong-sci 的 `attitude` 侧批量调用，或别的下游）时重开。
-
-**优先级**（按"有真实消费者 + 已有功课"排）：**G2**（最小语法、无并行/计划问题，即使没有外部
-消费者，也是库内 4 个算子的声明式写法）→ **G5**（NN 侧 4 个算子）→ G6（表/模式参数，`GptJ` 在
-shuffle 受限时还有标量回退，语法要能表达两条后端）。G3 的形状层视图已落地（宏待定，见下）、
-G4 与 G7 已否、G8 有意延后。
-
-**生成代码的形态**（本轮定下的两条约定）：
-
-- **绝对路径**：生成 `lasx_rs::shape::F16Mat<'_, {N}, {K}>` / `lasx_rs::shape::vec::dot_of((&a, &b))`，
-  所以用户**不必** `use` 类型或 trait（`matmul!` 用裸类型名、需要 import——新形态没沿用这条）。
-- **不支持的一对 dtype 走 `on_unimplemented`**：`dot!` 经一个**元组参数**的泛型函数
-  `dot_of` 落点。早先版本直接生成 `Dot::dot_with(&a, &b)`，rustc 会拿第二个实参去凑第一个
-  类型的唯一 impl，报成"实参类型不符"；改成元组后约束是 `Pair: DotPair`，缺失 impl 时才会
-  打出本库写好的提示（实测见下）。
-
-**诊断核对**（§19.8 的老办法：写一个只含错误公式的临时 example，一次编译看全部输出，核对完删除）：
-9 条错误公式各给一条消息 + 双锚定，例如——
-
-```text
-error: 点积的收缩维下标不一致：左侧写 K，右侧写 Q
-  --> examples/dsl_diag_probe.rs:20:20
-error: 点积要求两侧等长，请把下标写成同一个名字
-  --> examples/dsl_diag_probe.rs:20:27
-error: `gemv!` 需要左侧是权重矩阵（2 下标），`a` 只写了 1 个下标
-  --> examples/dsl_diag_probe.rs:25:21
-  = note: 本库 gemv 的权重是行主序 `[输出, 收缩]`，权重必须在左：`w[K, N] * a[N]`
-error: `dot!` 只认受支持的 dtype 组合
-  = help: the trait `DotPair` is not implemented for `(&F16Vec<'_, 8>, &F16Vec<'_, 8>)`
-  = note: 支持：`VecRef<f32>·VecRef<f32>`、`VecRef<f64>·VecRef<f64>`、`F16Vec·VecRef<f32>（两个方向）`…
-```
-
-**测试与文件**：规则层是纯函数（`check_dot`/`check_gemv`，不碰 `Span`），单元测试直接打它
-（proc-macro 的类型在测试里用不了：`procedural macro API is used outside of a procedural macro`）；
-生成形态由 `src/shape/vec.rs` 的 doc test 与 `examples/formula_vec.rs` 覆盖。
-代码分布：`src/shape/vec.rs`（通用向量 + `DotPair`）、`src/shape/f16.rs`（f16 视图 + gemv）、
-`macros/src/vec.rs`（新宏的解析/规则/生成），`macros/src/lib.rs` 只留入口与共享件。
-
-### 19.14 批量样本视图 `shape::batch`：修掉一个发布构建的 UB（2026-09-28）
-
-**这一轮做的是 G3 的**类型层**，不是宏。** 起因是核查 G3/G4 的消费者时发现的两件事：
-
-1. **发布构建里长度不一致是 UB**：批量内核用第一条数组的长度当 `n`
-   （`norm3_batch_lasx` 里 `let n = xs.len();` 之后按 `n` 读 `ys`/`zs`/`out` 的裸指针），
-   而转发层只有 `debug_assert_eq!`（发布构建编译掉）。`lasx_norm3_batch` 这类
-   **safe 的 `pub extern "C" fn` 内部却对调用方的裸指针做 `from_raw_parts`**，
-   所以从 Rust 侧安全调用、传错误长度就是 UB。
-2. **G4 的消费者不存在**（见 §19.13）：姿态/几何那 7 个批量算子（及它们的非批量入口）
-   在 loong-sci 里 0 处调用，"3×3 求逆/惯量"是当初的推测。所以 G4 否掉，
-   **不做**"定点小矩阵展开后端"。
-
-**落地的东西**（`src/shape/batch/{mod,v3,rv,dist2d}.rs`，每个文件一类视图）：
-
-| 视图 | 分量 | 覆盖的算子 |
+| 缺口 | 现状 | 下一步 / 触发条件 |
 |---|---|---|
-| `V3Ref` / `V3Buf` | x、y、z | `norm3`、`unitize3`、`cross3`、`vec3_add_scaled`、`j2_accel` |
-| `RvMut`（`f64`） | rx…vz（6 条） | `rk4_j2_step`（原地） |
-| `RvMut`（`f32`） | rx…vz（6 条）+ `k` | `ballistic_step`（原地） |
-| `V2Ref`（`f32`） | x、y | `batch_distance2d` |
-
-`new()` 把"所有分量等长、长度是 `N`"校验一次，**不等长就拿不到视图**（`Error::Shape` 里
-`what` 点名是哪一条分量）；之后方法是 `*_into`，直接调 `docs/ops.md` §6 的同一批内核，所以位精确零成本成立
-（每个方法都有 `to_bits()` 对照测试，含 `N` 不是向量宽整数倍的尾部与 `N∈{0,1}`）。
-输入 `&V3Ref` / 输出 `&mut V3Buf` 让**借用检查器**守"输入输出不重叠"。
-
-**`batch!` 宏（Stage 2）否掉**——理由由 loong-sci 的迁移实测给出（commit `bd3666d` + 紧随的
-访问器改动）：
-
-1. 迁移后调用点本来就已经是**一行**：给下游自己的 SOA 缓冲类型加三个访问器
-   （`Buf3::as_v3` / `as_v3_mut` / `as_v3_range{,_mut}`，内部各一次 `v3_of`/`v3_mut_of`），
-   调用点写成 `a.as_v3().add_scaled_into(&b.as_v3(), s, &mut o.as_v3_mut())` 就够了；
-   视图构造从**调用点上的 12 处收敛到 3 个 helper 里 0 处**，`add_scaled3_batch_range`
-   的 15 行降到 6 行、`accel_batch_range` 的 J2 分支 6 行降到 2 行。
-2. 宏能省的只剩那个 `.unwrap_or_else(...)` 尾巴和 `_into` 命名，而代价是**再养一条
-   解析/规则/生成路径 + 一套新诊断**（§19.13 已经写过"缺的是原语，不是 24 个宏"）。
-3. 这 5 个算子的形状本来就不齐（1 入 / 2 入、1 分量输出 / 3 分量输出 / 原地区分、额外标量参数
-   `s`/`mu,j2,re`/`dt,g`），宏规则层的分支数会明显高于 `dot!`/`gemv!` 那两个。
-
-**给下游的用法建议**（写进 `docs/ops.md` §6.7）：自己的 SOA 缓冲类型加访问器收敛视图构造，
-不要在每个调用点手写 `V3Dyn::new(&x, &y, &z)`。
-
-**没做的（明确记为否）**：分量写进公式的定点轴（`o[X,N] = a[X,N] × b[X,N]`）需要"定点轴 +
-展开后端"，而内核已经手写好了；通用 map 后端重写内核会掉速（收益不是速度）。
-
-### 19.15 `alpha`/`beta` 融合：落地（2026-10-15，**推翻 §19.9/§19.11 的"不做"**）
-
-**结论**：这次有实测提升，判据只有一条——与"朴素两遍法"在同一窗口里**进程级交替**对比。
-`β = 0`（`C = alpha·A·B`）省掉的正是"对 `C` 的一整遍读写"：宽薄档 **−10.3% / −23.7%**、
-小 `k` 累加档 **−6.5%**、方阵 **≈0**（与 §19.9 的 0.8% 上限一致）；`β ≠ 0` 且 `k > 384`
-按下面的边界**退回与二遍法同构**（1.006×，无收益也不亏）。
-
-**为什么上次否掉、这次能翻案（两条关键差别）**
-
-1. **上次那版是"另起一条简化 tile 路径"**：`scaled_tile4x32` 只覆盖
-   `k ≤ 384 && m%4==0 && n%32==0`，既不走共享打包面板 + k 分块 + 行块派活，也不走列块路径。
-   §19.11 里"融合内核 2.44 ms vs 生产打包内核 2.23 ms"那 9% 就是这条路径本身的代价。
-   这次把口径融进**现有生产内核的收尾**：`tile4x32_chunk`（打包 + k 分块）、
-   `tile4x32_f32_scaled`（列块）、`row_tail_*` 共用同一套 k 循环，**k 循环一条指令都没动**。
-2. **上次的收尾无条件读 `C`**：§19.11 自己的表里就写着"本内核（α=1, β=0，收尾照样读写 C）"，
-   所以它测的是融合的**最差形态**。CBLAS 语义下 `β = 0` 时 `C` 无需有效、**一个字节都不该读**；
-   这次 `Epi::Plain / Scale / Fma` 三条分开，`β = 0` 走**免读 C 的 store**（`C = alpha·acc`）
-   ——那才是最值钱的一条路。
-
-**接口与语义**
-
-| 入口 | 语义 |
-|---|---|
-| `api::matmul_scaled_into(m, k, n, alpha, beta, a, b, c)` | `C = alpha·A·B + beta·C`（原地） |
-| `matmul!(y[M,N] = alpha * x[M,K] * w[K,N])` | 同上但 `beta = 0`（DSL 标量前缀，见 §19.8） |
-| `shape::Prepared::apply_scaled*` / `Mat::mul_scaled*` / `plan::run_rows_into_scaled` | 上面两条的底层（静态/DYN、单核/多核同一套） |
-
-- `alpha = 1, beta = 0` **逐位等于** `lasx_matmul` / `api::matmul`（同一条内核、收尾 `Plain`，
-  连一次乘法都不多）；
-- `beta = 0` **不读 `C`**（CBLAS 语义），用 **NaN 探针**钉住：把 `c` 填 NaN，输出里不允许出现
-  NaN。它在开发中真抓到一个洞——回退路径写成 `0.0.mul_add(C_old, …)` 会读 `C` 并让 NaN 传播，
-  改成 `alpha * acc` 之后契约才在所有路径上成立；
-- **C 入口已加**（2026-10-15 同一批收口）：`lasx_matmul_scaled` +
-  `lasx_matmul_scaled_checked`，签名与 `lasx_matmul`/`lasx_matmul_checked` 同形、在维度后插
-  `alpha`、在 `c` 前插 `beta`（对齐 CBLAS 的参数次序）；导出符号 **81 → 83（42 裸 + 41
-  `_checked`）**，README/README.en/`docs/ops.md` §4 的计数与 §4.6 清点表在同一提交里改全。
-  C 入口与 `api::matmul_scaled_into` **逐位一致**（`src/ffi/matmul.rs` 的测试守着），
-  `_checked` 变体的校验口径与 `lasx_matmul_checked` 相同（维度非负 → 乘积不溢出 → 转切片，
-  失败只写状态、不触碰输出）。
-
-**数值口径：不是"差不多"，是逐位**
-
-融合只是把 `fma(beta, C_old, alpha·acc)` 从单独一遍 elementwise 搬进输出那一遍，`acc` 仍是沿
-`k` 从 0 起的同一个 f32 累加 ⇒ 与参考实现 `beta.mul_add(C_old, alpha * acc)` **逐位一致**
-（`to_bits()` 全量比对：6 个形状 × 6 组 `α/β`）。口径按**表达式**定义而不是按"数学值"：
-普通 `alpha * acc + beta * C_old` 在多数输入上差 1 ulp；列尾的标量段不是 FMA，但它与参考实现
-走同一段代码，所以仍然逐位。NaN 的 payload 不在承诺内。
-
-**哪些形状真的融合（边界与理由）**
-
-硬前提是"收尾时 `C_old` 还没被部分和覆盖"：
-
-| 档 | 触发 | 处理 |
-|---|---|---|
-| 打包 + k 不分块（`k·32·4 ≤ 48 KiB`，即 `k ≤ 384`） | 部分和在寄存器里 | 融合 |
-| 打包 + k 分块 + `beta == 0` | 中间块写部分和（Plain），**末块**才施加 `alpha` | 融合 |
-| 打包 + k 分块 + `beta != 0` | `C_old` 会被部分和覆盖 | **退回二遍法**（逐位等于参考、访存与手写两遍法相同，不假装更快） |
-| 列块路径 | 不分块 k | 融合 |
-| 流式路径（三条判据都不满足的小形状） | 第二遍只占 0.1–2% | **退回二遍法**，让这条路径与改动前逐字节相同 |
-
-**实测**（`lasx_bench matmul a|b`：`a` = 融合，`b` = 朴素两遍 = `lasx_matmul` 写 `acc` + elementwise；
-进程级交替 5 轮、丢首轮、中位数 + 极差）
-
-| 形状 / α,β | 融合 中位数（极差） | 两遍 中位数（极差） | 融合/两遍 |
-|---|---|---|---|
-| 256×64×4096, 1.5 / **0** | **2158.0 µs**（2156.5–2217.0） | 2405.0（2350.8–2443.8） | **0.897（省 10.3%）** |
-| 100×64×19147, 1.5 / **0** | **4045.7 µs**（4004.7–4146.4） | 5303.0（4953.0–5470.6） | **0.763（省 23.7%）** |
-| 256×64×4096, 1.5 / 1 | **2290.9 µs**（2285.9–2326.5） | 2450.8（2423.5–2502.6） | **0.935（省 6.5%）** |
-| 512³, 1.5 / **0** | 4355.5 µs（4334.7–4500.6） | 4544.3（4427.5–5219.5，含一次干扰轮） | 0.958；剔除干扰轮 ≈0.98 |
-| 512³, 1.5 / 1（回退档） | 4455.0 µs（4440.1–4582.3） | 4429.9（4395.1–4575.4） | **1.006（无收益，也不亏）** |
-
-**loadavg 与分级**：两批都跑在 `1min 3.39–3.77 / 5min 3.43–3.72`。本机桌面常驻
-（浏览器 + 合成器 + 音频）已占 **2.5–3**，而**单个 bench 进程本身 +1.0** ⇒ 只要在测，1 分钟均值
-必然 >3，**A 级（1min 且 5min ≤3）在本机物理不可达**——本仓库历史数据里的"load ≈2–3"就是这个
-原因，不是"没等窗口"。可信度靠**同窗口成对交替**（负载对两臂同阶、比值可比）与"每轮记
-`loadavg`"；本轮的正式性按 B 级（1min ≤4.5、无其它 bench/编译并发）记。
-
-**改既有内核的代价：一次真实的 0.1 µs 回归，以及修回来的过程**
-
-融合要沿路径传口径，第一版把生产入口重构成 `pick_f32_path` + `matmul_f32_stream` 两层，并给
-4×32 微内核加了运行时 `Epi` 参数。基线二进制的进程级交替（`ff9b74f` vs 本版，5 轮）抓到：
-
-- **f32 64³：7.6 → 7.9 µs（+3.9%）**，其余 8 行（f32 128³–512³、f64 四行）都在 ±0.4% 内；
-- 试着把 `Epi` 分支从每个 store 提到 tile 级——**反而更差（8.1–8.3 µs）**：函数变大后微内核
-  不再被内联，省下的分支全丢了。已回退；
-- 最终做法：**`matmul_f32` 的判据与流式循环改回改动前的内联结构**（scaled 入口自己复制那十几
-  行判据），**流式档的融合直接走二遍法**，列块新增 `tile4x32_f32_scaled`（Plain 臂仍调用原样的
-  `tile4x32_f32`）。64³ 回到 **7.7 µs（+1.3–2%，也就是 0.1 µs 一格，测量分辨率所在）**。
-- 教训与 §19.10 同源：**"重构"本身在最小形状上就是可测成本**；判据必须靠基线二进制的进程级
-  交替，不能靠"我没改算法"。
-
-**`Epi` 与 §19.7 冻结清单的关系**：`Epi` 只加在 `pub(crate)` 内部签名上
-（`matmul_f32_packed{,_rows}` / `matmul_f32_cols_block` / `tile4x32_chunk` / `row_tail_packed` /
-`row_tail_range_f32`），**§19.7 冻结的三条（池行块闭包、`Prepared::apply*`、`Policy::threads`）
-一个都没动**，所以不涉及规则 3 的"先记录再改"；新增的 `*_scaled*` 全部是**追加** API。
-
-**测量脚手架的坑（会把结论做假，记在这里当门禁）**：两遍臂第一版写成 `AlignedBuf` 的 `c[i]`
-索引（`Deref` 到切片），每个元素多一层调用——同一段循环实测 **3.75 ms**，改用 `as_slice()` 后
-**0.21–0.28 ms（13–18×）**。不修的话，"融合"会白得一个 3× 的假胜。这条写在
-`cli/src/suites/matmul.rs::fusion_ab` 的注释里。
-
-**给下游的判据**：`beta == 0` 且"宽薄（小 k、大 m×n）"⇒ 用融合；方阵/大 k 形状融合 ≈0，
-但**不会更慢**（回退同构）；`beta != 0` 且 `k > 384` 别指望融合。
-
-### 19.16 C ABI 的调用体验：能力 / 版本 / 状态串 / 内存归还（2026-10-15）
-
-**起因**（用户："优化调用动态链接库的体验和优化心智模型"）：审计 C 侧后确认三处真缺口，
-它们都不是"少一个便利函数"，而是**把安全责任推给了调用方**：
-
-| 缺口 | 原状 | 后果 |
-|---|---|---|
-| 无能力查询 | 头文件只能写"调用方须自行读 `cpucfg` CFG2.bit7" | LSX-only 机型上误调 `[LASX-only]` 符号 ⇒ **SIGILL**；而"读 CPU 寄存器"本来就该由库做 |
-| 无版本/状态串 | 只有 `lasx_alloc` 一个元信息符号 | 调用方要把 `0..6` 的语义硬编码进自己的 `switch`；出问题无法在日志里指明版本 |
-| 内存归属是"文档化的坑" | `lasx_alloc` 用 Rust `Layout`（align = `LASX_ALIGN`）分配，**不导出释放**；头文件写"本机 glibc 下 `free()` 可用" | **"在本机可用"不是契约**——换分配器/换平台就静默坏 |
-
-**落地**（`83 → 87`；**既有 83 个符号的原型与语义一字不改**，纯追加）：
-
-| 新符号 | 语义 | 为什么这么定 |
-|---|---|---|
-| `lasx_has_lasx` | `SimdPath::detect().is_lasx() as i32` | 必须与**算子入口同源**：调用方问的是"现在能不能安全调 `[LASX-only]`"，所以它**尊重 `lasx_force_lsx_thread`**（降级时返回 0）。若改成"读硬件有没有"，被强制降级的进程里它会撒谎 |
-| `lasx_version` | `concat!(env!("CARGO_PKG_VERSION"), "\0")` 的静态指针 | 永不为 NULL、生命周期 = 进程；不需要长度参数 |
-| `lasx_status_message` | `0..=6` 的中文说明；未知码给"未知状态码" | 永不为 NULL；消息与 Rust `LasxStatus` **同表**（`c_message()` 是唯一来源，`message()` 由它去掉 NUL 得来）⇒ C 侧与 Rust 侧永远不会漂 |
-| `lasx_free` | 与 `lasx_alloc` **共用 `f32_layout()`** 归还；`p == NULL` 与 `n <= 0` 都是 no-op | 抽共用 layout 函数是"同一 layout"的**结构性保证**（各写一份 `Layout::from_size_align` 是这类 API 最典型的堆破坏来源）；`n <= 0` 的 no-op 覆盖 `lasx_alloc(0)` 的对齐悬垂指针——它从来不是堆块，交给 `dealloc` 就是 UB |
-
-**心智模型（写进头文件与 `docs/ops.md` §4.8/§11）**：
-`lasx_version()` 知道版本 → `lasx_has_lasx()` 决定能不能调 `[LASX-only]` → 调算子 →
-`lasx_status_message(st)` 打日志；`lasx_alloc` 的缓冲**只能**用 `lasx_free` 归还。
-可编译样板在 `examples/c/`（`quickstart.c` + `Makefile`，`make run`）。
-
-**谁守（每条都点名）**：
-
-| 契约 | 由什么守 |
-|---|---|
-| `lasx_has_lasx()` ≡ 算子路径 | `src/ffi/meta.rs` 直接返回 `detect()`；单测断言 `force(true) ⇒ 0` 且逐点等于 `detect().is_lasx()` |
-| `lasx_version()` 非 NULL / NUL 结尾 / 与 `CARGO_PKG_VERSION` 一致 | 单测（`CStr::from_ptr` 读回比对）；`scripts/check_header.c` 再实测一次 |
-| `lasx_status_message()` 覆盖 0..6 + 未知码且非 NULL | 单测（0..6、±边界、`i32::MIN/MAX`）；`check_header.c` 实测 -1..8 |
-| `lasx_free` 与 `lasx_alloc` 同 layout | **构造保证**（同一个 `f32_layout()`）+ 单测（配对、两种 no-op） |
-| `lasx_free(p, n)` 的 `n` 必须等于分配时的值 | **只有约定**；违反（非 0 且不同）破坏堆 = UB，已在 `docs/ops.md` §15 第 4 条点名 |
-| 94 个符号一个不少 / 原型不漂 | `scripts/check_header.c` 对 94 个逐个取地址（编译期钉住 `LASX_SYMBOL_COUNT`）+ CI 的 ABI 门禁（`nm -D` 计数） |
-
-**诚实标注**：`examples/c` 的"无 LASX"分支在**本机（含 LASX）无法实测**（`lasx_force_lsx_thread`
-不导出给 C），与 `docs/ops.md` §3.3 那条"无 LASX 真机"是同一类限制；该分支的正确性由 Rust 单测守。
-显式示例的实测输出见本轮的 CI/汇报（`make run` 打印版本、能力、算子结果与归还）。
-
-### 19.17 计划句柄：把"打包一次"变成 ABI 能力（2026-10-15）
-
-**起因**（用户："C ABI 不导出线程池这个问题确实要讨论和处理"，随后追加"**不要死板的线程池**，
-且配套设施要一起上"）：剖析小节的 ⑤ 已经验穿根因——`lasx_matmul` 每次调用都重打包整个 B，C 侧
-"每线程各调一次"的扩展比只有 **1.08×**，天花板 ≈236 G。**先量后决**：定位/验证/对照都做完
-才动 ABI。
-
-**决策：加"计划句柄"（打包一次 + 调用方驱动线程），便利层可选、可调、可不用。**
-理由（按优先级）：
-
-1. **治根因**：打包从"每次调用"提到"每次计划"，这是 1.08× → 4× 的那笔账；
-2. **不夺线程控制权**：`lasx_matmul_run` 一次算**一个行块**，线程怎么开、块怎么切由调用方定
-   （OpenMP / 线程池 / 协程 / 纯串行都行）——这是"不死板"的实现方式：库**没有**把"库内固定池"
-   做成唯一路径，也**不读环境变量**；
-3. **零进程级状态**：不用便利层就没有全局池/`atexit`/lazy init；便利层也是**每次调用现建现拆**；
-4. **位精确可守**：计划走同一条按块内核（每个输出元素仍沿 k 单升序），因此与 `lasx_matmul`
-   逐位一致——而"调用方自己拼 `cols`"做不到（6/10 形状不逐位，§7.10 ⑤）。
-
-**落地（7 个新符号，87→94；只追加，`lasx_matmul` 行为一字不改）**：
-
-| 层 | 符号 | 说明 |
-|---|---|---|
-| Rust | `plan::MatmulPlan::run_block_into`、`parallel::matmul_f32_plan{,_with_stats}` | C 只是它的投影（"不只 C 能多核"） |
-| C 底座 | `lasx_matmul_prepare{,_checked}`、`lasx_matmul_run{,_checked}`、`lasx_matmul_plan_destroy` | 5 个：prepare 复制打包 B、句柄只读可并发 `run`、`destroy(NULL)` 空操作 |
-| C 便利层 | `lasx_matmul_run_threaded{,_checked}` | 2 个：`threads<=0` 自动物理核 / `1` 串行 / `N` 夹到物理核；动态取块；`_checked` 回填"实际 worker 数 / 块数 / 最慢与最快块毫秒" |
-
-**命名上的一个门禁故事**：`§9.1` 保留了库级词根 `free`（白名单已有 `lasx_free`），所以释放
-函数只能叫 `lasx_matmul_plan_destroy`——`lasx_matmul_plan_free` 会被 `scripts/namecheck.sh`
-直接拦下。名字是**规则定出来的**，不是随手挑的。
-
-| 契约 | 由什么守 |
-|---|---|
-| `run` / 便利层与单线程 `lasx_matmul` **逐位一致** | Rust 单测（`plan.rs` 含 k=384/385 两侧与不整除块；`parallel.rs` 含 LLM 形状）+ FFI 单测（1/0 线程都覆盖）+ `scripts/check_header.c` 的两个形状实测 + `scripts/bench_openblas.c --mode=verify` 的 `plan` 档 |
-| `prepare` 复制并打包 B ⇒ 调用方随后可释放 `b` | 实现（`from_row_major` 自持面板）+ 单测（`prepare` 后仍能跑出正确结果） |
-| 句柄只读 ⇒ 可跨线程并发 `run` | 类型系统（`&self`，无内部可变状态）+ `plan.rs` 的 `plan_is_shareable_across_threads` |
-| **不用便利层时零进程级状态** | FFI 单测 `plan_path_spawns_no_threads`（`/proc/self/task` 前后相等） |
-| `destroy(NULL)` 空操作；重复释放/用后即用 = UB | 前者实现 + 单测；后者**只有约定**，已在 `docs/c-abi.md` 第 11.3 节点名 |
-| 94 个符号一个不少 / 原型不漂 | `scripts/check_header.c`（`LASX_SYMBOL_COUNT` 编译期钉住 + 逐符号地址）+ CI 的 `nm -D` 计数 + `namecheck`/`doccheck` |
-
-**已知取舍（如实记，不粉饰）**：
-- 便利层**每次调用现建现拆线程池**，实测比"调用方驱动"慢一截（`threaded` 档 129.9 G vs `plan` 档
-  245.0 G；握手最小化后 `plan-tight` 档见 §7.10 ⑦）；这是"不用它就零进程级状态"的代价，热循环
-  请用 `run` + 自己的线程/池。Rust 侧想把池留下来复用，直接用 `WorkerPool`（`docs/ops.md` §4.9）。
-- **"按块"的粒度够用**：同进程对照里计划路径（行块在外）**比池还快**（346–355 G vs 292–300 G），
-  所以**没有加"面板粒度"符号**（试过、更慢、已回退，账目见剖析小节 ⑦ 的 ⑥ (4) 与 ⑦）。
-- 计划常驻内存 ≈ `k·n·4` 字节（`192×768×3072` 时 9 MB）；`n % 32 != 0` 时另存一小段列尾副本。
-- 只有 **f32** 有计划句柄（f64 按需再追加 `*_f64`，append-only 允许）。
-
-## 20. NN 侧 N1 批次：算子契约与依据
-
-`docs/ops.md §12.3` 的 N1 批次共 8 个算子（`softmax_rows`、`rms_norm`、`silu`、`gelu_quick`、
-`gelu_erf`、`rope`、`dot_f16`、`gemv_f16`）。本节是它们的实现侧参考：每个算子给出**当前设计**
-（要点列表）、**依据**（探针/实测/推导，并标明来源）与**被否掉的方案**。算子的语义与数值契约
-（对调用方的权威版本）在 `docs/ops.md` §2.6–§2.11，性能数据在 §7；本节不重复这两处的内容，
-只写它们背后的决定与证据。
-
-### 20.1 `softmax_rows`：语义、位精确构造、所需原语
-
-**语义**（v1）：
-
-```text
-out[i][j] = exp(scale·x[i][j] + mask[i][j] − max_j(scale·x[i][·] + mask[i][·]))
-          ÷ Σ_j …
-```
-
-- `scale` 是标量（llama.cpp 的 `soft_max` 用它做 attention 缩放）；
-- `mask` **可选**、与 `x` 同形状的**加性**偏置（FFI 侧用空指针表示"无 mask"）；
-- 行内 max 减掉是**数值必需**（否则 `exp` 溢出），也是 llama.cpp 的做法；
-- v1 不做：mask 的 stride/broadcast（llama.cpp 支持 mask 与输出不同形状），行内 KQ 掩码
-  之外的形态等，都留到有需求时再加。
-
-**位精确怎么保证**（这是这块的难点）：`exp` 没有硬件指令，只能用多项式；而"向量路径 +
-标量尾"天然会出现两种**结合次序**（向量水平归约 vs 逐个累加）。本仓库的位精确承诺要求
-两者逐位相同，所以设计上把整条链路拆成"**全部 lane-wise 操作 + 最后一次性固定次序的
-水平归约**"：
-
-| 步骤 | 做法 | 为什么位精确 |
-|---|---|---|
-| 行内 max | lane-wise `max`，末尾一次固定次序的水平 max | `max` 精确且满足结合律，次序不影响结果 |
-| `scale·x + mask` | lane-wise FMA（`mul_add`） | 每 lane 独立 |
-| 减 max、`exp` | lane-wise（见下的 op 序列） | 每 lane 独立 |
-| 行内 sum | **保留 8 个 per-lane 累加器**，只在最后做一次固定次序的水平归约 | 尾部不足 8 个元素时，**用 `−inf` 填充输入**（`exp(−inf)=0`），于是尾部走的还是同一串 lane-wise 操作，累加器次序完全一致 |
-| 归一化 | lane-wise 除法 | 每 lane 独立 |
-
-关键点就是那个 **`−inf` 填充**：它让"列尾"不是一条单独的标量路径，而是"少几个有效 lane 的
-同一条向量路径"，于是不需要为尾部再写一遍、也不会与主体不一致。这与 `matmul` 的
-"尾路径必须与主内核同序"是同一个思路，只是这里更干净。
-
-**`exp(x)` 的 op 序列**（标量与向量必须共用同一串；已确认所需 LASX 原语都在）：
-
-```text
-t  = x · LOG2E                          // 1 次 mul
-n  = (t + 12582912.0) − 12582912.0      // floor(t)，magic 数技巧（|t| < 2²² 时精确）
-f  = t − n                              // 精确（n 是整数值，Sterbenz）
-p  = exp2 的 6 次多项式(f)，Horner + FMA // |f| ≤ 0.5 时相对误差 ~1e-10
-k  = clamp(trunc_i32(n) + 127, 1, 254)   // 截断取整（n 已是整数值）
-2ⁿ = bitcast_f32(k << 23)                // 整数域构造指数位
-exp(x) = p · 2ⁿ
-```
-
-- `clamp(...,1,254)` 让**下溢落到 0**（而不是造出 NaN/错误指数）：softmax 输入减完 max 后
-  ≤ 0，`n` 很负时 `exp` 本就该是 0，这是正确行为；
-- 多项式系数用 `(ln2)^k / k!`；`|f| ≤ 0.5`；
-- `trunc_i32`（`xvftintrz_w_s`）对"已经是整数值的 `n`"是精确的 ✓。
-
-**所需的 arch 原语**（内核里不出现裸 `m256i ↔ m256` 转换——这是 §1 分层的不变量，
-所以转换集中在 `src/arch/lasx.rs`）：
-
-| helper | 作用 |
-|---|---|
-| `max_f32x8(a, b)` | lane-wise `max`（`xvfmax_s`） |
-| `trunc_i32(v: F32x8) -> m256i` | `xvftintrz_w_s` |
-| `pow2_from_i32(n: m256i) -> F32x8` | `(n+127)<<23` 后 bitcast 成 f32（内部一次 transmute，集中在 arch） |
-| `splat_i32(x) -> m256i` / `iadd_w` / `max_i32` … | 按需，避免内核里出现整数 intrinsic 细节 |
-| （f16 路径用）`fcvtl_s_h` / `fcvth_s_h` | LSX 128 位：`lasx_xvfcvtl_s_h`/`xvfcvth_s_h` 接受 `m128`，f16→f32 转换是**精确**的 |
-
-**代码位置**：`src/arch/lasx.rs`（原语）+ `src/ops/softmax_rows.rs`（内核与测试）+
-`src/ffi/nn.rs`（裸符号）+ `src/ffi/checked.rs`（`_checked`）+ `src/api.rs`
-（`api::softmax_rows`，返回对齐缓冲）+ `cli/src/suites/softmax.rs`（组 `softmax`）。
-
-**两条设计规定**（都有单测守着）：
-
-1. **下溢夹取是 −104**。`−inf` mask 位置的 lane 必须落成**精确的 0**，而不是 **1.04e-38**：
-   `exp(−87) ≈ 1e-38` 本身还是正规数，指数域并没有归零。归零条件是指数位为 0，即
-   `x·log2e ≤ −126.5` ⇒ **`x < −87.6831`**（§20.3 第 3 条有实测与推导）；入口夹到 −104 后
-   `−inf` 得到精确的 0。**这条对 attention 是有意义的**：屏蔽位置的权重必须是 0。
-2. **"列尾与整列逐位一致"的验收对象是填充不变式**：把同一行显式补 `−1e30` 到 8 的倍数再按
-   补齐宽度算，前 `cols` 个输出必须逐位相同。注意**不能**比较 `softmax(full[..cols])` 与
-   `softmax(full)[..cols]`——那是不同的行（不同的 max、不同的分母），本来就不同。
-
-**实测**：**5.2–7.0 GB/s**（单线程，2 条流口径，2026-09-25 复测）。
-
-读数要按**实际访存**理解，别按"2 条流"理解：这个实现有**三遍**（max / exp+sum / 归一），
-`x` 读一遍、`out` 写一遍再读改一遍 ⇒ 实际约 **3 条流**。把 `bytes` 口径（2 条流）折算回
-真实流量后是 **7.8–10.5 GB/s**，正好落在本机单流只读锚点（§7.1 的 11.7–12.2 GB/s）附近
-——也就是说**它已经在单线程带宽上限上**，想再快得减少遍数（例如把归一化并进第二遍需要
-两趟才算得出分母，或者按列切块让中间结果留在 L1）。
-
-与 `docs/ops.md` §12.2 的参照比：llama.cpp 的 `SOFT_MAX` 典型 **2.4–4 GB/s**，本实现 **5.2–7.0 GB/s**，
-约 **1.3–2.9×**；同节里"可达 ~25 GB/s"那个估计偏乐观（那是 DRAM 双流的粗估，没算三遍访存）。
-
-**测试**（`src/ops/softmax_rows.rs`，5 个）：与**标量模拟**（同一串 op、同一 per-lane
-累加、同一两两归约）**逐位一致**（覆盖 rows×cols 1×1 到 7×129、`scale ∈ {1, 0.125, 0, 8}`、
-有/无 mask）；显式补齐 == 列尾路径（8 种宽度）；f64 参考的精度（< 1e-6）；退化输入
-（行内全相等、`scale=0`、`−inf` mask 得 0、极负值不出 NaN）；FFI 裸符号 + `cols=0`。
-
-**不在契约内**：输入或 mask 含 `+inf` ⇒ `inf − inf = NaN`（定义域问题，算子不处理）。
-这条写进了 `docs/ops.md` 的 §2.6。
-
-### 20.2 `rms_norm`：行级数学放在标量域
-
-语义与契约的权威版本在 `docs/ops.md` §2.7；本节记实现侧的三条设计规定、两条测试规定与实测。
-
-**三条设计规定**：
-
-1. **平方和用 `fma(x, x, acc)`**（每个 k 步一次舍入），不是 `acc + x*x`（两次）。这既是精度
-   选择，也是**契约的一部分**：标量模拟必须写 `mul_add` 才逐位相同。
-2. **行级数学放在标量域**（`s/cols`、`+eps`、`sqrt`、`1/x` 各一次，然后广播）。省指令是次要的，
-   主要是**天然位精确**——不存在"向量 `sqrt` 与标量 `sqrt` 是否逐位相同"这个必须去查的问题。
-3. **开方与倒数用精确指令**，不用估算 + 牛顿：直接复用 §13.1 的实测结论（本机估算指令
-   6.8 周期 vs 精确除法 4.0），不重测。
-
-**两条测试规定**：
-
-1. **标量模拟必须写 `mul_add`**：向量路径是 `xvfmadd_s(vx, vx, acc)`（一次舍入），写成
-   `acc += x*x` 是两次舍入，逐位对不上。**"同一串 op"要写到 `mul_add` 这一层**，光看
-   "公式一样"不够。
-2. **列尾测试不能照抄 softmax 的"显式补齐"**：softmax 的分母是 `exp` 之和（填充 lane 贡献
-   可忽略、且 `cols` 不进分母），而 rms_norm 的 `mean = s/cols`——**把行补齐会同时改掉除数**，
-   那是另一个输入。所以 rms_norm 的列尾测试是"`cols` 扫过 1..=17 的边界、逐位对照独立模拟"。
-   这条差异记在测试的文档注释里。
-
-**实测**：**12.0–18.4 GB/s**（单线程，2 条流口径，2026-09-25 复测）。
-
-**与 softmax 的对比**（同为 2 条流口径）：rms_norm 12.0–18.4 GB/s，softmax 5.2–7.0 GB/s
-——同一个"2 条流"口径下差一倍多，原因不是实现质量，而是**遍数**：rms_norm 两遍（平方和、
-写回）＝ 2 条流；softmax 三遍（max、exp+sum、归一）＝ 3 条流。按每条流折算两者一致
-（各 1.7–9.2 GB/s），都落在本机单流只读锚点（11.7–12.2 GB/s，§7.1）**附近或以下**。
-**这条对比也给 softmax 的后续优化指了方向：把三遍压成两遍（例如把 max 与 exp 两遍合并
-需要 softmax 的在线算法）。**
-
-### 20.3 `exp` 共用件（`ops::nn_math`）
-
-`silu`/`gelu`/`rope` 都用同一份 `exp`（`src/ops/nn_math.rs`：标量与向量放在**同一个文件、
-相邻两段**，改动时不可能只改一条），`softmax_rows` 引用它——"只有一份实现"才谈得上
-"各算子精度一致"。
-
-`exp` 与调用方的分工由下面三条性质确定（每条都有测试）：
-
-1. **`exp` 自带输入夹取 → 它是全函数**（调用方不需要夹）。`silu`/`gelu` 的 `exp` 自变量是
-   `−c·x`，`x = ∓inf` 时自变量翻符号进 `±inf`，直接进 magic 数技巧就是 `inf − inf = NaN`。
-   夹取放在 `exp` 入口的两个理由：
-   - **安全**（真正的原因）：`|t| = |x·log2e| ≤ 127` 有界 ⇒ magic 数取整与 `n as i32`
-     永远在有效范围内（`|t|` 接近 `2²²` 时这个技巧本身就失效了，浮点转整型也随之落到
-     未定义区间）；
-   - **语义**：下溢侧精确 0、上溢侧有限且可复现（`exp(88) ≈ 1.65e38`）。
-   夹取是 lane-wise 的 `max`/`min`，**不破坏位精确**（标量/向量各夹一次，结果仍是逐位相同）。
-2. **夹取只有一处**（在 `exp` 入口），`softmax_rows` 不再自己夹一次：`max(−1e30, −104) = −104`，
-   再夹一次是幂等的。删掉之后它的两个逐位测试（"与标量模拟逐位一致 / 显式补齐 == 列尾"）
-   仍全绿，即合并等价。
-3. **下溢归零阈值是 `x < −126.5/log2e = −87.6831`**。推导：`kk = n + 127` 归零 ⟺ `n ≤ −127`
-   ⟺ `x·log2e ≤ −126.5`。实测 `exp(−87.68) = 8.34e-39`（次正规、非零）、`exp(−87.7) = 0`
-   （精确 0）。**注意别用 `−88.03`**：那是"数学上 `2^−127` 恰好不在正规数范围"的位置，
-   不是本序列的归零点。夹到 −104 仍安全（落在阈值内）。另一处容易写错的措辞：`n` 不是
-   `floor(t)`，`1.5·2²³` 的 magic 数给的是 **round-to-nearest**（于是 `f ∈ [−0.5, 0.5]`，
-   这正是多项式精度成立的前提），`trunc_i32` 只是把整数值取出来。
-
-**精度包络**（探针扫 `[−lim, lim]`，步长 1e-4，与 `f64::exp` 比相对误差）：
-
-| `\|x\| ≤` | 1 | 4 | 8 | 20 | 87 |
-|---|---|---|---|---|---|
-| 最差相对误差 | 2.1e-7 | 4.1e-7 | 6.2e-7 | 1.1e-6 | 3.9e-6 |
-
-模型很清楚：`≈ |x|·4e-8 + 2e-7`——第一项是 `x·log2e` 那**一次 f32 乘法**的舍入被指数放大，
-第二项是 Horner 链自身的 f32 舍入下限。这不是缺陷，是这个序列的固有形状，所以
-**文档只承诺实测包络**（`docs/ops.md` §2.6 即上表），不写"多项式相对误差 ~1e-10"
-那种只对中间量成立的数字（中间量 `2^f` 的精度确实是 1e-10 量级，但调用方拿到的是端到端结果）。
-
-**被否掉的方案：Cody–Waite 两段归约**（`t = x·HI + x·LO`，`HI` 取 7 位或 12 位有效位让
-`x·HI` 精确）。实测**更差**：`|x| ≤ 87` 时最差 6.4e-6（现方案 3.9e-6），因为多出来的那次
-加法自己有一次舍入，而它并不能消掉多项式那一侧的 2e-7 下限。也考虑过用 f64 做归约，但那要
-把 8 个 f32 lane 拆成两组 f64x4 再合回来，代价与收益不成比例（N1 的 softmax 在减完 max 后
-`|x| ≤ 20`，误差 ≲ 1.1e-6，已经够）。
-
-**关于夹取改动的影响**：把夹取挪进 `exp` 之后，softmax 的热循环净多 1 条向量指令（少一次
-外层 `max`、多两次入口夹取），复测 **5.46–6.94 GB/s**（文档里的旧值是 5.73–7.25）。看上去像
--2…-5% 的回归，于是**在同一个进程、同一台机上用"没改过的算子"做对照**：`rms_norm` 复测
-**8.87–16.81 GB/s**（旧值 11.45–17.65），也低了 5–22%。两次复测的机器 load 是 ≈2.7
-（旧值取自 load ≈1.1），所以这点差别归因于**环境负载**，不是这次重构。**结论：只有对照项同时
-变差时才能归因于环境；为了"解释掉"一个回归而只测被改的算子是不成立的。**
-
-### 20.4 `silu` / `gelu`：公式与位精确构造
-
-这一族是**逐元素、无归约**——位精确是构造性的（没有"两种结合次序"的问题），要定的是
-"公式写成哪种等价形式"。语义与契约的权威版本在 `docs/ops.md` §2.8；本节记三条设计规定。
-
-**三条设计规定**：
-
-1. **公式写成 `x / (1 + exp(−c·x))`（直接除法），不是 `x · σ(x)`**。两者在数学上一样，但
-   `x·(1/den)` 有两次舍入（倒数 + 乘法），直接除法只有一次。这与 softmax 的选择相反——那里
-   分母是所有列共享的，一次倒数换 N 次除法明显划算；**这里是每个元素各自一次**，没有共享
-   机会，直接除法既更准又更少指令。契约里写死：参考实现必须同样写 `x / (1 + exp(−c·x))`。
-2. **`silu` 就是 `c = 1` 的那个式子**（不是另写一遍）：`1.0·x` 精确，所以 `silu(x)` 与
-   `x/(1+exp(−x))` 逐位相同，两个算子共用同一条内核与同一个门控分母原语
-   （`nn_math::sigmoid_den_seq/vec`），只是 `c` 不同。
-3. **`gelu` 提供两个变体，各自绑定一个"对照实现"**（命名对齐生态，方便调用方对照）：
-   - `gelu_quick`：`c = 1.702`，即 `x·σ(1.702x)` —— ggml 的 `GELU_QUICK`；
-   - `gelu_erf`：`0.5·x·(1 + erf(x/√2))` —— PyTorch `gelu` 默认那个形式。
-     `erf` 没有硬件指令，用 **Abramowitz–Stegun 7.1.26**（`|ε| ≤ 1.5e-7`，对 f32 足够）：
-     `p = 0.3275911`，`t = 1/(1+p|z|)`，`erf(|z|) = 1 − ((((a5 t + a4)t + a3)t + a2)t + a1)·t·exp(−z²)`，
-     负半轴用奇对称。**实现细节与 ISA 约束见 §20.5**（两条指令存在性/排布的实测依据也在那里）。
-
-**尾处理**：向量主循环 + 标量尾，标量尾**用同一串公式**（`nn_math` 里的标量函数），
-与其他逐元素算子（`vec3_add_scaled_batch` 等）的既有做法一致；逐元素算子没有归约，
-所以"标量尾 == 向量路径"是构造性的，不需要像 softmax 那样做填充技巧。
-
-**测试覆盖**：
-
-- **逐位**：与"标量模拟"（`exp_seq` + `sigmoid_den_seq` + 同序除法）逐位一致，覆盖
-  `cols` 1..=17（跨过 8 的边界）、`rows` 0/1/多、数值跨 `±0.0`、`±inf`、`−1e30`、`1e30`；
-- **数值**：与 f64 参考比绝对/相对误差（`silu` 在 `x → −∞` 侧是"绝对值小到无意义"，
-  所以断言写**绝对误差**上限 + 大正侧的相对误差），并记录 `x < −88` 时"分母饱和"的行为；
-- **退化**：`x = 0 → 0`（`silu`）、`x → +∞ → +∞`、`x → −∞` 的**实测行为**（写进契约边界，
-  不假装是数学极限）；
-- **带宽**：逐元素两遍（读 + 写）的实测吞吐，与 `rms_norm`（同为两遍）对照。
-
-**代码位置**：`src/ops/nn_math.rs`（共用 `exp` + 门控分母）+ `src/ops/silu.rs` +
-`src/ops/gelu_quick.rs` + `src/ffi/nn.rs`（2 个裸符号）+ `src/ffi/checked.rs`（2 个
-`_checked`）+ `src/api.rs`（`silu`/`gelu_quick`，直接返回对齐缓冲——**没有失败模式就不套
-`Result`**，与 `api::sum` 同例）+ `cli/src/suites/activation.rs`（组 `act`）。
-符号总数见 `docs/ops.md` §4.6 的清点表（当前 **87 = 46 裸 + 41 checked**）。
-
-**重新导出**：`src/lib.rs` 里 `pub use ffi::nn::{…}`，符号在 crate 根可见
-（`lasx_rs::lasx_silu`），与 `docs/ops.md` §4 按 C ABI 名列的符号表一致；`ffi` 模块路径
-只是内部组织，不是调用方 API。
-
-**精度实测**（探针扫 `[−150, 150]`、步长 5e-4，与 f64 参考比）：
-
-| 算子 | 最差绝对误差 | `\|x\| ≤ 20` 绝对 | 相对（`\|y\| > 1`） |
-|---|---|---|---|
-| `silu` | 7.6e-6 | 1.9e-6 | 1.7e-7 |
-| `gelu_quick` | 7.6e-6 | 1.2e-6 | 1.6e-7 |
-
-绝对误差那列**主要是 f32 输入量化**（`silu'(x) ≤ 1`，`x` 只有 24 位有效位 ⇒ 误差上限
-`|x|·6e-8`，`|x| = 20` 时 1.2e-6），不是算子近似本身的误差——这条如果不查清就会误以为
-"`silu` 精度只有 1e-6"。正侧的相对误差被 `e^{−x}` 压掉，所以 `|y| > 1` 时比 `exp` 的包络还好。
-
-**带宽实测**：**4.55–9.20 GB/s**（单线程，2 条流口径，2026-09-25 复测）。
-
-**限制因素**（以 `n = 1M` 那行为例）：`silu` 7.13 GB/s vs `rms_norm` 在同样 2 条流、
-同样量级工作集下的 **17.99 GB/s**——访存口径一样、只差 2.5 倍 ⇒ **激活是算力受限**。瓶颈就是
-`exp`：每 8 个元素约 19 条向量指令（夹取 2 + mul 1 + magic 2 + sub 1 + 6×FMA + cvt/add/min/max
-5 + shift/mul 2）外加**一次向量除法**，而 rms_norm 每 8 个元素只要 2 条 `fma`。8M 那一行掉到
-4.6–4.7 GB/s 才是真的撞上 DRAM（32 MB 进 + 32 MB 出 ≫ L3 32 MB）。
-
-`gelu_quick` 比 `silu` 慢 3–20%（同一形状、只多一条 `c·x` 乘法，在 `exp` 的关键路径上）——
-原因未深究（要追得看反汇编而不是猜）。**下一步若真要提速，方向是缩短 `exp` 的
-多项式（精度换速度）或把 `exp` 的多项式重排成更短的依赖链，而不是动访存。**
-
-### 20.5 `gelu_erf`：A&S 7.1.26 近似
-
-语义与契约的权威版本在 `docs/ops.md` §2.9；本节记四条设计规定，每条都有对应测试。
-
-1. **不带 `copysign` 的等价形式**。直觉写法是 `0.5x(1 + sign(x)·erf(|x|/√2))`，但本机 stdarch
-   **没有**浮点 `copysign`，也**没有** `xvfabs_s`（只有 `xvfmaxa_s`，那是 `max(|a|,|b|)`）。
-   所以公式是 `y = 0.5x + 0.5|x|·erf(|x|/√2)`——数学等价、不需要"按符号选 lane"。
-   另外 **`abs`/`neg` 用按位 `and`/`xor` 实现**（`lasx_xvand_v`/`lasx_xvxor_v`，由
-   `portable.rs` 的 `impl_vvv!` 宏生成）：`abs` 一条 `and`、`neg` 翻转符号位，于是 `±0`
-   也精确。**别按 `generated.rs` 判断"某条指令不存在"**——宏生成的那一层同样要查
-   （`portable.rs` 的 `impl_*!` 列表才是完整的），否则会把"未找到"当成"不存在"。
-2. **`−inf` 返回 NaN，而不是 0**。`0.5·inf + 0.5·(−inf)` 是未定式。核对对照实现：
-   PyTorch 的 `gelu(−inf)` 同样返回 NaN（同一代数式），因此这**不是缺陷**，而是"与对照实现
-   一致"；契约因此明确只覆盖有限输入。`+inf` ⇒ `+inf` ✓（有测试守着）。
-3. **负侧尾部不单调**。真值从 `0⁻` 一侧趋于 0，而 `erf(|z|)` 在 `|x| ≈ 5.6` 处**舍入到恰好
-   1.0** ⇒ `1 − 1 = 0` 给出精确 0；再往右一点（`x = −5.5`）又给出 ~`−1.6e-7` 的小负数。
-   幅度在 A&S 的近似界内，但"单调"这个直觉在 f32 下不成立。测试因此写成：
-   `x ≤ −5.6 ⇒ 精确 0`、`x ≥ 0 ⇒ 单调`、每点与 f64 参考的差 `< 2.5e-7`（第三条才是真正要守的
-   不变式）。
-4. **`emul` 里必须显式写 `mul_add`**。gelu_erf 用了 FMA（`p.mul_add(t, a)`、收尾的
-   `(0.5ax).mul_add(erf_a, 0.5x)`、`ERF_P.mul_add(z, 1.0)`），标量模拟必须同样写 FMA，
-   否则 `x = −3` 处差 **1 ulp**。这与 §20.2 rms_norm 是**同一类**约束（公式看起来一样，
-   但 FMA 少一次舍入）——"逐位一致"必须写到 `mul_add` 这一层。
-
-**精度实测**（与**独立写的**高精度 f64 `erf` 比——Taylor 级数 + 连分式，不是拿同一个 A&S
-式子自比）：A&S 7.1.26 **本身**的误差折算到 gelu 输出上是 **2.1e-7**（`|x| ≈ 3.08`，与它公开的
-`|ε| ≤ 1.5e-7` 界一致），加上 f32 舍入后端到端 `<6e-7`（`|x| ≤ 1`）、`<8e-7`（≤4）、
-`<1e-6`（≤16）、`<6e-6`（≤40，这一档是输入量化主导）。
-
-**带宽实测**：**4.09–5.51 GB/s**（单线程，2 条流口径，2026-09-25 复测）。
-
-与 §20.4 的结论一致（算力受限）：`gelu_erf` 在小尺寸下比 `silu` 慢 ~1.7×（多 5 项 Horner 与
-`erf` 的除法），到 8M 三者收敛——那里已经撞上 DRAM。
-
-**基准套件的参照实现**：`gelu_erf` 的"标量参照"是同一个 A&S f32 式子的朴素循环（**7–10×**），
-才与另外两行可比。**不能用** f64 的"真 erf"当参照——那比较的是"本库未提供 f64 精度 erf"，
-会得出 **400–500×** 这种没有意义的倍数。**参照实现选错会让倍数失真一个数量级。**
-
-### 20.6 `rope`：表输入与两种配对
-
-`rope` 需要 `sin`/`cos`，而本库的近似件里只有 `exp`（§20.3）。三种做法与选择：
-
-| 方案 | 代价 | 结论 |
-|---|---|---|
-| A. 表当输入（**llama.cpp 的做法**）：`cos`/`sin` 由调用方或本库的表生成器给出，内核只做旋转 | 调用方要准备表；换来"旋转"这个热路径的位精确契约 | **选它** |
-| B. 本库实现多项式 `sin`/`cos`（含大角度归约） | 归约要做 Cody–Waite 才准，`\|x\|` 大时还要 Payne–Hanek；换来"自己算表" | 不做 |
-| C. 把 `sin`/`cos` 塞进内核逐元素算 | 最慢，且每个元素都付一次近似成本 | 不做 |
-
-**为什么是 A**：`rope` 的 `cos/sin` 只跟"位置 × 维度"有关，**与 batch 无关**——一次前向里每层
-每个位置算一次就够（表长 `rows × n_dims/2`，是 `x` 的一半）。把它塞进"每个元素都算一遍"的
-内核里，等于把一次性成本乘上 `heads × …`。这与 §20.3 的 `exp` 情形**分工相反**：`exp` 的
-自变量依赖数据（必须逐元素算），`rope` 的角度不依赖数据（只需算一次）。llama.cpp 也采用这一划分
-（rope cache + 旋转内核）。于是位精确承诺落在**旋转**上，而表的生成明确**不在**承诺里
-（`sin`/`cos` 由平台 libm 给，跨 libc 不保证逐位）。
-
-**接口分层**（`docs/ops.md` §2.10 是权威版本）：
-
-```text
-ops::rope::rope_f32(x, cos, sin, rows, cols, n_dims, mode, out)   // LASX 旋转，位精确
-ops::rope::rope_tables(positions, n_dims, freq_base) -> (Vec<f32>, Vec<f32>)  // 标量，f64 算角度
-api::rope(...)  /  api::rope_tables(...)  /  api::rope_at(...)（便捷：先建表再旋转）
-```
-
-**表布局**：`cos`/`sin` 各 `rows × (n_dims/2)`、行主序；第 `r` 行第 `i` 列对应
-`θ_i = positions[r] · freq_base^(−2i/n_dims)`。表比 `x` 小一半，仍然是"行对齐行"。
-
-**两种 mode 的配对**（写死，参考实现必须照抄）：
-
-| mode | 配对 | 对照 |
-|---|---|---|
-| `NeoX` | `i ∈ [0, n_dims/2)` 配 `(i, i + n_dims/2)` | HF `rotate_half` / Llama / Qwen |
-| `GptJ` | `i ∈ [0, n_dims/2)` 配 `(2i, 2i+1)` | ggml `ROPE_TYPE_NORMAL` / 原始 GPT-J |
-
-**旋转的 op 序列**（这一串是契约本身；两条都只做**两次舍入**：先 `x·s`，再 `fma`）：
-
-```text
-y0 = fma(x0, c, −(x1·s))      // 向量用 xvfmsub_s(x0, c, x1·s)（同一条指令语义，省掉显式取负）
-y1 = fma(x1, c,  (x0·s))
-```
-
-**向量布局**（`n_dims/2` 每次推进 8 个 `i`，尾部走标量）：
-
-- `NeoX`：`x0` 与 `x1` 各自是**连续 8 个**（`x[i0..i0+8]`、`x[i0+half..i0+half+8]`）⇒ 2 load + 2 store；
-- `GptJ`：**走标量**（配对的两个元素在内存里相距 1 个元素，而 `xvpick*`/`xvilv*` 只在 128 位
-  lane 内工作、拼不回"配对元素落在同一 lane"的自然序——依据见下方"被否掉的方案"）。
-  代价是实测的 2.5–3×（数字见本节末尾"实测"）。
-
-**契约里"谁守"**：
-
-- `n_dims ≤ cols`、`n_dims` 为偶数、`cos`/`sin` 长度 = `rows × n_dims/2`、`x.len() = rows × cols`：
-  `api` 与 `_checked` 校验（测试守）；**原始符号只靠约定** —— 违反是**读越界**（错结果甚至 UB），
-  这一点与 §19.7 第 2 条同类，必须点名；
-- 位精确（向量 == 标量）：测试；
-- mode 语义、`[n_dims, cols)` 原样复制、`cos=1,sin=0 ⇒ 恒等`：测试。
-
-**测试覆盖**：
-
-- 逐位：标量模拟（同序）+ 两种 mode，`n_dims/2` 扫 1..=17（跨 8 的边界）+ 10 多种形状；
-- 恒等：`c=1,s=0` ⇒ `out` 与 `x` **逐位**相同（顺带验 `[n_dims, cols)` 的复制路径）；
-- 不变量：旋转保长度（配对两元素的平方和守恒，相对误差 ≤ 几个 ulp → 卡 1e-6）；
-- 数值：与 f64 参考的绝对误差（应 ≈ `|x|·1e-7` 量级）；
-- 边界：`rows = 0`、`n_dims = cols`、`n_dims = 2`、`n_dims = 0`（全复制）、就地（`out == x`）；
-- **两种 mode 都走"逐位"那一条**：`GptJ` 的实现是标量（正确性只由这一条守），`NeoX` 的
-  向量路径同样对照标量模拟；
-- 实测：带宽（读 `x` + 写 `out` + 读表一半 ⇒ 约 2.5 条流），与 `docs/ops.md` §12.2 里"ROPE 无缺口"的参照对照。
-
-**代码位置**：`src/ops/rope.rs`（旋转 + 表生成 + 6 个单测）+ `src/ffi/nn.rs`（`lasx_rope`）+
-`src/ffi/checked.rs`（`lasx_rope_checked`）+ `src/api.rs`（`rope`/`rope_tables`/`rope_at`，
-并新增 `Error::BadValue` 变体表达"`n_dims` 必须是偶数"这类约束）+ `cli/src/suites/rope.rs`
-（组 `rope`）。符号总数见 `docs/ops.md` §4.6 的清点表。
-
-**被否掉的方案：`GptJ` 的 SIMD 交错**（原设计用 `xvpickev_w`/`xvpickod_w` 反交错，再
-`xvilvl_w`/`xvilvh_w` 交错回去）——**ISA 不允许**：
-
-1. 这两组 shuffle 都是 **128 位 lane 内**操作，而且实测排布与手册措辞不同：
-   以 `a = x[0..8)`、`b = x[8..16)` 为输入，`pickev(a,b) = [8,10,0,2,12,14,4,6]`
-   （自然序偶数是 `[0,2,4,6,8,10,12,14]`）；
-2. 想变回自然序就得对 `cos`/`sin` 施加同一个重排 π = `[4,5,0,1,6,7,2,3]`，而 π **跨 lane**
-   （输出 lane 0 要取高 lane 的元素），一条 lane 内 shuffle 做不到；
-3. 于是 `GptJ` **走标量**（llama.cpp 两种 mode 都是标量，所以并不落后），`NeoX` 满 SIMD。
-   **代价是实测出来的**：GptJ 10.8–12.8 GB/s vs NeoX 28.6–71.9 GB/s ⇒ 那 2.5–3× 就是"没做相邻配对
-   SIMD"的价格。将来要做，两条路：把表按 π 预重排（把表与 mode 绑死，破坏"一张表两种 mode"
-   的接口）、或自己写 `xvpermi_q` + 逐 lane shuffle 的组合。
-
-**设计规则**（由上面这条与 §20.5/§20.7 的三次修正共同得出）：凡涉及 ISA 行为的断言
-（"有/没有某条指令"、"某条指令的 lane 排布"），**必须标注"待实测确认"，不得写成结论**——
-这三次都不是靠"仔细查手册"避免的，而是靠先写探针/测试把真实语义打印出来。
-
-**实测**：`NeoX` 28.6–71.9 GB/s（标量的 2.0–3.2×）、`GptJ` 10.8–12.8 GB/s（标量路径，1.3–1.4×）；
-完整表在 §7.4（2026-09-25 复测）。
-
-1×128 与 32×128 的 GB/s 高于 DRAM 锚点（§7.1 的 11.7–12.2 GB/s），是因为工作集只有几百 KB
-到几 MB、整块在 L1/L2/L3 里；4096×128 的 5 MB 也仍在 L3（32 MB）内。**部分旋转那一行是另一类
-结论**：`n_dims ≪ cols` 时旋转只占 3% 的工作量，瓶颈变成"其余部分的复制"——与 softmax 的
-"遍数决定一切"同源：那时候快不快取决于 memcpy，而不取决于旋转。
-
-### 20.7 `dot_f16` / `gemv_f16`：累加次序与转换原语
-
-**语义**：权重以 f16 存的点积与矩阵-向量：
-
-```text
-dot_f16(a: &[u16], b: &[f32]) -> f32          // Σ f16(a[i]) · b[i]
-gemv_f16(a: &[u16], x: &[f32], m, k) -> [f32] // y[r] = dot_f16(a[r*k..], x, k)
-```
-
-f16 用 **u16 位型**进出（本库零依赖，不引入 half crate；Rust 的 `f16` 类型还在 nightly 门槛后）。
-
-**1）f16 → f32 是精确的**：f16 的每个值（含次正规、`±inf`）都能被 f32 精确表示，所以这一步
-**不引入任何误差**——误差只来自"权重本来是 f16"这件事本身（相对 ~2^-11 ≈ 4.9e-4）。
-原语：`xvfcvtl_s_h`/`xvfcvth_s_h`（f16→f32，各出 8 个 f32），由 `src/arch/lasx.rs` 的
-`load_f16x16_as_f32x8x2` 把一次 **256 位载入（16 个 f16）** 拆成两组 8×f32、按"元素下标 `j`
-落在 lane `j % 8`"交给 FMA ✓。**注意这两条转换指令的 lane 排布不是"低 8/高 8"**，见下方依据。
-
-**2）累加次序（契约本身，权威版本在 `docs/ops.md` §2.11）**：**4 条独立累加链**、
-`(c0+c1)+(c2+c3)` 固定次序合并，元素下标 `j` 落在 lane `j % 8`，尾部延续同一 lane 归属；
-标量模拟照抄同一棵树。用 4 条链而不是 1 条，是因为**单链会把 FMA 延迟暴露出来**（实测数字
-与探针见本节末尾）。
-
-**被否掉的方案：套用 `dot` 那套 4 链 + f64 落盘**。那个结构的目的是抑制长向量上的
-f32 累加误差，代价是复杂度；而 f16 的量化误差（4.9e-4）比 f32 累加误差（n=4096 时 ~1e-4 量级）
-**不会更小**，再套 f64 落盘是给自己找麻烦。累加口径够用这件事已由测试确认：与 f64 参考的
-相对误差在 1e-6 量级——比 f16 量化误差小两个数量级。
-
-**3）位精确的可验证形式**（这是本节唯一新增的契约形式）：
-
-- **转换的精确性可以穷举**：f16 只有 65536 个位型 ⇒ 测试**遍历全部位型**，把硬件
-  `xvfcvtl_s_h` 的结果与标量 `f16_to_f32` 逐位比较。这比"抽几个值看看"强得多，
-  而且顺带把"手写转换的次正规处理"钉死（次正规是最容易写错的地方）。`NaN` 的 payload
-  由硬件决定，**不在**逐位承诺内（单独断言 `is_nan()`）。
-- 累加：向量路径与标量模拟**逐位一致**（同一串 op、同一 lane 归属、同一归约树）。
-
-**4）`gemv_f16` 的形状与并行（多核已落地）**：`a` 是 `m × k` 行主序、`x` 长 `k`、输出长 `m`；
-每行独立 ⇒ `parallel::gemv_f16` 按行块切 `m`，每块调同一个 `ops::dot_f16::gemv_f16_rows`
-（单线程入口与并行入口共用这一个函数）⇒ **怎么切块都不改变结果**，与单线程逐位一致
-（测试覆盖 `m·k` 低于门槛、行尾、`k` 不整除 32 的行块）。
-
-只有输出 `y` 参与派活的独占借用，只读权重由闭包按 `start` 切片 ⇒ 池默认的
-"数组元素数之和"门槛（对 gemv 只有 `m`）会误判，因此给池加了
-`WorkerPool::for_each_row_block_mut_picked_work(…, work, …)`，gemv 传 `m·k + m`
-（用法与口径说明见 `docs/ops.md` §9）。
-
-**A/B（`examples/gemv_pool_ab`，进程级交替 4 轮、丢弃首轮、取中位；不绑核）**。
-下表是同一次会话的连续采集，跨窗口可差 ±20–40%（§6.4）；关系（哪一列赢）在复测中稳定，
-绝对值不然。复测命令：`for i in 1 2 3; do … serial; … pool 12; … pool 24; done`。
-
-| 形状（m×k） | 权重 | 单线程 | 池 12 线程 | 池 24 线程 |
-|---|---|---|---|---|
-| 1×2048 | 4 KiB | 63.0 GB/s | 63.5（走 `rows < 2` 串行分支） | 63.8 |
-| 64×2048 | 256 KiB | 0.018 ms / 14.7 GB/s | **0.004 / 66（4.5×）** | 0.043 / 6.3（**0.42×**） |
-| 256×1024 | 512 KiB | 0.042 / 12.6 | **0.008 / 70（5.3×）** | 0.044 / 12.0 |
-| 1024×2048 | 4 MiB | 0.300 / 14.0 | **0.038 / 110（7.9×）** | 0.078 / 54（3.8×） |
-| 4096×4096 | 32 MiB | 6.43 / 5.2 | 1.07 / 31（6.0×） | **0.73 / 46（8.8×）** |
-| 11008×4096 | 88 MiB | 21.2 / 4.3 | 4.07 / 22（5.2×） | **3.69 / 24（5.7×）** |
-
-（吞吐口径与 CLI 的 `f16` 套件一致：权重字节 `m·k·2` + 输入 + 输出。）
-
-**线程数：中小形状取物理核数（本机 12）**。本机 `available_parallelism() = 24`，而池每次
-派活的固定成本在该值附近有一个**台阶**——纯派活探针（`m=2, k=2048`，工作只有 4098 个元素，
-即刚过 `MIN_PARALLEL_LEN`）：
-
-| 线程数 | 8 | 12 | 16 | 20 | 22 | **23** | **24** |
-|---|---|---|---|---|---|---|---|
-| 每次调用 | 1 µs | 1 µs | 1 µs | 1 µs | 2 µs | **37 µs** | **38 µs** |
-
-**触发条件是把可用 CPU 占满，而不是"池里有 ≥23 个 worker"**。用 `taskset` 把一个 cpuset
-固定下来做双向对照（探针同上，全部在同一个 cpuset 里）：
-
-| 配置 | 可运行线程 | 派活成本 |
-|---|---|---|
-| cpuset = CPU 0–12（13 个 CPU），pool = 12 | 13 | 1 µs |
-| 同上，**在 cpuset 内**放 1 个 spinner | **14 > 13** | **30 µs** |
-| 同上，把同一个 spinner 放在 **cpuset 外**（CPU 23） | 13 | 2 µs |
-| cpuset = 12 个物理核（每个核取一个 SMT 线程），pool = 11 | 12 = 12 | 1 µs |
-| 同上，pool = 12 | **13 > 12** | **28 µs** |
-
-结论：**主线程 + worker 数只要超过"该进程可用的 CPU 数"，派活成本就从 1–2 µs 跳到 ~30 µs；
-留一个空位就不触发**（本机 24 逻辑核，`available_parallelism() = 24`，所以 23/24 worker 是
-最容易被触发的方式）。所以：
-
-- **SMT 的影响有两条**：物理核被两个线程共享（**吞吐**），以及逻辑核占满后派活/唤醒的
-  固定延迟上升（**延迟**）。台阶是后者——前者只会让吞吐掉到 ~2×，不会把 2 µs 的活变成 40 µs。
-- **绑定物理核不是提速手段**（把 12 个 worker 钉在 12 个物理核以外的做法一并量了）：
-  不绑核 pool = 12 与"12 物理核 + pool = 11"在真实形状上同量级或前者略好
-  （`1024×2048` 118.9 vs 113.6 GB/s；`11008×4096` 4.06 vs 3.98 ms；`4096×4096` 落在噪声内）。
-  也就是说操作系统本来就把 CPU-bound worker 摊在一个物理核一个；绑核的作用只是**避免占满**
-  （上表最后一行：同样钉在 12 个物理核上，pool 从 11 加到 12 就掉到 63 GB/s）。
-- 台阶在**派活/等待路径**：`m=1`（`rows < 2`，不派活、走原地串行分支）在 24 线程下仍是
-  63 GB/s。这不是 gemv 特有：`matmul_ab 128 256 256 pool` 在 22 线程 293 GF/s、
-  24 线程 152 GF/s。
-- 权重 ≥32 MiB 时 24 线程仍更快（上表最后两行）：那里是延迟/带宽受限，多出来的逻辑核
-  有活干、且 40 µs 相对毫秒级调用可忽略。
-
-**根因（改对了以后才看清）**：不是"主线程自旋抢执行槽"，而是**收尾在等"全体 worker 签到"**。
-原协议里每个 worker 每轮都要 `done += 1`（不管它有没有活），主线程等到 `done == threads`
-才返回；于是**没活干的 worker 有没有被调度到一个 CPU 时隙**就成了关键路径。`m=2` 的探针里
-24 个 worker 只有 2 个有活，主线程却要等另外 22 个轮流上 CPU 各签一次到——实测 ~30 µs。
-
-**修法：逐槽代次 + 只等有活的 worker**（`src/pool/mod.rs`）。
-
-- `Slot` 增加 `gen: AtomicUsize`：主线程**只写本轮有活的槽**，并把它标成"本轮代次"；
-- worker 先看 `slot.gen` 是否等于自己观察到的代次：不等就整轮跳过（不读其余字段、不计数）；
-- 主线程等的是 `active`（本轮写了几个槽），不是 `threads`。
-
-安全性论证（写进了 `Shared` 的 SAFETY 清单）：
-
-| 关注点 | 为什么成立 |
-|---|---|
-| 未写过的槽不会被误读 | 代次单调递增，旧 `gen` 永远不等于新代次 |
-| 调用方改写槽时 worker 不在读 | 槽本轮有活 ⇒ 调用方等过它的确认（`done == active`, Acquire）；确认后 worker 不再读该槽 |
-| 字段可见性 | 所有槽字段在 `epoch.fetch_add(Release)` **之前**写；worker 用 `epoch.load(Acquire)` 先拿代次 |
-| `gen` 本身 | 用 `Relaxed` 原子量，只当过滤器（不做内存序），避免与并发读形成数据竞争（UB） |
-
-**修复后的实测**（同一探针与形状，同一天，机器 load ≈1.4）：
-
-| 形状 | 线程 | 修复前 | 修复后 |
-|---|---|---|---|
-| `m=2, k=2048`（纯派活） | 23 | 37 µs | **1 µs** |
-| 同上 | 24 | 38 µs | **1 µs** |
-| `gemv 64×2048` | 24 | 0.043 ms / 6.3 GB/s | **0.007 ms / 37 GB/s（5.9×）** |
-| `gemv 1024×2048` | 12 | 0.041 / 102 | 0.041 / 102（不变） |
-| `gemv 1024×2048` | 24 | 0.078 / 54 | 0.078 / 54（**不变**） |
-
-最后一行要说清楚：**"块数 ≥ 线程数"时每个 worker 都有活**，收尾必须等它们各自跑完——这时
-24 线程慢于 12 线程是"25 个可运行线程挤 24 个 CPU"的调度代价（SMT 共享 + 最后一个 worker 晚
-一拍），**不在本轮修复范围内**。用法建议因此保持：延迟敏感的小内核用物理核数、并留一个空位
-（`docs/ops.md` §9）；`arch::parallelism()` 给出运行期探测的 `logical`/`physical`，别硬编码机型。
-
-**被否掉的两种改法（本轮试过，都退回了）**：
-
-1. **只让主线程 park**（worker 照旧全体签到）：没解决——被延迟的是**没活的那个 worker**，
-   不是主线程；实测 23/24 线程的派活成本没变。
-2. **只加 `active` 计数、不给槽加代次**：**不安全，会挂死**。主线程等 `active` 就返回，于是
-   下一轮可能在某个落后 worker 还没看到上一轮代次时就改写它的槽——该 worker 会读到下一轮的
-   指针并"替下一轮"计数，`done` 提前到齐 ⇒ 主线程带着不完整的结果返回（数据竞争），本次调试
-   里已经复现成挂死。先加代次过滤（现在这版）才安全。
-
-**回归测试**：`pool::tests::test_dispatch_with_fewer_blocks_than_threads`（6 种线程数 × 200 轮，
-交替"3 块"与"多块"，带 60 s 看门狗 —— 池的挂死表现为自旋卡住，必须让它变成一次明确失败）、
-`test_panic_with_dormant_workers_does_not_hang`（有休眠 worker 时 panic 仍续抛且池可复用）。
-
-**被否掉的方案：在内核层设"最小权重字节"阈值**。(1) 门槛的错配在池的"数组长度之和"口径，
-加显式 `work` 之后 `MIN_PARALLEL_LEN` 已是合适门槛（`m=2,k=2048` 只多花 1–2 µs）；
-(2) 台阶的触发条件是"CPU 被占满"（上面的 cpuset 双向对照），在内核层设阈值只会把它掩盖成
-"某些形状不敢并行"，而问题依旧。
-
-**测试覆盖**：
-
-- **穷举转换**（65536 个位型，含次正规/`±inf`/`NaN`）；
-- 逐位：向量 vs 标量模拟，`n` 覆盖 0/1/7/8/15/16/17/31/33/64/1000（跨 16 的边界）；
-- 数值：与 f64 参考（`f16_to_f32` 后用 f64 累加）的相对误差，卡 1e-6；
-- 退化：`n = 0` ⇒ `0.0`；`x` 含 `±inf`/`0` 的行为（`inf·0 = NaN` 属定义域问题，写进契约）；
-- `gemv_f16`：逐行等于 `dot_f16`（逐位）、形状校验（`k = 0`、`m = 0`、长度不符）；
-- `gemv_f16` 池化：与单线程逐位一致、形状错误口径、`k=0` 写全 0；
-- 实测：带宽（`m×k×2` 字节读 + 输出/输入），与 `docs/ops.md` §12.2 里 llama.cpp 的 f16 GEMV
-  **6.8 GB/s**（可达 ~25 GB/s 的 DRAM 参照）对照。
-
-**代码位置**：`src/ops/dot_f16.rs` + `src/arch/lasx.rs`（`load_f16x16_as_f32x8x2`）+
-`lasx_dot_f16`/`lasx_gemv_f16` + `_checked` + `api::dot_f16`/`api::gemv_f16` +
-`parallel::gemv_f16` + `cli/src/suites/f16.rs`（组 `f16`）+ `examples/gemv_pool_ab.rs`（A/B）。
-符号总数见 `docs/ops.md` §4.6 的清点表。
-
-**两条 ISA/结构依据**：
-
-1. **`xvfcvtl.s.h`/`xvfcvth.s.h` 是"每个 128 位 lane 的低/高 4 个"**，不是"低 8/高 8"。
-   所以一次 256 位载入（16 个 f16）拿到的是 `{0,1,2,3,8,9,10,11}` 与 `{4,5,6,7,12,13,14,15}`
-   ——**又一处 per-128-bit-lane**（与 §20.6 的 shuffle、§20.5 的 erf 同属"误判 ISA
-   按整寄存器排布"）。修法：把两组用两条 `xvpermi_q`（128 位 lane 选择）拼回自然序，
-   而 `xvpermi_q` 的立即数编码（2 位/lane，`0=b0,1=b1,2=a0,3=a1`，lane0 用 bit[1:0]、
-   lane1 用 bit[5:4]，**bit[3:2] 被忽略**）也是探针打出来的。
-   **这类排布问题只有穷举测试能守**：那 65536 个位型的转换对照在 `0x0004`（次正规）上立刻
-   失败——排布理解错了，值自然对不上。**穷举测试不看主观解释，只看位型。**
-2. **单条累加链把 FMA 延迟暴露了 3 倍**，所以契约写成 4 条链。朴素写法是 1 个 8 lane 累加器：
-   每 16 元素只有两条**互相依赖**的 FMA，实测 `1×2048` 是 565 ns、`dot n=4096` 1.2 µs。
-   **4 条独立链**（32 元素/轮）把两者压到 **190 ns（3.0×）**、**359 ns（3.3×）**。
-   **这一条数值上全对、只有测量能抓**——印证规则 4："理论上应该差不多"不算验收。
-   最终契约是"4 条链 + `(c0+c1)+(c2+c3)` 固定次序合并"，标量模拟照抄同一棵树。
-
-**实测**：`gemv` 3.75–48.2 GB/s、`dot` 41.8–68.5 GB/s（单线程，2026-09-25 复测）。
-
-与 `docs/ops.md` §12.2 的参照比：llama.cpp 的 f16 GEMV **6.8 GB/s**，本实现 `1024×2048` **10.5 GB/s**（1.5×，
-2026-09-24 那次是 14.3 GB/s——两次都远高于参照，但**同一形状两次差 1.36×**，属于本节开头
-第 3 条的负载噪声）。
-
-**"超出 L3 只有 3.75 GB/s"已查清（2026-09-25 的控制变量探针）**。做法：固定访存形态
-（每轮 32 个权重元素 = 2 次 256 位 f16 载入），逐层加算力，量每一层加了多少时间：
-
-| 段 | 时间 | 有效带宽 | 边际成本 |
-|---|---|---|---|
-| A 纯 f16 流（1 载入/16 元素 + 整数累加） | 2.05–2.13 ms | **15.8–16.4 GB/s** | —（内存不是瓶颈） |
-| F1 = A + 2×f16 载入 + 4×`x` 载入 + 4×FMA（不转换） | 3.89–3.93 ms | 8.5–8.6 GB/s | **+1.8 ms** |
-| F2 = F1 + 4×`cvt` | 6.10–6.27 ms | 5.4–5.5 GB/s | **+2.2 ms** |
-| F3 = F2 + 4×`permi_q`（= 真实内核） | 7.78–7.84 ms | 4.3 GB/s | **+1.6 ms** |
-
-三段成本**几乎是线性相加**（2.05 + 1.8 + 2.2 + 1.6 = 7.65 ≈ 实测 7.78 ms），说明内层没有
-把这几类操作重叠起来，而是被"载入 → 转换 → 重排 → FMA"这条链串起来了。结论有三条：
-
-1. **不是带宽问题**：纯 f16 流能到 15.8–16.4 GB/s（比 §7.1 里 f32 单流锚点 11.7–12.2 还高）。
-2. **不是"x 被挤出 L1"**：多行微内核（一次 2 行 / 4 行，`x` 载入分别减半 / 减到 1/4）
-   **实测没有收益**（2 行 6.4–6.8 ms、4 行 7.5 ms 对 1 行 5.9–7.1 ms，都在窗口噪声内甚至更差）
-   ⇒ 该假设被否定，避免了一次无收益的优化实现。
-3. **最大的一块是 `cvt`（+2.2 ms）与 `permi_q`（+1.6 ms）**，合起来占 7.8 ms 里的一半。
-   它们的数量是**契约决定的**：`cvt` 每 8 个元素必须一条（ISA 一次最多转 8 个 f16），
-   `permi_q` 是把转换结果拼回"元素下标 `j` 落在 lane `j % 8`"的自然序——**去掉它就等于改
-   累加次序、破坏位精确**。所以 3.75–4.3 GB/s 是**这个结构在这个核上的代价**，不是缺陷；
-   想更快必须动契约（`docs/ops.md` §2.11 记着这条）。
-
-**附带记录一个测量陷阱**：曾用"16 条独立 cvt"的纯寄存器循环测 `cvt` 吞吐，
-得到 **0.52 周期/条**——该结果**无效**：输入是 loop-invariant 的，LLVM 将 16 条相同的转换
-折叠掉了。改用控制变量法测**边际成本**才得到可信数值：`4 × cvt` 使 16.7 M 元素的循环增加
-2.2 ms ⇒ **≈2.3 周期/条**（比隔离循环中的读数慢 4 倍以上）。该问题与 §6.3 的"链数不足时
-量到的是延迟"属于同一类：**纯寄存器微基准必须保证每条指令的输入互不相同，否则编译器会
-把被测对象优化掉。**
-
-**还有一个没做的**：`gemv` 的并行（理由与前置条件见 §20.8 第 1 条）。
-
-### 20.8 未完成项
-
-N1 的 8 个算子已全部落地（语义/契约在 `docs/ops.md` §2.6–§2.11，实测在 `docs/dev.md` §7.4）。本节列的是
-**已知缺口**，按"要不要做"排：
-
-1. **激活算子的算力瓶颈**：`silu`/`gelu_*` 是算力受限而非带宽受限（§20.4 的 `n = 1M` 对照），
-   提速方向是缩短 `exp` 的多项式或重排依赖链，不是动访存。
-2. **f16/bf16 GEMM（prefill）**：`docs/ops.md` §12.2 的缺口表记着外部参照 8.4 / 16.6 GFLOP/s
-   对本库 f32 GEMM 的 60–67 GFLOP/s（§7.3）；N1 只做了 f16 的 GEMV/dot，**没有 f16 GEMM**。
-3. **N2 批次（GGML 量化格式互操作，按需）**：`quantize_rows_q8_0`、
-   `dot_q4_0_q8_0`/`gemv_q4_0`、`dot_q6_K_q8_K`（清单与倍数在 `docs/ops.md` §12.3）。
-4. **池的调度代价（"worker 全都有活且占满 CPU"）**（§20.7）：块数 < 线程数的那半已修（逐槽
-   代次 + 只等有活的 worker）；剩下的是"人人有活 + 25 个可运行线程挤 24 个 CPU"的调度代价
-   （`gemv 1024×2048` 24 线程 0.078 vs 12 线程 0.041 ms）。它**不是协议缺陷**，修法只能是
-   调用方少给线程（`docs/ops.md` §9 的建议 + `arch::parallelism()` 的运行期探测），或者
-   让池按"可用 CPU 数"而不是"请求数"建池——后者会静默改掉调用方的线程数，先不做。
-
-新增算子时沿用本节写法：**当前设计（要点列表）→ 依据（数据或推导，标明来源）→ 被否掉的
-方案**；凡涉及 ISA 行为的断言一律标"待实测确认"（§20.6 末尾的设计规则）。
+| `quat_to_dcm` 单独回退 | 与 `quat_rotate` 共用 `normalize_lasx`；统一 1 次除法时它慢 3–5%（4 读 9 写的 store-bound 内核） | 若占比变大，为它分叉出保留 4 次除法的助手 |
+| f64 大矩阵 | CLI 只到 512³；1024³ 只有历史读数 | 扩规模并核对是否仍落后 OpenBLAS ~1.1× |
+| 多核大矩阵乘 vs OpenBLAS | 1024³ 24 线程 97.5→393.3 GFLOP/s（3.9×）、16 线程 421；OB 12 线程 305.8–337.3（512³）更强 | 见下一条"并行打包" |
+| **并行面板打包** | 打包在并行层是串行的 ⇒ `m < 512` 与宽形状吃不到共享面板收益 | 给池加"按固定块长切分"接口，各线程打自己的 32 列条带；去掉 `SHARED_PACK_MIN_M` 后宽形状预计还有 15–20% |
+| f64 内核离天花板 11% | 单线程 512³ 31.4/35.2 = 89%（f32 同日 87%）；多核已由共享打包修复 | 剩余缺口是访存结构（A 重读 + C 按 k 块读写）；2048³ 由 A 的 1 GiB 流量决定（69%） |
+| 宽形状 `100×448×19147` | 同日 55.0 GFLOP/s，与 OpenBLAS 54.8 持平（旧表 41.6–44.1 是更早窗口） | 已排除 A 打包/C 分块/共享打包；剩下手段 = 调用方预转置 B（列主序）或给列块路径做流水 |
+| `dot_q4` 大集 | 3.6–7.2 GB/s（38–44%） | 已到 2.0 FMA/周期墙；除非授权改浮点结合次序 |
+| `rk4`/`j2` 再快 | 已降到每元素 4 次除法（sqrt 4 次），实测吞吐 ≈ 每个"昂贵操作" 4 周期 ⇒ 当前公式算术地板 | 只能改公式/放宽精度，或把 4 个 RK4 阶段并行化 |
+| 无损压缩路线 | 结论在 `docs/ops.md` | 若要做，是"换更窄表示"而非通用压缩 |
+| unsafe 审查工具 | Miri + cargo-careful 已接入、lint 已启用；**Rudra / Kani 未接入** | 需 `rustc-dev` 与特定 nightly；当前 Miri 已覆盖别名/越界/数据竞争 |
+| 动态调度细调 | `threads ≥ 20 && per_thread ≥ 32` 两条粗规则，块长取每线程 1/4 | 要再榨 5–10% 需可信负载模型（当前噪声 ±10% 量不出来） |
+| 池：块数 < 线程数的派活台阶 | **已修复**：原协议等"全体签到"，改为"逐槽代次 + 只等有活 worker"后 `gemv 64×2048`@24 线程 0.043→0.007 ms | 回归测试已加（含 60 s 看门狗） |
+| 池：worker 全有活且占满 CPU | 24 逻辑核上 `gemv 1024×2048` 24 线程仍比 12 线程慢一倍（0.078 vs 0.041 ms）——**调度代价，不是协议缺陷** | 调用方少给线程（物理核数、留一个空位）；让池按"可用 CPU 数"建会静默改调用方线程数，先不做 |
+| int8 推理路径 | 量化生产端/per-token scale/`gemv_i8` 已落地；`matmul_i8`、整数 softmax、int8 归一化未做（见 §8.2） | 按 N3 分档验收；性能已实测（`matmul_i8` 打不过 f32 GEMM、内循环 10–20 ms 目标推翻） |
+
+### 8.2 NN 与 int8 未完成项
+
+* **激活算子的算力瓶颈**：`silu`/`gelu_*` 是算力受限不是带宽受限；提速方向是缩短 `exp` 多项式或重排依赖链。
+* **f16 GEMM（prefill）未做**：N1 只做了 f16 的 GEMV/dot；外部参照 8.4/16.6 GFLOP/s vs 本库 f32 GEMM 60–67。
+* **N2 批次（GGML 量化格式互操作，按需）**：`quantize_rows_q8_0`、`dot_q4_0_q8_0`/`gemv_q4_0`、`dot_q6_K_q8_K`。
+* **int8**：`matmul_i8` 保留（有量化依据但非性能路径）；整数 softmax/归一化不做（实测不值得）；端到端改分档。
+
+### 8.3 平台与外部约束
+
+* **LA664 勘误与内核生命周期**：由 `docs/platform.md` 记录；由外部契约派生的待补项也在那里（不在本文重复）。
+* **工具链**：本库依赖 nightly feature（`stdarch_loongarch`）；稳定工具链不可用是**已知且接受**的边界。
+* **跨仓 rev**：`simd_dsl` 的 rev 由 `Cargo.toml` 钉死；升级必须重跑本仓门禁与 A/B（见 §7.2 表）。
+
+### 8.4 测量环境限制（结论的适用范围）
+
+* 本机常驻负载 2.5–3、测量本身 +1 ⇒ **A 级（≤3）基本不可达**；正式结论绝大多数是 **B 级**，C 级只作趋势。
+* **跨窗口不可比**：同一档位跨窗口可差 2–3×；报告必须带 `iters`/`ms_max`/`loadavg`。
+* **perf 软件事件（context-switches/cpu-migrations）在此机器不计到这些线程** ⇒ 不能用它支撑"同步没问题"；
+  硬件事件（`llc-*`）可用；比率必须同一次运行内算。
+* **OpenBLAS 对照**只在"对手身份行"（`OBIDENT`）打印后有效；调用模型（调用方驱动 vs 库内并行）必须一起写。
+* 无 A 级窗口时，"结构性达成"（如 C 侧 245.8 G）与"正式中位数 ≥300 G"要分开表述，不混成一件事。
 
 ---
 
-## 21. int8 推理的算子缺口：消费者、实测依据与批次归属（2026-10-02）
+### 8.5 2026-10-20 欠账结清（含不采纳决定）
 
-### 21.1 为什么现在提
-
-§19.13 的 G7 与 `docs/ops.md` §12.3 的 N2 都因"唯一消费者 loong-llm 不再作为目标"而搁置，
-依据是"没有调用点就没有验收对象"。本节记一个**新的具体消费者**——一个 0.2B 量级的判别式
-决策模型，其端侧目标就是本库的 int8 路径。算子表与验收标准放在 `docs/ops.md` §12.3 的
-**N3 批次**（与 N1/N2 并列）；本节只记形态、依据与批次划分的来源。
-
-### 21.2 消费者形态（决定缺哪些算子）
-
-| 项 | 值 |
-|---|---|
-| 任务 | 判别：给定（指令 A，环境/工具 B，结构化特征 x）输出概率，非生成 |
-| 结构 | cross-encoder（编码器 + 分类头）；**无自回归解码、无 KV cache** |
-| 序列长度 | ≤192 token |
-| 参数量 | 编码器 118M；推理时权重可全部 int8 |
-| 目标平台 | 龙芯 CPU，端侧 |
-
-由此决定：
-
-- 主力算子是**权重矩阵 × 激活向量（GEMV）**，不是长序列注意力的变体；现有 `lasx_gemv_f16`
-  （f16）与 `lasx_matmul`/`lasx_matmul_f64`（f32/f64）覆盖不到 int8。
-- 需要**量化/反量化算子**（生产端）。现有 `lasx_dot_i8`/`lasx_dot_q4` 只**消费**量化数据，
-  全库检索 `quantize`/`dequantize`/`amax`/`scale` 类算子为**零命中**。
-- 整数 softmax 只在保留注意力路径时才是硬需求（若按 §21.4 的沙袋归一化改造，注意力仍保留）。
-
-### 21.3 实测依据：为什么 per-token 激活量化是前提而非优化项
-
-对上述模型做训练后量化（PTQ），76 个文本可分辨测试对。**单种子、单次运行；测试对仅 76 个，
-1 个百分点约合 0.76 对**，故只取量级结论：
-
-| 配置 | 成对准确率 | AUC |
-|---|---:|---:|
-| fp32 基线 | 96.1% | 0.871 |
-| 权重 int8（per-output-channel） | **96.1%** | 0.871 |
-| 权重 int8 + 激活 per-tensor（absmax） | **93.4%** | 0.853 |
-| 权重 int8 + 激活 per-channel（按 token） | **96.1%** | 0.869 |
-
-权重逐张量相对量化误差（per-channel，77 个张量）：平均 **0.86%**、最大 **1.70%**。
-
-激活离群值实测（BERT 类结构的已知现象，此处给本模型读数）：
-
-| 层 | absmax | std | 峰度 |
-|---|---:|---:|---:|
-| layer 0 `output.dense` | 125.88 | 0.974 | 14790 |
-| layer 1 `output.dense` | 96.02 | 0.749 | 14497 |
-| layer 5 `output.dense` | 165.86 | 2.447 | 4108 |
-
-按 absmax 定 per-tensor scale 时 `scale = 165.86/127 ≈ 1.31`，而该层 std 仅 2.447，
-主干分布落在**约 2 个量化级**内——这是 per-tensor 掉 2.7 个百分点的直接原因。
-
-**结论**：per-output-channel 权重量化与 **per-token 激活量化在本模型上无损**；
-**per-tensor 激活量化不可用**。因此 per-token 激活量化的 scale 计算不属于可选优化。
-
-### 21.4 同期记录：三项架构改动的实测
-
-同一批数据（76 对、单种子）：
-
-| 配置 | 成对 fp32 | 成对 int8 | AUC fp32 | 峰度（底层最大） | absmax |
-|---|---:|---:|---:|---:|---:|
-| 基线（顶部 4 层 RMSNorm + LARS） | 96.1% | 96.1% | 0.871 | 11123 | 165.7 |
-| **+ 沙袋归一化** | 96.1% | **97.4%** | **0.918** | **48** | **8.8** |
-| + QK-norm | 96.1% | 96.1% | 0.825 | 11123 | 165.7 |
-
-- **沙袋归一化**（每个子层输出后接 RMSNorm，覆盖全部 12 层）：峰度 11123 → 48、absmax
-  165.7 → 8.8、AUC 0.871 → 0.918。两个实现前提：(1) **必须覆盖全部层**——离群值最大处在
-  冻结的 layer 0，只挂被微调的顶层无效；(2) 新增 RMSNorm 的 γ **必须用该层实测 RMS 初始化**，
-  使变换起点接近恒等。
-- **QK-norm**：峰度无变化（离群值在 FFN 输出，不在注意力），AUC 反降 ⇒ **否掉**。
-
-**方法学教训**：首次运行三项验证时结论相反（沙袋使 int8 由 73.7% 降至 47.4%）。追因为
-**量化实现漏除 `qmax`**——取 `s = max|w|` 而非 `max|w|/127`，使 `round(w/s) ∈ {-1,0,1}`，
-权重退化为三值。⇒ 量化实现的正确性应**单独断言**（例：量化后取值必须是 `scale` 的整数倍），
-不可由"指标看起来合理"判断。
-
-### 21.5 缺口与优先级（**已按下面的顺序落地**，状态列是实测结果）
-
-| 缺口 | 依据 | 状态 |
+| 欠账 | 结论 | 依据 |
 |---|---|---|
-| 量化 / 反量化（生产端） | §21.3：现有内核只消费；生产端算子零命中 | **已落地**：`amax`/`absmax_rows`/`quantize_i8_per_tensor`/`quantize_i8_per_row`/`dequantize_i8(_rows)`（契约 `docs/ops.md` §2.12、用法 §5.14） |
-| **per-token 激活量化的 scale 计算** | §21.3：per-tensor 掉 2.7 pt，per-token 无损 | **已落地**：与 per-channel 权重**同一个内核**（都是行主序按行归约），`api` 层分成 `quantize_i8_per_token` / `quantize_i8_per_channel` 两个名字（语义差别在调用方，不在内核） |
-| **`gemv_i8`** | §21.2：消费主力是 GEMV；现有仅 f16/f32/f64 | **已落地**：i8×i8 → i32 精确累加，出口 `(acc as f32)·(sw[o]·sx)`；**逐行复用 `dot_i8`** 而不是重写向量内核（契约 `docs/ops.md` §2.13） |
-| `matmul_i8`（prefill 式矩阵乘） | `docs/dev.md` §21.6 的 (b) 档按"批量把限制从带宽换成算力、≈3×"立项 | **已落地**（实测见 §21.6、契约在 `docs/ops.md` §2.14），但**实测反转**（本节 §21.8）：对"逐 token 跑 GEMV"是 **1.00×**（无收益），比 f32 `lasx_matmul`(n=192) **慢 2.5–2.7×** ⇒ 目标形态下应该用 f32 GEMM；int8 只在"权重装不进缓存、必须流 DRAM"时占优（~4× 流量）。**不做寄存器级 int8 微内核**（要先算赢 f32 的 16 FLOP/指令） |
-| 整数 / 定点 softmax | §21.2：仅当保留注意力路径 | **不做（实测）**：组合路径（反量化 → `softmax_rows` → 再量化）整层只占 int8 GEMM 的 **~2%**（`192×192` softmax 77.9 µs vs 该层 115.4 ms GEMM）⇒ 省下的上限就是 2%，却要引入定点 `exp` 的精度风险 |
-| int8 `rms_norm` / 激活 | 参数量小；亦可改用 ReLU（int8 精确可表示） | **不做（实测）**：同上，`192×768` 的"反量化 + RMSNorm + 再量化"= 367.3 µs，占该层 GEMM 的 ~0.3%。**组合路径就是答案**；真要抠，先做 `_into` 省分配（**已于 2026-10-03 落地**：分配占调用 58–59% / 62–63%、快 2.4×，见 §7.9 ①），而不是整数化 |
-| `parallel::gemv_i8`（行切分） | "行切分 = 现成骨架" | **不做**：按 `m` 行切分对 int8 唯一占优的档位（单 token，`m = 1`）**零并行度**；`m` 大的档位行切分有效，但那里 **f32 GEMM 已赢 2.5×** |
-| `parallel::gemv_i8_k`（**k 方向切分**） | 单 token 档位要的是 k 归约 | **已落地**（`src/parallel.rs`，2 个测试：与单线程**逐位一致**、错误/退化路径）：把"块"当"行"交给现有 `for_each_row_block_mut*`，**不需要给池加新原语**（本节原来那句"要新原语"是没查就写的，这里更正）；整数截断是同态 ⇒ 逐位一致不需要拆内核。**实测 5.4–6.9×**，门槛：每块 ≥1024 且 ≥4 块才并行（小 k 并行是 0.75×） |
-
-可复用基础（实现时确认成立）：`lasx_dot_i8` 的 i16 乘积 → i32 累加 + 每 1024 字节落 i64
-的防溢出结构——`gemv_i8` **直接复用**，所以"两处一致"是复用来的而不是碰巧；
-`lasx_dot_q4` 的分层与 `xvhaddw` 水平加宽归约（本次没走上：量化走"乘倒数 + 取整"）；
-`lasx_matmul` 的打包 + k 分块 + 列块骨架（留给 `matmul_i8`）。
-
-### 21.5.1 实现时定下的三条契约（都有实测支撑）
-
-1. **用倒数乘、不用除法**：LASX **没有向量除法指令**（`xv fdiv` 不存在——要用的 intrinsic
-   全部用编译器核对了一遍）。所以量化写 `x · (1/scale)`，与 `softmax_rows` 的 `e · (1/Σ)`
-   是同一条约定；参考实现写 `x / scale` 不保证逐位一致。
-2. **取整 ties-to-even**：向量 `xvftintrne.w.s`、标量 `f32::round_ties_even()`。`/tmp` 探针实测
-   两者一致：`0.5→0、1.5→2、2.5→2、−0.5→0、−1.5→−2、−2.5→−2`。
-3. **不夹取**：`|q| ≤ 127` 由 `scale = amax/127` 保证（边界样本实测打到 ±127）。最初写了
-   `clamp(±127)`，但**全 NaN 输入让两条路径分道扬镳**——`scale = 0 ⇒ NaN·0 = NaN`，
-   向量侧 `xvfmax/xvfmin` 是 maxNum 语义（NaN 变 −127），标量侧 `as i32` 给 0。
-   改成"去掉夹取 + `scale == 0` 直接写 0"之后，两条路径对**所有**输入逐位一致，
-   还少了两条向量指令。这是"先写对、再写一致"的一个具体例子。
-
-另外两条**实测的 ISA 事实**（已进契约）：`xvfmax.s(x, −x)` 与 `f32::abs` 逐 lane 相同
-（NaN 语义也一样）；归约用 `f32::max` 折叠时 NaN 被忽略，所以**全 NaN 输入 ⇒ `amax = 0`
-⇒ `scale = 0` ⇒ 输出全 0**（不让 NaN 扩散，也便于断言）。
-
-`dequantize` 目前是**逐元素标量**：i8→f32 的加宽链（`xvaddwev/xvaddwod`）出来是 even/odd
-交织 lane，写回连续下标还要一次重排；这一族只在残差/归一化出口用，先按"正确优先"取标量，
-**未做向量化、也不声称它慢**（没有实测就不写结论）。
-
-
-### 21.6 实测：三条都量了，其中一条**推翻了立项时的推算**
-
-2026-10-02 实测，数据在 **§7.9**（`cargo run -p lasx_bench --release -- int8`，`taskset -c 4`，
-进程级 3 轮丢弃首轮取中位数）。
-
-| 立项时的预期 | 实测结果 | 结论 |
-|---|---|---|
-| ① `gemv_i8` 相对 f32 `lasx_matmul` 的倍数 | **14.6–16.8×**（768×768 / 768×3072 / 3072×768），小形状 23× | 达到，但**必须拆开读**：4× 来自 int8 的 1 B/权重，3.6–4.2× 来自 f32 对照走的 `matmul`(n=1) 是 **GEMM 打包路径**（2.94–2.97 GB/s）——不是 f32 GEMV 的上限（f32 `dot` 有 41.8–68.5 GB/s，按元素/秒与 int8 同量级）。**int8 的真实收益是 4× 流量**，与 §21.5 的推算一致 |
-| ② per-token 量化的额外开销 | **几乎为零**：192×768 上 per_row 76.9 µs vs per_tensor 79.5 µs；192×3072 上 271.8 vs 315.4 µs——**逐行更快** | 达到（且是好事）：每行 3 KB 的两遍都在 L1，整张量一遍则要 2.4 MB 走 L2。"为准确率选 per-token"**不付性能代价** |
-| ③ 端到端能否落到 10–20 ms | **不成立**（见下） | **推翻**：立项时的推算只算了权重流量，漏了"序列里每个 token 都要过一遍权重" |
-
-**③ 为什么不成立（把账算清）**。立项时写的是"118M 权重 int8 = 118 MB ÷ 12.0 GB/s ≈ 10 ms"，
-它隐含"权重每个前向只读一遍"——那需要**批量 GEMM**（把 192 个 token 一次乘完），而本批实现的是
-**GEMV**。按实测：
-
-| 口径 | 账 | 结果 |
-|---|---|---|
-| 单 token 过一次 12 层 | 12 层 × (4×49.2 + 220.7 + 190.9) µs | **7.3 ms** |
-| 192 token，逐 token 跑 GEMV（今天能做到的路径） | 192 × 7.3 ms（权重被重读 192 次） | **≈1.4 s**（单核） |
-| 192 token，批量 GEMM（需 `matmul_i8`，**未实现**） | 流量 = 118 MB（读一遍）；算力 = 16.3 GMAC ÷ 12.0 GMAC/s（实测单核整数吞吐） | 流量 9.8 ms／算力 **1.36 s（单核）**、12 核线性 ≈ **113 ms** |
-
-即：读**一遍**权重只要 9.8 ms，但 16.3 GMAC 的整数运算按实测单核吞吐（12.0 GMAC/s）要 1.36 s。
-**真正的杠杆是"批量"**——它把限制从"每 MAC 一次权重读"（带宽）换成"算力"，上限见 §21.7。
-
-**因此修正立项目标**：把"端到端 10–20 ms"改成**分档目标**（都按上文实测外推、含 12 层
-GEMM，不含注意力/归一化/embedding）——
-(a) **今天的路径（int8 GEMV 逐 token，带宽受限）**：单核 ≈1.4 s；12 核按实测的批量内核
-    扩展比（≈8×）≈**175 ms**；
-(b) **批量 + f32 GEMM + 池**：单核 ≈516 ms（16.3 GMAC ÷ 31.6 GFMA/s 实测单核），
-    按实测的池扩展（4 线程 3.3–3.9×、12 线程 2.5–3.3×）⇒ **≈150–210 ms**
-    ——**这才是当前硬件上最快的可达档**（比 int8 GEMV 逐 token 快约 7–10×）；
-(c) **10–20 ms**：比 (b) 还差 **≈10×**；§21.7 已证明单核吞吐上没有这条余量（ISA 无融合
-    int8 点积、f32 也只有 16 FLOP/指令），所以只有"更多核 + 更好的数据复用"才谈得上，
-    属于要重新立项的目标。
-
-
-### 21.8 批量 int8 的实测反转：`matmul_i8` 打不过 f32 GEMM
-
-`matmul_i8` 已实现（contract `docs/ops.md` §2.14、3 个位精确测试），但**实测结论是它不该被
-用于本项目的目标场景**。数据见上文几条读数，三条：
-
-1. **批量相对"逐 token 跑 GEMV"是 1.00×**（9.03 vs 9.06 ms @192×768×768）——原预测的 3×
-   收益**没有出现**。原因：复用发生在错误的地方——`matmul_i8` 每个输出元素调一次 `dot_i8`
-   （整条读 W 的行），同一个 W 行被 192 个 token 各读一遍——只是从 DRAM 换成了 L2，
-   而 L2 带宽也是 ~12 GB/s（实测 12.5 GMAC/s ≈ GEMV 的 12.0）。
-   **要在寄存器里复用**（打包 + 多累加器微内核），这才是 `lasx_matmul` 快的原因。
-2. **比 f32 `lasx_matmul`(n=192) 慢 2.5–2.7×**（9.03 vs 3.58 ms）。差距来自指令效率：
-   f32 一条 `xvfmadd.s` = 8 FMA = **16 FLOP/指令**；LASX 的 int8 链（2 条 mul 出 32 个 i16 乘积
-   + 加宽 + 累加）只有 **~4–5 MAC/指令**（§21.7 第 2 条：本 ISA **没有融合 int8 点积**）。
-3. **所以 int8 的适用面被收窄到"带宽受限"**：单 token、权重 > 缓存的形态（int8 赢 ~4× 流量）；
-   批量且权重驻 L2/L3 的算力受限形态**反而是 f32 赢 ~2.5×**。对 §21.2 的消费者
-   （192 token、每层权重 2.36 MB、L2 = 3 MB）**f32 GEMM 是更快的选择**。
-
-**决定**：`matmul_i8` **保留**（它是对的、有测试、与 `gemv_i8` 逐位一致，是"权重装不进缓存"
-那一档的唯一选择），但**所有引用处都写明它在本项目目标形态下不占优**（`docs/ops.md` §2.14、
-`docs/ops.md` §5.15 的判据、§12.3 的 N3 表、本节 §21.5/§21.6）。**不做**寄存器级 int8 微内核：那要先证明它能超过
-f32 的 16 FLOP/指令——按 §21.7 的天花板（~40–50 MAC/指令·秒/核）与 f32 实测 64 GFLOP/s 比，
-**短期内没有胜算**，属于"要先把账算赢再开工"的那一类。
-**给下游的一句话判据在 `docs/ops.md` §5.15**（先看权重装不装得进缓存，再选精度；
-批量形状按 4 线程派活）——本节只存依据，不复述判据，免得两处漂移。
-
-
-### 21.7 int8 内循环的实测上限：为什么 10–20 ms 够不着
-
-`/tmp` 探针（不进仓库；`black_box` 包住每次加载 + 每轮换一段区域 —— 上一版探针两次被 LLVM
-把内循环提出测量循环、跑出 280 GMAC/s 的假数，见本节的教训）。32 MiB 随机数据，
-3 轮取中位数，绑核。**绝对数受 `black_box` 开销污染（它会把向量过栈），只作横向比较；
-可靠的绝对锚点是 §7.9 里 L1 驻留那行（`1×3072`，33.8 GB/s = 33.8 GMAC/s）**：
-
-| 工作集 | A 现役（2 mul + 4 加宽 + 4 累加） | B `xvmaddwev.w.h` 融合（2 mul + 4 madd） | C 两累加器 |
-|---|---|---|---|
-| L1 32 KiB | 10.9 GMAC/s | **13.1**（＋20%） | 12.6 |
-| L2 2 MiB | 7.97 | 8.35（＋5%） | 8.05 |
-| 16 MiB | 2.38 | 3.21（＋35%，但两轮不稳） | 2.92 |
-
-**三条结论**：
-
-1. **指令级优化买不到数量级**：把"加宽 + 累加"用 `xvmaddwev.w.h` 并成一条（10 条指令/32 MAC
-   → 6 条）在**指令受限**的 L1 区只值 **+20%**；一旦数据出 L1，A/B/C 三者无差别
-   （L2/DRAM 是带宽受限）。**而 model 的真实形状恰恰是带宽受限**（10.7–12.4 GB/s
-   ≈ 单流锚点）⇒ **这个改动对目标场景的收益 ≈0，所以没做**（做了也只是多一条要维护的路径）。
-2. **本 ISA 没有更强的原语可用**：nightly stdarch 的 LASX intrinsic 全表已过一遍，
-   **不存在融合 int8 点积指令**（x86 的 `VPDPBUSD` / ARM 的 `SDOT` 那一类；`xvd*` 零命中）。
-   现有写法"2 条 `xvmulwev/wod.h.b` 出 32 个 i16 乘积 + 加宽到 i32"已经是 ISA 给的最好形式，
-   即 **~4–5 MAC/指令**；乘上实测 IPC 就是**每核 ~33.8 GMAC/s 的上限**（上面的 L1 行实测值，
-   已在"4–5 MAC/指令 × 3 IPC"这个量级上贴顶）。
-3. **于是 10–20 ms 只可能靠堆核**：16.3 GMAC ÷ 33.8 GMAC/s ≈ **0.48 s/核**（批量、L1 受限理想值），
-   到 10–20 ms 需要 **24–48 个核等效**。这也解释了为什么"端到端 10~20 ms"在立项时看起来可行——
-   它算的是 118 MB ÷ 12 GB/s = 9.8 ms 的**流量**，把 16.3 GMAC 的**算力**记成了零。
-
-**方法学教训（值得单独记一条）**：微基准的第一版必须**验证它真的在跑被测量的循环**——
-两次假数都是"编译器把不变量提出循环"（第一次 281、第二次 280 GMAC/s，在 16 MiB 上相当于
-280 GB/s，超过单核 DRAM 带宽两个数量级，一看就知道是假的）。**先算一遍"这个数在物理上
-可能吗"，再拿它当结论。**
-
-### 21.9 N3 批次收口（2026-10-02）：状态清单、否掉的项、遗留与触发条件
-
-这一节是**收口记录**：N3 的每一行现在都有归宿（落地 / 实测否掉 / 待触发），不再有"未做但没有理由"
-的项。判据本身不在本节（在 `docs/ops.md` §5.15），本节只记**为什么收、收在哪、什么条件下回来**。
-
-**落地（代码 + 测试 + 契约 + 数据）**：
-
-| 内容 | 位置 |
-|---|---|
-| 8 个 int8 算子 + 8 个 `_checked`（当时使导出符号总数到 83；2026-10-15 后为 87） | `src/ops/quant_i8.rs`、`src/ops/gemv_i8.rs`、`src/ops/matmul_i8.rs`；契约 `docs/ops.md` §2.12–§2.14；用法 §5.14 |
-| 12 个新单测（位精确 / 误差界 / 满量程 / NaN / C ABI 逐位一致 / `_checked` 状态通道） | `cargo test`，总数 128 → **203** |
-| `parallel::gemv_i8_k`（k 方向切分，`m = 1` 可用）+ 2 个测试（逐位一致、错误/退化） | `src/parallel.rs`；数据见 §21.6 |
-| bench 套件 `int8_gemv` / `int8_quant`（含批量 GEMM、多核 GEMM、k 归约、保活胶水四组行） | `cli/src/suites/int8.rs` |
-| `scripts/doccheck.sh`（引用 / 表格列数 / 符号计数）+ CI 一步 | `.github/workflows/ci.yml`；它在本轮抓出 6 处真缺陷（含 2 个"校验器自己错了"） |
-
-**实测否掉（每一项都有数字，不是"没查过"）**：
-
-| 项 | 否掉的理由 | 数据 |
-|---|---|---|
-| `matmul_i8` 的立项理由 | 批量对 GEMV 是 1.00×，比 f32 GEMM 慢 2.5–2.7× | §21.8 |
-| 寄存器级 int8 微内核 | 要先算赢 f32 的 16 FLOP/指令；本 ISA 无融合 int8 点积 | §21.7 |
-| 整数 softmax / int8 归一化 | 组合路径整层只占 int8 GEMM 的 **1.9%** | 见 §21.5 |
-| `parallel::gemv_i8`（行切分） | `m = 1` 零并行度；`m` 大时 f32 已赢 | §21.5 |
-| 端到端 10–20 ms 的立项目标 | 只算了权重流量、漏了 16.3 GMAC 的算力 | §21.6（改为分档：最快可达 ≈150–210 ms） |
-| DSL 的 G2/G4/G5/G6/G7 | loong-sci 全库 12 个算子名 **0 处**调用 | §19.13 |
-
-**遗留与触发条件**（写清楚"什么条件下回来"，避免下一个人重新论证）：
-
-1. **8 线程处的系统性下降——已修（`need_shared_pack` 加了"B 规模"这一维）**。完整链路：
-   记录 load 的对照测量（1→6 单调、8 起效率 75–86% → 32–43%，`loadavg` 1.73/1.75/3.05 ⇒ 非超订）
-   → 两个判别实验排除缓存争用与块粒度 → `perf` 定位到"6 线程走打包面板、8 线程走每块
-   `lasx_matmul`" → 找到判据 `m/threads >= PACK_MIN_M`（m=192 时 6 线程压线通过、8 线程掉出）
-   → **形状扫六个档后改判据**（`256³/512³/1024³` + `192×768×3072`/`192×3072×768`）：
-   8 线程 4.93 → **2.54 ms**、12 线程 5.11 → **2.97 ms**、`512³`/24 1.35 ms → **791.6 µs**，
-   而 `256³`（未过门槛）行为未变。数据与 A/B 见上文 §21.6。
-2. **真出现"权重装不进缓存"的消费者**（更大的模型 / 单 token 冷缓存）：`gemv_i8_k` 已就绪
-   （5.4–6.9×），f32 那侧的对应物是 `parallel::matmul_f32` 的 4 线程用法。
-3. **`_into` 版本**：若真要抠上文那 1.9% 的保活开销，先做 `api::rms_norm`/`softmax_rows`
-   的 `_into`（省每次调用的输出分配），**而不是**把内核整数化。**（现状更新：这两个 `_into`
-   已于 2026-10-03 落地——实测分配占调用 58–59% / 62–63%、`_into` 快 2.4×，见 §7.9 ①；本条保留的是
-   2026-10-02 当时"为什么先做它、而不是把内核整数化"这个优先序依据。）**
-4. **`matmul_i8` 只在**"权重流 DRAM"档位有意义；若目标形态变了（权重 > L3），先按 `docs/ops.md` §5.15 重判。
-
-**收口时的门禁状态**：203 库 + 5 宏 + 17 文档测试全过；`clippy -D warnings`、`fmt --check`、
-`cargo doc -D warnings`（全 workspace）、`bash scripts/doccheck.sh` 全绿；三远端同步。
+| 组合桥升级（`iso_kernel`/`kv_cache`） | **已结清**：升级为 `Algorithm::IsoKernelBuild`/`KvCacheWrite`，入口改走 `engine::execute`；新路径与旧宏展开的等价物 `to_bits()` 全等 | simd `7c40fc3`；enginecheck 15/3/0 |
+| `spectral`/`stencil2d` 升级 | **不升级**：阶段数是运行期变量、`gaussian_blur` 最大 97 阶段、变体字段会爆炸，且算法知识属算子层（分层倒挂） | simd 侧评估（task-115 notes） |
+| 引擎线程池 | **不采纳**：`#![forbid(unsafe_code)]` 下 std 无作用域池；空 scope 12 线程 267µs，axpy n=262144 并行 0.35×、1M 0.98×、4M 1.63×（跨算子调度收益已由 chain 的"整链一次 spawn"拿到） | simd `9de506a` |
+| 入口计数含测试代码 | **已结清**：`enginecheck`/`build.rs` 剥离 `#[cfg(test)]`；编译期打印 33/28/1（旧 41 虚增 8 次） | simd `9de506a` |
+| P2/P3 数值融合 | **不采纳**（P2 上限 1.291×→向量后端 1.107× 且非逐位；P3 epilogue 占比 0–1%） | simd ROI 记录 |
+| 文档臃肿 | **已清理**：dev 7807→~870、ops 2705→1200、AGENTS 835→97；simd docs 2452→1570 | 本轮提交 |
 
 ---
 
-## 22. crates.io 发布：决定、实测前置条件与被否掉的选项（2026-10-03）
+## 9. 旧编号锚点（跨文档引用兼容）
 
-**决定**：把 `lasx_rs` 与其宏 crate 发布到 crates.io。
+> 重排后本文的小节编号变了，但**其它文档仍按旧编号引用**（`docs/ops.md`、`docs/dsl.md`、
+> `docs/c-abi.md`、`AGENTS.md`、`README.md`/`README.en.md`）。为让 `scripts/doccheck.sh` 的交叉引用
+> 继续通过，本节保留**最小锚点**：每个旧编号一个标题 + 一句"现见"。等外部引用统一改号后，整节删除。
+> **本节不承载内容**；不要在这里追加新内容。
 
-**触发条件**：库已到可用状态（`§21.9` 收口那一套全绿：203 库 + 5 宏 + 17 文档测试、
-位精确、零第三方依赖），而分发渠道目前只有源码仓库。crates.io 是 Rust 生态的默认入口，
-不上就没有"`cargo add` 得到"这条路径。
+### 6.4 测量与 A/B 方法学（旧编号锚点）
 
-**本节记的是"为什么冻结之后还要动"**（`AGENTS.md` 规则 3）：这次发布要改
-`src/lib.rs` 里"（`lasx_rs_macros`，`publish = false`）"这句**已写下的话**，
-以及 `Cargo.toml` 的依赖声明。**先记，再改。**
+现见 **§4.1**（同进程调用级交替 / 分级 / 绑核规则 / 跨库四条）。
 
-### 22.1 实测确认的前置条件（2026-10-03）
+### 7 决策流水与实测（旧编号锚点）
 
-| 项 | 实测结果 |
-|---|---|
-| `cargo publish --dry-run`（不带 `--registry`） | `crates-io is replaced with non-remote-registry source registry 'tuna-sparse'` ⇒ 本机 crates.io 被换成了清华镜像，**必须显式带 `--registry crates-io`** |
-| `cargo publish --dry-run --registry crates-io` | **失败**：`all dependencies must have a version requirement specified when publishing. dependency 'lasx_rs_macros' does not specify a version` |
-| 名字 `lasx_rs` / `lasx_rs_macros` | crates.io API 均返回 **404 ⇒ 可用**（未占用） |
-| `src/` 的 `target_arch` 门控 | **0 处 / 66 个文件** ⇒ 本 crate **只在 loongarch64 上编译** |
-| `LICENSE` | 存在（MIT，21 行） |
-| `Cargo.toml` 已有 | `name` / `version = 0.1.0` / `edition` / `description` / `license` |
-| `Cargo.toml` 缺 | `repository` / `readme` / `keywords` / `categories` / `rust-version` / `exclude` |
+现见 **§7.1 里程碑表**与 **§4 性能与测量方法学**（数字唯一位置在 §4）。
 
-**本轮（2026-10-04）已补**：两个 crate 都补上 `repository`（github 远端）
-/ `readme` / `keywords` / `categories`；根 crate 另加 `exclude = ["/docs", "/scripts",
-"/cli", "/yll", "/AGENTS.md"]`（打包实测：**90 个文件**，只有 `src/` 与元数据，
-`docs/` 那 250 KB+ 不进包）。
+### 7.10 对外对比：OpenBLAS（旧编号锚点）
 
-**`rust-version` 故意不设**（这一条要记下来，免得下次又去补）：本 crate **只在 nightly 上编译**
-（`#![feature(stdarch_loongarch)]`），没有稳定的 MSRV 可写；`rust-version` 的语义是"最低
-**稳定**版本"，写一个 nightly 版本号是误导。**改用 crate 文档点名（见 §22.3）。**
-
-**两条新实测（都是这一轮踩出来的，会改变 §22.6 的门禁顺序）**：
-
-| 实测 | 结论 |
-|---|---|
-| `cargo publish --dry-run`（不干净的工作区） | cargo **拒绝**：`2 files … contain changes that were not yet committed`（要 `--allow-dirty`）⇒ **门禁必须在提交之后跑**，或者明写 `--allow-dirty` |
-| 本体 `cargo publish --dry-run --registry crates-io` | **在宏真发之前不可能通过**：`no matching package named lasx_rs_macros found / location searched: tuna-sparse index`——带 `version` 的依赖是从 **registry** 解析的，本地 path 不参与打包校验 |
-
-⇒ **§22.2 的"发布顺序（宏在前）"不只是"等索引一分钟"的礼节，而是门禁本身的前置条件**：
-宏**真发**之后，本体的 dry-run 才可能通过。替代的本地检查是
-`cargo package -p lasx_rs --registry crates-io --no-verify --list`（验文件清单与元数据，不做依赖解析）。
-
-
-### 22.2 必须改的两处（不改就发不出去）
-
-`macros/Cargo.toml`：
-
-```toml
-- publish = false
-- description = "lasx_rs 的公式 DSL 宏实现（内部 crate，不发布）"
-+ description = "…"                       # 改成对外口径
-+ repository / readme / keywords / categories
-```
-
-`Cargo.toml`：
-
-```toml
-- lasx_rs_macros = { path = "macros" }
-+ lasx_rs_macros = { path = "macros", version = "0.1.0" }
-```
-
-`path` 供本地开发用，`version` 供发布后从 crates.io 解析（cargo 的原话：
-*"The published dependency will use the version from crates.io, the `path` specification
-will be removed"*）。
-
-**发布顺序**：宏在前（它是 `lasx_rs` 的依赖），等索引约一分钟，再发本体。
-
-**注意一处重复事实**：`src/lib.rs` 里"（`publish = false`…）"那句与 `macros/Cargo.toml`
-的 `description` 是同一件事的两个副本 —— **同一次改动里一起更新**，否则又是一次漂移
-（同本文档开头"同一份数字存两处最终会漂移"那条规矩）。
-
-### 22.3 发布后产生的两段 crate 文档义务
-
-crates.io 的用户只读 crate 级文档（docs.rs）与 README，**不会读 `docs/platform.md`**。
-所以下列两条必须进 crate 文档本身：
-
-| 事项 | 为什么必须在 crate 文档里 |
-|---|---|
-| **仅 loongarch64** | 其他平台编译不过；且依赖方**必须**写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会直接红（Cargo 为所有目标解析依赖，不按平台跳过） |
-| **LA664 勘误** | 受影响且未升级固件的机器上会**静默错结果**。当前 `master` 的生产路径已全部使用带屏障的序（见本文档的平台勘误记录），但用户需要知道这个平台风险的存在 |
-
-### 22.4 被否掉的选项
+现见 **§4.4**（对手身份行 + 单线程/多线程/宽薄/计划句柄的现行结论；旧表已按"跨窗口不可引用"淘汰）。
 
-| 选项 | 否掉的理由 |
-|---|---|
-| 把宏内联进 `lasx_rs` | proc-macro 必须是 `proc-macro = true` 的独立 crate，做不到 |
-| 只发 `lasx_rs`、不发宏 | crates.io 拒绝无 `version` 的 path 依赖；且 `publish = false` 的包无法被解析 |
-| 加 `target_arch` 门控 + 标量兜底，让它在 x86 上也能装 | **会把"用错平台"从编译期错误退化成运行期错结果**，与位精确承诺相悖。改为在 crate 文档里点名，让错误停在编译期 |
-| 只发 `lasx_rs_macros` 的二进制 / 不走 crates.io | 与"crates.io 是生态默认入口"这个触发条件互相抵消 |
+### 7.49 算子层系统审计（旧编号锚点）
 
-**"只在 loongarch64 上编译"这条契约的守卫是编译器（import 解析失败）—— 这是规则 5 里
-最强的一档。不要为了"能在 x86 上安装"把它换掉。**
+现见 **§7.1** 里程碑表 2026-10-19 的"算子层审计 + HEAD 复测"行（512³ 0.911× / 1024³ 1.034×，grade B）。
 
-### 22.5 edition 2024 迁移（2026-10-04）
+### 7.52.5 引擎真实优化扩面（旧编号锚点）
 
-**决定**：四个 crate（`lasx_rs`、`lasx_rs_macros`、`lasx_bench`、`lasx_yll`）的
-`edition` 从 **2021 升到 2024**（工具链 `nightly-1.100.0`，stable 是 1.98.1）。
+现见 **§2.6** 与 **§7.1** 中 2026-10-19/20 各行（引擎接管与 rev bump）。
 
-**四个破坏点（全部实测，不是推测）**：
-
-| # | 破坏点 | 命中 | 处理 |
-|---|---|---|---|
-| 1 | `gen` 在 2024 成为**保留字** | **9 处编译错误**（`src/pool/mod.rs` 的逐槽代次字段与局部量） | 用**原始标识符 `r#gen`**：字段名与文档都不用改（改名的 9 处注释会漂移），只在代码里写 `slot.r#gen` |
-| 2 | `extern "C" {}` 块必须写 `unsafe extern "C" {}` | 1 处（`yll/src/yll.rs:27`） | 直接加 `unsafe` |
-| 3 | `unsafe_op_in_unsafe_fn` 默认警告 | **~149 处**：`src/arch/*` 的 intrinsic 包装、`src/ops/*` 对它们的调用、`examples/kernel_probe.rs`（该文件 155 处 —— 探针整文件都在 `unsafe fn` 里） | **显式允许**（4 个 crate 根 + 那个 example，各一行带理由）——**这是记在案的迁移债**，理由：这些函数的 SAFETY 契约本来就写在模块/函数级（各文件顶部的 SAFETY 段），逐处包块是纯机械改动；**触发条件：下次动 `src/arch` 或 `src/ops` 时按文件就地显式化** |
-| 4 | clippy 因 2024 的 `if let` 链而要求合并嵌套 `if let` | 1 处（`macros/src/lib.rs:321`） | 改成 let-chain（`if let Some(..) = .. && ..`） |
-
-**为什么允许而不是逐处改**：允许是**可见的债**（一行 + 计数 + 触发条件），而 149 条警告会被
-习惯性忽略。这条取舍写在这里，免得后来人以为是漏改。
-
-**还债进度（口径 = `unsafe fn` 的个数，因为一个函数体里常有多个 unsafe 操作）**：
-
-| 批次 | 文件 | 函数数 | 状态 |
-|---|---|---|---|
-| 1 | `src/arch/lsx.rs`（4）+ `src/arch/lasx.rs` 的 4 个 load/store | **8** | ✅ 已显式化（2026-10-04） |
-| 2 | `src/arch/lasx.rs` 剩 2（`load_f16x16_as_f32x8x2`、`trunc_i32`）⇒ **`src/arch/*` 整块清零** | **2** | ✅ 已显式化（2026-10-04） |
-| 3 | `src/ffi/status.rs`（`checked_slice`/`checked_slice_mut`）+ `src/ops/dot_f16.rs` 的 `gemv_f16`/`gemv_f16_rows` | **4** | ✅ 已显式化（2026-10-04） |
-| 4 | `src/ops/dot_q4.rs`（`group_sums`/`horizontal_i64`） | **2** | ✅ 已显式化（2026-10-04） |
-| 5 | `src/ops/matmul.rs`（`copy_block32`/`scaled_store4`） | **2** | ✅ 已显式化（2026-10-04） |
-| 6 | `src/pool/mod.rs`（`publish_no_wait` 的 `UnsafeCell` 写、`thunk` 的 `from_raw_parts_mut`） | **2** | ✅ 已显式化（2026-10-04） |
-| 7 | `src/ops/rope.rs`（`rope_f32` 循环开头那 4 行指针运算——函数内部**本来就**有 `unsafe {}`，露出来的是它们） | **1** | ✅ 已显式化（2026-10-04） |
-| 8 | `src/ops/dot_f16.rs` 的 `dot_f16` 本体（**长体**：4 条累加链 + 尾部 lane 聚合） | **1** | ✅ 已显式化（2026-10-04） |
-| 9 | `src/ops/rk4_j2_step_batch.rs` 的 `j2_accel_vec`（长体，纯寄存器 J2 摄动加速度） | **1** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧清零** |
-| 10 | `yll/src/yll.rs` 的 `arg`（`*argv.add(idx)`）；**并把 `cli/src/main.rs` 的 allow 删掉**（实测 `cli/src` 的 `unsafe fn` 数为 **0** ⇒ 删后 `cargo build` 仍 0 告警，这就是"无债"的证据） | **1** | ✅ 已显式化（2026-10-04） |
-| 11 | `src/ops/matmul_f64.rs` 的 `copy_block16`(14 处) + `src/ops/dot_i8.rs` 的 `step_pair`(10 处)；**并删掉 `src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明 `src/` 真的清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`src/` 侧真正清零** |
-| 12 | `yll/src/yll.rs` 剩 3（`arg_f64`/`arg_int`/`arg_arr_len`——体里既调本模块的 `unsafe fn`、又调 `unsafe extern` 的宿主函数，都收进 `unsafe {}`） | **3** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/yll.rs` 清零** |
-| 13 | `yll/src/convert.rs` 的 `read_array`（体最长：`arg_arr_len` + 逐元素 `yll_arr_get`/`yll_is_*`/`yll_as_*`）+ `read_f64`/`read_f32`/`read_i8`（体各一句） | **4** | ✅ 已显式化（2026-10-04）（**该文件 8 个里做了 4 个**） |
-| 14 | `yll/src/convert.rs` 的 `push_f64_array`/`push_f64_arrays`（宿主构造器，前提是"解释器线程内"） | **2** | ✅ 已显式化（2026-10-04）（**该文件剩 2**：`read_f64_soa`/`read_f64_soa_at`） |
-| 15 | `yll/src/convert.rs` 的 `read_f64_soa`/`read_f64_soa_at`（SOA 读取：体里调 `read_f64`） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll/src/convert.rs` 8/8 清零** |
-| 16 | `yll/src/lib.rs` 的 `add`/`add_const`（模块注册：调 `unsafe extern` 的 `yll_module_add_*`）；**并删掉 `yll/src/lib.rs` 的 allow**（删后 build/clippy **0 告警** ⇒ 权威判据证明整个 `yll` 扩展清零） | **2** | ✅ 已显式化（2026-10-04）⇒ **`yll` 扩展清零** |
-| — | `examples/kernel_probe.rs` 11 | — | ✅ 已显式化（2026-10-04）⇒ **全仓 0 豁免** |
-
-**债已还清（2026-10-04 收口）**：
-
-- **全仓 0 豁免**：4 处 `#![allow(unsafe_op_in_unsafe_fn)]`（`cli/src/main.rs`、`src/lib.rs`、
-  `yll/src/lib.rs`、`examples/kernel_probe.rs`）**全部删除**，包括探针那 10 个 `unsafe fn`。
-  收口用的是**权威判据**（不是代理指标）：删后 `cargo build --workspace --release` 与
-  `clippy --workspace --all-targets -D warnings` **都是 0 告警 / 0 错误**（216 + 5 + 17 也全过），
-  且 `grep -rn "unsafe_op_in_unsafe_fn" src/ cli/ yll/ examples/` **为空**。
-- **顺带纠正一条错误印象**："探针不进 crates.io 包"**实测是错的**（`cargo package --no-verify
-  --list` 显示它带进了 **13 个文件**）。已在 `Cargo.toml` 的 `exclude` 里补上 `"/examples"`，
-  并复核：**examples 0 个文件、包内总数 90 → 77**。
-
-> **口径提醒**：`grep -c "unsafe fn" <file>` 数的是**该文件的定义数**，**不是"还剩几处"**——
-> `convert.rs` 做完 4 个后它仍然打印 8。**"还剩多少"只能靠逐文件核对已处理清单，或者（更权威）
-> 删掉该 crate 的 allow 后看告警数。**
-
-**一次错误的"清零"结论与它的纠正（2026-10-04）**：中途曾据批次表宣布"`src/` 侧清零"——**是错的**。
-删掉 `src/lib.rs` 的 allow 后**出现 25 条警告 / 27 条 clippy 错误**，真实剩余站点**只在两个文件**里：
-
-| 文件 | 站点数 |
-|---|---|
-| `src/ops/matmul_f64.rs` | **14** |
-| `src/ops/dot_i8.rs` | **10** |
-
-**根因不是"漏改"，而是"用了被截断的清单排批次"**：最初那张"每文件 `unsafe fn` 数"的表是用 `grep -rc … | head -14`
-打印的（当时总计 56，只看到前 14 行），这两个文件在**第 15 行之后**，于是从来没进过批次计划。
-⇒ **教训**：**"某个 crate 清零了没有"只有一种权威判据——删掉 allow 后看 build/clippy 的告警数**；
-`grep` 计数只能用来排批次，且**不许被 `head` 截断**（要么 `wc -l` 看总数、要么 `| tail` 看被截掉的
-部分）。
-
-**两处代理指标的假阳性**（口径修正）：`src/pool/mod.rs:186` 是**函数指针类型**（不是定义）、
-`noop_thunk` 是**空函数体**（没有 unsafe 操作、本来就不需要块）；`grep -rc "unsafe fn"` 还会把
-**注释**里提到的 "unsafe fn"（`src/lib.rs` 两处）算进去 ⇒ 早期报的"总计 56"里有 3 处是假阳性，
-**真实函数数 ≈ 53**。后面的批次按"真实的 `unsafe fn` 定义"计数。
-
-**长函数体的做法**（后面照用）：不必整段重写——只做**两次小编辑**：① 在签名行之后插入
-`unsafe {`（并写 `// SAFETY:`）；② 在函数最后一行返回值之后插入 `}`。缩进交给 `cargo fmt`，
-语义零改动。`dot_f16` 就是这么做的（且它体内没有嵌套 `unsafe`，所以不会触发 `unused_unsafe`）。
-
-**验证**：216 + 5 + 17 全过；`cargo fmt --all`（2024 风格，改了若干文件）/ `clippy -D warnings` /
-`doccheck` 全绿；`cargo build --workspace --release` **0 警告 0 错误**。
-
-**与发布的关系**：edition 2024 的最低编译器是 **1.85**，但本 crate 因
-`#![feature(stdarch_loongarch)]`（issue #117427）**仍然只有 nightly 能编** ⇒ §22.1 里
-"`rust-version` 故意不设"的结论**不变**。
-
-
-
-### 22.6 发布前的门禁
-
-`§21.9` 收口那套之外，再加一条：
-
-```
-cargo publish --dry-run --registry crates-io     # 必须通过
-```
-
-**这条门禁的正确执行顺序（2026-10-04 实测修正）**：
-
-```text
-1. 宏：cargo publish --dry-run --registry crates-io -p lasx_rs_macros   # 已通过（7 文件 / 60.6 KiB）
-2. 宏：真发（不可撤销）—— 之后等索引
-3. 本体：cargo publish --dry-run --registry crates-io -p lasx_rs       # 只有此时才可能通过
-4. 本体：真发
-```
-
-**为什么门禁不能提前**：带 `version` 的依赖从 registry 解析（实测报错见 §22.1），所以
-"宏没发 ⇒ 本体的 dry-run 必失败"。**在 2 之前能做的最强本地检查**是
-`cargo package -p lasx_rs --registry crates-io --no-verify --list`（文件清单 / 元数据）。
-另：**门禁要在提交之后跑**——cargo 拒绝含未提交改动的工作区。
-
-**`cargo publish` 本身不可撤销**（版本一旦上传，名字与内容永久存在于该命名空间，
-yank 只是从新解析中隐藏）。因此本节所记的两处 `Cargo.toml` 改动、两段 crate 文档、
-以及发布顺序，**都应在真正按下发布之前完成并复核**。
-
-### 22.7 打包与安装（2026-10-15）
-
-**决定**：一次构建产出三种产物（`crate-type = ["cdylib", "rlib", "staticlib"]`——`rlib` 保留，
-Rust 侧依赖它；`staticlib` 给不想带 `.so` 的 C 消费者）；**SONAME 用 `build.rs` 的
-`cargo:rustc-cdylib-link-arg=-Wl,-soname,liblasx_rs.so.0` 固定为 `liblasx_rs.so.0`**，而不是写进
-`.cargo/config.toml`——`rustc-cdylib-link-arg` 只作用于 cdylib（rlib/staticlib/测试都不受影响），
-而 `rustflags` 会洒到所有目标；且 `build.rs` **只打 `cargo:` 指令、不引入任何构建依赖**
-（零第三方依赖是卖点，打包环节不能破）。
-
-**为什么版本化文件名放在安装脚本、不放进 Cargo**：cargo 的 cdylib 产物名固定是
-`liblasx_rs.so`，"发行布局"（`liblasx_rs.so.0.1.0` + `.so.0` + `.so` 两个符号链接）由
-`scripts/install.sh` 负责——构建管一段、安装管一段，职责不重叠，也让 `cargo build` 的产物树
-保持可预测。安装脚本还会核对产物的 SONAME（`readelf` 可用时）并在不对时**拒绝安装**：
-把错误 SONAME 写进系统 libdir 是真实事故，不能静默放过。
-
-**ABI 规则**（与 `docs/ops.md` §17.5 同一份）：符号**只追加**（现有 87 个；历史 15 个签名与
-语义永不改），追加不改 SONAME；只有"改已有符号签名/语义、删符号、改 `LasxStatus` 码值或调用
-约定"才把 major +1，届时同改 `build.rs`、`scripts/install.sh` 的 `SONAME` 变量与
-`docs/ops.md` §17.5/§4。0.x 阶段 major = 0 表示"尚未承诺二进制兼容"，但"只追加"实践已在遵守。
-
-**实测自检（本决策的验收，2026-10-15）**：
-
-```bash
-readelf -d target/release/liblasx_rs.so | grep -i soname   # Library soname: [liblasx_rs.so.0]
-nm -D --defined-only target/release/liblasx_rs.so | grep -c " T lasx_"   # 83
-ls target/release/liblasx_rs.a                             # 静态库在
-scripts/install.sh --prefix=/tmp/lasx_install              # 装完并用 gcc 从安装树链接最小 C 程序
-```
-
-**边界（明确记下，别当遗漏）**：`install.sh` 与 `lasx_rs.pc.in` 是**源码仓库**里的打包输入——
-`Cargo.toml` 的 `exclude` 把 `/scripts` 排除在 crate 之外，所以从 crates.io 装的用户拿到的是
-库本体（含 `build.rs` 已固定的 SONAME），发行布局由各发行版自己写或从源码仓库取；C 头
-`include/lasx_rs.h` 由仓库提供，安装脚本只负责拷贝、缺了就报错退出（不生成、不猜）。
-
-### 7.14 `simd_dsl` 侧优化在 **LASX 档**上的逐条实测（2026-10-17，R17）
-
-**背景**：`simd_dsl` 一边在清技术欠账，产出若干**后端可见**的改动（相位约减、启用递推建核、FFT 参照实现）。
-**"在可移植档变快"不等于"在 LASX 档也变快"** ⇒ 逐条在 LASX 档上过一遍（`simd_dsl` rev 已 bump 到
-`40f927e`；同进程交替、同一目的缓冲、7 对丢首对、中位 + 极差、`loadavg 4.2–4.7`；
-形状 = 谱检测帧的 DFT：`rows=p=513, n=4096, b=256`）：
-
-| 项 | 可移植档（Idiomatic） | **LASX 档（手写 SIMD）** | 判定 |
-|---|---|---|---|
-| **`opt_in = true`（启用递推建核）** | `16.57` vs `62.56 ms`（3.78×） | **`10.0603` vs `67.7882 ms`（6.75×，省 57.7 ms）** | **LASX 上收益更大** ✓ |
-| **DFT 现状：LASX `matmul_f32` ×2** | `234.51 ms` | **`42.2193 ms`**（`1.078e9 MAC` ⇒ **≈25.6 GFLOP/s**，是可移植档的 **2.75×**） | **性能档本职达标** |
-| **FFT 替换 DFT**（可移植标量 FFT + 转置） | `112.38 ms`（赚 `2.087×`） | 朴素转置 **`109.3`**、分块转置 **`86.5`**、**仅变换 `33.2 ms`** ⇒ **`0.488×`（亏）** | **不接线** |
-
-**⇒ 结论（都要记住的两条）**：
-1. **同一条优化在不同档上符号可以相反**：FFT 在可移植档赚 46%、在 LASX 档亏 51%。**任何"选路规则"
-   落地前必须在两档都测**（LASX 侧应有对应的 A/B 装置，不能只在 `simd_dsl` 里测）。
-2. **FFT 在 LASX 上"拉回来"的瓶颈已定位**：**变换本体 `33.2 ms` 与 LASX matmul `42.2 ms` 只差 1.27×**
-   （标量 vs 手写 SIMD）；**真凶是数据布局**——朴素转置 `76.5 ms`、分块后仍 ≈`53 ms`（同量级字节
-   的流式读写本该亚毫秒级）⇒ **恢复路径 = 免转置的跨步/四步 FFT**（必要时再给蝶形 LASX 向量化）。
-   **未做** ⇒ 现阶段 FFT 记为"**仅弱后端可用**"。
-
-**口径**：本节数字与 `simd_dsl/docs/performance.md` 里 **R17 的"后端相关 FFT"小节**同一批探针，**两边记同一组数**（不新开
-第二个数字家）；探针为临时 example，跑完即删。
-
-**规模扫描（同批探针，`p ≈ n/8 + 1`、同进程交替、同目的缓冲、5 对丢首对、`loadavg 3.53 4.41 4.62`）**：
-A = 该档 `matmul_f32` ×2；B = 可移植 FFT（`64×64` 分块转置 + f64 变换）；**A/B > 1 ⇒ FFT 更快**：
-
-| `n` | `p` | `b` | **LASX 档 A/B** | 可移植档 A/B |
-|---|---|---|---|---|
-| 256 | 33 | 8 | **0.654×** | 1.844× |
-| 1024 | 129 | 32 | **0.278×** | 2.101× |
-| 4096 | 513 | 64 | **0.417×** | 2.233× |
-| **16384** | 2049 | 32 | **1.549×（LASX 也翻正）** | **9.682×** |
-
-**⇒ 对本仓最重要的一条**：**"FFT 只在弱后端有用"是错的**——那只是**中小形状**的结论；
-`n = 16384` 时 **LASX 档上 FFT 已经比本仓手写 matmul 快 `1.549×`**。**交叉点在本档位于
-`4096–16384` 之间**（可移植档在 `256` 以下就翻正）⇒ **任何选路都要"按档位 + 按规模"双门限，且两档都得实测**。
-**待做**：① 交叉点精确定位；② `n` 更大时本档是否反超更多；③ **免转置的跨步/四步 FFT**（把交叉点往小形状推）。
-
-**③ 已做：免转置跨步 FFT（`simd_dsl` `1d58c53`）—— 本档在帧工作点上翻正 `1.510×`**：
-`kernels::scalar::fft_radix2_strided_f32` 直接吃**行主序 `[n,b]`**（每列一条信号），**不转置不拷贝**。
-装置同上（两档 × 两规模、同进程交替、同缓冲、5 对丢首对、`loadavg 5.92 4.64 4.58`）；
-A = 该档 `matmul_f32`×2、B = 转置 + 连续 FFT、**C = 跨步 FFT**：
-
-| 规模 | 档 | A | B | **C** | A/B | **A/C** |
-|---|---|---|---|---|---|---|
-| `n=4096, p=513, b=256`（**帧工作点**） | **LASX 手写** | `43.6512` | `109.7996` | **`28.8988`** | `0.398×` | **`1.510×`** |
-| 同上 | 可移植 | `278.3006` | `110.0400` | **`27.9375`** | `2.529×` | **`9.962×`** |
-| `n=16384, p=2049, b=32` | **LASX 手写** | `121.3787` | `72.0482` | **`16.2609`** | `1.685×` | **`7.464×`** |
-| 同上 | 可移植 | `885.9220` | `72.1030` | **`16.1437`** | `12.287×` | **`54.877×`** |
-
-**⇒ 对本仓最重要**：**转置就是那个瓶颈**（B 与 C 同算法、只差布局：帧形状 `109.80 → 28.90 ms`）。
-**本档在帧工作点上已比手写 matmul DFT 快 `1.510×`**（§7.14 之前记的是 `0.382×`）⇒
-之前那句"FFT 对本档没用"**作废**；大形状上本档 `7.464×`。**若要再压**：本档可给跨步蝶形做 LASX 向量化
-（现在用的是可移植标量实现）。
-
-### 7.15 谱检测**整帧**在 LASX 档上的 A/B（R19-D，2026-10-17）
-
-**动机**：此前"FFT 接入谱检测"的帧级 A/B **只在可移植档**做（本仓没有 `ops_dsl` 依赖 ⇒ 跑不了整帧）。
-本轮给本仓加**可选 `ops_dsl`**（同一 git rev、同一 `dsl-backend` feature；方向仍
-`lasx_rs → ops_dsl → simd_dsl`）⇒ **整帧 `detect` 终于能在 LASX 档上测**。
-装置是本仓**入库示例** `examples/spectral_frame_ab.rs`（可复跑）；真实工作点 `n=4096, p=513, b=256`；
-同进程交替、同一目的缓冲、6 对丢首对、中位 + 极差、`loadavg 3.49 1.63 1.48`。
-
-| 指标（**LASX 档**） | `DftMode::Direct` | **`DftMode::Auto`（=FFT）** | 比值 |
-|---|---|---|---|
-| `build_plan` | `11.2594 ms` | **`0.3286 ms`**（不建 `kc/ks`） | **`34.26×`** |
-| 帧体（预建计划） | `63.2169 ms` | **`51.3121 ms`** | **`1.232×`** |
-| **一次性 `detect`** | `80.0497 ms` | **`50.8781 ms`** | **`1.573×`** |
-| 正确性（FFT vs Direct） | — | out `5.075e-7` / psd `8.924e-5`（`masked_rel`） | ✓ |
-
-**同进程档位并列**：`Auto`：可移植 `59.5697 ms` vs **LASX `50.4332 ms`**（**`1.181×`**）；
-`Direct`：可移植 `265.8876 ms` vs **LASX `80.3155 ms`**（**`3.311×`**）。
-
-**⇒ 对本仓最重要的一条（杠杆变了）**：`Direct` 时本仓帧比可移植快 **`3.311×`**（手写 matmul 的功劳），
-但换 FFT 后只快 **`1.181×`** ⇒ **FFT 把 matmul 从瓶颈挪走了**，剩下的开销**不在 matmul 上**
-（归约/逐元素/超越函数目前都走 `Backend` 的**可移植默认实现**）。
-**因此下一步的后端杠杆是"把归约与逐元素族也接到 LASX"**，而不是再堆 matmul/FFT。
-**如实边界**：① FFT 臂用的是**可移植** `fft_strided_f32`（本仓无向量化 FFT）⇒ 该数不是本仓上限；
-② 两臂共享同样的可移植非 matmul 步骤 ⇒ 比值只反映 DFT 的变化。
-**口径**：本节数字与 `simd_dsl/docs/performance.md` 的 R19-D 小节同一批探针（**两边记同一组数**）。
-
-### 7.16 归约 / 逐元素族接 LASX（R19-E）——帧级 `1.057×`，且**输出逐位一致**
-
-**接了什么**（`src/ops/dsl_map.rs` + `LasxBackend` 覆写 5 条）：
-`map_binary_f32`（`Add`/`Sub`/`Mul`/`Div`）、`map_affine_f32`、`reduce_sum_f32`、
-`reduce_sum_cols_f32`、`reduce_weighted_sum_cols_f32`。
-
-**等价类（逐条钉住，测试 `r19e_elementwise_and_axis_reduce_are_bitwise_vs_scalar`）**：
-* 逐元素四条 + `map_affine` + 两条按列归约 ⇒ **与 `simd_dsl::kernels::scalar` 的参照逐位**：
-  逐元素无归约；轴归约保持"**每列一条 lane、按行序**累加"（累加次序与参照相同）；
-  **`map_affine` 故意不融 FMA**（`a·x` 再 `+b`，两步 ⇒ 与参照同舍入）；
-* `reduce_sum_f32` 的参照本身是**多累加器**（容差类）⇒ 本仓 LASX 归约同性质；
-* **`Max`/`Min` 不在本文件实现**：NaN 语义按 Rust（`f32::max`）而 LASX `xvfmax` 是 IEEE
-  ⇒ **委托标量参照**（`BinaryOp` 是 `#[non_exhaustive]`，未知变体也一律委托）。
-
-**同进程 A/B**（`LasxBackend` vs **`LasxBackendHybrid`**，后者 = matmul/建核/打包照旧 LASX、
-逐元素/归约回落可移植默认 ⇒ "接族之前"；同进程交替、同一目的缓冲、6 对丢首对、中位+极差、
-`loadavg 3.02 3.52 3.02`、真实工作点 `n=4096,p=513,b=256`、`DftMode::Fft`）：
-
-| 指标 | 接族前（hybrid） | **接族后（LASX）** | 比值 |
-|---|---|---|---|
-| 帧体（预建计划） | `48.4248 ms`（极差 0.6797） | **`45.8299 ms`**（极差 3.0408） | **`1.057×`** |
-| 一次性 `detect` | `50.2413 ms`（极差 3.7140） | **`48.1958 ms`**（极差 3.2540） | **`1.042×`** |
-| 输出（前后对比） | — | **`masked_rel = 0.000e0`（逐位一致）** | ✓ |
-
-**⇒ 两条结论**：① 这一族**真的有收益但不大**（帧级 `4–6%`），与"它只占帧的一小段"一致；
-② **接完之后，帧里最大的剩余块是"可移植 FFT 本体"**——按 §7.15 的变换级实测该部分约 `28.9 ms`
-（占当前 `48.2 ms` 的 **≈60%**）⇒ **下一个大杠杆是 LASX 向量化的跨步 FFT**，不是继续堆逐元素。
-**如实边界**：FFT 臂仍是可移植实现；`reduce_sum_rows_f32`/`map_unary_f32`（超越函数，含 `ln`/`exp`/`cos`）
-**本轮未接**（前者默认已可向量化、后者需要 LASX 的 `log/exp` 近似且牵扯精度口径 ⇒ 另开一轮评估）。
-
-### 7.17 **完整性能报表**（R19-F）：DSL+LASX / DSL+可移植 / **中间抽象层损失**
-
-**装置（入库示例）**：`examples/dsl_perf_report.rs`（`cargo run --release --features dsl-backend
---example dsl_perf_report`）。**口径（本仓正式规程）**：同一目的缓冲、同进程交替 6 轮丢第 1 轮、每臂每轮
-`iters` 次取均值，输出**中位 + 极差 + `iters`**；两次跑的 `loadavg` 为 **3.30 / 3.35**（1 分钟）。
-**三层**：**L0**＝`lasx_rs::api::*`（手写 floor）或 `Backend::方法` 直调；**DSL**＝宏→引擎→后端；
-**抽象层损失**＝`DSL 臂 / 同后端 L0 臂`。
-
-| 工作负载 | L0（手写/直调） | **DSL+LASX** | DSL+可移植 | **可移植/LASX** | 层损(LASX) | 层损(可移植) |
-|---|---|---|---|---|---|---|
-| W1 matmul `512³` | 4.6295 | **4.6341** | 37.4282 | **8.077×** | `1.001×` | `1.000×` |
-| W2 matmul 帧形状 `513×256×4096` | 20.4030 | **20.5173** | 144.2909 | **7.033×** | `1.006×` | `1.003×` |
-| W3 dot `n=2²⁰` | 0.4780 | 0.4781 | **0.4762** | **`0.996×`（LASX 无优势）** | `1.000×` | `1.000×` |
-| W4 reduce_sum `n=2²⁰` | 0.1166 | **0.1167** | 0.1795 | **1.540×** | `1.001×` | `1.001×` |
-| W5 map_affine `n=2²⁰` | 0.4089 | 0.4081 | **0.3583** | **`0.880×`（LASX **更慢**）** | `0.998×` | `1.002×` |
-| W6 map_binary add `n=2²⁰` | 0.4592 | **0.4594** | 1.4533 | **3.163×** | `1.001×` | `0.997×` |
-| W7 轴归约 cols `4096×256` | 0.2250 | **0.2252** | 0.2744 | **1.219×** | `1.001×` | `1.000×` |
-| W8 加权轴归约 `513×256` | 0.0293 | **0.0292** | 0.0324 | **1.111×** | `0.996×` | `1.000×` |
-| W9 等距核构造 `64×1024` | 0.3023 | **0.3019** | 0.3188 | **1.056×** | `0.999×` | `1.000×` |
-| W10 **整帧 `detect`**（`n=4096,p=513,b=256`） | —（无手写入口） | **49.9650** | 60.6684 | **1.214×** | — | — |
-
-W10 另两档（同进程）：`LASX(hybrid)`＝**51.5754 ms**（只 matmul 走 LASX ⇒ 比全 LASX 慢 `3.2%`，
-即 R19-E 的净收益）、`Scalar`＝**164.2304 ms** ⇒ **LASX/Scalar = 3.29×**。
-
-**⇒ 四条结论**：
-1. **中间抽象层几乎免费**：层损 **`0.996–1.006×`**（全部在噪声内，极差 ≤ 0.03 ms）⇒
-   `宏解析 + 引擎编排 + trait 分派` 的代价 **< 1%**，"DSL 层慢"这个担心**不成立**；
-2. **LASX 的赢面全在"计算/指令密度"**：matmul **`7–8×`**、`map_binary` **`3.16×`**、
-   `reduce_sum` `1.54×`、轴归约 `1.22×`/`1.11×`、建核 `1.06×`、整帧 `1.21×`；
-3. **两个如实负结果**：① `dot 2²⁰` **`0.996×`**——纯 DRAM 带宽瓶颈，向量化无用（该形状已到单流带宽）；
-   ② `map_affine 2²⁰` **`0.880×`（LASX 反而慢 12%）**——本仓为**逐位等价**故意不融 FMA
-   （`a*x` 再 `+b`，两步），而 `IdiomaticBackend` 用 FMA（一步）⇒ **指令数差一倍**。
-   **要赢就得允许 FMA ⇒ 从逐位降为容差类**——这是"逐位 vs 速度"的真实取舍，**未擅自改**；
-4. **整帧**：LASX 比可移植快 `1.214×`、比 Scalar 快 `3.29×`；而 `hybrid`（只 matmul 走 LASX）
-   只慢 3.2% ⇒ **接归约/逐元素族（R19-E）的净收益就是这个 3.2%**。
-
-**口径警告**：绝对毫秒受 `loadavg` 影响（本轮 3.3，正式规程要求 ≥1.0 时只认同进程比值）；同进程比值是正式的。
-
-### 7.18 R19-G（FMA + 4× 展开）与 R19-H（LASX 跨步 FFT）之后的重测
-
-**口径**：同 §7.17（`examples/dsl_perf_report`，同进程交替 6 轮丢第 1 轮、同一目的缓冲、中位+极差；
-本轮 `loadavg 3.3–4.5`）。
-
-**R19-G（用户批准"允许 FMA"）**：`map_affine` / 加权轴归约改 **FMA 单指令**，逐元素循环加 **4 路展开**；
-精度类由"逐位"改为**容差类**，实测界：`map_affine` **`9.653e-8`**、加权轴归约 **`9.093e-8`**（相对峰值）。
-**效果**：`map_affine 1M` 从 **`0.880×`（LASX 更慢）翻成 `1.287×`**（`0.2752 ms` vs 可移植 `0.3541`）——
-**归因**：FMA 省一条指令 + 4 路展开摊薄访存；单路时期是"指令数少但循环开销与访存并行度不足"。
-**如实**：加权轴归约（513×256）跨轮在 `0.88–1.12×` 间跳（`0.03 ms` 量级，**不作决策依据**）。
-
-**R19-H（LASX 原地按列 radix-2 复数 FFT）**：沿**列**切 8 条 lane（b=256 是 8 的倍数）、旋转因子在同一
-蝶形里对 8 列是同一标量 ⇒ 广播即可、**不转置**；旋转因子 f64 预算降 f32。**正确性（容差类 vs f64 参照）**：
-`1.55e-7`（`n=4096,b=256`；`n=64/1024` 分别 `9.8e-8/8.2e-8`）。**速度**：
-
-| 指标 | 可移植参照 | **LASX** | 比 |
-|---|---|---|---|
-| 按列 FFT 本体（`4096×256`） | `23.7701 ms` | **`7.5346 ms`** | **`3.26×`** |
-| **整帧 `detect`** | `61.3330 ms` | **`30.3931 ms`** | **`2.018×`** |
-| 整帧（`hybrid`＝只 matmul 走 LASX） | — | `51.5161 ms` | （比全 LASX 慢 69%） |
-| 整帧（`Scalar`） | `158.9082 ms` | — | LASX/Scalar **`5.23×`** |
-
-**⇒ R19-H 应验了 §7.16 的预判**：FFT 本体是帧里最大的一块（可移植 `23.77 ms`，占原帧 `48 ms` 的一半），
-把它接到 LASX 后整帧从 `~49 ms`（R19-E 后）降到 **`30.39 ms`**，比可移植快 **`2.02×`**、比 Scalar 快 **`5.23×`**。
-
-**完整重测表（11 行；中位 ms）**：
-
-| 工作负载 | L0（手写/直调） | **DSL+LASX** | DSL+可移植 | **可移植/LASX** | 层损(LASX) | 层损(可移植) |
-|---|---|---|---|---|---|---|
-| matmul `512³` | 4.4354 | **4.4345** | 36.3991 | **8.208×** | 1.000× | 1.000× |
-| matmul 帧形状 `513×256×4096` | 20.7088 | **20.6962** | 143.9531 | **6.956×** | 0.999× | 0.992× |
-| dot `2²⁰` | 0.4051 | 0.4054 | 0.4001 | **0.987×**（带宽墙） | 1.001× | 0.998× |
-| reduce_sum `2²⁰` | 0.1212 | **0.1200** | 0.1800 | **1.500×** | 0.990× | 1.001× |
-| map_affine `2²⁰`（FMA+展开） | 0.2755 | **0.2752** | 0.3541 | **1.287×** | 0.999× | 1.000× |
-| map_binary add `2²⁰` | 0.4487 | **0.4468** | 1.4464 | **3.237×** | 0.996× | 1.000× |
-| 轴归约 cols `4096×256` | 0.2247 | **0.2248** | 0.2744 | **1.220×** | 1.001× | 1.000× |
-| 加权轴归约 `513×256` | 0.0369 | 0.0368 | 0.0324 | 0.878×（不稳，见上） | 1.000× | 1.001× |
-| 等距核构造 `64×1024` | 0.3026 | **0.3025** | 0.3204 | **1.059×** | 1.000× | 1.001× |
-| **按列 FFT `4096×256`** | 23.7701 | **7.5346** | 24.5330 | **3.256×** | — | 1.032× |
-| **整帧 `detect`** | — | **30.3931** | 61.3330 | **2.018×** | — | — |
-
-### 7.19 回答："DSL 没有优势吗？大计算任务呢？"
-
-**先给否定答案（如实）**：**单算子层面，DSL 没有速度优势**——层损 `0.990–1.001×`，与手写/直调等价。
-"DSL 更快"这句话在单算子粒度上**不成立**，本仓不这么宣传。
-
-**DSL 的优势在整任务，且随任务量放大**（都有实测）：
-1. **判据驱动的算法重写**：谱检测帧的可移植档 `288.01 → 62.66 ms`（**`4.596×`**，R19-A）——手写路径
-   不会在运行时自己把"两次瘦长 matmul"换成"免转置 FFT"；
-2. **同一份源码吃三档硬件**：整帧 LASX **`30.39`** / 可移植 **`61.33`** / Scalar **`158.91 ms`**
-   ⇒ **LASX 快 `2.02×`、比 Scalar 快 `5.23×`**，而**源码一个字没改**（只换后端类型）；
-3. **判据让"计划"变便宜**：FFT 路 `build_plan` `12.61 → 0.33 ms`（**`34.6×`**）——判据知道不需要
-   `kc/ks`，于是**不建**；手写路径通常"建了再说"；
-4. **选路/重写规则带实测门限**：stencil ↔ 谱路按 `θ`/`k` 自动选、`opt_in` 递推→闭式 **`6.75×`**
-   （`docs/performance.md` 的规则表），**不达标就如实不启用**（如 R5-A 规则① 报 `BelowThreshold`）。
-**"大计算任务"为什么更有利**：① 重写收益 **∝ 任务量**（`4.596×`/`2.018×` 都是整帧级的收益，
-不是单算子）；② 后端差（matmul **`7–8×`**）作用在**主导阶段**；③ 计划复用按帧摊薄。
-**反过来也要说**：**带宽墙任务 DSL 也救不了**——`dot 2²⁰` 是 `0.987×`，因为瓶颈不在表达式层。
-**一句话结论**：DSL 的价值**不是"每步更快"，而是"整任务选对算法/后端，并把选择变成可验证、可复跑的判据"**；
-单算子它只保证**不加税**。
-
-## 7.20 P4-e 前置 A/B：**融合原语（标量）比向量化两步路径慢 1.793×**（**负结果，如实**）
-
-**装置**：`tests/fused_primitives_ab.rs`（`--features dsl-backend`，同进程交替 A/B、每臂 5 轮丢弃首轮取中位数；
-`n=4096, b=256`，`loadavg` 未记录——单机单次测量，**只作方向判断，不作性能承诺**）。
-
-**测什么**：`energy[b] = Σ_n (x[n,b] − mean[b])²` 的两种实现：
-* **臂 A（现状）**：`map_binary_f32(Sub) → map_binary_f32(Mul) → reduce_sum_cols_f32`（三趟、两个全尺寸临时缓冲，
-  但全部走 **LASX 向量化**内核）；
-* **臂 B（P4 新原语）**：`reduce_centered_sq_sum_cols_f32`（**单遍、零临时缓冲**，但本轮 LASX 覆盖是**标量**实现）。
-
-| 臂 | 中位数 | 相对 |
-|---|---|---|
-| A 三趟向量化 | **3.2394 ms** | 1.000× |
-| B 单遍融合（标量） | **5.8094 ms** | **1.793×（更慢）** |
-
-**数值**：两臂 **逐位相同**（`max rel = 0e0`）⇒ 融合原语的**语义对**，差的是**实现效率**。
-
-**结论（如实，不修饰）**：
-1. **P4-c（engine 计划期发射）暂不接线**——在融合核向量化之前接线只会让帧更慢；
-2. 这个负结果**同时印证了两条已有判断**：① "**省趟 ≠ 省时间**"（少两趟但多花 1.79×）；
-   ② "**内存收益 ≠ 速度收益**"（臂 B 省两个 4 MiB 临时缓冲，却更慢）；
-3. **下一步**：把 `energy_dc`/`psd_pair` 改成 LASX 向量化（8 lane、FMA；**必须先核对 `src/arch/lasx.rs`
-   与 `core::arch::loongarch64` 两条路径的真实封装名**，禁止凭记忆写 intrinsic），然后**用同一装置重测**；
-   只有 **≥10% 才算收益**，否则继续如实记为"未达"。
-**附**：`matmul_pair_psd_f32`（成对 epilogue）本轮**未测**——它省三块中间缓冲但同样受"标量 vs 向量化"影响，
-在 `energy_dc` 向量化之前测它没有信息量。
-
-## 7.21 P4-e 重测（向量化后）：**融合/多步 = 0.363× ⇒ 快 2.75×**，且**仍逐位**
-
-**改动**：`ops/fused.rs` 从纯标量改为 **LASX 向量化**——两个内核都按 **8 lane = 8 列**分道（与
-`dsl_map::reduce_sum_cols` 同款"每列一条 lane、按 `r`/`t` 顺序累加"），并且**刻意不用 `xvfmadd`**
-（用 `sub`→`mul`→`add` 分开做）⇒ 同列内运算序列与参照**完全一致** ⇒ **逐位类不变**。
-`lasx_xvfsub_s` 本轮**核实存在**（`ops/ballistic_step.rs`、`ops/layer_norm.rs` 已在用，`use std::arch::loongarch64::*`）。
-
-**同装置重测**（`tests/fused_primitives_ab.rs`，同进程交替、5 轮丢首轮取中位数，`n=4096, b=256`）：
-
-| 臂 | 标量版（§7.20） | **向量化版（本节）** |
-|---|---|---|
-| A 三趟向量化 | 3.2394 ms | 3.4767 ms |
-| B 融合原语 | 5.8094 ms（**1.793× 慢**） | **1.2638 ms** |
-| **B / A** | 1.793×（更慢） | **0.363×（快 2.75×）** |
-
-**数值**：两臂 **逐位相同**（`max rel = 0e0`）⇒ 收益**不是**靠放松等价类换来的。
-
-**结论**：① 达到 **≥10% 门限**（2.75×）；② **P4-c（计划期发射）现在有数据依据**，下一轮可开始接，
-但必须带 §7.20/`structure.md §7` 的三条护栏（能力探测 / 实测门限 / 逐方法等价类）；
-③ 仍未做：`matmul_pair_psd_f32` 的 A/B（同款向量化已就位，下一轮补测）；帧级（`detect` 整帧）A/B 待 P4-c 接线后做。
-**口径**：单机单次测量、`loadavg` 未记录 ⇒ 只作**方向判断**；帧级收益必须等 P4-c 后的整帧 A/B 才能宣称。
-
-## 7.22 P4-c 判定：帧级天花板 **7.6% < 10% ⇒ 不接线**（用已有数据算，未改公式）
-
-**整帧实测**（`examples/spectral_frame_ab`，LASX 档，FFT 臂）：
-`② 帧体（预建）` **29.1157 ms**（极差 0.72）；`④ 一次性 detect（Auto=FFT）` LASX **30.2362 ms** / 可移植 58.9433 ms；
-`③ 一次性 detect` FFT 29.9725 vs Direct 76.6235（**2.556×**）；`① build_plan` FFT 0.3314 vs Direct 11.2034（**33.80×**）。
-
-**天花板算账**（融合只作用于 `energy` 那一步；微基准 §7.21 同形状 `n=4096, b=256`）：
-* 现路径该步 3 趟 **3.4767 ms**；向量化融合 **1.2638 ms** ⇒ **每帧省 2.21 ms**；
-* 帧体 29.1157 ms ⇒ **2.21 / 29.12 = 7.6%**（一次性 detect 30.24 ms 口径下 = **7.3%**）；
-* 再加成对 epilogue（`psd_pair`）能省的只有 `p×b`（≈131k 元素）的中间写回，按同类带宽估 **<1 ms** ⇒ 合计仍 **<10%**。
-
-**结论（如实，不修饰）**：
-1. **P4-c 不接线**——即使融合完全生效，整帧上限 **7.3–7.6%**，**达不到本项目"≥10% 才采纳"的硬门限**；
-2. 这不是"融合没用"，而是**该步在帧里的占比本来就小**（帧被 FFT/matmul 主导，与 §7.19 结论一致）；
-3. 因此**不为此改公式**（P4-c 需要在 `spectral.rs` 换调用/加专用宏，属于"动公式"的成本）——
-   收益上限不达标时，**不动公式是正确决定**；
-4. 两个融合原语**保留在契约层**（作为逐位 API 与未来后端内部优化的基础），**不接线、不删**；
-5. 若将来帧结构变化使该步占比上升（或做 2D/3D 负载），**同一判据可复用**：先算占比，再决定是否接线。
-
-**口径**：单机单次测量；`loadavg` 未记录；天花板是**用实测分子（微基准）+ 实测分母（整帧）算出的比例**，不是外推模型。
-
-## 7.23 P5-a：gather/scatter —— **1.037×（memcpy 上限），两条负结果比正结果更有价值**
-
-**契约**（`simd_dsl/docs/structure.md §7`，零兼容垫层）：`gather_rows_f32` / `gather_rows_i8` / `scatter_rows_f32`，
-`stride` 显式（`row_len` 与 `*_stride` 分开）、`ids: &[u32]`、越界 ⇒ `Err`（非 UB/截断）、scatter 同 id ⇒
-**调用方顺序 last-write-wins**、`Err` 时 `out` **不被部分写入**；等价类 **逐位**（纯行拷贝、无算术）。
-
-**性能实测**（§5 口径：同进程交替、5 轮丢首轮取中位数；`n_rows=4096, row_len=768`，256 行）：
-* 内核 **0.0642 ms** vs 朴素 **0.0665 ms** ⇒ **1.037×**（≥1.0 达标，未达 1.2 目标）；
-* 原因如实：**纯行拷贝已到 memcpy/内存带宽上限**（768 KB / 0.064 ms ≈ **12 GB/s**），朴素版本身就是 memcpy
-  ⇒ **上限即 memcpy 速度，不是实现缺陷**。
-
-**负结果①（照要求"手写 8-lane"却被数据否掉）**：`load_f32x8`/`store_f32x8` 手写 8 lane 版本实测
-**0.042×（比朴素慢 23×）**——那两个封装**未内联/未展开**，每 8 元素一次函数调用 ⇒ 改 `copy_nonoverlapping`
-（编成 memcpy）。**结论**：**手写 8-lane 只在行内还有算术时才有价值；纯拷贝没有**（已写进内核注释）。
-
-**负结果②（校验位置决定 25%）**：逐行 `checked_mul` + 错误闭包在 256 行就吃掉约 **25%**（实测 **0.769×**）
-⇒ 改为**先一次校验 `max_id`、主循环只做算术**，才拿到 1.037×。
-
-**边界与门控**：`#[cfg(all(feature = "dsl-backend", test))]` → 现已转生产档（trait 方法落地 + 3 个 override）；
-`nm -D` 仍 **98**；默认/feature 两档 clippy 通过；`ops::gather_scatter` 6 passed。
-**数字家**：本文件（`docs/optimizations.md` 只引不抄）。
-
-## 7.24 P5-b 负载调研：`Q·Kᵀ` 转置上限 **24.6–26.8%**（≥10% 门限 ⇒ 解冻理由成立）
-
-**探针**：`examples/stride_headroom.rs`（同进程、5 轮丢首轮取中位数；"现状工作法"= 物化转置 + `api::matmul`）。
-
-| 形状（S×D） | 朴素转置 | **分块转置（公正基线）** | matmul | 上限（朴素 / **分块**） |
-|---|---|---|---|---|
-| 1024×64 | 0.877 ms | **0.741 ms** | 2.272 ms | 27.9% / **24.6%** |
-| 2048×128 | 8.705 ms | **7.941 ms** | 21.685 ms | 28.6% / **26.8%** |
-
-**结论**：① 转置占比 ~25%（即使与分块转置比）⇒ **达到"≥10% 才解冻"门限**，P5-b 的"转置操作数"子集值得做；
-② 但这是**上限**：跨步读会降低 matmul 向量化效率，**净收益必须实施后复测**；
-③ 更便宜的替代是先补 **blocked transpose 原语**（0.74/7.94 ms 已实测）——若跨步 matmul 达不到，就先交这个；
-④ 2D PDE/卷积的"邻域跨步"**仍不做**（仓内无算子，不造负载）。
-**口径**：单机单次测量、`loadavg` 未记录；只作方向判断。**范围**：2D stencil/通用 view **未解冻**。
-
-## 7.25 P5-b 终局判定：NT-GEMM **原语保留、不接线**（`Layout` 跨步仍冻结）
-
-**已落**：`ops/matmul_bt.rs`（标量 NT 内核，`out[i*n+j] = Σ_t a[i*k+t]·b[j*k+t]`，**按 `t` 顺序单累加器 ⇒ 与
-「物化转置 + `matmul_f32`」逐位**，`to_bits` 已钉住；`m=7,k=37,n=11` 非 8 整除含尾部）；门控 `cfg(all(feature,test))`
-（无生产调用方，禁 `allow(dead_code)`，#49）。
-
-**实测（release，同进程交替、5 轮丢首轮、中位）**：
-| 形状 | ① 物化转置+朴素点积 | **② NT 标量内核** | ③ 分块转置+点积 | ①/② |
-|---|---|---|---|---|
-| 1024×64×1024 | 136.124 ms | **70.159 ms** | 149.681 ms | 1.940× |
-| 2048×128×2048 | 2852.998 ms | **648.144 ms** | 3386.733 ms | 4.402× |
-
-**但这些是 vs 朴素基线的数字，不是生产**：生产基线 = 分块转置 **0.741 ms** + `api::matmul` **2.272 ms** ≈ **3.0 ms**
-（§7.24），而 NT 标量 **70 ms ⇒ 慢 23×**。⇒ **按"≥1.10× 才接线"规则：标量版不接线。**
-
-**决定性发现（"无转置 + 逐位 + 8-lane"三者不可兼得）**：lane 取不同 `j` 时，内层每个 `t` 需要
-`b[j0..j0+8, t]` 这 8 个**跨步 k** 的值；`src/arch/lasx.rs` 只导出 load/store/splat/zero/max/neg/abs
-（**无 gather、无 pack/insert**）⇒ 只能先把 8 行**块转置**成连续——**那正是 NT 要省掉的数据移动**；
-而 FMA（`xvfmadd`）会改舍入、破坏逐位。三者无法同时满足。
-**因此本仓当前架构下 NT-GEMM 拿不到生产收益**；除非先补 **vector insert/shuffle 封装**（届时再评估）。
-**结论**：`matmul_bt` 作为**逐位契约原语保留**（可写、可测、跨后端一致），**生产路径仍是"物化转置 + NN"**；
-`Layout` 跨步与 2D stencil **继续冻结**（触发条件不变）。
-**数字家**：本文件。**口径**：单机单次、`loadavg` 未记录；①/③ 为测试内朴素实现，非 `api::matmul`。
-
-## 7.26 P5-b 跨步原语：**三次 A/B 全过门限 ⇒ 推广**（`Strides` + copy/map_unary/map_binary）
-
-**契约（simd_dsl 侧 `50a23fc`，`Backend` 47 → 50）**：`Strides{row,col}`（元素单位，连续 = `{cols,1}`）+
-`copy_strided_f32` / `map_unary_strided_f32` / `map_binary_strided_f32`（**输入与输出均可跨步**）；
-新错误变体 `StridedOutOfRange{op,what,index,len}`（`Err` 时**不部分写入**）；**等价类逐位**——跨步版与连续版
-**共用同一个逐元素函数**（`apply_unary`/`apply_binary`），8 个 `UnaryOp` × 6 个 `BinaryOp` × 两档后端 `to_bits` 相等。
-
-**LASX 覆盖（本仓）**：`copy_strided` → `col==1` 走 **memcpy 行拷贝**（依据 P5-a：手写 8-lane 拷贝慢 23×）；
-`map_unary_strided` 仅 `Sqrt`/`Rcp`、`map_binary_strided` 仅 `Add`/`Mul`/`Div` 走快路径，**其余变体委托
-`simd_dsl::kernels::scalar::*`**（逐位不变）；门控已转生产档 `cfg(feature = "dsl-backend")`（有调用方，`#49`）。
-
-**A/B（同进程、5 轮丢首轮、中位；`rows=1024, cols=768, src_st.col=2`；臂① 物化连续副本+连续 op，臂② 跨步直接）**：
-
-| 轮次 | 臂① | 臂② | 比值 |
-|---|---|---|---|
-| 1 | 2.414 ms | 2.003 ms | **1.205×** |
-| 2 | 2.327 ms | 1.822 ms | **1.277×** |
-| 3 | 1.835 ms | 1.618 ms | **1.134×** |
-
-**判定：三次全部 ≥1.10× ⇒ 达到门限 ⇒ 推广**（此前单次 1.127× 确在噪声带，故按"三次复跑"规则裁决）。
-
-**边界（如实）**：`rows/cols==0` ⇒ 空操作且 dst 不写；溢出 ⇒ `ShapeOverflow`；视图越界 ⇒ `StridedOutOfRange`；
-**`src`/`dst` 别名冲突 = 未定义**，仅 `debug_assert` + 文档声明，**测试不引 `unsafe` 造重叠 ⇒ 该分支未测**。
-**口径**：单机单次测量，`loadavg` 未记录。**数字家**：本文件（`optimizations.md` 只引不抄）。
-
-## 7.27 完整性能对照：**DSL+LASX vs OpenBLAS（GFLOPS）** + 大负载
-
-**口径**：`GFLOPS = 2·m·n·k / t / 1e9`；f32；`nice -n 10`；**同进程只跑一实现、OpenBLAS 与 LASX 严格串行（绝不混跑）**；
-每步记 `loadavg`；**未碰 2048³**。
-**GUI 基线噪声（如实记录）**：全程 `loadavg` **3.6–7.3**，来源是**本机 GUI 本身**——
-`firefox` 内容进程 64%、`cosmic-comp` 37%、`pipewire` 8%，**不是团队构建**；因此绝对数字带噪声，
-**比值（同条件交替）才可比较**。
-
-### 7.27.1 单线程（threads=1）：**拐点 256³，之后 OpenBLAS 单调拉开**
-| 尺寸 | LASX ms / GFLOPS | OpenBLAS ms / GFLOPS | OB/LASX |
-|---|---|---|---|
-| 64³ | 0.0078 / **67.56** | 0.0099 / 53.17 | **1.27×（本库快）** |
-| 128³ | 0.0650 / **64.42** | 0.0731 / 57.35 | **1.12×（本库快）** |
-| 256³ | 0.5394 / **61.96** | 0.5436 / 61.54 | **1.01×（持平）** |
-| 384³ | 1.8670 / 60.58 | 1.7706 / 62.01 | 0.98× |
-| 512³ | 4.3930 / 56.18 | 4.1411 / **62.34** | 0.94× |
-| 768³ | ~19.72 / **45.95**（med of 46.53/45.56/45.95） | ~17.48 / **51.83**（50.43/51.83/52.30） | **0.886×** |
-| 1024³ | ~49.27 / **43.58**（44.87/43.21/43.58） | ~42.39 / **50.65**（49.09/50.66/50.65） | **0.860×（OB 快 16.2%）** |
-
-**结论**：**ISA 差距很小**（单线程 1024³ OB 只快 **16.2%**）；本库在**小尺寸更快**（64³ 1.27×），
-大尺寸**掉 GFLOPS 更快**（本库 57→44，OB 62→49）。GFLOPS 峰值：本库 **67.6（64³）**、OB **62.3（512³）**。
-
-### 7.27.2 512³ 四臂（threads=1，同进程交替）：**抽象层税 ≈ 0**
-| 臂 | ms | GFLOPS |
-|---|---|---|
-| `lasx_rs::api::matmul`（直调） | 4.494 | **59.7** |
-| **DSL + LASX 后端** | 4.473 | **60.0** |
-| `L0_port`（可移植） | 36.60 | 7.33 |
-| **DSL + 可移植** | 36.38 | 7.38 |
-
-**判定**：① **DSL 层 vs 直调 ≈ 1.00（无税）**——两者**走同一个 LASX 内核**，差别只在发射层；
-② **DSL 相对可移植 = 8.2×**——差距来自 **ISA**，不是抽象层。**臂与路径对应必须同读**（防稻草人臂）。
-
-### 7.27.3 12 线程口径：**本库有多线程 GEMM（上一版此节结论错误，已修）**
-**纠错记录（2026-10-18，用户质疑后复核）**：§7.27 初版写"LASX 无 12 线程 GEMM 入口"，**错误**——
-本库**有**线程化入口：`ffi/matmul_plan.rs::lasx_matmul_run_threaded`（库内派发）+ `bench_openblas.c`
-的 `--split=threaded` 档，另有 rows/cols/plan/tight/tight-dyn/omp 多策略；初版用 `api::matmul`（**单线程**）
-代表 LASX 是**选臂错误（稻草人臂）**，与结果无关的是"LASX 弱"，真相是"那一臂没线程化"。
-
-**重测（现有 `scripts/bench_openblas.sh gflops 3`，12 线程，串行不混跑）**：
-| 用例（12t） | LASX 最佳 | OpenBLAS | OB/LASX |
-|---|---|---|---|
-| `m192x768x3072` | **297.23 GFLOPS**（tight-dyn；rows 173.38 / cols 223.50 / plan 247.57 / tight 173.38 / omp 206.85 / threaded 244.68） | 335.60–367.76 | 0.35–0.84（**最好 0.839×**） |
-| `w256x64x4096` | **221.16 GFLOPS**（12t plan；12t cols 133.54） | 220.23–220.36 | **1.007×（打平）** |
-| `w256x64x4096`（1t） | **61.84 GFLOPS** | 40.97 | **1.514×（本库快）** |
-
-**修正后的结论**：① **不是"没有多线程"**，而是**多线程效率按形状分化**——`w256x64x4096` 12t **与 OpenBLAS 打平（1.007×）**、
-1t 快 51%；`m192x768x3072` 12t 落后（**最好 0.839×**，策略差异 173–297 GFLOPS）。② 12t 峰值本库 ~297、
-OpenBLAS ~368 ⇒ **大 k/n 形状下多线程效率是本库真实短板**，但**单线程 ISA 优势仍在**（§7.27.1、1.514× 例）。
-③ 策略间差距之大（173 vs 297 GFLOPS）说明**选策略本身值钱**，值得后续做"按形状自动选 split"。
-**口径**：单次 3 轮、同进程只跑一实现、GUI 基线噪声（§7.27 开头）未消除；数字只作方向判断。
-
-### 7.27.4 未跑 / 口径限制（如实）
-* **768³/1024³ 的四臂未跑**：`dsl_perf_report` 尺寸写死 512³，改它需一轮；
-* **12 线程档**：初版用单线程 `api::matmul` 代表 LASX 属**选臂错误**，已由 §7.27.3 纠正（本库**有**多线程入口）；
-* 大尺寸测量 `iters=2`（1024³）、`iters=5`（768³）；
-* 绝对数字受 GUI 基线噪声影响（§7.27 开头），**只可信同条件比值**。
-
-**下一轮要做的（若继续）**：**按形状自动选 split 策略**（12t 下策略间 173–297 GFLOPS，差距比 ISA 大）
-+ 给 `bench_gflops.sh` 补 12t 线程化臂（现在它只跑单线程臂，本次纠错就源于此）。
-
-**数字家**：本文件（`simd_dsl/docs/performance.md` / `optimizations.md` 只引不抄）。
-
-## 7.28 DSL 后端线程化：GEMM 内核自动并行（默认开、阈值 32M）+ 覆盖矩阵
-
-**用户裁决**：Q1 = **默认开**（自动并行是后端自己的事）；"用编译期尺寸是对的"（`matmul_f32_pinned` 归宏侧另派）。
-**契约零改动**：`simd_dsl` 一行未动、`Backend` 方法**不加线程参数**、`LasxBackend` 仍是单元结构体（`Copy`）、**`nm -D` 仍 98**。
-
-### 7.28.1 做了什么
-1. **`ops/matmul.rs`**：`matmul_f32`（本仓公开内核）拆为「自动分派 + `matmul_f32_single`（原实现逐行未改）」：
-   `work = m·k·n ≥ PAR_MIN_WORK = 32M` 且 `pool::global().threads() > 1` ⇒ **`pool::global()` + `parallel::matmul_f32`**；
-   否则走原单线程主体（打包 / 列块 / 流式三路径不变）。
-   池版要求 `a: &mut [f32]`（行内核就地整理）⇒ **用内部 scratch 消化**，**对内对外签名仍是 `&[f32]`**。
-2. **`dsl_backend.rs::matmul_f32` override** 改调 **`api::matmul_into`**（删掉了早先"自己复制 A"的写法）⇒ **DSL 侧零复制**。
-3. **逃生门**：`pool::init_global(1)`（首次使用前调用）强制单线程；不调用则按 `WorkerPool::auto()`（物理核，`pool/mod.rs:360`）。
-
-### 7.28.2 阈值来源 = 实测（不是猜）
-分进程（`OnceLock` 全进程只能一种线程配置）实测 1t vs auto（`examples/matmul_auto_threshold.rs`）：
-
-| 尺寸 | work | 1t 中位 | auto 中位 | 1t/auto |
-|---|---|---|---|---|
-| 256³ | 16.7M | 0.546 ms | 0.544 ms | 1.00× |
-| 320³ | **32.8M（≈阈值）** | 1.091 ms | 1.094 ms | **1.00×（中性）** |
-| 384³ | 56.6M | 1.865 ms | **0.454 ms** | **4.11×** |
-| 512³ | 134M | 4.509 ms | **1.086 ms** | **4.15×** |
-
-⇒ 交叉点落在 32.8M–56.6M 之间；**取 32M 是安全下界**（该点并行中性、不产生回归；56.6M 起收益 4.11×）。
-
-### 7.28.3 四形状实测：DSL 抽象层税 ≈ 0、1t→auto 4.11–6.35×
-**分进程、非同进程交替**（表头必须这样读）；`nice -n 10`；loadavg 全程 5.13/5.17/4.56（**GUI 基线噪声**：Firefox/cosmic-comp/pipewire，**非团队构建**）。
-
-| 形状 | 1t 直调 | 1t DSL | DSL/直调 | auto 直调 | auto DSL | DSL/直调 | 1t→auto | auto GFLOPS |
-|---|---|---|---|---|---|---|---|---|
-| 512³ | 4.431 ms | 4.413 ms | 0.9958 | 0.863 ms | 0.879 | 1.0184 | **5.13×** | 310.9 |
-| 1024³ | 39.721 ms | 39.297 ms | 0.9893 | 6.251 ms | 6.072 | 0.9714 | **6.35×** | 343.6 |
-| 192×768×3072 | 15.297 ms | 15.225 ms | 0.9953 | 2.978 ms | 3.018 | 1.0135 | **5.14×** | 304.3 |
-| 256×64×4096 | 2.167 ms | 2.172 ms | 1.0024 | 0.527 ms | 0.536 | 1.0177 | **4.11×** | 254.8 |
-
-**两臂同走 `api::matmul_into`**（DSL 臂 = `LasxBackend::matmul_f32`），差异只在一次 `Backend` 分派 ⇒ **八个比值全在 0.97–1.02**，即**抽象层税 ≈ 0**。
-
-### 7.28.4 逐位（硬约束）
-池版**只按输出行切、绝不 split-K** ⇒ 每个输出元素的累加顺序与单线程完全相同 ⇒ **数值逐位不变**（`api::matmul` 的**时间行为**变了，**数值未变**——这是用户批准的默认升级）。
-递归风险已排除：`parallel::matmul_f32` → `matmul_f32_picked` 只调 `matmul::matmul_f32_packed_rows`，**不回调** `ops::matmul::matmul_f32`。
-
-### 7.28.5 覆盖矩阵（`simd_dsl::Backend` 55 方法 × 状态）
-> 基线：本表以 `docs-dev` 的只读审计 `audit_lasx_caps.md`（file:line）为准，正则统计只作交叉核对。
-
-**A. 已覆盖（走 LASX 专核，22 项）**：`matmul_f32`（**本轮改走自动并行**）、`matmul_f32_packed`、`pack_f32`、`dot_f32`、`map_affine_f32`、`map_binary_f32`、`reduce_sum_f32`、`reduce_sum_cols_f32`、`reduce_weighted_sum_cols_f32`、`reduce_centered_sq_sum_cols_f32`、`build_kernel_f32`、`gather_rows_f32`、`gather_rows_i8`、`scatter_rows_f32`、`copy_strided_f32`、`map_unary_strided_f32`、`map_binary_strided_f32`、`fft_strided_f32`、`matmul_pair_psd_f32`、`name`、`precision_claim`、`supports`。
-
-**B. 无 lasx 内核 ⇒ engine 默认即最优（保持回落，不硬造）**：
-- `reduce_sum_rows_f32` / `reduce_rows_map_f32`：`lasx_rs/src/**` **零命中**；engine 默认 `scalar::reduce_sum_rows_f32`（`simd_dsl/src/kernels/scalar.rs:637`）**已是多累加器、可向量化** ⇒ 再包一层 LASX 只是重复实现。**等价类 = 容差类（累加次序不同），不给逐位承诺**。
-- `map_unary_f32`：本仓只有 `map_affine`/`map_binary`（`dsl_map.rs`）与**跨步** unary（P5-b），**无通用一元内核** ⇒ 保持回落。
-- **触发条件（将来才做）**：实测 engine 默认在真实负载上成为瓶颈时才特化，**不因为"能写"就写**。
-
-**C. 其余缺失项（回落 portable，待补优先级）**：`reduce_max_f32`/`reduce_min_f32`、`reduce_max_cols_f32`/`reduce_min_cols_f32`、`reduce_max_rows_f32`/`reduce_min_rows_f32`、`reduce_cols_map_f32`、`reduce_sum_f64`、`reduce_weighted_sum_f32`/`_f64`、`dot_f64`、`dot_f32_pinned`、`matmul_f64`、`matmul_bt_f32`、`matmul_f32_pinned`、`map_unary_f32_routed`、`map_unary_f64`、`map_unary_masked_f32`、`map_binary_rows_f32`、`map_binary_cols_f32`、`map_binary_scalar_f32`、`map_ternary_f32`、`stencil_rows_f32`、`build_banded_kernel_f32`。
-**判据**：有现成内核且**能逐位**的先补（`reduce_max/min_*` 与 `map_binary_scalar_f32` 属此类）；不能逐位的如实标等价类后再补。
-
-**`capabilities()` 缺口（如实）**：目前只有 `Capability::Packing` 为 `true`（"只报确实为真"）；线程化**不是能力位**，`capabilities()` 不报（`Backend` 没有线程相关能力项，这是设计使然，不是漏）。
-
-### 7.28.6 谁守（契约归属）
-| 契约 | 谁守 | 违反后果 |
-|---|---|---|
-| 线程数 = 全局池（`pool::global()` / `init_global`） | 后端实现（`lasx_rs`） | 不崩，但性能不符合预期 |
-| 自动并行阈值 `PAR_MIN_WORK = 32M` | 后端常量（本仓） | 同上；无正确性影响 |
-| **逐位**（只切行、不 split-K） | 后端实现 + 测试 | **错结果**（若改成 split-K） |
-| 默认行为变更（时间行为变、数值不变） | 用户裁决 + 本节记录 | —— |
-
-### 7.28.7 与审计的冲突（如实）
-审计快照（`audit_lasx_caps.md` §3.2 行 108）写"**`LasxBackend`（DSL）单线程**（`dsl_backend.rs:35` 明写未接未测）"——**该结论在本提交后已过时**：`dsl_backend.rs` 的 `matmul_f32` 现在调 `api::matmul_into` ⇒ 经由 `ops::matmul::matmul_f32` 的自动分派**默认并行**。审计的 file:line 当时仍然正确（历史状态），**冲突项以本节的实测为准**。
-另：审计文件（`audit_lasx_caps.md`，第 3.4 节）记录 `shape::auto_threads`（`shape.rs:420`）已有"`rows/4≥2` 且 `rows·k·n ≥ AUTO_MIN_WORK=4M` 才并行"的形状自适应阈值 ⇒ **本仓现在有两条独立阈值**（typed shape 4M、GEMM 内核 32M），**二者服务于不同入口、不互相覆盖**；后续若要统一，应在后端层做（仍不进 DSL）。
-
-## 7.29 阶段1 落地：群论可分离 ⇒ 引擎编译期发射（**稠密 4.73–4.79× 采纳；稀疏 5 点 BelowThreshold**）
-
-**原型审计**（`/home/lik/tmp_keep/audit_simd_prototypes.md`，`simd_dsl` 侧只读）：`perceive_stencil_grid`/`perceive_index`/
-`perceive_symmetry`/`criteria::group` 全部"只判不算"（零生产消费者）；`⑪` 2D 对角化**缺 2D 成本模型**（现委托 1D 判据）
-⇒ 只作能力储备不发射；`perceive_symmetry` 传播退化（`kept_by` 只返回 `{BatchPerm}`，两条 const 断言空真）。
-
-**落地（`simd_dsl`，零新契约）**：`Stencil2Sym`/`Tap2` 下沉 `contract/stencil.rs`（解 layercheck 陷阱）；
-`select_separable` 改收**画像**、只出"可分离候选"（`separable_saving_ppm` 降为账本上界，**不再决定发射**）；
-`engine/rewrite.rs` 新增 2D 可分离发射（行 pass + 列 pass，**零转置**：行主序下行/列偏移都连续）；
-`stencil_cols_f32` 契约**曾加又删**（实测证明零新契约即可，符合 P4 护栏）。
-
-**实测（引擎内，同进程交替 5 对丢首对中位；loadavg 4.88/5.34/4.98）**：
-| 负载 | 直接 | 两趟 | 结论 |
-|---|---|---|---|
-| 稠密 7×7 256² | 8.5998 ms（49 抽头） | 1.7959 ms（14 抽头） | **4.789× 采纳** |
-| 稠密 7×7 512² | 33.8188 ms | 7.1487 ms | **4.731× 采纳** |
-| 稀疏 5 点 256² | 0.2623 ms | 0.8310 ms | **0.316× ⇒ BelowThreshold（不发射）** |
-| 稀疏 5 点 512² | 1.0504 ms | 3.2118 ms | **0.327× ⇒ 同上** |
-
-**`ops_dsl` 独立 A/B 同向**：稠密 7×7 **3.631×/3.373×/3.615×**（512²/1024×768/2048²，浮点核容差类
-`max|sep−dir| ≤ 3.58e-7`；整数核其内部两实现逐位）；稀疏 5 点 **0.60–0.76×**（反例，保留在 example 输出）。
-
-**诚实 negatives**：① 引擎发射是**容差类不是逐位**（两趟/直接求和次序不同：整数核 `max rel 8.9e-6`，618/768 元素位模式不同）
-——与 `ops_dsl` 的"其内部逐位"**不一致**，逐位对齐是已记录缺口；② 稀疏 5 点实测更慢 ⇒ 不发射；③ ⑪ 不发射（2D 成本模型缺失）；
-④ 通用化后稀疏 5 点从早期特化的"1.74×"掉到 0.32× ⇒ **早期特化数字不能当结论**。
-**数字家**：本文件（`simd_dsl/docs/structure.md §7` / `optimizations.md §10` 只引不抄）。
-
-## 7.30 阶段2：群论能力进基础宏 —— 新宏 `stencil!`（**E2E 4.862×/4.662×**；稀疏 5 点仍 BelowThreshold）
-
-**设计裁决（Lead）**：走"宏只透传、engine 决策"；宿主**新增第 17 个宏 `stencil!`**（不是扩 `nabla!`——`nabla!` 的 `h` 必填且语义=导数，
-硬塞 `template` 会让用户填被忽略的参数）；**`nabla!` 一行未改**；门禁例外：`macroslayer` 的"原子层只许发射契约层"与
-`nabla!`→`::simd_dsl::diff_rows_f32` 的既有先例同型 ⇒ 明确"**根重导出的单一 façade 视为契约层入口**"（只加注释、不改匹配规则）。
-
-**语法**：`stencil!(b; out[r, c] = x[r, c], template = [a0, a1, …], bc = Interior)`——`template` 为**完整 1D 抽头表**
-（字面量、奇数长 ≥3；2D 核 = `template ⊗ template`）；宏零判断，发射 façade `simd_dsl::stencil2d`。
-
-**E2E 实测（`tests/stencil_macro.rs`；同进程交替 5 对丢首对取中位、记 loadavg）**：
-| 负载 | 宏（可分离 14 抽头） | 直接 7×7（49 抽头） | 倍率 |
-|---|---|---|---|
-| 稠密 7×7 256² | 2.3304 ms | 11.3299 ms | **4.862×** |
-| （复跑） | 2.3339 ms | 10.8809 ms | **4.662×** |
-
-**等价类**：宏展开物 vs 直调 `stencil2d` **逐位**；`bc=Periodic`/非方阵/小尺寸 `max rel ≤ 1.85e-5`（**容差类**，两趟 vs 直接求和次序不同）。
-**反例（保留）**：稀疏 5 点仍 `route=Direct`、`⑩ skipped=BelowThreshold`（0.32×）。**编译期拒绝**：5 负例 + 2 正例（缺 template/偶数长/未知参数/下标不同名…）。
-连带修：`Tap2` 有理外积 `i16→i32`（`i128` 判定）、负数字面量 token 解析、`opcheck` 白名单 9 → 17 个真实宏（漏登修正，非放宽）。
-
-## 7.31 阶段3 批2：**7/7 组合版都输 ⇒ 已批准融合原语进契约**（真实 A/B，非趟数模型）
-
-**实测（`examples/composed_ab.rs`；同进程交替、6 对丢首对取中位；threads=12；loadavg 5.49/6.49/6.78）**：
-| 算子 | `api` ms | 组合 ms | api/组合 | 等价类 |
-|---|---|---|---|---|
-| softmax_rows | 1.588 | 8.345 | **0.190×** | 容差 2.79e-9 |
-| rms_norm | 0.512 | 1.676 | **0.305×** | 容差 1.83e-7 |
-| layer_norm | 0.736 | 2.906 | **0.253×** | 容差 2.08e-7 |
-| gelu_quick | 24.904 | 130.154 | **0.191×** | **容差 5.26e-3（LASX tanh 近似，非 1e-5）** |
-| axpy | 10.537 | 33.316 | **0.316×** | 容差 8.27e-8 |
-| amax | 5.630 | 47.784 | **0.118×** | **逐位** |
-| rope | 0.191 | 0.804 | **0.237×** | 容差 6.92e-8 |
-
-**判定**：**赢 0 项、输 7/7（慢 3.2–8.5×）** ⇒ 纯组合**不能**作为迁移落点。
-**Lead 裁决（P4 护栏）**：**批准 7 个融合原语进 `Backend` 契约**（`softmax_rows_f32`/`rms_norm_rows_f32`/`layer_norm_rows_f32`/
-`gelu_quick_f32`/`rope_apply_f32`/`axpy_f32` + `UnaryOp::Abs`）：portable 默认 = 组合版（逐位/容差给界），
-**LASX override = 现成融合核**（`api::*`）⇒ DSL 路径目标 **≥0.98**；能力位只报确实为真。
-**关键教训**：`gelu_quick` 的等价界是 **5.26e-3**——"可迁移性"必须由**实测等价界**决定，不能按"容差 1e-5"想当然。
-
-**数字家**：本文件（`simd_dsl` docs 只引不抄）。
-
-## 7.32 阶段4：**融合 = 加速选项**（4/6 过线）+ **引擎 KPI 真正成果**（组合版 5→1 / 8→2 趟）
-
-**用户口径（已入 `simd_dsl/docs/structure.md` 的决策记录）**：**组合版是源实现（唯一跨后端路径），融合核是加速选项**；
-组合版慢是**引擎的 KPI**，不是换融合核的理由。
-
-### 7.32.1 融合加速 A/B（`examples/fused_ab.rs`；threads=12；loadavg 4.90/4.55/5.67；6 对丢首对中位；**6/6 先验逐位**）
-
-> **⚠️ 证据分级 C**：轮前 loadavg（4.90/4.55/5.67）**超过第 6.4 节的 B 级门限**（1min≤4.5）⇒ **本表只作趋势，不作验收**；
-> 需正式采纳时须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
-| 算子 | `api` ms | DSL ms | api/dsl |
-|---|---|---|---|
-| softmax_rows | 1.074 | 1.065 | **1.008×** |
-| rms_norm | 0.354 | 0.385 | 0.920×（**薄转发噪声**，逐位相同） |
-| layer_norm | 0.536 | 0.563 | 0.952×（同上） |
-| gelu_quick | 17.498 | 17.014 | **1.028×** |
-| axpy | 12.557 | 11.810 | **1.063×** |
-| rope | 0.189 | 0.194 | 0.974× |
-
-⇒ **4/6 ≥0.98**；rms/layer 的 0.92/0.95 是**同一内核的薄转发开销 + 小尺寸噪声**（逐位可证），**未调阈值、未换内核**。
-`supports(FusedNorms/FusedElementwise)` 仅当 6 方法全接上才报 true；`UnaryOp::Abs` 无 LASX 专用核 ⇒ 不报能力位（走 portable 逐位 2 趟）。
-
-### 7.32.2 引擎 KPI（组合版源实现降趟，`simd_dsl` `af3d85e`；**只用 `Backend` 契约方法，不用任何后端融合核**）
-| 方法 | 趟数 | 手段 | A/B（新 vs 旧组合） | 结论 |
-|---|---|---|---|---|
-| `rms_norm_rows_f32` | **5 → 1** | 窄三元组 `reduce_rows_map_f32{SumSq, SqrtMeanPlusEps, Div}` | **1.617× / 1.625×** | **采纳** |
-| `layer_norm_rows_f32` | **8 → 2** | 两段 `{Sum,Mean,Sub}` + `{SumSq,SqrtMeanPlusEps,Div}` | **1.304× / 1.303×** | **采纳** |
-| `softmax_rows_f32` | 5 → 3（候选） | 拆成 3 段窄融合 | 0.997–1.028×（<1.10） | **不采纳**（`exp` 落在两次归约之间，省下的趟被多累加器重扫抵消） |
-| `gelu_quick` / `rope` / `axpy` | 7/6/3 不变 | 需多输入融合/原地别名/后端核 | — | **不采纳**（超出"不改源实现"铁律） |
-
-**缓冲复用**：rms **3 块 → 0 块**、layer **3 块 → 1 块**。**等价类未升级**：`axpy`/`Abs` 仍逐位；rms/layer 与标量参照 `max abs = 0e0`。
-**关键教训**：**pass 数少 ≠ 一定更快**（softmax 反例）——必须实测，不能按趟数拍板；`reduce_rows_map_f32` 是"行统计→逐元素变换"形态的唯一杠杆。
-
-### 7.32.3 阶段3 批3（零契约组合版，诚实数字）
-`cmatmul` Direct **1.027×（逐位）**、`dot_f64` **1.013×（逐位）** 过线；`absmax_rows` **0.676×**、`batch_distance2d` **0.70–0.73×**
-（**逐位但趟数 3/6 vs 融合核 1**）⇒ **BelowThreshold，组合版保留**（符合"组合版是源实现"口径）。
-
-### 7.32.4 Master 总表（`examples/auto_ab.rs`；threads=12；loadavg 6.20/6.41/6.56；6 对丢首对中位；**全部逐位**）
-
-> **⚠️ 证据分级 C**：轮前 loadavg（6.20/6.41/6.56）**超过 B 级门限**（1min≤4.5）⇒ **本总表只作趋势，不作验收**；
-> 正式结论须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
-
-**`*_auto` / override 路径 vs `lasx_rs::api::*`**：
-| 项 | api ms | auto/override ms | api/auto | 结论 |
-|---|---|---|---|---|
-| softmax_rows_auto | 1.068 | 1.088 | 0.982× | ✅ |
-| rms_norm_auto | 0.389 | 0.354 | **1.100×** | ✅（1 趟融合净收益） |
-| layer_norm_auto | 0.566 | 0.549 | 1.031× | ✅ |
-| gelu_quick_auto | 17.217 | 17.240 | 0.999× | ✅ |
-| matmul_f32 @1024³ | 5.764 | 5.866 | 0.983× | ✅ |
-| matmul_f32 @192×768×3072 | 2.880 | 2.886 | 0.998× | ✅ |
-| matmul_f32 @512³ | 0.790 | 0.849 | **0.931×** | ❌（**同一内核、逐位**，薄转发+小尺寸+loadavg 6.2 噪声；非算法回退） |
-| matmul_f64 @512³ | 9.854 | 10.021 | 0.983× | ✅ |
-
-⇒ **`*_auto` 4/4 达标、8 项中 7 项 ≥0.98**；能力位实测 `FusedNorms=true FusedElementwise=true`。
-
-**两列架构对照（组合版 vs api；auto/override vs api）**：
-* 批2：softmax **0.190× → 0.982×**、rms **0.305× → 1.100×**、layer **0.253× → 1.031×**、gelu_quick **0.191× → 0.999×**、
-  rope **0.237× → 0.974×（override）**、axpy **0.316× → 1.063×（override）**、amax **0.118×（无融合原语，LASX 无 Abs 内核 ⇒ 逐位组合版保留）**；
-* 批3：`BelowThreshold` 不迁（cmatmul Direct / absmax_rows / batch_distance2d，数字见 §7.31；组合版保留为跨后端源实现）。
-* **架构结论**：**组合版 = 跨后端唯一源实现**（LASX 上慢 3.2–8.5×，如实保留）；**能力探测 auto/override 后 7/8 项 ≥0.98**
-  ⇒ "源实现 + 加速选项"架构成立；下一步引擎 KPI 仍应继续压组合版趟数（§7.32.2 已采纳 rms/layer）。
-
-**f64 逐元素契约（`task-45`）落地后补本节续篇（编号待定）。**
-
-## 7.33 阶段4 收尾：f64 契约（P0 6 方法）+ f64 几何五入口（**全部 BelowThreshold，源实现先跑通**）
-
-### 7.33.1 f64 逐元素/轴归约契约（`Backend` 56 → 62；portable 默认，无 LASX override）
-| 方法 | 等价类 |
-|---|---|
-| `map_binary_f64` / `map_ternary_f64` / `map_affine_f64` | **逐位** |
-| `reduce_sum_cols_f64` / `reduce_weighted_sum_cols_f64` | **逐位** |
-| `reduce_sum_rows_f64` | **容差**，实测 **rel ≤ 1.233e-15**（1024×4096，non-dyadic 数据） |
-
-**能力位**：本仓**无 f64 逐元素内核** ⇒ 不报 `F64Elementwise`/`Reduction`；生产路径 = portable 默认（跨后端可用）。
-**教训**：f64 数据取二进制精确值（0.125）时多累加器与顺序累加**完全相同**，测不出容差差 ⇒ 必须用 non-dyadic 数据。
-
-### 7.33.2 f64 几何五入口（`ops_dsl`，SoA 布局；组合版源实现）
-| 入口 | 趟数 | 等价类 vs `lasx_rs::api` |
-|---|---|---|
-| `vec3_add_scaled_f64` | 6 | 容差（lasx FMA 单舍入 vs 两步；≤1 ulp） |
-| `norm3_batch_f64` | 6 | **逐位** |
-| `unitize3_batch_f64` | 9 | 容差（≤1 ulp）；**已知差异：零向量 lasx=(0,0,0)、本实现 NaN**（契约无 f64 选择原语，已文档化钉住） |
-| `cross3_batch_f64` | 9 | **逐位** |
-| `mat3_mul_vec3_batch_f64` | 15 | **逐位** |
-
-**A/B（n=1M，threads=12，loadavg 3.95，6 对丢首对中位）**：
-| 用例 | api ms | ops ms | ratio |
-|---|---|---|---|
-| vec3_add_scaled | 8.747 | 20.473 | **0.427** |
-| norm3_batch | 4.905 | 22.452 | **0.218** |
-| unitize3_batch | 9.135 | 36.284 | **0.252** |
-| cross3_batch | 10.327 | 39.029 | **0.265** |
-| mat3_mul_vec3 | 26.550 | 63.361 | **0.419** |
-
-⇒ **五项全部 `BelowThreshold`（0.22–0.43×），不替换生产入口**：LASX **无 f64 逐元素 override** ⇒
-组合版是 **6–15 趟 portable 标量** vs **1 趟向量融合核**。这正是"**源实现先跑通、加速选项待后端覆盖**"的活例：
-* 若要加速：给 LASX 加 f64 逐元素 override（`map_binary/affine/ternary_f64` 的 LASX 实现）或几何融合核；
-  按 P4 护栏需 portable 默认已存在（✅）+ 能力探测 + 实测门限。
-* **未迁移（8 个，`NotMigrated`，理由入模块头）**：`quat_*`、`j2_accel_batch`、`ballistic_step`、`rk4_j2_step_batch`
-  —— f64 SoA 交叉索引 + 领域融合语义，建议做领域库而非塞 `Backend`。
-
-## 7.34 任务1：f64 几何 5 融合原语进契约 + LASX override（fused A/B **3/5 ≥0.98**）
-
-**契约（`simd_dsl` `1507da3` / 现 rev `0fd6d66`；`Backend` 62 → 67）**：`vec3_add_scaled_f64` / `norm3_batch_f64` /
-`unitize3_batch_f64` / `cross3_batch_f64` / `mat3_mul_vec3_batch_f64`（`m:[&[f64];9]` 9 条逐元素数组）
-+ `Capability::FusedGeometry`；**portable 默认=现有组合版、逐位**（默认实现逐行照抄 `ops_dsl::geometry` 组合序列，6/6/9/9/15 趟），
-portable **不自称**能力位。零向量：默认 `NaN`（组合语义）。
-**LASX override（`a62a48c`）**：前 4 直接映射 `api::*_into`；`mat3` 新增 **Rust 层 `mat3_mul_vec3_batch_into`**
-（内部逐元素核、免分配、**无新 C 导出 ⇒ `nm -D` 98**）；`supports(FusedGeometry)` **5 全接才 true**；
-override 保持 LASX 内核语义（零向量 `(0,0,0)`）⇒ **"能力探测路径各自语义"已文档化 + 测试分别断言**。
-**fused A/B（`examples/geomf64_fused_ab.rs`；threads=12；loadavg 6.30/5.63/3.93；n=1M；6 对丢首对中位；5/5 逐位）**：
-| 算子 | api ms | DSL ms | api/dsl |
-|---|---|---|---|
-| vec3_add_scaled_f64 | 10.985 | 11.297 | 0.972× ❌ |
-| norm3_batch_f64 | 4.398 | 4.148 | **1.060×** ✅ |
-| unitize3_batch_f64 | 10.092 | 10.249 | **0.985×** ✅ |
-| cross3_batch_f64 | 14.069 | 12.669 | **1.110×** ✅ |
-| mat3_mul_vec3_batch_f64 | 20.925 | 21.958 | 0.953× ❌ |
-
-⇒ **3/5 ≥0.98（0.22–0.43× → 0.95–1.11×）**；两项 <0.98 是**薄转发 + 参数校验开销**（内部同一内核、结果逐位；
-`mat3` 多一层 15 项长度校验），**不调阈值、不换内核**。`ops_dsl` 侧 `*_auto` 入口（`0fd6d66`）：`supports` 真走 1 趟融合、
-否则组合版（组合版保留为跨后端源实现）；auto 路径 A/B 另测（见下）。
-
-**auto 路径 A/B（`examples/geomf64_auto_ab.rs`；基线 `cd090eb`；n=1M；threads=12；loadavg 4.94/4.96/4.77；6 对丢首对中位；5/5 逐位）**：
-| 算子 | api ms | auto ms | api/auto |
-|---|---|---|---|
-| vec3_add_scaled_auto | 16.802 | 12.990 | **1.293×** ✅ |
-| norm3_batch_auto | 5.162 | 4.329 | **1.192×** ✅ |
-| unitize3_batch_auto | 17.199 | 10.674 | **1.611×** ✅ |
-| cross3_batch_auto | 17.886 | 13.609 | **1.314×** ✅ |
-| mat3_mul_vec3_batch_auto | 29.454 | 24.738 | **1.191×** ✅ |
-
-⇒ **5/5 ≥0.98**（运行时 `cap: FusedGeometry=true` ⇒ auto 走 1 趟融合分支）。**归因（别误读成"组合版更快"）**：
-两臂内部是**同一个 LASX 内核**（结果逐位相同）；比值 >1 来自 **A 臂 `api::*_batch` 每次调用分配 1–3 个 `AlignedVec`、
-B 臂 `*_auto` 复用调用方缓冲**（暂存参数在融合分支被忽略）⇒ 这是"**免分配入口 vs 分配版入口**"的差，**不是算法差异**。
-若看"同分配语义"对照，见上面的 `geomf64_fused_ab`（3/5 ≥0.98，vec3 0.972 / mat3 0.953 = 薄转发 + 15 项长度校验）。
-**零向量**（不参与比值）：auto(融合)=`(0,0,0)`（LASX 内核语义）；组合版=`(NaN,NaN,NaN)`（路径各自语义，override 不打补丁）。
-
-## 7.35 任务2（引擎 KPI 续）：softmax 三案 **全部 <1.10 不采纳**；axpy 单趟因契约禁止别名 **只记提案**
-
-**softmax 两趟再试（`simd_dsl` `9e34439`；同进程 A/B 新组合 vs 现 5 趟；64×512；≥5 对丢首对中位；loadavg 6.49/5.58/3.84，复跑 6.86/7.25/5.28）**：
-| 候选 | 拆法 | 实测（两次） | 结论 |
-|---|---|---|---|
-| A | `{Max,Raw,Sub}` + exp + `{Sum,Inv,Mul}` | 0.977× / 0.988× | **不采纳** |
-| B | 2 块缓冲（p1 写 out、exp 写 ex、p3 回写） | 0.999× / 1.000× | **不采纳** |
-| C | B + 行块（工作集 ~256 KiB） | 0.999× / 0.999× | **不采纳** |
-
-**归因（实测，不是猜测）**：`reduce_rows_map_f32` 内部 = 归约 + map **两次物理扫描** + 多累加器 ⇒ 一次调用 ≈ 2 物理趟；
-"3 逻辑趟"实际 ≈ 5 物理趟 ⇒ 省下的 pass 被内部重扫吃掉；`exp` 必须落在两次行归约之间 ⇒ 真 2 趟需要
-"**边 map 边累加**"的融合归约，**现有契约没有**（候选 A 的设想不可表达）。候选 B 只省缓冲（内存收益），**不是时间收益**。
-等价类：三案 vs 旧 5 趟 `max abs = 9.31e-10`（同容差界，未升级）。
-**axpy 单趟**：先验证后断言——`kernels::scalar` 的 `map_affine_f32`/`map_binary_f32` 用 `assert_no_alias`（`debug_assert` 基地址比较）
-**契约明确禁止输出别名输入** ⇒ **不实现**（保留 3 趟、逐位不变）；**提案**：新增 `axpy_inplace_f32(y:&mut, x, alpha)` 或
-按 op 分类放宽别名规则（"纯逐元素、读前写后"），等价类仍**逐位**；影响面：契约文档 + 所有后端 override 复核 + `assert_no_alias` 分类放行；
-收益上限 3→1 趟（**未测**，本轮不实现）。
-**教训**：① **"逻辑趟数"不是性能指标**——复合原语（`reduce_rows_map` = 2 次物理扫描）拼"更少趟"可能更慢，必须实测；
-② **省缓冲 ≠ 省时间**；③ `assert_no_alias` 是 `debug_assert` ⇒ **release 下"跑通了"不能当作别名合法的证据**。
-
-**数字家**：本文件（`simd_dsl` docs 只引不抄）。
-
-## 7.36 P0-1：`axpy_inplace_f32` 契约落地 —— **3 趟 → 1 趟（7.753×）**，逐位
-
-**契约**（`simd_dsl` `33f3584`；`Backend` 67→68）：`axpy_inplace_f32(y:&mut, x, alpha)`，语义 `y[i] = alpha*x[i] + y[i]`、
-**逐位**（刻意保持旧路径求值顺序：`t = alpha·x + 0.0`（保留 `−0 ⇒ +0`）→ `y + t`）；`x` 只读且**不得与 `y` 重叠**
-（`assert_no_alias` 为 `debug_assert` 基地址比较；**release 下靠调用方约定，违反=静默错结果，非 UB**）。
-`axpy_f32` 签名/语义不变，portable 默认改为直接调它 ⇒ **3 趟 → 1 趟、无临时缓冲**；LASX 已有 override 不受影响。
-**A/B（同进程交替 5 对丢首对中位；loadavg 1.58/1.35/0.76；n=262144）**：旧 3 趟 **0.5575 ms** vs 新 1 趟 **0.0719 ms** = **7.753×** ⇒ 采纳。
-**等价类**：新 1 趟 ≡ 旧 3 趟 ≡ 标量参照，`to_bits` 全等（alpha=0.375 精确 / 0.1 非精确 / −2.5 三组）。
-**如实边界**：**重叠调用形态未测**（安全 Rust 借用检查器拒绝构造 `&[f32]` 与 `&mut [f32]` 指向同一块内存；本仓不用 `unsafe` 造别名），
-守它的是 `assert_no_alias` 的谓词单测（`#[should_panic]`，debug 档）。
-
-## 7.37 P0-2：`map_rows_sum_f32` 单趟融合归约 + softmax **5→3 趟（1.328–1.464×）**
-
-**契约**（`simd_dsl` `8845f87`；`Backend` 69 方法）：`ReduceMapOp { Exp, ExpShiftedRow }`（**值枚举**，非闭包——
-为了 `dyn Backend` 可用 + LASX 可精确 override + 可穷尽匹配）+ `map_rows_sum_f32(x, rows, cols, shift, map, out_mapped, out_rowsum)`：
-**一次物理扫描**同时写映射值并累加行和。portable 默认=`kernels::scalar` 逐元素+行累加（**不调任何后端融合核**）；
-守卫：`Exp` 传非空 `shift` ⇒ `Err`、`ExpShiftedRow` 的 `shift.len()!=rows` ⇒ `Err`、长度错 ⇒ `Err`、`n=0` ⇒ `Ok`、输出与输入不得重叠。
-**趟数**：`softmax_rows_f32` **5 趟 → 3 趟**（行 max → 单趟 `map_rows_sum{ExpShiftedRow}` → 行级 `1/Σ` + 乘）。
-**A/B（同进程交替、5 对丢首对中位）**：
-
-> **⚠️ 证据分级 C**：两轮 loadavg（7.33/5.91/3.51、6.60/7.21/5.09）均**超过 B 级门限** ⇒ **1.328×/1.464× 只作趋势，不作正式验收**；
-> 同节的 LASX override 4.4×（loadavg 7.22/6.26/5.36）亦然。正式结论须在 B 级窗口重跑（C 片审计发现，2026-10-19 标注）。
-
-| 轮次 | loadavg | 新 3 趟 | 旧 5 趟 | 倍率 |
-|---|---|---|---|---|
-| 首测（64×512） | 7.33/5.91/3.51 | 0.2925 ms | 0.3885 ms | **1.328×** |
-| 复跑（提交内容上） | 6.60/7.21/5.09 | 0.2539 ms | 0.3718 ms | **1.464×**（逐对 1.34–1.51×） |
-
-⇒ **≥10% 采纳**。**等价类（修正后口径，勿写成逐位）**：**portable 默认路径**内部是"映射值逐位"（`Exp` vs `map_unary(Exp)` 位差 0；`ExpShiftedRow` vs `Sub+exp` 位差 0）；但**契约类 = 容差**——
-**LASX override 用 `exp_vec`（≠ libm exp）⇒ 映射值 rel ≤ 1.50e-7、行和 rel ≤ 1.86e-6**（后端实测，`map_rowsum_ab`）。
-行和另因累加次序不同属容差类（本数据 `max abs/rel = 0e0` 属巧合）；softmax vs 标量参照 `max abs 9.31e-10`（仍 ≤1e-6 界）。
-**关键教训**：上一轮"逻辑趟数减少"全假——`reduce_rows_map_f32` 是复合操作（**2 次物理扫描**）；
-这次能赢的关键是**真的少一次物理扫描**（单趟同时写两个输出），不是"少一个逻辑步骤"。
-**LASX override（已落地，`b49b6c4`）**：`src/ops/map_rows_sum.rs` 单趟 exp+per-lane 行和（尾部 lane 用 −1e30 填充 ⇒ exp 精确 0、不污染行和）；
-A/B（A=portable，B=override；6 对丢首对中位；loadavg 7.22/6.26/5.36）：64×64 **4.37×/4.40×**、1024×1024 **4.22×/3.98×**、2048×4096 **2.57×/2.52×**
-⇒ **6/6 ≥1.10（全部 ≥2.5×）⇒ 保留 override**；等价值见上（容差类）。
-
-
-## 7.38 P0-3：行归约/归一分派推广 —— 行归一化 **3–10×**；列归约仅 **≥67M** 有收益
-
-**做法**（`lasx_rs` `3054591` 合并；`src/parallel.rs` 新增 5 个切分层入口，接收显式 `&WorkerPool` ⇒ 同进程 1t vs auto 可对照）：
-行归一化按**行块**切（逐行独立 ⇒ **逐位**）；列归约按**列块**切（每列行序不变 ⇒ **逐位**）。**阈值实测校准**：行归一化 **8K 元素**、列归约 **33.5M 元素**。
-**A/B（同进程 1t vs auto，12 线程；loadavg 1.32→3.77；5/5 逐位相等）**：
-| 算子 | 8K | 32K | 786K | 4.2M | 16.7M | 33.5M | 67M |
-|---|---|---|---|---|---|---|---|
-| reduce_sum_cols | 0.95 | 1.01 | 0.99 | 1.04 | 1.00 | 1.01 | **4.04×** |
-| reduce_weighted_sum_cols | 0.97 | 1.00 | 0.98 | 1.00 | 1.01 | 1.02 | **5.17×** |
-| softmax_rows | 4.51 | 6.69 | 6.94 | 3.97 | 3.75 | 3.71 | 3.69 |
-| rms_norm | 2.95 | 5.32 | 9.06 | 3.15 | 3.02 | 2.82 | 2.24 |
-| layer_norm | 3.88 | 7.66 | **10.16** | 3.73 | 3.13 | 3.51 | 2.79 |
-
-**采纳**：行归一化 3 项（≥1.10，最大 **10.16×**）；列归约 2 项**仅 ≥67M 采纳**（阈值 33.5M 以下中性或更慢，结构上回退 1t）。
-**未做（如实）**：`reduce_sum_rows_f32`/`reduce_rows_map_f32` **没有 LASX 内核**（当前是 Backend 标量默认）⇒ 无可并行化内核，需先补内核。
-**坑**：① `for_each_row_block_mut` 闭包第二参是**块行数**（不是结束下标）；② 列归约按列块切在 ≤4M 无收益（跨行扫描/预取差），与"行切在 8K 就有收益"对比鲜明 ⇒ 阈值分开标定；③ `dsl_map` 在 feature 下 ⇒ 并行入口同 feature 门控。
-
-## 7.39 P1-4：LASX f64 逐元素 override —— **逐位**，二元 1.3–1.8×、ternary/affine ≈1.0×（**未达 2× 目标，如实**）
-
-**实现**（`3054591` 合并）：`src/ops/f64_map.rs` 新增 LASX f64 内核（**4 f64/lane**、4 路展开=16 f64/迭代、尾部标量）；
-`src/dsl_backend.rs` 加 3 个 override + `supports(F64Elementwise)=true`；`map_affine` **故意不融 FMA** ⇒ **全部逐位**。
-**A/B（同进程交替 6 对丢首对取中位；loadavg 4.72→5.30）**：
-| 用例 | 1M A/B | 8M A/B | 等价类 |
-|---|---|---|---|
-| map_binary Add | **1.61×** | **1.30×** | 逐位 |
-| map_binary Sub | **1.65×** | **1.35×** | 逐位 |
-| map_binary Mul | **1.48×** | **1.32×** | 逐位 |
-| map_binary Div | **1.79×** | **1.42×** | 逐位 |
-| map_ternary SubSub | 1.02× | 1.00× | 逐位 |
-| map_affine a·x+b | 1.08× | 0.99× | 逐位 |
-
-**如实结论：未达 ≥2×**。归因（有数据）：① **portable 默认并非未向量化**——LLVM 已对 `kernels::scalar` 的 zip 循环自动向量化（A 臂带宽 3.7–4.8 GB/s），手写内核只剩"4 路展开 + 显式向量"增量 ⇒ 二元 1.3–1.8×；
-② `ternary`/`affine` 在 8M 档**完全访存受限**（≈1.0×）⇒ 要更快需**融合/少往返**，不是"向量化"能解决。
-**可选后续**（同接口、纯内核调优）：8 路展开/软件预取；或与相邻 op 融合（超出本任务）。
-
-## 7.40 P1-5：量化/i8 契约（4 方法，`Backend` 69→73）—— ties-even + clamp；dot/gemv **i64 累加 + 饱和到 i32**
-
-**契约**（`simd_dsl` `0fa14a8` + `6d3e41a`）：`quantize_i8_rows_f32` / `dequantize_i8_rows_f32`（每行独立 `scale`）/
-`dot_i8`（`&[i8]×&[i8] → i32`）/`gemv_i8`（`a[j·k] × x[k] → out[j]`，i8×i8→i32）；`Capability::Quant` **一位覆盖 4 方法**
-（理由：4 方法总作为同一套量化后端一起出现；粒度同 `FusedGeometry`；**只报真**=4 个全 override 才报，portable 默认不报）。
-**写死的语义**：① **ties-even**（`(x/scale).round_ties_even()`）：`±0.5⇒0`、`±1.5⇒±2`、`±2.5⇒±2`、`±3.5⇒±4`；
-② **先舍入后 clamp 到 [-128,127]**：`127.5⇒127`、`-128.5⇒-128`、`200⇒127`、`-200⇒-128`；
-**NaN⇒0、+inf⇒127、-inf⇒-128**；`scale` 非有限/0/负**不报错**（按 IEEE 除法确定，调用方不应依赖，已文档化）；
-③ `dequantize` **逐位**（`q as f32 × scale[r]`），往返误差 ≤ `scale/2`（实测 worst `1.0e-1 ≤ 1.875e-1`）；
-④ `dot_i8`/`gemv_i8`：单项乘积精确 ⇒ **i64 中间累加 ⇒ 最终饱和到 i32**（**不回绕**）。
-理由：饱和结果**与累加顺序无关**（整数结合律+单调饱和）⇒ 任何分块/多累加器/后端 override 结果相同；回绕会静默符号翻转。
-**等价类**：整数路径**逐位**；测试含 `n=0/1/7/64/1024` vs i64 参照逐位、**饱和用例**（`k=200000` 全 `127·127` ⇒ `i32::MAX`
-（i64 原始和 3225800000 > MAX）、全 `127·(-128)` ⇒ `i32::MIN`）、`gemv` `k=0`/`j=0`/长度错边界。
-**坑（值得记）**：**饱和必须用 i64 累加**——用 `i32::saturating_add` 逐项饱和会**与累加顺序相关**，那就不是契约级承诺。
-**LASX override（已落地，`77b5640` 合并于 `0f9bdf7`）**：`src/ops/quant_i8.rs`（`xvfdiv_s` → 浮点钳位 → `xvftintrne_w_s`（RN-even = ties-even）→ NaN 掩码 → 逐 lane 转 i8；
-注释论证并单测钉住**"先浮点钳位再取整 ≡ 先取整再钳位"**（端点为整数、取整单调幂等；NaN 不能靠 `fmax/fmin`——maxNum 语义会把它变 −128））、
-`src/ops/dot_i8.rs`（拆出 `dot_i8_i64` 精确和 + `dot_i8_saturating` **末端一次饱和**，N3 的 FFI 截断入口语义保持不变）、
-`src/ops/gemv_i8.rs`（逐行复用饱和 dot，**不是**中途 `saturating_add`）。
-**A/B（A=portable，B=override；同进程交替 6 对丢首对中位；threads=12；loadavg 6.19）**：
-| 用例 | A ms | B ms | 加速比 | 等价 |
-|---|---|---|---|---|
-| quantize_i8_rows_f32（1M） | 4.412 | 0.986 | **4.47×** | **逐位** |
-| dot_i8（1M） | 0.314 | 0.138 | **2.27×** | **逐位**（整数） |
-| gemv_i8（1024×1024） | 0.328 | 0.107 | **3.06×** | **逐位**（整数） |
-
-三项 ≥1.10 ⇒ **全部保留**。**`dequantize_i8_rows_f32` 如实不接**：LASX 拓宽指令是 **128-bit lane 语义**
-（`xvsllwil_h_b` 取每半区低 8 字节，链到 w 后 lane 序为 `[b0..b3,b16..b19]`），拼连续 8 字节块需 4 次 unaligned load + `xvpermi_q`
-（或标量 scatter），而 portable 默认已是 1 乘/元素 ⇒ **收益不足**；探针与原因写进模块注释。
-**`Capability::Quant` 仍报 false**（只低估）：位语义=4 方法全有专用实现，3/4 不报。
-
-## 7.41 P2-6：大尺寸 GEMM 追 OpenBLAS —— 基线可复现；**三个方向实测均未达 10%，零代码改动**
-
-**case 入表**（`scripts/bench_openblas.sh` 新增 `s1024^3-f32`/`s1536^3-f32`，1t、pin cpu、rows split）⇒ 正式表可复现：
-`bash scripts/bench_openblas.sh <label> 6 s1024` / `… 6 s1536`。
-**基线（脚本格式，3 轮丢首轮；loadavg 7.99/7.18/6.95 ⇒ grade C，只作趋势）**：
-| case | LASX ms | LASX GFLOPS | OpenBLAS ms | OB GFLOPS | OB/LASX |
-|---|---|---|---|---|---|
-| s1024^3-f32 | 39.91 | 43.60 | 34.86 | 52.23 | **0.873** |
-| s1536^3-f32 | 141.57 | 39.95 | 127.06 | 48.48 | **0.897** |
-
-更早 grade C 趋势：1024³ **0.865×**（49.11 vs 56.76）、1536³ **0.845×**（45.71 vs 54.07）；两库数值一致（`--impl=both` max_rel 1.12e-6/1.71e-6，tol 1e-3）。
-**grade B/A 未给出**（loadavg 一直 7–9.5，<4.5 才够 B）——case 已入表，低负载一条命令可复跑。
-**三个优化方向（全部实测后回退，无代码改动）**：
-| 实验 | 1024³ | 1536³ | 结论 |
-|---|---|---|---|
-| 循环次序交换（行块外、条带内，想让 A 留 L1） | 40.66→**62.56 ms（0.65×）** | 153→**206 ms（0.74×）** | **反证**：B 条带 32KB 的 L1 复用是主导，换序后 B 面板 2MB 反复取 L2/L3 |
-| 微内核 k 方向 2 步展开 | 41.55→42.40 ms（0.98×） | ≈150→153（噪声） | 循环开销不是瓶颈 |
-| `K_CHUNK` 256→384 + `L1_BUDGET` 48→56KB | 42.53→42.06 ms（1.01×） | ≈1.00× | k 块 C 部分和往返不是瓶颈 |
-
-**实测瓶颈**：本库 1t ~43–49 GFLOPS vs OpenBLAS ~48–57 ⇒ 好条件 ≈**86%**（差距 ~14%）。三项实验共同排除"循环/分块/次序"类原因
-⇒ 瓶颈在 **4×32 微内核的 FMA 吞吐与寄存器调度**（16 条独立累加链；LASX 仅 32 个向量寄存器，4×64 / 8×32 需 32 个累加器 ⇒ 必溢出）。
-**闭合这 14% 需要换微内核形状/手写调度**（并接受 spill 或双档微内核权衡），不是参数改动——本轮不硬造。
-
-## 7.42 P2-7：稀疏 5 点 stencil —— **红黑不采纳（已测反例）、三行滚动缓冲采纳（1.38–1.75×，逐位）**
-
-**候选 A：red-black（两色四奇偶子网格）⇒ 不采纳**：256² 1.13–1.29、1024² 1.06–1.24、**4096² 0.82–0.86（反而慢）**。
-原因：单次 Laplacian 没有"原地迭代"可利用；4 个子网格把访存步长变 2、跨步调用 ×4 ⇒ 最大规模局部性变差。
-**保留为已测反例**（迭代求解器仍有并行价值）。
-**候选 B：三行滚动缓冲 ⇒ 采纳**：256² 1.07–1.41、1024² 1.38–1.65、**4096² 1.52–1.75**（两轮 loadavg 8.6–12.3）；
-`laplacian_2d_direct` 在 **`rows≥5 && cols≥512`** 自动切换；旧实现保留为 `laplacian_2d_direct_strided`（小形状回退 + A/B 对照臂）。
-**采纳后验证**（A=旧 strided，B=新主入口）：256² 1.007（阈值未触发、同路径）、1024² **1.429**、4096² **1.559**，**全部逐位**。
-**实现**：`ops_dsl/src/stencil2d.rs` 新增 `laplacian_2d_red_black`（逐位）/`laplacian_2d_rolling`（每行 5 个连续 `combine!`/`affine!`，暂存 3·(cols-2)）；
-`tests/stencil_sparse.rs` 4 测试（8 形状逐位 vs direct、f64 参考界、退化形状、长度/暂存不足 `Err`）。
-**注意**：A/B 必须用 `LasxBackend`——便携后端对 strided/连续族实现不同，混比会把"后端差异"算成"算法差异"。
-
-## 7.43 P3-8a：FFT/谱检测 **流量与趟数实测** —— FFT 路**访存受限**、Direct 路**计算受限**
-
-**背景**：`simd_dsl/docs/structure.md` 的"不确定项"曾写"FFT 的流量/趟数只有运算量估算、未实测"。本轮只**加测量装置**
-（`ops_dsl/examples/spectral_traffic.rs`），**算子实现零改动**。
-**口径（三层分开数，别混）**：① **API 层趟数** = `Backend` 调用次数（`Counting` 装饰器包 `IdiomaticBackend`，覆盖 spectral 用的 10 个方法，**实测**）；
-② **每趟字节** = `(Σ切片len)×4`（逐切片实测）；③ **`fft_strided_f32` 内部流量**按 portable 内核**逐项建模**
-（f32→f64 工作区 + 位反转整行交换 + `log2 n` 级蝶形 + f32 回写 ⇒ 每样本 `(8 + 80 + 32·log2 n)` 字节；n=1024 ⇒ 408 B/样本）；
-④ 装置内额外流量（clone/零初始化/拷贝）由源码逐项列常量；FLOP：逐元素 1 / affine 2 / wsum 2 / matmul `2mkn` / FFT `5n·log2n/列`（超越函数按 1 保守）。
-**趟数/流量**：
-| 配置 | 路 | 趟数 | 实际总流量 | 最小必需 | 倍数 | 总 FLOP |
-|---|---|---|---|---|---|---|
-| n=1024,p=64,b=64 | **FFT** | **57** | 30.64 MB | 262.9 kB | **116.5×** | 4.06 M |
-| n=1024,p=64,b=64 | Direct | **58** | 4.65 MB | 262.9 kB | 17.7× | 17.57 M |
-| n=4096,p=128,b=64 | **FFT** | **57** | 137.91 MB | 1.05 MB | **131.4×** | 18.76 M |
-| n=4096,p=128,b=64 | Direct | **58** | 19.36 MB | 1.05 MB | 18.4× | 137.25 M |
-
-57/58 趟里约 **40 趟**是 n·b 级预处理/统计/检测的逐元素+归约；FFT 路只多 **1 趟** `fft_strided_f32`，但它**内部流量占 FFT 路总量 ~87–90%**。
-**roofline（同进程交替 6 对丢首对中位；loadavg 3.27；便携后端锚点：流带宽 5.87 GB/s、算力 8.83 GFLOPS ⇒ 平衡点 1.51 FLOP/B）**：
-| 配置 | 路 | ms | 有效带宽 | 算力 | AI | 带宽%/算力% | 判定 |
-|---|---|---|---|---|---|---|---|
-| 1024/64/64 | FFT | 1.846 | 16.60 GB/s | 2.20 GFLOPS | **0.133** | 283% / 25% | **访存受限** |
-| 1024/64/64 | Direct | 2.777 | 1.68 GB/s | 6.33 GFLOPS | 3.776 | 29% / 72% | **计算受限** |
-| 4096/128/64 | FFT | 15.144 | 9.11 GB/s | 1.24 GFLOPS | **0.136** | 155% / 14% | **访存受限** |
-| 4096/128/64 | Direct | 22.615 | 0.86 GB/s | 6.07 GFLOPS | 7.090 | 15% / 69% | **计算受限** |
-
-⇒ **FFT 路访存受限**（AI 0.133–0.136 ≪ 1.51；算力只用到 14–25%），流量大头是 **FFT 内部 f64 工作区往返（~90%）**；
-**Direct 路计算受限**（AI 3.8–7.1；算力 69–72%）。当前形状 FFT 路仍比 Direct **快 ~1.5×**（0.66–0.67×，FLOP 优势 ~7× 超过访存劣势）；
-两路 `out` 最大差 3.6e-7/4.8e-7（容差类；**必须选能产生非零输出的阈值**——默认 0.5 dB 时 out 全 0，会得到"最大差=0"的假等价）。
-**口径警示（如实）**：模型有效带宽 > DRAM 上界（283%/155%）是**模型流量中 f64 工作区大块命中 cache** 的信号，**不能据此说"带宽更低"**；
-判定按 AI 与两端百分比，不改口径。**下一步含义**："省流量"的正道是**缩小/复用 FFT 工作区与中间缓冲**；"提算力"只对 Direct 路有意义。
-
-## 7.44 P2-6 续：GEMM 微内核轮 —— 6 个假设全部实测回退，差距 14–18% 指向 **FMA 端口吞吐**
-
-**干净基线（loadavg 3.12/1.25/1.33 ⇒ grade B；5 轮丢首轮；pin cpu4；脚本口径）**：
-| case | LASX ms | LASX GFLOPS | OpenBLAS ms | OB GFLOPS | OB/LASX |
-|---|---|---|---|---|---|
-| s1024³-f32 | 38.34 | 52.74 | 33.68 | **63.29** | **0.878** |
-| s1536³-f32 | 135.63 | 52.14 | 111.99 | **62.53** | **0.825** |
-
-先验一致性：1024³ max_rel 1.12e-6 / 1536³ 1.71e-6（tol 1e-3）⇒ 两库数值一致；本库稳定 ~52 GFLOPS、OB ~63 ⇒ 差距**真实存在（≈14–18%）**，不是噪声。
-**六个假设（每个 pin、进程交替 ≥5 轮、iters=3、bitwise 测试全过；全部回退、零代码改动）**：
-| # | 假设 | 1024³ | 1536³ | 判定 |
-|---|---|---|---|---|
-| A | 循环次序交换（行块外/条带内，保 A 段 L1） | 40.7→**62.6 ms（0.65×）** | 152→**206 ms（0.74×）** | ❌ 反证：B 条带 L1 复用才是主导局部性 |
-| B | 微内核 k 2 步展开 | 41.55→42.40（**0.98×**） | ≈150→153 | ❌ 循环开销非瓶颈 |
-| C | `K_CHUNK` 256→384 / `L1_BUDGET` 48→56 KB | 42.53→42.06（**1.01×**） | ≈1.00× | ❌ C 部分和往返非瓶颈 |
-| D | A 行 cache-line 预取（`preld`，每 16 k 步 4 条） | 42.07→41.93（**1.003×**） | — | ❌ A 不在延迟瓶颈 |
-| E | B 1 步软件流水（双缓冲） | 41.2→**51.2 ms（0.80×）** | — | ❌ 寄存器压力/调度反噬（25 向量 + 控制流） |
-| F | 6 行 × 32 列微内核（24 累加 + 4 B + 1 广播 = 29 reg） | 42.01→41.88（**1.003×**） | ≈150→155（0.97×） | ❌ 非 FMA 比例降 17% 未兑现为吞吐（FMA 端口受限） |
-
-**瓶颈结论（有证据）**：六个方向覆盖"局部性/循环开销/分块/预取/流水/寄存器形状"⇒ 结果一致指向
-**4×32（及 6×32）微内核的 FMA 端口吞吐已到平台**；非 FMA 指令不是瓶颈；与 OB 差距 ≈14–18% 对应约 **1.2× FMA 吞吐需求**。
-在 **32 个向量寄存器**的 LASX 上，4×32/6×32 已是"累加器 vs 装载/广播"的甜点；再往上（4×48/4×64/8×32）需 ≥32 累加器 ⇒ 必溢出。
-**结论**：这 14% 不是"参数+现成循环技巧"能闭合的；需**手写 asm 微内核**（显式指令调度/1 FMA/cycle、k2、B 预取）或换 ISA 级策略。
-**最后一次尝试**：手写 asm 4×32 微内核（见后续"asm 轮"结果，采纳标准 1t 1024³ ≥10%，不达标零改动并给指令级证据）。
-
-**asm 轮最终结论（实证，不再换方向）**：**不写 asm**——用 **L1 常驻微内核吞吐探针**（B strip 32KB + A 4KB + C 512B 全 L1、同一 A/B 反复复用）实测：
-| 对象 | GFLOPS | 占理论峰值 |
-|---|---|---|
-| **微内核 L1 常驻（探针）** | **69.29** | **≈90%**（理论 2×256-bit FMA/cyc×16 flop = 32 flop/cyc，按 ~2.4 GHz ≈77 GFLOPS） |
-| 本库真实 1024³（grade B） | 52.74 | 68% |
-| OpenBLAS 1024³ | 63.29 | 82% |
-
-⇒ **微内核已 ~90% 峰值且 69.3 > OB 实际 63.3 ⇒ 微内核不是瓶颈**；真实 69.3→52.7（**−24%**）来自**内存/局部性**，不是指令调度。
-指令槽位：每 k 步 16 FMA + 4 B load + 4 broadcast = 8 load 槽 / 16 FMA 槽；2 FMA/cyc + 2 load/cyc ⇒ **FMA-bound**（与探针 90% 一致）。
-**完美 asm 的上界 = 69.3**，要 0.95×OB（≥60.1）需把全部内存损失压到 ≤13%，而实测损失 **24%** ⇒ **asm 上界不足以补上，写了也只能拿 0–11% 且不解决根因**。
-**真实流量反推**：A 重读（A 行被 32 个列条带各读一遍 ⇒ ≈128 MB）+ C 部分和读写 4 次（≈36 MB）+ B 打包 ≈8 MB ⇒ **≈172 MB / 38 ms ≈ 4.5 GB/s 有效**；
-L1/L2 miss 直接堵 FMA 流水 ⇒ **下一步只能是分块与布局重构（A-blocking / 更宽列条带 / 减少 C 往返），不是汇编**（已派后续任务）。
-
-**分块轮最终结论（修正归因，仍是负结果）**：实现 **A-blocking（m 块 `MC_ROWS=128`，循环次序 `(m块)→(k块)→(列条带)→(块内4行)`）**，流量模型：
-原 A 重读 = strips(32)×m·k·4 = **128 MB**、B≈4 MB、C≈36 MB ⇒ ≈168 MB；A-blocking 后 A=**8 MB**、B 重读≈**32 MB**、C 36 MB ⇒ **≈76 MB（模型 −55%）**；**bitwise 验证通过**（33 项测试含 bit-exact 对照）。
-**实测（grade C，loadavg 8.5–10.6；pin、进程交替、iters=5、9 轮中位）**：1024³ baseline 41.86 vs A-blocking 42.03 = **0.996×（无收益）**；1536³ 155.1 vs 154.0 = 1.007×（噪声内）。
-⇒ **模型预测 −55% 流量却 0 收益 ⇒ A 重读不是瓶颈**：A 只有 4 MB，整块在 **L3**，32 遍重读是 **L3 命中**，不是 DRAM。
-**修正 `§7.44` 上文归因**：所谓"172 MB 流量堵 FMA 流水"应改为 **这些字节绝大部分由 L3 服务、带宽不是限制**；真实 −24%（相对 L1 探针 69.3 GFLOPS）更可能是 **L1 级效应**：
-每个 (条带, k 块) 切换要把 32 KB B 带重新填 L1（1024³ 共 32 条带×4 k 块 = 128 次/面板×2 面板）、**C 部分和的 L1 RMW**、以及微内核外循环/分支开销。
-更宽条带（64/128）需要 32 个累加器（LASX 仅 32 向量寄存器 ⇒ 必溢出）；单 k 块条带 128 KB 超 L1（既有实测 47–49 GFLOPS 更差）⇒ 均未做。
-**GEMM 最终判定（不再盲试）**：1t 1024³ **52.74 GFLOPS = 0.878× OB**、1536³ **52.14 = 0.825×**；已排除微内核编译/调度、k 展开、K_CHUNK、A 预取、B 双缓冲、6 行形状、A-blocking；
-**唯一有依据的下一步 = 用 perf 计数（L1D miss）定位 L1 冲突/条带常驻设计**（本机本会话无 perf 权限，无法定量）⇒ **零改动保留原实现**。
-
-### 7.44.1 perf 诊断（perf 权限可用后首测；loadavg 2.2–3.0 ⇒ grade A/B；`taskset -c 4`、`--iters=3`、`:u` 计数）
-| 形状/实现 | cycles | instructions | IPC | L1D loads | **load miss（率）** | L1D stores | **store miss（率）** | branches |
-|---|---|---|---|---|---|---|---|---|
-| 512³ lasx | 69.08M | 182.05M | 2.63 | 37.17M | **7.74M（20.8%）** | 37.05M | **9.78M（26.4%）** | **11.21M** |
-| 512³ OB | 46.95M | 158.17M | 3.37 | 47.55M | 2.59M（5.5%） | 42.12M | 3.12M（7.4%） | 1.72M |
-| 1024³ lasx | 374.68M | 1077.83M | 2.88 | 355.12M | **47.29M（13.3%）** | 360.64M | **47.44M（13.2%）** | **71.18M** |
-| 1024³ OB | 327.08M | 1034.61M | 3.16 | 346.46M | 14.73M（4.3%） | 351.21M | 12.99M（3.7%） | 8.58M |
-| 1536³ lasx | 1305.54M | 3901.94M | 2.99 | 1210.59M | **128.71M（10.6%）** | 1124.52M | **125.19M（11.1%）** | **257.57M** |
-| 1536³ OB | 1097.68M | 3447.13M | 3.14 | 1162.59M | 36.95M（3.2%） | 1160.47M | 35.90M（3.2%） | 23.73M |
-
-（`l1-dcache-prefetches(-misses)` = 0（本库无软预取）；`branch-misses` 在 `:u` 下未返回 ⇒ **不可用，明说**；perf 多路复用约 40% ⇒ **只用同形状同 impl 的比值与 OB 对照**，不当绝对量。）
-**三个定量结论**：① **L1D miss 率是主因且量级够解释 −24%**：1024³ load miss **13.3% vs OB 4.3%（3.1×）**、store miss **13.2% vs 3.7%（3.6×）**；1536³ 10.6%/11.1% vs 3.2%/3.2%；**IPC 2.88 vs 3.16（−8.9%）**而指令数只差 4.2% ⇒ 多出的 cycles 基本是 stall；lasx 多 32.6M 次 L1 load miss（1024³），足以定性解释探针 69.3 vs 实际 52.7 的 −24%。
-② **store miss 与 load miss 同量级（13.2% ≈ 13.3%）= C 部分和 RMW 实锤**（k 分 4 块 ⇒ 每个 C 元素读-改-写 4 次，且 32KB strip 与 A/C 抢 L1）。
-③ **分支数 8.3×**（1024³ 71.2M vs 8.58M）：内层未展开 + miss 放大 stall。512³→1024³ miss 率**下降**（20.8%→13.3%）⇒ miss 主要来自**每 strip/每 k 块的 L1 重填**（固定开销被摊薄），不是容量碾压 ⇒ 正指向 **strip 常驻 + 冲突对齐 + C RMW 消除**。
-
-**对齐实验（唯一实做的 L1 优化项，回退）**：打包条带 stride `k*32 → k*32+16`（**+64 B/条带**，只改缓冲布局，**bitwise 不变**；同步改 `pack_b` 写出偏移/两处读基址/`parallel` 面板切片与 cap；单测全过）。
-A/B（pin、交替 5 轮、`iters=3`；loadavg 6.1 ⇒ **grade C**）：**1024³ 41.09→39.89 ms = 1.030×（仅 +3%）**；**1536³ 140.96→143.84 ms = 0.98×（噪声/略差）** ⇒ **<10% 门槛，按红线零改动回退**。
-**未做两项及前置证据**：A) 真·strip-resident 需把整块 n 面板（k=1024 时 **2 MB**）常驻 L1 ⇒ 物理不可行；上一轮"行块外/条带内"次序已实测 **0.65×/0.74×**（牺牲 B 的 L1 复用即灾难）。
-C) C 常驻需单条带 **128 KB 常驻（超 L1 预算）**；`K_CHUNK` 384 实测 1.01×、K_CHUNK 变化不改变 miss 结构。
-**P0 最终判定（证据链完整，停止盲试）**：1t 1024³ **0.878× OB**、1536³ **0.825×**；差距 14–18% 已踩实为 **L1 级**——
-证据链：① 微内核 L1 探针 **69.3 GFLOPS ≈90% 峰值 > OB 63.3**（微内核不是瓶颈）；② A-blocking 模型 −55% 流量但实测 **0.996×**（带宽不是瓶颈）；③ **+64B 冲突对齐仅 3%**（冲突不是唯一机制，**重填次数才是**：1024³ 共 128 次/面板）；
-④ perf：L1D load miss **3.1×**、store miss **3.6×**、IPC **−8.9%**（指令数仅 +4.2% ⇒ stall 主导）。
-**结论**：在现有 **L1 容量（64 KB/核）/遍历结构**下，这 14–18% **不能靠参数或对齐闭合**；唯一有数据支撑的下一步是
-**"L2 常驻条带 + 更小 k 微块"的混合方案**（让一个条带一次进 L1、4 个 k 块的 C 累加在条带内完成），属**数天级重构**且牵动并行路径与 bitwise 复核 —— **本轮不做、零改动保留原实现**。
-
-### 7.44.2 **突破：差距已抹平（1024³ 0.980×、1536³ 1.002× OB，grade B）——根因是"1t 用例仍库内自动并行"的派发伪影**
-
-**关键复盘（修正 §7.44/§7.44.1 的口径）**：`bench --threads=1` 只关**调用方**线程，`api::matmul` 在
-`work ≥ 32M` 时仍走**库内全局池**；而池按**物理核数 12** 建、进程又被 `taskset` 绑到**单核**
-⇒ 单核上跑 12 线程。pin 单核实测：**全派发 vs 纯内核 = 40.29 vs 37.24 ms（+8.2%，1024³）、
-150.13 vs 140.78 ms（+6.6%，1536³）**。⇒ 此前 `0.878×/0.825×` **主要是派发伪影**，不是纯内核差距
-（纯内核 pin 对比 OB 1t：1024³ ≈0.98×、1536³ ≈0.99×）。
-
-**两处修复（`lasx_rs` `9429852`，逐位不变）**：
-1) **`pool::auto` 按可用 CPU 数封顶**：`available_parallelism()` 尊重 `sched_getaffinity`/cgroup，
-   与 `physical_cores()`（读 sysfs 拓扑、不看亲和性）取 **min**；全机空闲时仍=12（多线程行为不变），
-   `taskset -c N` 时按 N 建池——**这是生产正确性修复，不是测量取巧**；
-2) **`KernelCfg::default()` 打开 `strip_outer`（条带主序 `strip → k块 → 行块`）**：`task-73` 实测 1t
-   内核态 **1024³ +5.1%、1536³ +11.3%**；并行路径固定 `legacy()` 保持旧次序 ⇒ 多线程路径不变。
-
-**正式 A/B（同机 pin cpu4、进程级交替 5 轮丢首轮中位、**grade B**（loadavg<4.5、conc=0））**：
-| 形状 | lasx ms / GFLOPS | OpenBLAS ms / GFLOPS | 比值（lasx/OB） |
-|---|---|---|---|
-| **1024³** | 35.58 / **60.36** | 34.83 / 61.59 | **0.980×** ✅ ≥0.95 |
-| **1536³** | 122.02 / **59.21** | 122.45 / 59.10 | **1.002×** ✅ ≥0.95 |
-其他形状无回归（512³ 0.936 vs 基线 0.771、256³ 1.006、64³ 1.282；均同 runner 对照）。
-
-**已排除的十六个方向（保留为反例）**：循环换序 0.65×、k 展开 0.98×、K_CHUNK 1.01×、A 预取 1.003×、
-B 双缓冲 0.80×、6×32 形状 1.003×、A-blocking 0.996×、+64B 对齐 1.03×、C-once 0.82×、6 行 k-inner 0.88×、
-8 行×5-spill（未实测，算术上非 FMA 指令翻倍）、16×8 微内核（本轮 Lead 实做：逐位通过但 53.2 vs 53.1 GFLOPS
-≈持平，k×2 展开亦无增益；**实验代码未合入、未保留分支**，此处只留结论）、A k-major 打包+permute（ISA 上半区 shuffle
-需 2 条/行 ⇒ 净增指令）、load 槽位假设（IPC 2.88 ⇒ 未饱和）。
-
-**为什么之前会走偏（决策记录）**：`§7.44` 的 perf 证据（L1D miss 3.1×、store miss 3.6×）本身是对的，
-但它们是在**12 线程挤单核**的口径下取的 ⇒ miss 与 IPC 都被线程争用放大。**教训**：**测量 1t 前必须确认
-"库内线程数 = 1"**（本仓 = `pool::init_global(1)` 或等价亲和性），否则得到的是"单核上的多线程"而不是 1t 性能。
-
-
-## 7.45 契约瘦身 + 自动化：73 方法盘点、单源真相表、Plan 执行器（试点 axpy/softmax）
-
-**问题**：`Backend` 已 73 方法，"每来一个融合能力就加一个具名方法"，加一个能力要手改 **6 处**（trait/默认实现/scalar 参照/namecheck 白名单/文档/测试）。
-**交付 1（`simd_dsl` `d2e4570`）：单源真相自动化**
-- `src/contract/primitives.tsv`：**73 行**（name / family / capability / tier / 等价类）= trait 方法清单唯一真相；
-- `scripts/gen_primitives.sh`：表 → `scripts/gen/namecheck_whitelist.gen`（`allowed_ops`=表 ∪ **自动发现的 62 个 `scalar` pub fn**；`allowed_components` 从名字 tokens 自动派生）+ `docs/primitives.md`（族计数+明细）；`--check` 防漂移；
-- `scripts/namecheck.sh`：**删除两行手工维护清单**，改读生成物 + 先 `--check`；`tests/primitives_table.rs`：**表↔trait 双向集合相等**、族/tier/class 闭集、生成物新鲜度。
-- **指标（如实）**：加一个原语的手改处 **6 → 3**（trait 1 / 默认实现 1 / **表 1 行**；namecheck/文档/组件/结构测试全自动）；**边界**：方法体、scalar 实现、等价类测试仍需语义判断 ⇒ 不宣称"1 行搞定一切"。
-**交付 2（`simd_dsl` `daa9419`）：Plan 执行器（入口维度瘦身）**
-- 新增 `PatternKind { Axpy, SoftmaxRows }` + `FusedPlan { Axpy{alpha}, SoftmaxRows{rows,cols} }` + `FusedIo{x,y,out}` + `supports_plan`（默认 false）+ `exec_fused_plan`（**portable 默认=解释计划=现有组合**）；
-- **试点**：`axpy_f32`/`softmax_rows_f32` 默认实现改**薄委托** `exec_fused_plan`（签名/语义不变；底层 `axpy_inplace_f32`/`map_rows_sum_f32` 保留）；
-- **数值**：AXPY 计划路径 vs 迁移前 vs 标量参照 **`to_bits` 全等**；softmax 计划路径 vs 迁移前 3 趟序列 **`to_bits` 全等**；vs 标量参照 `max abs 7.45e-9`（原 1e-6 界不变）；
-- **性能（同进程 5 对丢首对中位；loadavg 8.24/6.52/4.50）**：softmax 迁移后 vs 迁移前 **1.027×**、axpy 薄委托 vs 就地原语 **1.009×** ⇒ **不退化**；
-- **指标**：**新增一个 pattern 的成本 = 表 1 行 + 1 个 `match` 臂；trait 方法 0 增长**（新增能力不再扩契约）；本轮试点后 `Backend` 方法 73→75（+2 = `supports_plan`/`exec_fused_plan`），**具名方法未删**——
-  **瘦身是"入口维度"的结构性解法，不是靠删方法**（如实）。
-**未迁清单（兼容保留，不假删；`simd_dsl` 的 `docs/structure.md` 第 3.1.1 节标注）**：① `rms_norm`/`layer_norm`/`gelu_quick`/`rope_apply`（优先）；
-② 几何 5；③ 量化 4。迁移路径 = 各自变成 `FusedPlan` 变体 + `exec_fused_plan` 解释臂 +（可选）后端 pattern override。
-
-**交付 3（后端适配，`lasx_rs` `1dca0d8`）：Plan 路径不因抽象掉性能**
-- `dsl_backend.rs`（独占）实现 `supports_plan`：**按 `PatternKind` 粒度如实**（`Axpy`/`SoftmaxRows` 都已接融合核 ⇒ 两个都 true；portable 仍两个 false）；
-  `exec_fused_plan`：`Axpy → api::axpy`（就地）、`SoftmaxRows → api::softmax_rows_into`（LASX 1 趟），长度/形状校验（`LengthMismatch`/`ShapeOverflow`/空 ⇒ `Ok`）；
-- **语义映射读契约 + `tests/fused_plan.rs` 确认、不猜**：Axpy = `y := alpha·x + y`（就地，`io.out` 空）；SoftmaxRows = 行 softmax（`io.out` 输出，`io.y` 空）；
-- **A/B（同进程交替 6 对丢首对中位；threads=12；loadavg 7.56）**：Axpy（1M）Plan **0.358 ms**、命名 0.360、api 0.360 ⇒ **B/A 1.004×、C/A 1.011×**；
-  SoftmaxRows（512×2048）Plan 0.185、命名 0.189、api 0.197 ⇒ **B/A 1.023×、C/A 1.038×**；
-  **三路逐位等价**（axpy/softmax），vs portable 计划解释差 2.38e-7 / 3.96e-9（融合核容差类，与既有原语一致）。
-- ⇒ **Plan 入口 → LASX 融合核闭环**：契约不再为每个融合能力加具名方法，后端只需实现一个执行器；性能/数值与直连 api 同级。
-
-**P1 批1（`simd_dsl` `9af59f7`）：`rms/layer/gelu/rope` → Plan，并删除 4 个具名方法（`Backend` 75 → 71）**
-- `PatternKind`/`FusedPlan` 各 +4；**`FusedIo` 扩展 `cos`/`sin`**（rope 用，其余传 `&[]`）；`exec_fused_plan` 4 臂 = **逐行照抄删除前的默认序列**（rms 1 趟窄三元组、layer 2 段、gelu 7 趟、rope 6+1 趟）；
-- **删除** `rms_norm_rows_f32`/`layer_norm_rows_f32`/`gelu_quick_f32`/`rope_apply_f32`（无兼容壳/死代码）；`axpy`/`softmax` 仍按前一批约定保留薄委托（如实说明）；
-- 调用方同一提交同步：`ops_dsl` 的 rms/layer/gelu/rope `*_auto` 改 `supports_plan`+`exec_fused_plan`；`fused_probe` mock 改 Plan 面；旧测试用"测试内 `PlanCall` 糖"复用调用式（明确不是生产兼容壳）；
-- **验收**：rms/layer/gelu 计划路径 ≡ 删除前旧序列 **`to_bits` 全等**（逐位）；rope vs 标量参照 `max abs 0e0`、尾部逐位；portable `supports_plan` 仍全 false；
-- **自动化收益实测**：**删 4 行 `primitives.tsv` 后，namecheck 白名单/文档/结构测试全自动同步，0 处手改**；`gen_primitives.sh --check` 绿；
-- 门禁：62 test binaries 全过、clippy/rustdoc/docrefcheck/opcheck/layercheck/covercheck/portcheck 全绿。
-- **未假删说明**：无（本轮 4 个方法全部真删；`axpy`/`softmax` 的保留是前一批的显式约定）。
-
-**P1 批1 后端适配（`lasx_rs` `fa120ac`）：6 pattern `exec_fused_plan` + 删 4 旧 override**
-- `supports_plan` 扩到 **6 kind 全 true**（portable 6 个全 false，A/B 打印证实）；`exec_fused_plan` 6 臂：
-  `Axpy→api::axpy`、`SoftmaxRows→api::softmax_rows_into`、`RmsNormRows→api::rms_norm_into`、`LayerNormRows→api::layer_norm_into`、
-  `GeluQuick→api::gelu_quick_into`、`RopeApply→api::rope_into(RopeMode::NeoX)`；**删除 4 个旧 override**；
-  校验与契约默认解释器同口径（`rows×cols` 溢出 ⇒ `ShapeOverflow`、长度不符 ⇒ `LengthMismatch`、空 ⇒ `Ok`、Rope 的 `n_dims`/`cos`/`sin`）。
-- **A/B（A=Plan 路，B=直接 api；同进程 6 对丢首对中位；3 次复跑；loadavg 7.8–9.3）**：6 条中位 **≈1.0（0.99–1.05）**，
-  但单次 pair 有 ±10% 噪声（0.913/0.939/0.955 单点）⇒ **不宣称"每条硬 ≥0.98"，给原始数字**；三路（Plan/命名/api）**逐位等价**（axpy/softmax/rms/layer/gelu/rope）；
-  vs portable 差：2.38e-7 / 3.96e-9 / 3.58e-7 / 5.01e-6 / **相对 2.07e-2（gelu 文档界 5.26e-3 是相对值，断言必须用相对）** / 2.38e-7。
-- **坑**：`FusedIo` 加 `cos`/`sin` 后所有字面量要补（15 处）；Axpy 就地累加的数值差要在计时循环**之前**取（计时会反复累加 ⇒ 假差）；
-  删方法后必须同步示例/测试调用方（`fused_ab.rs` 4 组），否则 feature 档编译红。
-
-**P1 批2（`simd_dsl` `b89a32f`）：几何 5 → Plan，删 5 个具名方法（`Backend` 71 → 66）**
-- **payload 决定**：`FusedPlan` 改为 **`FusedPlan<'a>`（非 Copy）**，5 个几何变体**自带 f64 缓冲**；**`FusedIo` 零改动** ⇒ 既有 f32 调用点无一行改动（代价：plan 值较大、按值传，已写进枚举文档）；
-- 解释器 5 臂**逐行照抄删除前默认序列**（6/6/9/9/15 趟；复用 `fused_geo_len`/`mat3_row_f64`）⇒ 等价类不升级；`unitize3` 零向量：解释器 NaN、LASX override 仍 0（**"路径各自语义"**保留，`*_auto` 文档 + 测试钉住）；
-- **删除** 5 个方法 + tsv 5 行（生成器自动同步白名单/文档，**0 处手改**）；调用方（`ops_dsl::geometry` 的 5 个 `*_auto`、`geometry_auto` mock、`geometry_fused_contract`）同步改 Plan 面（测试内糖明确非生产壳）；
-- 验收：`tests/geometry_fused_contract.rs` 4/4 经 Plan 路径全过（逐位项 `to_bits` 全等、容差项 ≤1 ulp 界不变）；`Backend` **71→66**；62 test binaries；本地 nightly rustdoc + 全门禁绿。
-- **流程教训（Lead 侧，已记 #66）**：批1 合入后 CI 红在 **nightly rustdoc**（删方法后残留 intra-doc link），
-  而我在本地用 **stable `cargo doc` 的缓存产物**得到"假通过" ⇒ **验证必须用与 CI 相同的命令（nightly）+ 新鲜构建**。
-
-**P1 批2 后端适配（`lasx_rs` `fb90c4b`）：11 pattern、删几何 5 旧 override**
-- `supports_plan` 扩到 **11 kind 全 true**；`exec_fused_plan` 5 个几何臂映射 `api::*_into`（mat3 走 Rust 层 helper）+ 校验（`n==0 ⇒ Ok`、全部输出等长、mat3 9 条 `m`）；`unitize3` 零向量 LASX=0 / portable 计划解释=NaN（保留）；
-- **删 5 个几何旧 override**；`Capability::FusedGeometry` 改**不报**（位语义"5 方法全 override"已不成立，能力由 `supports_plan` 承载）；
-- **A/B（A=Plan，B=直接 api；3 次复跑；loadavg 7.6–9.3）**：9/11 中位落在 **0.98–1.12**；**Mat3 三次一致 0.94–0.96（未达 0.98）**、Norm3 一次 0.913（另次 1.041 ⇒ 噪声）；
-  两臂**同一内核、逐位相同**；Mat3 偏低**未完全归因**（候选：两臂写不同输出缓冲 ⇒ 地址/对齐/缓存别名；借用检查下无法复用同一缓冲），**如实记、不宣称全部 ≥0.98**。
-- 删除了已无对照臂的 `geomf64_fused_ab.rs`（几何 A/B 由 `plan_ab` 承接）。
-
-**P1 批3（`simd_dsl` `fd37e6b`）：量化 4 → Plan，删 4 个具名方法（`Backend` 66 → 62）**
-- payload：4 变体**自带 i8 输入/输出与 `&mut i32`**（`FusedIo` 继续零改动；`DotI8` 用 `&mut i32` 承接返回值）；代价（plan 值变大）已记录；
-- 解释器 4 臂**逐行照抄旧默认**（ties-even+clamp；dot/gemv **i64 累加+末端饱和**）⇒ **全部逐位**；边界 ±0.5/±1.5/±2.5/NaN/±inf/饱和端点 + 8 用例全过；
-- `Capability::Quant` **保留变体**但语义改为"由 `supports_plan` 探测"（平滑过渡，不制造无谓破坏；`#[non_exhaustive]` 内 match 需穷尽）；
-- **9 处 intra-doc 破链已改**并本地跑 CI 同款 nightly rustdoc 通过；`Backend` **66→62**；62 个方法累计 **9 个具名融合方法**迁 Plan 并真删；
-- 门禁：379 tests、clippy、nightly rustdoc、namecheck（读表）/docrefcheck/opcheck/layercheck/covercheck/portcheck、`gen --check` 全绿。
-
-**P1 批3 后端适配（`lasx_rs` `1551df1`）：14 pattern、`Dequantize` 如实 false + portable 回退**
-- **按代码事实删 3 个旧 override**（`quantize`/`dot`/`gemv`）——`dequantize_i8_rows_f32` **从 P1-5 起就没有 override**（第 61 条那轮已如实不接），**任务写"删 4 个"是笔误，代码事实是 3 个**，如实记；
-- `supports_plan`：**14 kind true**（批1 6 + 批2 5 + quantize/dot/gemv），**`DequantizeI8Rows` 明确 false**（不虚报）+ `exec_fused_plan` 该臂**回退 portable 解释**（与契约默认逐位）；
-- `Capability::Quant` 在 `supports` 里**不报**（语义已由 plan 承载）；
-- **A/B**（A=Plan；量化无公开 `api::` 直调 ⇒ B=portable 默认；同进程 6 对丢首对中位；2 次复跑）：quantize **4.040×/4.198×**、dot **3.226×/3.216×**、gemv **3.154×/3.262×**；**A≡portable 逐位**（ties-even/clamp；i64+末端饱和）；与 P1-5 的 override 比值（4.47/2.27/3.06×）一致 ⇒ **Plan 抽象未掉性能**；dequantize 同路径无对照意义 ⇒ 不做性能 A/B（如实）。
-
-## 7.46 P2：pattern 层表驱动自动化 —— **新增 pattern 的手改：6 处 → 「表 1 行 + 变体 + 解释臂」**
-
-**单源真相**：`src/contract/patterns.tsv`（16 行；`kind / FusedPlan 变体 / form / portable 解释入口 / 职责`）。
-`scripts/gen_patterns.sh` 生成：`src/contract/patterns_gen.rs`（`PatternKind` 枚举、`ALL`、`name()`、`doc()`、`FusedPlan::kind()`——**手写枚举已删除**）、`docs/patterns.md`（总表）。
-`namecheck` 接入 `gen_patterns.sh --check` 防漂移；`tests/patterns_table.rs` 断言 **表 ↔ 枚举 ↔ `ALL` ↔ `exec_fused_plan` dispatch 臂 ↔ `kind()`** 五方一致（表加了行但没实现 ⇒ 测试红）。
-**真 pattern 演示（`Norm2BatchF64 = √(x²+y²)`，非桩）**：`to_bits` 与手算参照逐位（`5/√5/√8/5` 四例）、`n=0 ⇒ Ok`；**手改 diff = 22 行**，其中**"表相关" = 1 行**（`patterns.tsv`），其余为 `FusedPlan` payload 变体 7 行 + 解释臂 14 行。
-**before → after**：新增 pattern 此前需手改 **6 处**（`PatternKind` 变体 + `ALL` + `name` + `doc` + `kind()` 映射 + 文档行 + 一致性测试）⇒ 现在 **0 处**（全部生成）；手改只剩"表 1 行 + payload 变体 + 解释臂"。
-**诚实边界（已写进 `structure.md` 第 3.1.4 节与 `docs/patterns.md`）**：payload 字段形态与解释体（数学）**无法从表生成**（异构 payload + 语义判断）；后端 override（LASX 内核）仍手写，生成器不产出内核代码。
-**门禁**：63 个测试目标全过（含 `patterns_table` 2 个）、clippy、**nightly rustdoc**、双 `--check`（patterns + primitives）、namecheck/docrefcheck/opcheck/layercheck/covercheck/portcheck 全绿。
-
-**P1 总账（三批 + 三批后端适配，全部落地并真删）**：`Backend` 公开方法 **73 → 75 → 62**（原始 73；Plan 试点新增 `supports_plan`/`exec_fused_plan` 2 个入口 ⇒ 75；三批共删 **13 个**具名方法 ⇒ **62**）。
-**13 个具名融合方法** = rms/layer/gelu/rope（4）+ 几何 5 + 量化 4，全部迁入 `FusedPlan` 并**删除**；
-`axpy_f32`/`softmax_rows_f32` 按试点约定**保留为薄委托**（未假删、已说明）；`ops_dsl` 调用方全部改 Plan 面；
-LASX 侧 `exec_fused_plan` 覆盖 **14 pattern**（`DequantizeI8Rows` 如实 false + portable 回退）。
-
-## 7.47 降低"其他后端"开发成本：共享校验 + 一致性 harness + 骨架生成器（可量化）
-
-**改造前的实测成本**：`lasx_rs/src/dsl_backend.rs` **2915 行**；其中 `exec_fused_plan` 的**校验+派发 374 行**
-（16 pattern × 每后端重抄长度/形状/溢出/别名口径）；`supports_plan` 22 行；后端自建 **311（lib 档）** 测试。
-
-**四项交付（`simd_dsl`）**：
-1) **`FusedPlan::validate(&self, io: &FusedIo<'_>) -> Result<(), BackendError>`**（`d5c8356`，`src/contract/plan_validate.rs`）：
-   **16 pattern 一处实现**（`rows*cols`/`j*k` 溢出 ⇒ `ShapeOverflow`、长度 ⇒ `LengthMismatch`、空输入 ⇒ `Ok`、
-   Rope 的 `n_dims` 偶数/≤cols/`cos`/`sin` 长度、几何 5 的数组长度、量化 4 的 i8/i32 切片）；portable 解释器先调它。
-2) **conformance harness**（`329aff9`，feature `conformance` 默认关）：`backend_conformance!(MyBackend)` 宏展开
-   **16 个测试 / 15 组**（默认≡scalar 6 组、plan 解释≡具名组合 3 组、`validate` 错误契约 3 组、能力位只报真 2 组、
-   `FusedIo` 口径 1 组）；本仓用 **MinimalBackend** 演示：**只实现 2 个必需方法（≈11 行）+ 1 行宏** ⇒ **15 组全过**。
-3) **骨架生成器** `scripts/gen_backend_skeleton.sh <Name>`（读 `primitives.tsv` + `patterns.tsv`）：生成
-   **167 行可编译 stub**（62 方法：**必需 2** + 走默认 60；`supports_plan` 全 false 模板；**16 臂 `exec_fused_plan`
-   真代码模板** = `plan.validate(&io)?` + portable 回退）；`--check` 幂等/漂移负例；`/tmp` 下游 crate 编译 + 2 个语义测试通过。
-4) **《新后端开发指南》`docs/backend_guide.md`**：分步清单、成本 before/after、**Top10 最值得覆盖方法排序**、
-   线程规则（DSL 不传线程/后端自管/亲和性感知）、能力位只报真+等价类、conformance 用法、诚实边界。
-
-**lasx 落地验证（`bb574c6`）**：`exec_fused_plan` **374 → 216/222 行（−40.6%，成员口径 222，本人复核 216）**；
-删 **21 处 `return Err` 校验 + 5 处 `checked_mul` + 1 处 `n_dims` 检查 + 19 行 helper**，新函数内 `return Err`/`checked_mul` = **0**；
-**conformance 1 行宏 → 15 组全过**（另 2 个 LASX 专项钉住融合差异：能力位如实、等价类界、空输入）；
-两档门禁全绿、`nm -D` 98、逐位不变。
-
-**硬指标（before → after）**：
-| 指标 | before | after |
-|---|---|---|
-| 新后端 plan 校验代码 | 每后端抄 **374 行** | **0 行**（调 1 次 `plan.validate`） |
-| 一致性测试 | 自建 **311** 个 lib 测试 | **1 行宏 = 15 组 / 16 测试** |
-| 新后端起步 | 手抄骨架 | 生成 **167 行可编译 stub**（仅 2 个必需方法要真实现） |
-| 加一个 pattern 的后端成本 | 校验+派发 ~25 行/个 | **0 行校验** + 生成器给出臂模板；只需填内核映射 |
-| lasx `exec_fused_plan` | **374 行** | **216/222 行（−40.6%）** |
-
-**诚实边界（未做/做不到，逐条列）**：① `validate` 仍是手写 `match`（`patterns.tsv` 没有校验规格列，
-**不能从表直接生成**；后续增量 = 给表加一列校验 DSL）；② portable 解释器**各臂内联校验尚未删**
-（共享入口已存在且被所有后端/portable 调用，但"校验只有一份"的最终态仍差一步，属独立小步）；
-③ harness 约定 "`Default` = portable 等价配置"，**融合后端不能直接套**（lasx 用 `LasxPortableBackend` 接入
-+ 2 个专项测试钉融合差异）；④ 生成器**不产出内核数学/性能调优/能力位真实性**，只产出骨架与模板；
-⑤ 共享 validate 的 `op` 字段文本统一成契约名 ⇒ **对外错误 message 文本变化、错误变体/判定条件不变**（已记录）。
-
-**Commits**：`simd_dsl` `d5c8356`/`f74ec2f`/`329aff9`（+`8bb5c97`/`4dfc356` 文档与生成器收尾）；
-`lasx_rs` `bb574c6`（落地）、`94a8182`（违规记录）。
-
-## 7.48 抽象层系统审计 + 首轮改进（I1–I5，含新增三步门禁）
-
-**审计**（完整报告：`simd_dsl/docs/abstraction_audit.md`；只读，三片并行 + Lead 逐条复核）：
-- **分层/依赖干净**：代码级 `use crate::` 实测无逆向边、无越层（doc 注释里的跨层引用不计）；但 criteria/engine/kernels/reference **整体 `pub mod`** 暴露（对外 76/129/63/6 项），下游（lasx/ops_dsl）已实际依赖内部路径 ⇒ 暂不能 crate-private；
-- **契约面**：`Backend` 62 = **必需 2 + 默认 60**；`#[non_exhaustive]` **26 处**（38 个公开 enum 的 68%）、`#[must_use]` **仅 1**；`Capability` 12 变体里 **9 个在 crate 内无消费者**（只被后端申报/测试断言）；
-- **自动化残留**：`primitives.tsv` 63 行 / `patterns.tsv` 17 行；validate `match`（可自动、缺"校验规格列"）、plan payload/解释臂（中）、scalar 参照（低）仍手写；
-- **冗余**：校验 helper **三套**（contract 2 + plan_validate 2 + kernels 私有 2）；`engine` 的 `perceive_*` **7 模块 / 2594 行（52%）无外部可达入口**；`reference` 561 行仅测试/对照用；ops_dsl 直调 backend 83 处（多数合理，f64 元素宏缺口 31 处）；
-- **测试/门禁**：296（219 集成 + 77 内联）；perceive 家族 56 pub 无集成测试；namecheck/opcheck **无自测**、抓不到 API 面膨胀/死 pub/跨文件重复；本地 vs CI 有 nightly/`--workspace` 差异（历史红点 #39/#41/#66）；
-- **审计勘误（如实）**：成员报告 4 处与实测不符（`primitives.tsv` 76→**63**、`patterns.tsv` 27→**17**、`non_exhaustive` 8→**26**、perceive 9/3582→**7/2594**），已由 Lead 复核纠正并写入审计 §8。
-
-**本轮已落地改进（全部有自测/CI 证据）**：
-| # | 改进 | 提交 | 证据 |
-|---|---|---|---|
-| **I1** | CI 补 conformance 档（此前 harness 不在 CI，会腐烂） | `simd fc5e18b` | CI 两步 `Test release (conformance harness)`/`Clippy conformance harness` 绿 |
-| **I2** | 文档漂移修复（指南说 harness"待合入"、行数过时；structure 无 conformance） | `f340983` | "待合入" 0 命中；structure conformance 11 处；docrefcheck OK |
-| **I3** | **能力位消费门禁** `capabilitycheck.sh` + 自测 + allowlist | `f04cafe`→`475239f` | 12 变体 = 消费 4 + 豁免 8；自测 **9/0**；CI 步骤绿 |
-| **I4** | contract 内 4 个长度/溢出 helper → `contract::guard`（2 原语 + 2 适配器） | `444a7e4`→`70d9464` | 383 tests 绿、clippy/nightly rustdoc 绿；独立校验 4→2 |
-| **I5** | **API 面快照门禁** `apicheck.sh` + 基线（**463 条**）+ 自测 | `b220241`→`a7912ad` | 自测 6 类（含"同文件同名删一个"防假绿）；CI 步骤绿 |
-| 附加 | CI 增 `Capability consumer guard` / `API surface snapshot guard` 两步 | `simd d4d2dd0` | 本地三脚本绿；CI 随后验证 |
-| **I8** | 本地/CI 门禁不一致 ⇒ `gate_local.sh`（23 步一条命令 + `--check` 比对 CI 全部脚本调用 + 5 用例自测） | `e989c0b`→`2ae08b7` | **实测抓到真实漂移**：合入后 `--check` 报"CI 引用 21、本地缺 2"（namecheck_test/opcheck_test），补齐后缺口 0；`gate_local_test` 5/5 |
-| **I9** | namecheck/opcheck 无自测 ⇒ 各补 4 反例真红且点名 + 2 正例；CI 改为"先自测再门禁" | `e3aa7a9`→`7df0c79` | 各 **6/6**；原门禁不回归（namecheck 163 文件 / opcheck 18 文件） |
-
-**未做（如实留在审计报告的"改进优先级/未做与风险"章节）**：**I6** 只做了"rewrite 判据下沉"的一部分（规则⑦ 4 子情形，见 §7.48.1），
-perceive 家族 `analysis` feature 门控 / reference 门控仍未实施（breaking 面积大，需单独决策）；
-**I7** f64 元素宏（评估收益，不盲做）；`must_use`/剩余 `non_exhaustive` 补齐（API breaking 面）。
-
-## 7.48.1 第二轮改进（T1–T4，全部落地；含新门禁）
-
-| # | 改进 | 实测指标 |
-|---|---|---|
-| **T1** | validate **表驱动**：`patterns.tsv` 增 `bind`/`validate` 列（16 行×7 列），生成器产出 16 臂校验（`patterns_gen.rs` 22 行），**删除手写 `plan_validate.rs`（165 行）** | 手写 match **165→0 行**；生成物 +62 行；错误变体/expected/got/what 逐字不变；65 测试目标全绿 |
-| **T2** | **engine 判据下沉**：`criteria::rewrite::{LogPowForm, classify_log_pow}`（规则⑦ 4 子情形，条件/阈值逐字搬迁） | criteria +80 行（17 用例表驱动）/ engine +6 行；`pow_fold` 5→9 测试、4 子情形**逐位**；engine 内阈值残留 **0** |
-| **T3** | **pub 无测试门禁** `pubtestcheck.sh` + 73 条逐项原因 allowlist + 自测 9/9 | pub 项 **327** / 有测试引用 **252** / allowlist 75 / **零引用未豁免 0**；纳入 `cfg(test)` 后零引用名字 145→66；发现 **3 个 dead API**（`decl_nabla`/`is_bit_exact`/`SEPARABLE_MIN_SAVING_PPM`） |
-| **T4** | **§ 编号门禁** `sectioncheck.sh` + 自测 8/8 | 8 文档 **119 处引用**：MISS **0**；映射行跳过 47、跨仓 EXTERNAL 15、例外 41（逐条原因） |
-| **I6（非破坏部分）** | `analysis`/`reference` 两个 feature：8 个 `perceive_*` 研究模块（3259 行）+ 两档参照后端（561 行）可 opt-in 关闭 | **`default = ["analysis","reference"]` ⇒ 默认构建/API 完全不变**；slim = `cargo build -p simd_dsl --release --no-default-features` 实测通过（可省 **3820 行**）；CI 与 gate_local 各加一步 slim 构建 |
-| 集成 | CI 增 `Pub-without-test guard`/`Section reference guard`/`Slim build`；`gate_local.sh` 26 步 | `gate_local --check`：CI 引用 25 脚本 / 覆盖 28 / **缺口 0**；`apicheck` 基线 **463→464**（有意变更，见审计 §11）；步骤数自测改为**动态**（=run_step 数） |
-
-**诚实边界**：T1 的表内校验仍是**人写逻辑搬进表**（微语法=短 Rust 表达式），不是自动推导"正确校验"；T2 只下沉规则⑦的 4 子情形；
-T3 是名字级 grep 口径（`new`/`name` 等常见名可能假绿）；T4 只查标题存在性/只认同行前缀/映射行不设防；
-`docrefcheck` 为不误伤门禁自身排除 `sectioncheck*.sh`（样例路径，非真引用）。
-**过程记录（阻塞与恢复，如实）**：① CI 首次 run 在 "Test release" **0.4s 失败**、本地同一命令全绿，手动 `ci-run` 重跑即 success ⇒ panel 单 runner 瞬时故障；
-② 审计 I8/I9 落地期间**磁盘配额耗尽（EDQUOT）**：`bash` 工具连 `echo alive` 都写失败、`write` 工具报 `-122`，连续 3 轮无法跑门禁/提交 ⇒ 目标标 blocked；
-用户清理磁盘并重启后**复验**：namecheck/capabilitycheck（当时红）**恢复绿**、`test --features conformance`/clippy/nightly rustdoc/docrefcheck/apicheck/capabilitycheck/gate_local --check/两个自测全绿 ⇒ 证实此前红是磁盘假象，非代码问题。
-③ 第二轮出现一次**既有**负载敏感 A/B 性能测试失败（`plan_delegation_does_not_regress_performance`，loadavg 高时偶发），单测复跑 2/3 通过 ⇒ 判为 flaky、非本轮改动（与 T1 成员报告的 `fused_contract::engine_kpi_*` 同类，已如实记录）。
-**Commits**：`simd_dsl` `fc5e18b`/`f340983`/`f04cafe`/`444a7e4`/`b220241`/`d4d2dd0`/`e989c0b`/`2ae08b7`/`523391d`；`lasx_rs` 本文件 + `AGENTS.md` 第 38 节（违规 #71–#74）。
-
-## 7.49 算子层系统审计 + HEAD 复测 + 数字家/分级修正（2026-10-19）
-
-**审计报告**：`simd_dsl/docs/operator_audit.md`（三片只读审计 + Lead 复核，范围：ops_dsl 18 模块/75 入口、ops_dsl/tests 88 用例、17 宏、四后端）。
-关键结论（实测）：① **16 个 plan kind 里 8 个无算子入口**——`Axpy`/`SoftmaxRows`(直接)/`RopeApply`/`QuantizeI8Rows`/`DequantizeI8Rows`/`DotI8`/`GemvI8`/`Norm2BatchF64`；
-即 **LASX 有融合核但算子层不走**（axpy 仍是 3 趟组合、rope 是 6 处具名 strided、quant 只有 absmax 入口）；
-② `supports_plan ? exec : composed` 模板在 3 模块重复 **8 组/16 次**；③ `iso_kernel`/`laplace` 在 ops_dsl/tests **零引用**；
-④ 文档断链 2 处（`ops_dsl/src/stencil2d.rs` 引不存在的 `tests/stencil5.rs`，已修）；⑤ `opcheck`/`opsgraph` 的 4 类盲区（注释宏名、fold、`use super::*`、注释假边）已实测。
-
-**HEAD matmul 复测（`d74c984`；fresh `/tmp/bench_openblas`；grade B：轮前 loadavg 3.3–4.0、conc=0、3 轮丢首轮、`SETTLE=10`；`scripts/bench_gflops.sh`）**：
-
-| case | lasx med / GFLOPS | OpenBLAS med / GFLOPS | **OB/lasx** |
-|---|---|---|---|
-| 512³ f32 | 4.5922 ms / 45.53 | 4.1846 ms / 52.05 | **0.911** |
-| 512³ f64 | 9.3611 ms / 19.30 | 8.5593 ms / 23.81 | **0.914** |
-| 1024³ f32 | 35.7571 ms / 59.82 | 36.9889 ms / 58.05 | **1.034** |
-
-与历史并列（不挑好的）：1024³ f32 历史 §7.44 记 **0.980×**（旧二进制）→ 本次 HEAD **1.034×**；512³ f32 历史 **0.936×** → 本次 **0.911×**。
-差异来源：轮数（2 轮中位 vs 5 轮）、日期/loadavg、以及 HEAD 前 28 个 `src/ops` 提交；**两次都如实保留**。
-
-**数字家修正（C 片审计发现）**：`docs/ops.md` 第 9.0 节（DSL matmul `0.1367 ms / 368 GFLOP/s`）、第 9.06 节（`diag_cmatmul_routes` 表：Direct 63.13 ms/57.4、Karatsuba 53.35 ms/67.9、单条 15.04 ms/60.2）、
-第 9.10 节（等距递推 0.3524 ms / 0.20× 即快 5.1×）——这些是主表未收录的**第二个数字家**；现已改为**历史记录 + 指向本节**（本节即权威）；`docs/dsl.md` 的对应引用同步改为指向本节。
-
-**C 级窗口标注（C 片审计发现）**：以下 A/B 的轮前 loadavg 超第 6.4 节的 B 级门限（1min>4.5），**只作趋势、不作验收**，已在小节标题/正文显式标注：
-- `§7.32.1` 融合 A/B（loadavg 4.90/4.55/5.67）；
-- `§7.32.4` Master 总表（loadavg 6.20/6.41/6.56）；
-- `§7.37` 的 softmax override 4.4×（loadavg 7.22/6.26/5.36）与 map_rows_sum 1.328–1.464×（7.33/6.60/5.21）。
-采纳结论仍保留，但**证据分级如实降为 C**；需正式验收时须在 B 级窗口重跑。
-
-**本轮改进（全部已合入，含指标）**：
-- **O1 `plan_auto` 模板**：`ops_dsl/src/lib.rs` 两臂宏（Plan / 能力位），3 模块改调；**直调 17 次/9 组 → 3 次/1 处**（宏体内），语义逐字不变（probe 先求值、plan/io 只在融合分支求值、Result 原样透传）；LOC 净 **+32**（宏与文档，非"减少行数"型重构，如实）；65 测试目标全绿；
-- **O4 测试缺口**：**+9 个 `#[test]`**（`iso_kernel_laplace.rs` 新文件 4 条：iso_kernel 奇数 n/NaN/长度错 + laplace 逐位/NaN·inf；matmul/stencil2d/spectral 各补 NaN·inf 与**奇数形状**（k=13、5×7/7×5/3×13、n=13）；composed_ops 补 **norm `to_bits` 逐位直接证据**——证实"逐位 masked_rel=0"口径，无需降级文档）；**未暴露真实 bug**；
-- **O5 门禁增强**：opcheck **3→5 类**（注释/字符串剥离前置、fold+范围字面量），opsgraph（剥离后建边、生产 `use super::*` 判"未解析依赖"、测试模块不建边）；自测 **10/10** 与 **7/7**；真实树：opsgraph 绿（17 模块 0 真边，旧版唯一边是注释假边），opcheck 变严后暴露 **2 处并已收口**（rope.rs 走跨步原语 ⇒ 新增**显式豁免标记** `opcheck-allow-no-macro` + 具体理由，循环/fold/+= 仍查；activations 测试参考级数改 `repeat_n` 避开范围字面量误报）⇒ 真实树绿（18 文件）；
-- **O3 断链修复**：`ops_dsl/src/stencil2d.rs` 两处引用 `tests/stencil5.rs`（不存在）改指真实证据 `ops_dsl/tests/stencil_sparse.rs` / `examples/stencil2d_ab.rs`。
-
-**Commits**：`simd_dsl` `1c89ed3`（O1）、`17043b7`（O4）、`c55d2a5`（O5）、`44c5efe`（审计报告+O3+收口）；`lasx_rs` 本节（§7.49）。
-
-## 7.50 算子审计第二收尾：O2 接线 / O6 基准 / dead API 清理（2026-10-19）
-
-**O2 接线（`simd_dsl` `be14fff`）**——先保等价，再谈性能：
-- **axpy 采纳**：`ops_dsl::axpy` 改为 `supports_plan(Axpy) ? exec_fused_plan : 原 3 趟组合`；精度**逐位**
-  （`to_bits` 对拍含 `-0.0`/次正规/`3e38`/`alpha∈{0.375,1,-1.25,0}` 全等）；**A/B：composed/plan = 2.232/2.392/2.232/2.990/3.054/2.482×（6 个独立进程，中位 ≈2.44×）**；
-- **量化三入口新增**：`quantize_i8_rows`/`dot_i8`/`gemv_i8`（走 plan，回退 scalar）；整数全等（ties-even ±0.5/±1.5、clamp 127.5/−129.5、NaN⇒0、±inf⇒端点、dot/gemv 饱和端点 k=200k）；**如实：本仓内零性能差**，收益只可能在外部向量后端；
-- **rope 评估后不接线**：portable 组合/plan = **0.930/0.857/0.911/0.978/0.936/1.000× ⇒ 无收益**（plan 内部同样 6 次跨步+分配）；LASX 单趟核不在本仓测试/门禁范围 ⇒ 无法证明收益。**保留 7 趟组合 + 模块文档记录评估**；
-- 新增 `ops_dsl/tests/wire_plan.rs` **8 个测试**（`PlanOnScalar`/`PlanOnIdiomatic` wrapper 对拍）。
-- **未接**：`SoftmaxRows` 直接、`DequantizeI8Rows`、`Norm2BatchF64`（语义/收益未评估完，留待下轮）。
-
-**O6 基准（`simd_dsl` `2ba6fc8`，`ops_dsl/examples/zero_evidence_ab.rs`，8 case）**——主表 **grade A**（loadavg 2.68/2.24，6 对丢首对中位）：
-| case | A/B | 结论 |
-|---|---|---|
-| rope 8192×128 | **7.316×**（组合慢 7.3×，逐位） | **稳定负结果**：strided 组合多趟开销大（C 窗口 4.3–5.9× 方向一致）；结论是"该组合实现慢"，非"DSL 慢" |
-| gelu erf/quick | 0.989× | 打平（不同近似，只比成本） |
-| embedding f32 / i8 | 0.934× / 1.137× | **i8 在 C 窗口三测 1.14/0.87/1.51× 符号翻转 ⇒ 无稳定结论** |
-| kv_cache | 0.883× | ±12%，需 B/A 级多轮复核 |
-| ln / log2 / log10 | 0.907/0.970/0.954× | 仅 portable 两档（都走标量 libm），无向量化对照 |
-
-**未覆盖（如实）**：外部后端档（`ops_dsl` 硬约束只依赖 `simd_dsl`，LASX 档需本仓另写 example）；lasx 侧 `layer_norm`/`gather`/`scatter`/`cmatmul`/`matmul_bt` 仍无 bench 入口。
-
-**P2 dead API 清理（`simd_dsl` `05632fc`）**：删除 3 个零调用 pub API（`decl_nabla`、`is_bit_exact`、`SEPARABLE_MIN_SAVING_PPM`，公开面 **464→461**，`apicheck --update` 显式更新）；
-**`Tap2::{eq_coeff,negated}` 经编译验证有调用（`src/engine/perceive_stencil_grid.rs:59/62/80/169/175`）⇒ 保留**，并纠正 allowlist 里的错误台账（原写"无调用"）。
-**教训（流程）**：**名字 grep 不能判 dead**——`t.eq_coeff(m)` 的类型在 4 个文件之外推断、`is_bit_exact` 的命中全是测试函数名子串；
-**判据应是"先删、编译绿"**（本轮 `Tap2` 就是靠 E0599×5 当场纠正）。此条已写入 `docs/operator_audit.md` P2 行。
-
-**Commits**：`simd_dsl` `be14fff`（O2）、`2ba6fc8`（O6）、`092e1bd`（P2 合入）、`05632fc`（P2）；`lasx_rs` 本节（§7.50）。
-
-## 7.51 W3：GeluQuick 融合核删除 + axpy 逐位修正 + simd rev bump（2026-10-19）
-
-**动机（Lead 实测 ROI，grade B，6 对丢首对中位；composed/fused）**：softmax 2.41–2.46×、rms 6.96–6.99×、
-layer 4.28–4.36×、**gelu_quick 0.763–0.773×（融合核比组合慢 29%）**、axpy 3.35–3.40×**但 bitwise=false**
-（max_abs 2.44e-4 ≈ 1 ulp）、geometry norm3 2.13×/mat3 1.43×（逐位）。
-
-**1) GeluQuick 融合核删除（lasx 侧）**：`supports_plan` 由 true 改 **false**（true 计数 **14 → 13**，
-false 集合 = `GeluQuick`/`DequantizeI8Rows`/`Norm2BatchF64`）；删 `exec_fused_plan` 的 LASX 臂，
-改为**回退 portable 解释器**（`simd_dsl::ScalarBackend.exec_fused_plan`，与 portable 逐位）；
-`FusedPlan::GeluQuick` 变体**保留**（契约面不删）。**`api::gelu_quick_into` 保留**（理由见下"偏差"）。
-**simd 侧待 Lead 收尾**：`ops_dsl::activations::gelu_quick_auto` 的 `plan_auto!(GeluQuick)` 分支
-（W2 改名合入后由 Lead 改纯组合）。
-
-**2) axpy 逐位修正（硬承诺达成）**：LASX 内核由**单条 FMA**（一次舍入）改为 `t = alpha·x + 0.0`、
-`y = y + t`（两次舍入；向量序列 `vmul → vadd(+0) → vadd`，尾段标量同序）⇒ 与契约默认解释器
-**逐位**（含 `±0` 语义）。证据：`plan_ab` 示例新增"融合 vs 组合（`t=alpha·x+0.0` + `y+t` + copy）"
-逐位断言 **`to_bits` 全等**（修正前 `0.763–0.773×` 报告同时带 `bitwise=false`）。
-**新 A/B（5 个独立进程；composed/fused）**：**1.734× / 1.729× / 1.782× / 2.255× / 2.217×**
-（中位 ≈**1.78×**，融合仍快；`Plan vs api::axpy` ≈1.0×——同一内核，纯噪声）。原"1 ulp 容差"声明
-不再需要（文档/测试已按逐位更新）。
-
-**3) simd rev bump**：`Cargo.toml` 的 `simd_dsl`/`ops_dsl`/dev-dep rev `329aff9` → **`83c21a2`**
-（`cargo update -p simd_dsl`；`Cargo.lock` 同步）⇒ lasx 与当前 simd 契约（`plan_auto!`、量化三入口等）一致。
-
-**4) 死 kind 清单（只建议、不删契约）**：`DequantizeI8Rows`（LASX 无高效 i8 拓宽核）、
-`Norm2BatchF64`（无 f64 norm2 融合核）保持"支持=false + portable 回退"；`GeluQuick` 本轮从
-LASX 支持集删除。**建议**：simd 侧下一 breaking 批次一次性删 `PatternKind::GeluQuick` +
-`FusedPlan::GeluQuick` + `ops_dsl` 的 auto 分支（三处同批，避免半删状态）。
-
-**偏差（如实，待 Lead 决策）**：任务书写"删除 `gelu_quick_into`"；但它是**公共 Rust API**
-（`docs/ops.md §5.11` 对外承诺、`docs/dsl-rust-surface-inventory.md §3.2` 入册、api 单测覆盖），
-且**不依赖融合核**（只调 `ops::gelu_quick` 内核）⇒ 本轮**保留**，未随融合核删除。若确要删，
-建议与 `FusedPlan::GeluQuick` 同一 breaking 批次，并同步那三处文档清单。
-
-**§7.51 收尾（Lead，联合命名收尾）：**
-1) **ROI 判定（用户口径：组合不慢于融合 ⇒ 删融合核）**：Lead 在 `/tmp` 探针用 LasxBackend 实测
-   （grade B、6 对丢首对中位、逐对交替、两次复跑）：softmax **2.41–2.46×**、rms **6.96–6.99×**、
-   layer **4.28–4.36×**、axpy **3.35–3.40×**、geometry norm3 **2.13×** / mat3 **1.43×** ⇒ 保留；
-   **gelu_quick `composed/fused = 0.763–0.773×`（融合核慢 29%）⇒ 删除融合核**（本批已落地）。
-   `FusedPlan::GeluQuick` 变体保留，下一 breaking 批与 `ops_dsl` 历史分支一起删。
-2) **axpy 逐位修正**：旧 LASX 核用 FMA（一次舍入）与契约组合（两次舍入）差 1 ulp ⇒ 改 `vmul→vadd(+0)→vadd`
-   同序，`to_bits` 全等；新 A/B 中位 **1.78×**（5 进程），仍远超门槛。
-3) **`ops_dsl` 命名收尾（simd `b882ebe`）的连带影响**：`*_auto`/`*_composed` 公开名全部删除（每算子一个公开名）。
-   lasx 的三个 example 依赖这些旧后缀 ⇒ **已删除**（`auto_ab` / `composed_ab` / `geomf64_auto_ab`，连同
-   `Cargo.toml` 条目）：其历史数据仍在 §7.32.1/§7.32.4/§7.47，但**不可再从 HEAD 复现**（如实标注）；
-   新口径见 `simd_dsl/docs/operator_audit.md` §9。
-4) **rev bump**：`simd_dsl`/`ops_dsl`/conformance 三处 rev → **`b882ebe`**；`--features dsl-backend` 两档
-   clippy/test、nightly rustdoc、`doccheck`、`nm -D` **98** 全绿。
-5) **命名收尾的回归（Lead 复核）**：`norm` 三算子首版 portable 回退改成 5/8 趟显式组合，实测比原引擎快路径慢
-   **1.43×（Scalar）/1.99×（Idiomatic）** ⇒ 已改回 `rewrite_softmax_rows`/`fuse!` 旧生产路径，复测
-   `new/rewrite = 1.019/1.027`、max_abs=0（逐位）。
-
-## 7.52 B1（M5）：LASX 组合原语 override 第一批——`axpy_inplace_f32` 落地 + 5 个缺口如实报（2026-10-19）
-
-**背景（`A_diagnosis.md` §6 M5）**：组合（`fuse!`/宏）路径在 LASX 上会回落到 portable **标量**默认
-⇒ "融合 vs 组合"的 A/B 混着"SIMD vs 标量"。本轮按"有现成 `src/ops` 内核才接、无则报缺口、不硬造"执行。
-
-**已落地 1/6：`axpy_inplace_f32`**（`src/dsl_backend.rs`，映射 `api::axpy` 两舍入 LASX 向量核）
-- **等价类：逐位**（同一 `t = alpha*x + 0.0; y += t` 两次舍入序列，含 `±0`/次正规/大值；
-  `tests/prims_override.rs` 用 `to_bits` 对拍 portable 默认，含非 8 倍数尾巴 n=4099，全等）。
-- **A/B（`examples/prims_ab.rs`，Lead 口径：受控线程；同进程交替 5 对丢首对中位）**：
-
-| threads | n | A=Portable ms | B=LASX ms | A/B | loadavg（grade） |
-|---|---|---|---|---|---|
-| **1**（隔离核效率） | 1M | 0.604 | 0.604 | **1.000×** | 8.71 5.77 6.87 ⇒ **grade C** |
-| **1** | 8M | 14.447 | 13.743 | **1.051×** | 同上 |
-| **12**（生产默认） | 1M | 0.503 | 0.544 | **0.926×** | 8.71 ⇒ grade C |
-| **12** | 8M | 20.855 | 24.592 | **0.848×** | 同上 |
-
-**如实结论**：**逐位成立，但性能无稳定收益**——该原语是 1 趟内存流（8M ≈ 96 MB 流量），
-portable 默认已被 LLVM 自动向量化 ⇒ LASX 手写核落在噪声带（1.00–1.05×/0.85–0.93×，本轮 loadavg 8.7 = grade C）。
-**override 仍保留**：它是 B2 `axpy!` 宏（3 趟→1 趟）的落点，组合路径的收益由 B2 在**宏层**兑现后再测；
-本表只证明"原语级不比 portable 慢/更不更快"。
-
-**缺口 5/6（`src/ops` 无现成内核 ⇒ 本轮不硬造，逐条如实报）**：
-| 原语 | 现状 | 缺口原因 |
-|---|---|---|
-| `reduce_rows_map_f32`（rms/layer 组合回退唯一入口） | 缺 override | `src/ops` 只有**窄版** `map_rows_sum_f32`（`ops/map_rows_sum.rs`，Exp/ExpShiftedRow），**没有通用 RowFuse**（RowReduce×RowEpilogue×map 组合）内核 |
-| `reduce_sum_rows_f32` | 缺 override | 只有 `reduce_sum_cols`（`ops/dsl_map.rs:144`），无按行版 |
-| `reduce_max_f32`（整片 max） | 缺 override | 无整片 max 内核（`reduce_max_rows/cols` 是轴版） |
-| `map_unary_f32`（exp/sqrt 族） | 缺 override | `nn_math` 只有 `exp_vec/exp_seq/sigmoid_*` **内部 helper**，无通用 `UnaryOp` 映射内核（exp 之外还有 Sigmoid/Tanh/Sqrt/Rcp/Log… 且与 libm 非逐位） |
-| `map_binary_scalar_f32` | 缺 override | `dsl_map::map_binary` 是**双数组**版，无标量广播版内核 |
-
-**下一批建议（按 A 诊断优先级）**：`reduce_rows_map_f32`（通用 RowFuse）与 `map_unary_f32`（exp/sqrt 族）
-最值钱——补上后 rms/layer/softmax 的组合路径才真正 SIMD 化；`map_binary_scalar_f32` 可先做双数组+广播小内核。
-
-**门禁**：`fmt --check` 0；clippy **默认/`dsl-backend` 两档 0**；test 两档 0（含新 `tests/prims_override.rs`
-2 个用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
-
-### 7.52.1 B1b（task-108）：`map_unary_f32` + `reduce_rows_map_f32` override——组合路径去标量化（2026-10-19）
-
-**落地**：新增 `src/ops/prims.rs`（**218 行**，`dsl-backend` feature 门控）+ `src/dsl_backend.rs` 两个 override。
-- `map_unary_f32`：`Exp` 用 `nn_math::exp_vec`（8 lane 多项式，尾块用同串 `exp_seq`）；
-  `Sqrt` 用 `lasx_xvfsqrt_s`；**其余变体（Sin/Cos/Ln/Erf/Sigmoid/Rcp/Abs）整片委托
-  `kernels::scalar::map_unary_f32`**（不做未经验证的向量化，等价类优先）。
-- `reduce_rows_map_f32`：`RowReduce::{Sum,SumSq}` × 6 个 `RowEpilogue` × `BinaryOp::{Add,Sub,Mul,Div}`
-  走向量（行内 8-lane 累加 + **与标量多累加器同 lane 同序 hsum** + 标量 epilogue + 向量 map）；
-  `Max` 归约与 `Max/Min` map **整片委托标量参照**（`NaN`/`±0` 语义不为优化让路）；
-  长度/溢出错误码与 portable 默认同口径。
-
-**等价类（实测，`tests/prims_override.rs` 现 6 个测试）**：
-- `map_unary`：`Sqrt` 与全部委托变体 **`to_bits` 逐位**；`Exp` **容差类**，实测
-  `max_rel = 1.675e-7`（vs libm `exp`；声明界 `5e-7`）。
-- `reduce_rows_map`：全矩阵（3 reduce × 6 epilogue × 6 map × cols∈{3,13,16,64} = **432 组**）
-  与 **portable 契约默认（8 lane 多累加器）`to_bits` 逐位**；`Max` 与顺序下限臂逐位；
-  与 `ScalarBackend`（顺序单累加器）的容差类差（行统计量口径）实测 **`max_rel = 1.294e-6`**
-  （cols=1000、SumSq；声明界 `2e-6`）。
-- 错误路径：长度不符/`rows×cols` 溢出与 portable 同 `Err`（新增 2 条断言）。
-
-**A/B（`examples/prims_ab.rs` 扩两节；`THREADS=1|12`；同进程轮转 5 对丢首对中位；
-loadavg **16.08/22.12 ⇒ grade C**；绝对 ms 不可跨窗口横比）**：
-
-| 用例（`LASX_NO_PLAN=1` 组合回退） | threads | A=改前(Scalar) ms | B=改后(LASX) ms | F=融合 ms | A/B | B/F |
-|---|---|---|---|---|---|---|
-| rms_norm 1024² | 1 | 3.366 | 1.011 | 0.640 | **3.33×** | 1.58× |
-| layer_norm 1024² | 1 | 7.117 | 1.827 | 1.032 | **3.90×** | 1.77× |
-| softmax_rows 1024² | 1 | 8.843 | 3.344 | 1.818 | **2.64×** | 1.84× |
-| rms_norm 4096×128 | 1 | 1.644 | 0.524 | 0.271 | **3.14×** | 1.93× |
-| layer_norm 4096×128 | 1 | 3.085 | 0.803 | 0.528 | **3.84×** | 1.52× |
-| softmax_rows 4096×128 | 1 | 4.255 | 1.647 | 0.839 | **2.58×** | 1.96× |
-| rms_norm 1024² | 12 | 4.188 | 1.317 | 0.364 | 3.18× | 3.61× |
-| layer_norm 1024² | 12 | 10.359 | 3.852 | 0.484 | 2.69× | 7.96× |
-| softmax_rows 1024² | 12 | 8.623 | 3.095 | 0.360 | 2.79× | 8.59× |
-| rms_norm 4096×128 | 12 | 1.644 | 0.545 | 0.061 | 3.02× | 8.96× |
-| layer_norm 4096×128 | 12 | 3.086 | 0.759 | 0.092 | 4.07× | 8.21× |
-| softmax_rows 4096×128 | 12 | 5.609 | 2.061 | 0.357 | 2.72× | 5.77× |
-
-**结论/边界（如实）**：
-1. **组合路径确实去掉了标量瓶颈**：三个算子生产回退快 **2.6–4.1×**（两线程配置方向一致）；
-   `axpy_inplace` 核效率仍持平（1/12 线程 0.94–0.99×，逐位，与 B1 结论一致）。
-2. **仍未打平融合**（`B/F` 1.5–9.0×）：t1 时 1.5–2.0×；t12 时 3.6–9.0×——后者主要是**融合核内部
-   auto-parallel**（B3 矩阵已测 threads=12 时融合/组合 2.06–3.24×），不是本 override 目标。
-3. **grade C（loadavg 16）**：上表是同窗口趋势；正式验收需 loadavg ≤4.5 的 B 级窗口复跑。
-4. **A 臂是"改前"的近似**：`ScalarBackend` = 顺序单累加器下限臂；旧 Lasx 回退是多累加器标量
-   （softmax 还含 1 个 LASX `reduce_sum`）⇒ A 略慢于真旧值，**收益方向可信、幅度需 B 级复核**。
-5. **A≡B 非逐位**（max_abs 4.8e-7 / 3.1e-6 / 7e-9）：来自"顺序臂 vs 多累加器"的容差类差，
-   不是生产路径差；生产路径等价证据见测试（与 portable 默认 `to_bits` 逐位）。
-6. **剩余缺口（本轮未做，如实）**：`reduce_sum_rows_f32` / `reduce_max_f32` /
-   `map_binary_scalar_f32` 仍无 override（`src/ops` 无现成内核，按任务口径不硬造）。
-
-### 7.52.2 引擎接入（simd `b5eb1fb`/`099783c`）：算子不再直调 plan，lasx rev bump（2026-10-19）
-
-- **背景（用户口径）**：此前 `ops_dsl` 各算子自己 `if supports_plan { exec_fused_plan } else { 宏组合 }`，
-  **引擎被绕过**，只能看见单条原语。E1–E3 后：算子只构造 `Algorithm`，由 `engine::execute` 做**唯一决策**
-  （① `supports_plan` ⇒ FusedPlan；② 能力位 ⇒ NamedCapability；③ 否则 ⇒ PortableComposition）并产出
-  `EngineReport`；引擎在 ③ 显式调 `exec_fused_plan_portable`（本仓 override 不吞组合路径）。
-- **门禁**：`simd_dsl/scripts/enginecheck.sh --strict`（算子代码级 `exec_fused_plan`/`supports_plan` = 0；
-  `reduce/norm/quant/geometry/rope/activations` 6/6 经 `engine::execute`），已进 gate_local/CI；
-  等价矩阵见 `simd_dsl/docs/engine_integration.md`（13 变体 × 策略断言）。
-- **本仓影响**：`LasxBackend` 无需改动（`exec_fused_plan` 覆盖语义不变）；**rev bump** 到
-  `simd_dsl 099783c`（`Cargo.toml` 3 处 + lock）。两档 clippy/test、nightly rustdoc、`doccheck`、`nm -D` 98 全绿。
-- **未完成（如实）**：引擎当前是**单算子路由**（`execute_all` 只聚合报告，无跨算子消趟/融合）；
-  **并行选择未进引擎**（融合核 auto-parallel 仍在内核内部；B3：threads=1 组合反快 3–4.7×、
-  threads=12 融合快 2–3×，说明"按线程选策略"是引擎欠账）；未接线模块清单见
-  `simd_dsl/docs/engine_integration.md §6`。
-
-### 7.52.3 引擎接入第二波 + **测量校正**（simd `4e2222c`，2026-10-19）
-
-- **引擎口径第二波（simd E4/E5）**：17/17 模块都有引擎入口——**真实优化 6**（`engine::execute`：
-  norm/geometry/quant/rope/activations/axpy）+ **组合桥 11**（`execute_composed*`：入口 + op/stages
-  感知与报告，**无 plan 替换**）；13 个入口如实未迁移（matmul 4 薄变体、spectral 3 计划句柄、
-  stencil2d 6 变体）。门禁 `enginecheck --strict` 自动发现模块、分计两类入口。
-- **测量校正（重要）**：此前三臂探针 **缺少 `-C target-feature=+lasx`**（该 flag 只在 lasx 仓库的
-  `.cargo/config.toml` 生效，独立探针不继承）⇒ LASX intrinsics 退化为函数调用，**组合路径被严重低估**
-  （`map_unary(Exp)` 41ms→1.2ms、`map_rows_sum` 42ms→1.1ms、softmax 组合 41ms→2.9ms @1024²）。
-  基于旧探针的"组合/融合"数字**作废**。
-- **修正后同窗口三臂（grade C 趋势，loadavg 6.6–6.8；组合/融合 >1 ⇒ 融合更快）**：
-
-  | case | threads=1 | threads=12 |
-  |---|---|---|
-  | softmax 1024² | 1.86× | 8.49× |
-  | rms_norm 1024² | 1.24× | 4.14× |
-  | layer_norm 1024² | 2.81× | 12.21× |
-  | axpy 1M | 1.25× | **0.96×** |
-  | norm3 f64 200k | **0.95×** | **0.99×** |
-  | mat3 f64 200k | 2.40× | 1.75× |
-
-  ⇒ **`axpy`/`norm3` 组合 ≈ 融合（删除融合核候选，待 B 级窗口复核后再动）**；
-  softmax/rms/layer/mat3 融合仍赢，且**多线程差距最大**（收益主因是内核内 auto-parallel）。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `4e2222c`；两档 clippy/test、nightly rustdoc、`doccheck`、
-  `nm -D` 98 全绿。
-- **引擎侧仍未做（如实）**：组合路径**没有并行**（无按线程选策略能力）——**E6 已补，见 §7.52.4**；
-  无跨算子融合（`execute_all` 只聚合）、11 个模块只有组合桥入口；13 个入口未进引擎。
-
-### 7.52.4 引擎并行决策（simd `a57412e`）：组合路径并行化 + 修正后的 B 级三臂（2026-10-19）
-
-- **E6（引擎侧）**：`engine::parallel` 按行/元素切块 + `std::thread::scope`；`engine::execute` 自动选
-  线程数（`available_parallelism`、按规模伸缩），`execute_with_threads`/env `SIMD_DSL_ENGINE_THREADS`
-  可显式控制；组合路径（softmax/rms/layer/norm3）已接线；**并行结果与串行逐位**（测试守）。
-- **修正后三臂（engine 自动并行；LasxBackend；6 轮丢首轮中位；grade B，loadavg≈3.8）**：
-
-  | case | A=lasx api | B=DSL 融合 | C=DSL 组合（并行） | C/B |
-  |---|---|---|---|---|
-  | softmax 1024² | 0.222 | 0.321 | 0.830 | **2.58×** |
-  | rms_norm 1024² | 0.088 | 0.256 | 0.713 | **2.79×** |
-  | layer_norm 1024² | 0.123 | 0.284 | 0.763 | **2.68×** |
-  | axpy 1M | 0.421 | 0.536 | 0.604 | **1.13×** |
-  | norm3 f64 200k | 0.392 | 0.580 | 0.582 | **1.00×** |
-  | mat3_mul_vec3 200k | 2.169 | 3.109 | 7.845 | **2.52×** |
-
-  ⇒ 对比 §7.52.3 的串行组合（threads=12）：softmax 8.49→**2.58**、rms 4.14→**2.79**、
-  layer 12.21→**2.68**（引擎并行把差距缩小 1.5–4.5×）。**“axpy/norm3 删除融合核候选”结论作废**：
-  axpy 并行后 1.13×（线程开销 > 省趟数）、norm3 1.00×（持平但非稳定优势）——
-  **均未删融合核**。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `a57412e`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
-- **仍缺（如实）**：线程池复用（每次调用创建线程，小算子吃亏）；后端原生并行 vs 引擎并行的统一策略；
-  跨算子融合；11 个模块仅桥入口、13 个入口未进引擎。（**E7/E8 已补入口与部分真实优化，见 §7.52.5**）
-
-### 7.52.5 引擎真实优化扩面（simd `e88c6c4`→`c69f08e`）：8 模块真实优化 + 13 入口补齐（2026-10-19）
-
-- **E7（真实优化扩面）**：`Algorithm` 新增 `MapUnary`/`MapAffine`/`ReduceRows`/`ReduceCols`/`Gather`；
-  `ops_dsl` 迁移 `log` 3（1 趟/2 趟）、`reduce` 6（行归约**并行**、列归约串行）、`embedding_lookup(f32)`
-  （**并行 gather**）。执行层后端方法不变 ⇒ 数值口径不变；并行只按行/id 切 ⇒ 与串行 `to_bits` 全等
-  （simd 新测试守）。`EngineReport` 新增 `op` 字段（非 plan 家族没有 `PatternKind`，`kind` 为占位）。
-- **E8（入口补齐）**：剩余 13 个入口接组合桥：`matmul` 4 变体、`spectral` 3（`detect` 有意外层+内层
-  各一次引擎入口）、`stencil2d` 6 变体；闭包内实现一字未改 ⇒ 数值/错误面不变。
-- **矩阵（`enginecheck --matrix`）**：**真实优化 8 / 仅组合桥 9 / 未接线 0**；再没有任何"未进引擎"的
-  算法入口（多出的 4 个 spectral `pub fn` 是纯配置 getter，不算入口）。
-- **门禁口径同步（simd 侧）**：`opcheck` 第 1 条放宽为"宏调用**或**引擎入口调用"（E7 起"整个算法
-  交给引擎"是合法算法体；`opcheck_test` 10/10 仍守负例）。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `c69f08e`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
-- **验证纪律（如实）**：E7 单独提交 `e88c6c4` 的 CI（runId `1792422999`）**红**，但面板只保留最新
-  `build-summary`、**失败步骤未取到**；本地全门禁通过，紧随的 `c69f08e`（同内容 + E8）CI success。
-  ⇒ 不臆断为 flake，**如实记为未查明原因**；后续若复现再查（已记 `AGENTS.md §43`）。
-
-### 7.52.6 引擎真实优化再扩（simd `fe2e191`）：matmul / transpose 并行（2026-10-19）
-
-- **E10（simd 侧）**：`Algorithm` 新增 `MatmulF32`（按输出行块并行）、`MatmulF64`（能力位
-  `MatmulF64` 为真走后端整块，否则行块并行）、`TransposeF32`（按列块并行）；`ops_dsl` 的
-  `matmul_f32`/`matmul_f64`/`transpose_copy_f32` 由组合桥改为 `engine::execute`；
-  `matmul_const`（`_pinned` 编译期形状）**仍桥**（引擎枚举无法表达 const 泛型）。
-- **等价**：分块只切独立输出 ⇒ 与串行 `to_bits` 全等（simd 新测试守）。
-- **实测**（`ScalarBackend`、引擎自动并行 vs 后端直调；同进程交替 6 轮丢首轮取中位；
-  loadavg 5.5 ⇒ **grade C 趋势**）：matmul f32 512³ **3.53×**（308.9→87.4ms）、
-  transpose 1024×2048 **7.07×**（11.75→1.66ms）。
-- **矩阵（simd `enginecheck --matrix`）**：真实优化 **10** / 仅组合桥 **7** / 未接线 **0**。
-- **边界（如实）**：`Capability` 无 `MatmulF32` 位 ⇒ 有专用核的后端也不会被 `NamedCapability` 选中；
-  batched/scaled matmul 仍桥；其余 7 个模块（complex/diff/iso_kernel/kv_cache/laplace/spectral/stencil2d）
-  仍只有组合桥；跨算子融合、线程池仍未做。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `fe2e191`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
-
-### 7.52.7 引擎真实优化再扩（simd `fffbf4a`）：complex/laplace/diff（2026-10-20）
-
-- **E11（simd 侧）**：`Algorithm` 新增 `ComplexMatmulF32`（6 阶段：4 matmul 行块并行 + 2 逐元素加减；
-  能力位 `ComplexRoutes` 为真报 `NamedCapability`）、`LaplaceForward`（3 阶段）、`DiffRows`
-  （路线选择在 `engine::nabla`）；专用入口 `execute_diff` 返回 `(EngineReport, DiffReport)`。
-  `ops_dsl` 的 `complex::cmatmul_f32`、`laplace::forward`、`diff::diff_rows_f32` 从组合桥改真实路由。
-- **等价/校验**：执行层后端调用与旧宏相同 ⇒ 逐位口径不变；三个变体在**引擎内**做与 portable 同口径的
-  `LengthMismatch` 校验（`laplace_forward_nan_inf_and_contract` 抓到"未校验时短缓冲先越界切片"，已修）。
-- **矩阵（`enginecheck --matrix`）**：真实优化 **13** / 仅组合桥 **4**（iso_kernel、kv_cache、
-  spectral、stencil2d）/ 未接线 **0**。
-- **边界（如实）**：`ComplexMatmulF32` 的 `NamedCapability` 只是策略报告（执行顺序不变，后端没有可选的
-  复数融合核）；4 个模块仍桥；跨算子融合、线程池仍未做。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `fffbf4a`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
-
-### 7.52.8 引擎决策可见性（simd `f65bed1`）：默认编译期打印、运行时零成本（2026-10-20）
-
-- **用户口径**："决策尽量在编译期；默认打印决策内容，避免运行时读变量影响性能和稳定性。"
-- **默认编译期打印（simd 侧）**：`ops_dsl/build.rs` 每次编译把 `模块 → engine::execute×N +
-  execute_composed*×M` 打到 cargo 输出（`cargo:warning=[simd_dsl][compile-time] …`；默认开、
-  **不读任何运行时环境变量、默认路径无运行时分支**）。实测一次打印：真实优化 38 / 组合桥 28，17 模块。
-- **运行时 trace 改为 feature 门控**：未开 `engine-trace` ⇒ `enabled()` 编译期常量 `false`；
-  开 feature + `SIMD_DSL_ENGINE_TRACE=1` 才打印每次决策。实测（axpy n=8，300k 次）：
-  引擎每调用开销 161ns → **23.5ns**（默认）、trace 检查 134ns → **0ns**；
-  `ScalarBackend::supports_plan` 常量折叠 0ns。
-- **剩余（E13 待做，如实）**：能力位仍是后端实例属性（`dyn Backend` 与 LASX 测试钩子
-  `LASX_NO_PLAN` 阻止全常量折叠）——下一步做常量能力描述（`#[inline] fn caps()`）+ 把测试钩子移出
-  生产热路径，让生产后端的能力判定也被 LLVM 折掉；`objdump`/IR 验证。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `f65bed1`；两档 clippy/test、nightly rustdoc、`doccheck` 全绿。
-
-### 7.52.9 跨算子优化计划（simd `1ebeda1`，**仅文档/未实现**）
-
-- 用户问"跨算子有没有计划"。simd `docs/engine_integration.md §14` 落成书面计划，要点：
-  **现状**——单算子都经引擎，但**算子之间**未优化（`execute_all` 仅聚合；中间缓冲、多趟读写、
-  每算子一次线程启动都在）；**设计**——`engine::chain`（slot 缓冲/workspace，引擎看到整张图）+
-  row-block 贯穿整链一次线程启动 + 分级融合（P1 逐元素链/P2 axpy→norm 逐位；P3 matmul epilogue 容差）；
-  **诚实点**——改变数值路径的融合必须新增后端融合核并在两后端×threads A/B 达标才保留
-  （gelu 融合更慢已删先例）；**门禁**——`enginecheck` 链覆盖检查、`engine-trace` 链决策、
-  `SIMD_DSL_NO_FUSE=1` 对照、P1/P2 `to_bits` 全等测试。
-- **rev bump**：`simd_dsl`/`ops_dsl` → `1ebeda1`（本轮 simd 仅加计划文档，无接口变化）；
-  两档 clippy/test、`doccheck` 全绿。
-
-### 7.52.10 跨算子 MVP：`engine::chain::execute_map_chain`（simd `7f5b9be`）
-
-- simd E14 MVP：逐元素链（Unary/Affine）按行块**一次 thread::scope** 跑完整链，两块缓冲交替、末步写 out；
-  与逐算子顺序执行/`engine::execute` 均 `to_bits` 全等；ops_dsl 的 `pipeline!` 宏未接。
-- 实测（Scalar，3 步逐元素，4.19M 元素，threads=8）：顺序 9.69ms → 链 9.33ms（**1.038×**；
-  如实写：幅度小，逐元素本身不是瓶颈，跨算子真正的融合需后端新核，P1 新核/P2/P3 未做）。
-- rev bump 到 `7f5b9be`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.11 跨算子链条 + RMS 终止步（simd `8492b35`）
-
-- simd E14.2：`MapChain.term = Some(MapTerm::RmsRows{eps})` —— 逐元素链后在同一行块内直接做行 RMS 归一（
-  `reduce_rows_map_f32` SumSq/SqrtMeanPlusEps/Div），**一次 spawn 跑完**；`ChainReport.termed` 可见。
-- 等价：与"先跑链、再 `engine::execute(RmsNormRows)`"串行/并行均 `to_bits` 全等（simd 测试）。
-- 实测（Scalar，2 步逐元素 + RMS，4.19M 元素，threads=8）：顺序 8.43ms → 链 8.13ms（**1.037×**）；
-  如实写：省 spawn/join，非算术融合；LayerNorm 终止步、P2/P3 融合核仍未做。
-- rev bump 到 `8492b35`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.12 算子层"整条算法"入口（simd `5235d33`）
-
-- simd E14.3：新增 `ops_dsl::pipeline::exec_map_pipeline` —— 只做参数绑定，执行/优化决策全在引擎
-  （`engine::chain::execute_map_chain`）：逐元素链 + 可选 RMS 终止步，引擎按行块**一次并行**跑完。
-- 等价：与逐算子 `engine::execute` 顺序执行 `to_bits` 全等；长度不匹配透传引擎错误码（不越界）。
-- 门禁同步（理由已写）：`enginecheck` 把 `execute_map_chain(` 计入"入口级感知"（链入口，
-  非 `Algorithm` 单算子枚举）；`opcheck` 白名单接受它（与 `execute_composed*` 同级）。
-- 如实边界：仍是**调度层**（省 spawn/join，1.03–1.04×），不是数值融合；`pipeline!` 宏、P2/P3 融合核未做。
-- rev bump 到 `5235d33`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.13 链 + 行 LayerNorm 终止步（simd `00e15ac`）
-
-- simd E14.4：`MapTerm::LayerRows{eps}` —— 块内跑完逐元素链（落 tmp）后，对该块调用引擎既有
-  `Algorithm::LayerNormRows`（threads=1）写 out；块内不另起 thread::scope，整链仍一次 spawn。
-- 等价：行间独立 ⇒ 与"先跑链、再逐算子 LayerNormRows"在 threads=1/8 下 `to_bits` 全等。
-- **实测：本轮未测**（无空闲窗口）——不写没测过的数；按 14.1/14.2 同构预期 ~1.03×。
-- 边界：复用 portable 组合、非新融合核；P2/P3、pipeline! 宏未做；rev bump 到 `00e15ac`。
-
-### 7.52.14 `pipeline!` 宏：编译期把整条链展开给引擎（simd `d3b97c2`）
-
-- simd E14.5：`ops_dsl::pipeline![be, rows, cols, threads, term; x, tmp, out; step, …]` 是
-  `macro_rules!` ⇒ **编译期展开成定长 `[MapStep; N]`** + 一次 `exec_map_pipeline`；步数/顺序在展开结果可见，
-  运行期引擎做行块调度/并行（`ChainReport`）。
-- 等价：`ops_dsl/tests/pipeline_macro.rs` 证明与逐算子 `engine::execute` 顺序执行 `to_bits` 全等
-  （RMS 终止步 + 纯逐元素链两种形态），并断言 `steps/termed/row_blocked`。
-- 边界：宏只做语法展开、不做数值融合；`Some/None` 由调用方显式写；P2/P3 融合核仍未做。
-- rev bump 到 `d3b97c2`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.15 编译期报告加入"链入口"（simd `94c376f`）
-
-- simd E13 扩展：`ops_dsl/build.rs` 默认打印三类入口（真实优化 / 组合桥 / **链入口**），实测
-  `真实优化 41 / 组合桥 28 / 链入口 1（共 18 模块）`——"多算子整条链交给引擎"在**编译期**可核对；
-  计数只扫 `src/`（`pipeline![` 调用点 + `execute_map_chain`），tests 里的宏调用不计入。
-- 如实：宏调用点数 ≠ 运行期趟数；能力位仍是运行期决策（`engine-trace` feature 才打印细节）。
-- rev bump 到 `94c376f`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.16 P2 `axpy→rms` 融合 ROI 决策（simd `4dba5ac`，**未实现**）
-
-- simd `engine_integration.md §15` 记录量测：Scalar/单线程/n=4M，两趟 18.20ms vs 单趟**标量** 14.10ms
-  = **1.291×（上限）**；但单趟改变归约累加次序 ⇒ `to_bits` 不全等（max_rel 1.309e-7，不是逐位）。
-- 关键判断：LASX 两趟已是向量核，标量单趟大概率负收益 ⇒ P2 要落地必须**同时写 LASX 向量融合核**。
-- 决策：本轮**不实现**；三前置 = 逐位（或容差例外+实测界）/ 两后端 × threads 1/12 同窗口 A/B /
-  按能力位按后端启用。在此之前跨算子只宣称调度层收益（1.03–1.04×），**不宣称数值融合**。
-- rev bump 到 `4dba5ac`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.17 P2 决定：**不采纳**（向量化后端下收益只剩 1.107×；simd `6eb8e85`）
-
-- simd §15 补测：向量化参考后端 `IdiomaticBackend`（n=4M、threads=1）两趟 15.41ms vs 单趟标量 13.92ms
-  = **1.107×**（Scalar 无向量核时为 1.291×）；且单趟非逐位（max_rel 3.565e-7）。
-- 结论：后端越向量化，标量单趟融合相对收益越小；LASX 的 rms 核本身更快（实测 2.79×）⇒ 标量单趟
-  在 LASX 上**大概率负收益**。**决定 P2 不采纳**（不进默认路径）；仅未来作为"非向量化后端容差例外"
-  按能力位启用，并重过三前置（逐位/实测界、两后端 A/B、按能力位）。
-- rev bump 到 `6eb8e85`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.18 P3 matmul epilogue 融合 ROI（simd `3a605f6`，**暂不采纳**）
-
-- simd §16 实测（Scalar/threads=1）：512³ matmul 306.12ms，+bias 303.67ms（噪声内）、+erf 307.43ms；
-  2048×64×512：92.80ms → +bias 93.59ms（+0.9%）→ +erf 107.88ms（erf 计算 +15.4%，**融合省不掉**）。
-- 结论：P3 融合只能省 epilogue 访存那一趟，Scalar 上占比 ~0–1%；LASX 上 matmul 更快占比会升，
-  但按访存估算仍个位数百分比。**决定暂不采纳**；若做，需 LASX 实测占比 ≥5% 且融合核 ≥1.05×。
-- rev bump 到 `3a605f6`；两档 clippy/test、doccheck 全绿。
-
-### 7.52.19 目标闭环汇总（simd `027f69e`）：引擎接管证据矩阵
-
-- simd `engine_integration.md §17` 汇总可复核证据：禁止直调 0 处；18 模块 真实优化 14 / 仅组合桥 4 /
-  未接线 0；单算子可断言 `EngineReport`；跨算子链（RMS/LayerNorm 终止步）+ 流水线入口 + `pipeline!` 宏
-  逐位等价；`build.rs` 编译期打印 41/28/1。
-- 优化如实：跨算子目前**仅调度层** 1.03–1.04×；P2/P3 数值融合经实测否决（§15/§16），**未采纳且不宣称**。
-- 已知边界：enginecheck 不剥离 `#[cfg(test)]`（pipeline.rs 计数来自测试，实际为链级入口）。
-- 剩余欠账（非阻塞）：4 个仅桥模块、线程池复用、enginecheck 剥离测试块。
-- rev bump 到 `027f69e`；两档 clippy/test、doccheck 全绿。
-
-
-
-
-
-
-
-
-
-**门禁**：`fmt --check` 0；clippy 默认/`dsl-backend` 两档 0；test 两档 0（默认 292、feature 325 个 lib 测试，
-新增 6 个 prims 用例）；nightly rustdoc 两档 0；`doccheck` OK；`nm -D` **98**（未新增 C 导出）。
+### 9.5 DSL 能知道什么 / 不能知道什么（旧编号锚点）
 
+现见 **§2.5**（整体结论：代数重写可做、委派 LLVM 不划算、完全 SIMD 红线取 A、核↔矩阵乘融合不采用）。
 
+### 9.5.1 表达式级代数重写（旧编号锚点）
 
+现见 **§2.5** 第 1 条（等距字面量/运行期步长/负例/未挂 `#[fast_trig]` 的四种裁决）。
 
+### 9.5.2 落地进度（旧编号锚点）
 
+现见 **§2.5**（递推核落地：安全区 ≤1e-4、超区逐行回退 libm 且逐位；A/B 小 NB −43.5%、大 NB −59.0%）。
 
+### 9.5.3 "委派给 LLVM"的收益缺口（旧编号锚点）
 
+现见 **§2.5**（迭代器版核 1.48× / 组合 1.09×；朴素标量 6.24× / 3.20×）。
 
+### 9.5.4 四变体对照与分界线（旧编号锚点）
 
+现见 **§2.5**（"代码形状 → 谁来优化"的分界线：f64 + 无 `mul_add` = 逐位类；无变体达到快 ≥3% 的超越门槛）。
 
+### 9.5.5 决策记录：核↔矩阵乘融合不采用（旧编号锚点）
 
+现见 **§2.5** 与 **§3.6**（现场生成 libm 与物化的两条路都试过，opt-in、默认路径不变）。
 
+### 9.5.6 完全 SIMD 红线取 A（旧编号锚点）
 
+现见 **§2.5**（`lasx_rs` 作为专门后端**保留手写内核**，不把内核外包给 LLVM）。
 
+### 18 矩阵视图与打包计划（旧编号锚点）
+
+现见 **§2.1**（分层：`view` 管布局、`plan` 管复用）与 **§6.5**（`MatmulPlan` 契约）。
+
+### 19.7 接口冻结（旧编号锚点）
+
+现见 **§6.1**（池行块闭包 / `Prepared::apply*` / `Policy::threads` 三条冻结 + 谁守 + 改法）。
+
+### 19.8 公式 DSL v1（旧编号锚点）
+
+现见 **§2.4**（v1 表面、诊断、覆盖矩阵、`shape::batch` 的 UB 修复）。
+
+### 19.13 DSL 覆盖矩阵与缺口（旧编号锚点）
+
+现见 **§2.4** 与 **§8.2**（缺口与下一步；完整覆盖表在 `docs/ops.md`）。
 
 
