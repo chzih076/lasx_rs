@@ -5,8 +5,8 @@
 //!   （`RowFuse` 的 `Sum`/`SumSq` × `Add/Sub/Mul/Div` 向量路径；未验证组合委托标量）。
 //!   本文件的后两个测试覆盖**全矩阵**与**奇数 cols（3/13）**，并打印实测 rel 界。
 //!
-//! 其余原语（`reduce_sum_rows_f32`/`reduce_max_f32`/`map_binary_scalar_f32`）仍缺 `src/ops`
-//! 现成内核 ⇒ 缺口清单见 `docs/dev.md §7.52`。
+//! `reduce_sum_rows_f32` 已由 `src/ops/dsl_map.rs` 接上（8-lane 顺序 fold，与默认实现**逐位**，本轮起有 override）；
+//! 其余原语（`reduce_max_f32`/`map_binary_scalar_f32`）仍缺 `src/ops` 现成内核。
 #![cfg(feature = "dsl-backend")]
 
 use lasx_rs::dsl_backend::LasxBackend;

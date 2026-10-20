@@ -256,3 +256,69 @@ pub(crate) fn reduce_weighted_sum_cols_range(
 pub(crate) fn reduce_sum(x: &[f32]) -> f32 {
     crate::ops::sum::sum(x)
 }
+
+// ================= P4.2：行和（`reduce_sum_rows_f32`）的 LASX override + 自动并行 =================
+//
+// **等价类 = 逐位**（与 `simd_dsl::kernels::scalar::reduce_sum_rows_f32` 的默认实现逐位相等）：
+// 默认实现是"8 个 per-lane 累加器（lane `l` 加下标 `c ≡ l (mod 8)` 的元素）→ **顺序 fold** 8 lane
+// → 顺序补尾"。这里用 LASX 的 8-lane 向量加法做**同一件事**：向量加法 = 8 个独立的 per-lane 加法
+// （次序相同），水平归约**不**用两两树，而是把 8 lane 落回标量后**顺序 fold**（与参照同序），
+// 尾部再按 `c` 递增顺序补加 ⇒ 每条输出的运算次序完全一致 ⇒ `to_bits()` 相等。
+//
+// **并行**：行与行之间独立（每行的归约次序不变）⇒ 行块切分仍是**逐位类**；只改"哪一行先算"。
+
+/// 行和的**逐行 kernel**：`out[r] = Σ_c x[r·cols + c]`（**逐位**，见本段文档）。
+pub(crate) fn reduce_sum_rows_rows(x: &[f32], cols: usize, out: &mut [f32], rows_local: usize) {
+    for r in 0..rows_local {
+        out[r] = row_sum_bitwise(&x[r * cols..(r + 1) * cols]);
+    }
+}
+
+/// 单行和：8-lane 向量累加 + **顺序 fold** + 顺序补尾（与标量参照逐位）。
+#[inline]
+fn row_sum_bitwise(row: &[f32]) -> f32 {
+    let (chunks, tail) = row.as_chunks::<8>();
+    let mut acc = lasx::zero_f32x8();
+    for c in chunks {
+        // SAFETY: 每个 chunk 恰有 8 个 f32。
+        unsafe {
+            acc = lasx_xvfadd_s(acc, lasx::load_f32x8(c.as_ptr()));
+        }
+    }
+    let mut buf = [0.0f32; 8];
+    // SAFETY: `buf` 有 8 个元素，store 8 lane 合法。
+    unsafe { lasx::store_f32x8(buf.as_mut_ptr(), acc) };
+    // **顺序 fold**（不要两两树）：与标量参照 `acc.iter().copied().fold(0.0, |s, v| s + v)` 同序。
+    let mut s = 0.0f32;
+    for a in buf {
+        s += a;
+    }
+    for v in tail {
+        s += v;
+    }
+    s
+}
+
+/// 行和的自动并行阈值（元素数；由 `examples/row_par_ab.rs` 实测定）。
+///
+/// **实测**（12 线程、loadavg≈2.7–2.9、同进程 1t vs auto、6 对丢首对取中位；判据 1t/auto ≥1.10）：
+/// 8K–3.1M **0.99–1.01×（中性，不进并行是对的）**；**4.2M 8.55×**、16.7M 2.65×、33.5M 2.30×、
+/// 67M 2.17×。拐点在"数据超出 L3（≈16 MB）"：3.1M 元素 = 12.6 MB 仍在 L3，串行已打满带宽；
+/// 4.2M = 16.8 MB 起并行才有效 ⇒ 阈值取 **4M 元素**（`1<<22`）。阈值以下原地串行
+/// （**不许变慢**：8K–3.1M 实测 0.99–1.01× 是与 1t 同一路径/或并行无收益）。
+pub(crate) const PAR_MIN_SUM_ROWS_ELEMS: u128 = 1 << 22; // 4M 元素
+
+/// 行和入口（`LasxBackend::reduce_sum_rows_f32` 的落点；**自动并行**）。
+///
+/// `work = rows·cols ≥ PAR_MIN_SUM_ROWS_ELEMS` 且池线程 > 1 时按**行块**并行
+/// （`parallel::reduce_sum_rows`）；否则串行。线程数由 `pool::global()` 决定
+/// （`init_global(n)` 可控；默认 `WorkerPool::auto()`）。
+pub(crate) fn reduce_sum_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_SUM_ROWS_ELEMS && pool.threads() > 1 && rows >= 2 {
+        crate::parallel::reduce_sum_rows(pool, x, rows, cols, out);
+        return;
+    }
+    reduce_sum_rows_rows(x, cols, out, rows);
+}

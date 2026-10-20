@@ -882,6 +882,30 @@ pub fn reduce_rows_map(
     });
 }
 
+/// **`reduce_sum_rows_f32` 并行版**：按**行块**切（每行内的 8-lane 累加 + 顺序 fold 不变 ⇒ **逐位**）。
+///
+/// 每块调用与串行主体**同一个** `dsl_map::reduce_sum_rows_rows` ⇒ 同一行的指令序列完全相同，
+/// 并行只改变"哪一行先算"（每行只写自己的 `out[r]`，互不重叠）。
+///
+/// **门控**：`dsl-backend`（`ops::dsl_map` 在该 feature 下；默认构建无 `simd_dsl` 依赖）。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_sum_rows(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // 本 helper 每次只写 `out[r0..r1]`（一行一个标量 ⇒ 数组宽度 1）。
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, 1)], |r0, rlen, [o]| {
+        let r1 = r0 + rlen;
+        crate::ops::dsl_map::reduce_sum_rows_rows(&x[r0 * cols..r1 * cols], cols, o, rlen);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +996,30 @@ mod tests {
             super::reduce_rows_map(&p1, &x, rows, cols, &mut a, plan);
             super::reduce_rows_map(&p4, &x, rows, cols, &mut b, plan);
             assert_eq!(bits(&a), bits(&b), "reduce_rows_map 行块并行不逐位");
+        }
+    }
+
+    /// **task-123**：`reduce_sum_rows` 的行块并行与单线程**逐位一致**
+    /// （每行内部 8-lane 累加 + 顺序 fold 的次序不变，并行只改"哪一行先算"）。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn test_reduce_sum_rows_parallel_bit_for_bit() {
+        let p1 = crate::pool::WorkerPool::new(1);
+        let p4 = crate::pool::WorkerPool::new(4);
+        // 奇数行、8 的倍数/非倍数行宽都覆盖（尾块 + 尾列）。
+        for &(rows, cols) in &[(37usize, 70usize), (7, 8), (1, 1), (128, 8), (9, 41)] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+                .collect();
+            let (mut a, mut b) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+            super::reduce_sum_rows(&p1, &x, rows, cols, &mut a);
+            super::reduce_sum_rows(&p4, &x, rows, cols, &mut b);
+            assert_eq!(
+                bits(&a),
+                bits(&b),
+                "reduce_sum_rows {rows}×{cols} 并行不逐位"
+            );
         }
     }
 

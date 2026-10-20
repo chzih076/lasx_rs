@@ -12,9 +12,10 @@
 //!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
 //!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
 //!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`、
-//!   **`map_unary_f32`/`reduce_rows_map_f32`/`axpy_inplace_f32`（B1b 组合原语；内核在 `ops/prims.rs` 与 `ops/axpy.rs`）**；
-//! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约（`reduce_sum_rows_f32`/
-//!   `reduce_max_f32` 等；`reduce_rows_map_f32` 已接）、`max/min_{cols,rows}`、
+//!   **`map_unary_f32`/`reduce_rows_map_f32`/`axpy_inplace_f32`（B1b 组合原语；内核在 `ops/prims.rs` 与 `ops/axpy.rs`）**、
+//!   **`reduce_sum_rows_f32`（P4.2：LASX 8-lane 行和 + 行块自动并行；与默认实现**逐位**）**；
+//! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约的其余项
+//!   （`reduce_max_f32` 等）、`max/min_{cols,rows}`、
 //!   `map_binary_scalar_f32`、banded/stencil、**f64 逐元素的其他族（如 f64 轴归约、
 //!   `map_unary_f64`）** ⇒ **走 `simd_dsl` 标量默认**（**不 panic**；性能必然不如向量版，
 //!   迁移时按"无内核 ⇒ 不替换"如实记）；
@@ -439,6 +440,44 @@ impl Backend for LasxBackend {
             "{op}: out 不得与 x 重叠（契约）"
         );
         crate::ops::dsl_map::reduce_sum_cols(x, rows, cols, out);
+        Ok(())
+    }
+
+    /// **行和 override（P4.2）**：`out[r] = Σ_c x[r·cols + c]`。
+    ///
+    /// **等价类 = 逐位**：本仓内核（`ops::dsl_map::reduce_sum_rows`）用 LASX 8-lane 向量加法做
+    /// **与默认实现完全相同**的 per-lane 累加，水平归约走**顺序 fold**（不是两两树）、尾部顺序补加
+    /// ⇒ 与 `simd_dsl::kernels::scalar::reduce_sum_rows_f32` 逐位一致（测试 `to_bits` 钉住）。
+    ///
+    /// **自动并行**：`work ≥ PAR_MIN_SUM_ROWS_ELEMS`（**4M 元素**，实测定：8K–3.1M 中性、
+    /// 4.2M 起 8.5×/2.6×/2.3×）且池线程 > 1 时按行块并行
+    /// （`parallel::reduce_sum_rows`；线程数由 `pool::global()`/`init_global(n)` 控制，默认 auto）。
+    /// 行块切分**不改变**任何行的归约次序 ⇒ 并行仍是**逐位类**。
+    ///
+    /// 错误面与默认实现一致（`rows×cols` 溢出 ⇒ `ShapeOverflow`；长度不符 ⇒ `LengthMismatch`）。
+    fn reduce_sum_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let op = "reduce_sum_rows_f32";
+        let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+            op,
+            what: "rows×cols",
+        })?;
+        if x.len() != total {
+            return Err(len_err(op, "x", total, x.len()));
+        }
+        if out.len() != rows {
+            return Err(len_err(op, "out", rows, out.len()));
+        }
+        debug_assert!(
+            !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+            "{op}: out 不得与 x 重叠（契约）"
+        );
+        crate::ops::dsl_map::reduce_sum_rows(x, rows, cols, out);
         Ok(())
     }
 
@@ -2817,5 +2856,90 @@ mod tests {
             ),
             Err(BackendError::ShapeOverflow { .. })
         ));
+    }
+
+    /// **P4.2：`reduce_sum_rows_f32` override** —— 与默认实现（`simd_dsl` 标量参照）**逐位**，
+    /// 且错误面完全一致。
+    ///
+    /// 逐位依据：内核用 8-lane 向量加法做与参照**相同**的 per-lane 累加，水平归约用**顺序 fold**
+    /// （非两两树）、尾部顺序补加 ⇒ 每条输出的运算次序一致（注释见 `ops::dsl_map::row_sum_bitwise`）。
+    #[test]
+    fn sum_rows_override_bitwise_vs_default_and_error_surface() {
+        let be = LasxBackend;
+        // 覆盖：8 的倍数/非倍数行宽、奇数行、单行、空形状。
+        for &(rows, cols) in &[
+            (0usize, 0usize),
+            (0, 5),
+            (3, 0),
+            (1, 1),
+            (7, 8),
+            (37, 70), // 尾列 + 尾行块
+            (64, 41), // 非 8 倍列宽
+            (128, 8),
+            (256, 1024),
+            (2048, 2048), // 4M 元素 = 阈值 ⇒ 真正走自动并行（全局池线程 >1 时）
+        ] {
+            let n = rows * cols;
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+                .collect();
+            let mut got = vec![f32::NAN; rows];
+            let mut want = vec![0.0f32; rows];
+            let _ = be.reduce_sum_rows_f32(&x, rows, cols, &mut got);
+            simd_dsl::kernels::scalar::reduce_sum_rows_f32(&x, rows, cols, &mut want)
+                .expect("scalar 参照");
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "reduce_sum_rows_f32 {rows}×{cols} 与默认实现不逐位"
+            );
+            // 与"纯顺序"参照是容差类（多累加器 vs 单累加器），只校验在这里不夸张（实测界见测试消息）。
+            if n > 0 {
+                let mut seq = vec![0.0f32; rows];
+                simd_dsl::kernels::scalar::reduce_sum_rows_f32_sequential(&x, rows, cols, &mut seq)
+                    .expect("顺序参照");
+                let max_rel = got
+                    .iter()
+                    .zip(&seq)
+                    .map(|(a, b)| {
+                        let d = (a - b).abs();
+                        let s = b.abs().max(1e-12);
+                        d / s
+                    })
+                    .fold(0.0f32, f32::max);
+                // 实测界打印（默认实现=8 累加器 vs 纯顺序=1 累加器 ⇒ **容差类**；仅记录用）。
+                eprintln!("[P4.2] {rows}×{cols} vs 顺序参照 max_rel={max_rel:.3e}");
+                assert!(max_rel <= 1e-5, "与顺序参照 max_rel={max_rel:.3e} 超出预期");
+            }
+        }
+
+        // 错误面：长度不符 ⇒ LengthMismatch（op 名与默认实现一致）
+        assert!(matches!(
+            be.reduce_sum_rows_f32(&[0.0; 6], 2, 4, &mut [0.0; 2]),
+            Err(BackendError::LengthMismatch {
+                op: "reduce_sum_rows_f32",
+                what: "x",
+                ..
+            })
+        ));
+        assert!(matches!(
+            be.reduce_sum_rows_f32(&[0.0; 8], 2, 4, &mut [0.0; 3]),
+            Err(BackendError::LengthMismatch {
+                op: "reduce_sum_rows_f32",
+                what: "out",
+                ..
+            })
+        ));
+        // 溢出 ⇒ ShapeOverflow
+        assert!(matches!(
+            be.reduce_sum_rows_f32(&[], usize::MAX / 2 + 1, 3, &mut []),
+            Err(BackendError::ShapeOverflow {
+                op: "reduce_sum_rows_f32",
+                ..
+            })
+        ));
+        // 空输入：合法空操作
+        be.reduce_sum_rows_f32(&[], 0, 0, &mut [])
+            .expect("空输入合法");
     }
 }

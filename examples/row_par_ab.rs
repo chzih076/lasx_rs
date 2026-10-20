@@ -84,6 +84,9 @@ fn main() {
         (512, 512),          // 256K
         (1024, 512),         // 512K
         (1024, 768),
+        (1024, 1024), // 1M：行和并行阈值细扫（L3 内 ⇒ 预期不进并行）
+        (2048, 1024), // 2M
+        (3072, 1024), // 3M
         (4096, 1024),
         (8192, 2048),  // 16.7M：列归约阈值探针
         (16384, 2048), // 33.5M
@@ -220,6 +223,29 @@ fn main() {
             },
         );
         row("reduce_rows_map", n, t1, tn);
+
+        // **P4.2（task-123）**：`reduce_sum_rows`（行和；行内 8-lane 累加 + 顺序 fold ⇒ 逐位）。
+        // 复用本行的 `c1/cn` 缓冲（长度 cols ≥ rows 的情形下取前 rows 个）。
+        let mut s1 = vec![0.0f32; rows];
+        let mut sn = vec![0.0f32; rows];
+        parallel::reduce_sum_rows(&p1, &x, rows, cols, &mut s1);
+        parallel::reduce_sum_rows(&pn, &x, rows, cols, &mut sn);
+        assert!(
+            s1.iter()
+                .map(|v| v.to_bits())
+                .eq(sn.iter().map(|v| v.to_bits()))
+        );
+        let (t1, tn) = ab(
+            || {
+                parallel::reduce_sum_rows(&p1, &x, rows, cols, &mut s1);
+                black_box(&s1);
+            },
+            || {
+                parallel::reduce_sum_rows(&pn, &x, rows, cols, &mut sn);
+                black_box(&sn);
+            },
+        );
+        row("reduce_sum_rows", n, t1, tn);
     }
 
     println!("loadavg(结束) = {}", loadavg());
