@@ -1219,8 +1219,9 @@ impl Backend for LasxBackend {
 
     /// **只低估**：已实现且**有测试**的能力才打开。
     /// * `Packing`：`pack_f32` + `matmul_f32_packed`（逐位断言已过，测试 `packed_bitwise_same_as_matmul`）；
-    /// * `MatmulF64`：**IS-2 已接** `matmul_f64`/`dot_f64` → LASX f64 内核（与 `api::*` 逐位，
-    ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）；
+    /// * `MatmulF64`：**已接** `matmul_f64`/`dot_f64` → LASX f64 内核（与 `api::*` 逐位，
+    ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）；但 **2026-10-21 起不在 `supports` 报 true**——
+    ///   该核单线程，报 true 会让引擎跳过行并行（512³ 慢 4.0×、大形状 12.5×），见下方 `supports`；
     /// * **`F64Elementwise`（P1-4 新增）**：`map_binary_f64`/`map_affine_f64`
     ///   已 override 到 `ops::f64_map`（LASX 4 f64/lane；与 `kernels::scalar` **逐位**，
     ///   测试 `f64_map_is_bitwise_vs_scalar`）。
@@ -1301,7 +1302,11 @@ impl Backend for LasxBackend {
         matches!(
             cap,
             Capability::Packing
-                | Capability::MatmulF64
+                // **2026-10-21 引擎审计**：**不再报 `MatmulF64`**——`matmul_f64` 是单线程内核，
+                // 报 true 会让引擎走"整块单次调用"而**跳过行并行**；实测 512³ 慢 4.0×、
+                // 1024×256×1024 慢 12.5×（64³/256³ 因引擎默认线程=1 同速）。改报 false 后引擎
+                // 自行 `rows_in_parallel` 调同一内核（逐行独立 ⇒ **逐位**）。根治方案是让
+                // `matmul_f64` 接 `pool::global()`，届时可恢复能力位（见 docs/dev.md 引擎审计节）。
                 | Capability::F64Elementwise
                 | Capability::FusedNorms
                 | Capability::FusedElementwise
@@ -1418,11 +1423,16 @@ impl Backend for LasxBackend {
     // （两次舍入核修正，原 FMA 单次舍入差 1 ulp）。
 
     fn supports_plan(&self, kind: PatternKind) -> bool {
-        // **f32 的 5 个（Axpy/Softmax/Rms/Layer/Rope）+ 批2 的 5 个 f64 几何
-        // + 批3 的 quantize/dot/gemv：全部 true**；
-        // **`GeluQuick`/`DequantizeI8Rows`/`Norm2BatchF64` 明确 false**（不虚报）：
-        // GeluQuick = 融合核实测更慢（W3 删除）；Dequantize = 无高效连续 i8 块拓宽核；
-        // Norm2BatchF64 = 无 f64 norm2 融合核。三者 `exec_fused_plan` 对应臂都回退 portable 解释。
+        // **f32 的 5 个（Axpy/Softmax/Rms/Layer/Rope）+ 批2 的 5 个 f64 几何：true**；
+        // **2026-10-21 引擎审计**：i8 三条 plan 路实测**比 portable 慢**（LASX plan 核：
+        // quant 逐 8-lane 转标量存回、dot 拓宽累加指令多；portable 侧 `kernels::scalar`
+        // 被 LLVM 自动向量化更快）——QuantizeI8Rows 慢 2.2×、DotI8 慢 5.9–6.7×、
+        // GemvI8 慢 4.8–5.9×，三形状一致且**逐位相同** ⇒ 改报 false，让引擎走 portable
+        // （立即收益、无正确性风险）；LASX i8 核待重写（见 docs/dev.md 引擎审计节）。
+        // `GeluQuick` 保持 true（plan=成熟 1 趟核；审计探针在其 /tmp 环境显示 plan 慢
+        // 1.25–1.43×，与比赛台架（plan 0.97×）矛盾 ⇒ 记为"待复测"，不静默切路由）。
+        // `DequantizeI8Rows`/`Norm2BatchF64`：无高效融合核 ⇒ false（`exec_fused_plan`
+        // 对应臂回退 portable 解释）。
         // **测试钩子**：`LASX_NO_PLAN` 已设置 ⇒ 一律 false（基准探针测生产组合路径用）。
         if no_plan_hook() {
             return false;
@@ -1438,11 +1448,12 @@ impl Backend for LasxBackend {
             | PatternKind::Unitize3BatchF64
             | PatternKind::Cross3BatchF64
             | PatternKind::Mat3MulVec3BatchF64
-            | PatternKind::QuantizeI8Rows
+            | PatternKind::GeluQuick => true,
+            PatternKind::QuantizeI8Rows
             | PatternKind::DotI8
             | PatternKind::GemvI8
-            | PatternKind::GeluQuick => true,
-            PatternKind::DequantizeI8Rows | PatternKind::Norm2BatchF64 => false,
+            | PatternKind::DequantizeI8Rows
+            | PatternKind::Norm2BatchF64 => false,
         }
     }
 
@@ -2235,9 +2246,11 @@ mod tests {
             be.supports(Capability::Packing),
             "Packing 已实现且逐位断言过 ⇒ 应为 true"
         );
+        // **2026-10-21 审计后改报 false**：matmul_f64 是单线程核，报 true 会让引擎跳过行并行
+        // （512³ 慢 4.0×、1024×256×1024 慢 12.5×）。false 时引擎自行行并行走同一内核 ⇒ 逐位。
         assert!(
-            be.supports(Capability::MatmulF64),
-            "IS-2 后 matmul_f64/dot_f64 有专用实现 ⇒ 应为 true"
+            !be.supports(Capability::MatmulF64),
+            "matmul_f64 单线程 ⇒ 不应报 MatmulF64（否则引擎跳过行并行，见引擎审计）"
         );
         assert!(
             be.supports(Capability::F64Elementwise),
@@ -2435,11 +2448,11 @@ mod tests {
         );
     }
 
-    /// **P3 Plan（task-63）→ 批1（task-66）→ 批2（task-69）→ W3（task-104）**：**13 个 kind**
+    /// **P3 Plan（task-63）→ 批1（task-66）→ 批2（task-69）→ W3（task-104）**：**10 个 kind**
     /// 的语义映射与数值——Plan 路 ≡ 直接 `api::*` **逐位**（同一内核）；vs portable 计划解释 =
     /// 既有容差类/几何零向量"路径各自语义"（LASX `unitize3` = 0、契约默认 = NaN）；
-    /// portable 后端 `supports_plan` 全 false；`GeluQuick`/`Dequantize`/`Norm2` 如实 false
-    /// 且回退 portable 解释；长度/形状错 ⇒ `Err`（不 panic）。
+    /// portable 后端 `supports_plan` 全 false；`GeluQuick` 为 true 但**审计显示需复测**；
+    /// i8 三条与 `Dequantize`/`Norm2` 如实 false 且回退 portable 解释；长度/形状错 ⇒ `Err`。
     #[test]
     fn plan_overrides_map_to_fused_kernels_and_stay_bitwise() {
         use simd_dsl::{FusedIo, FusedPlan, PatternKind, ScalarBackend};
@@ -2455,15 +2468,23 @@ mod tests {
             PatternKind::Unitize3BatchF64,
             PatternKind::Cross3BatchF64,
             PatternKind::Mat3MulVec3BatchF64,
-            // 批3：quantize/dot/gemv 已接；**DequantizeI8Rows 明确不接**（见下）
-            PatternKind::QuantizeI8Rows,
-            PatternKind::DotI8,
-            PatternKind::GemvI8,
         ];
-        // ① 能力位：按 PatternKind 粒度、只低估——本后端 13 个接；portable 全 false。
+        // ① 能力位：按 PatternKind 粒度、只低估——本后端 10 个接；portable 全 false。
         for k in kinds {
             assert!(be.supports_plan(k), "LASX 应报 {k:?} = true");
             assert!(!ScalarBackend.supports_plan(k), "portable 不应报 {k:?}");
+        }
+        // **2026-10-21 引擎审计后改报 false**：i8 三条 plan 路比 portable 慢（2.2–6.7×）且
+        // 逐位相同 ⇒ 让引擎走 portable；LASX i8 核待重写（见 `supports_plan` 注释）。
+        for k in [
+            PatternKind::QuantizeI8Rows,
+            PatternKind::DotI8,
+            PatternKind::GemvI8,
+        ] {
+            assert!(
+                !be.supports_plan(k),
+                "{k:?} 的 plan 路实测比 portable 慢 ⇒ 不应报 true"
+            );
         }
         // **task-130：GeluQuick 改接成熟 1 趟核 `api::gelu_quick_into` ⇒ 如实 true。**
         // （W3 删的是"为融合另写的一份"慢核；此处的核是既有的、比赛里快 10.7× 的实现。）
