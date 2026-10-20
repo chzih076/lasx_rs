@@ -857,6 +857,31 @@ pub fn layer_norm(
     });
 }
 
+/// **`reduce_rows_map_f32` 并行版**：按**行块**切（行内统计量/epilogue/map 次序不变 ⇒ **逐位**）。
+///
+/// 每块调用与串行主体**同一个** `reduce_rows_map_rows` ⇒ 同一行的指令序列完全相同，
+/// 并行只改变"哪一行先算"（输出行互不重叠）。
+///
+/// **门控**：`dsl-backend`（`RowFuse` 与 `ops::prims` 都在该 feature 下；默认构建无 `simd_dsl` 依赖）。
+#[cfg(feature = "dsl-backend")]
+pub fn reduce_rows_map(
+    pool: &crate::pool::WorkerPool,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    plan: simd_dsl::RowFuse,
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // 闭包第二参是块行数；`o` 是本块的行主序切片（长度 rlen·cols）。
+    pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, cols)], |r0, rlen, [o]| {
+        let r1 = r0 + rlen;
+        crate::ops::prims::reduce_rows_map_rows(&x[r0 * cols..r1 * cols], o, cols, rlen, plan);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +931,48 @@ mod tests {
     /// `Vec<f32>` 的位模式（逐位断言用）。
     fn bits(s: &[f32]) -> Vec<u32> {
         s.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// **task-120**：`reduce_rows_map` 的行块并行与单线程**逐位一致**
+    /// （行内统计量/epilogue/map 的次序不变，并行只改"哪一行先算"）。
+    #[cfg(feature = "dsl-backend")]
+    #[test]
+    fn test_reduce_rows_map_parallel_bit_for_bit() {
+        use simd_dsl::{BinaryOp, RowEpilogue, RowFuse, RowReduce};
+        let p1 = crate::pool::WorkerPool::new(1);
+        let p4 = crate::pool::WorkerPool::new(4);
+        // 奇数行 + 非 8 倍数行宽 ⇒ 覆盖行尾块与列尾。
+        let (rows, cols) = (37usize, 70usize);
+        let n = rows * cols;
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
+            .collect();
+        let plans = [
+            RowFuse {
+                reduce: RowReduce::Sum,
+                epilogue: RowEpilogue::InvSqrtMeanPlusEps,
+                map: BinaryOp::Mul,
+                eps: 1e-5,
+            },
+            RowFuse {
+                reduce: RowReduce::SumSq,
+                epilogue: RowEpilogue::Mean,
+                map: BinaryOp::Sub,
+                eps: 0.0,
+            },
+            RowFuse {
+                reduce: RowReduce::Sum,
+                epilogue: RowEpilogue::Inv,
+                map: BinaryOp::Div,
+                eps: 0.0,
+            },
+        ];
+        for plan in plans {
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            super::reduce_rows_map(&p1, &x, rows, cols, &mut a, plan);
+            super::reduce_rows_map(&p4, &x, rows, cols, &mut b, plan);
+            assert_eq!(bits(&a), bits(&b), "reduce_rows_map 行块并行不逐位");
+        }
     }
 
     /// 池化矩阵乘必须与单线程**逐位一致**。形状要同时覆盖三条分支：

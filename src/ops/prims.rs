@@ -138,10 +138,36 @@ pub(crate) fn reduce_rows_map(
         return scalar::reduce_rows_map_f32(x, rows, cols, out, plan);
     }
 
+    // **自动并行分派（P0-3 推广）**：`reduce_rows_map` 的每一行都是**独立**的
+    // （行内统计量 → epilogue → 行内 map），并行只改"哪一行先算"，**任何元素的运算次序不变**
+    // ⇒ **逐位类**（与 `rms/layer/softmax` 的行块切分同一论证）。
+    // 阈值 `PAR_MIN_ROWS_MAP_ELEMS` 由 `examples/row_par_ab.rs` 实测定；阈值以下原地串行。
+    let work = (rows as u128) * (cols as u128);
+    let pool = crate::pool::global();
+    if work >= PAR_MIN_ROWS_MAP_ELEMS && pool.threads() > 1 && rows >= 2 {
+        crate::parallel::reduce_rows_map(pool, x, rows, cols, out, plan);
+        return Ok(());
+    }
+    reduce_rows_map_rows(x, out, cols, rows, plan);
+    Ok(())
+}
+
+/// `reduce_rows_map_f32` 的**行区间主体**：对 `rows_local` 行（`x`/`out` 都是该区间的行主序切片）
+/// 执行行内统计 + epilogue + 行内 map。
+///
+/// 串行主体（整段）与并行分块（`parallel::reduce_rows_map` 的每块）**共用本函数** ⇒ 两条路径
+/// 对同一行执行完全相同的指令序列（**逐位**）。
+pub(crate) fn reduce_rows_map_rows(
+    x: &[f32],
+    out: &mut [f32],
+    cols: usize,
+    rows_local: usize,
+    plan: RowFuse,
+) {
     let square = matches!(plan.reduce, RowReduce::SumSq);
     let inv_cols = 1.0f32 / cols as f32;
     let map = plan.map;
-    for r in 0..rows {
+    for r in 0..rows_local {
         let row = &x[r * cols..r * cols + cols];
         let stat = row_stat_vec(row, square);
         let k = epilogue(stat, inv_cols, plan.eps, plan.epilogue);
@@ -175,8 +201,18 @@ pub(crate) fn reduce_rows_map(
             };
         }
     }
-    Ok(())
 }
+
+/// `reduce_rows_map_f32` 的自动并行阈值（元素数；按 `examples/row_par_ab.rs` 校准）。
+///
+/// **实测**（12 线程、loadavg≈5、同进程 1t vs auto、6 对丢首对取中位；判据 1t/auto ≥1.10）：
+/// 8K **2.72×**、16K 4.62×、32K 5.73×、64K 8.27×、128K 7.54×、256K 8.32×、512K 7.71×、
+/// 786K 7.49×、4.2M 2.11×、16.7M 2.29×；**8K 以下走串行**（不触发分派 ⇒ 与 1t 同一路径）。
+/// 阈值取 8K 与 `rms_norm`/`softmax`/`layer_norm`（P0-3 同口径）一致；等价类 = **逐位**
+/// （并行只改行序，行内次序不变）；
+/// 方差如实记：同一二进制另一次运行（loadavg≈3.9、池首次唤醒）在 8K–32K 曾出现 0.06–0.31×
+/// ⇒ 小规模收益对"冷池 + 高负载"敏感，但**阈值以下不启用**，生产小调用不会变慢。
+pub(crate) const PAR_MIN_ROWS_MAP_ELEMS: u128 = 1 << 13; // 8K 元素
 
 /// 行统计量：**与标量多累加器版同序**——每个 8-lane chunk 加到对应 lane 的向量累加器，
 /// 末尾按 `acc[0]+acc[1]+…+acc[7]`（自 0 起）顺序归约，再按 c 递增补尾。

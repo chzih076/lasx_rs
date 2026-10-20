@@ -79,6 +79,10 @@ fn main() {
         (16usize, 512usize), // 8K：小规模门槛下界探针
         (64, 512),           // 32K
         (128, 128),          // 16K
+        (256, 256),          // 64K：行并行阈值细扫
+        (512, 256),          // 128K
+        (512, 512),          // 256K
+        (1024, 512),         // 512K
         (1024, 768),
         (4096, 1024),
         (8192, 2048),  // 16.7M：列归约阈值探针
@@ -193,6 +197,29 @@ fn main() {
             },
         );
         row("layer_norm", n, t1, tn);
+
+        // **P0-3 推广（task-120）**：`reduce_rows_map_f32`（行内独立 ⇒ 逐位）。
+        // 组合取 `Sum + InvSqrtMeanPlusEps + Mul`（RMS 形态），覆盖"向量统计 + epilogue + 向量 map"。
+        let plan = simd_dsl::RowFuse {
+            reduce: simd_dsl::RowReduce::Sum,
+            epilogue: simd_dsl::RowEpilogue::InvSqrtMeanPlusEps,
+            map: simd_dsl::BinaryOp::Mul,
+            eps,
+        };
+        parallel::reduce_rows_map(&p1, &x, rows, cols, &mut o1, plan);
+        parallel::reduce_rows_map(&pn, &x, rows, cols, &mut on, plan);
+        assert!(bitwise(&o1, &on), "reduce_rows_map 并行不逐位");
+        let (t1, tn) = ab(
+            || {
+                parallel::reduce_rows_map(&p1, &x, rows, cols, &mut o1, plan);
+                black_box(&o1);
+            },
+            || {
+                parallel::reduce_rows_map(&pn, &x, rows, cols, &mut on, plan);
+                black_box(&on);
+            },
+        );
+        row("reduce_rows_map", n, t1, tn);
     }
 
     println!("loadavg(结束) = {}", loadavg());
