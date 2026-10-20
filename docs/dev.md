@@ -824,19 +824,23 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 错误面同口径（`ShapeOverflow`→`LengthMismatch`）。同时删除 2 条 LASX 死 override（`map_ternary_f64`/
 `map_unary_strided_f32`）与死内核，见 simd `docs/structure.md §7.2` 精简记录。
 
-#### 7.3.3 引擎优化审计：LASX 侧路由修正（2026-10-21）
+#### 7.3.3 引擎优化审计：LASX 侧复核（2026-10-21，含一次"假象"纠正）
 
-simd 引擎审计（见 simd 仓 `docs/engine_integration.md` 的「引擎优化审计」一节）发现 LASX 后端有两处
-"声明了更快路径、实测反而更慢"的错误路由，本仓修正：
+simd 引擎审计（见 simd 仓 `docs/engine_integration.md` 的「引擎优化审计」一节）对 LASX 后端提出两条
+"声明更快路径但实测更慢"的候选。**复核后：`MatmulF64` 确认并已修；i8 三条是测量假象、不改**。
 
-| 问题 | 实测（独立复核：3 形状 × 8 对丢首对 min，loadavg 4.4–5.2） | 修正 |
+| 问题 | 复核结论（`+lasx` 生产 flags；同后端同输入、逐位核对） | 处理 |
 |---|---|---|
-| i8 三条 `supports_plan=true`，但 plan 路（LASX i8 核）比 portable（`kernels::scalar`，LLVM 自动向量化）慢 | QuantizeI8Rows **2.2–2.3× 慢**、DotI8 **5.9–6.7× 慢**、GemvI8 **4.8–5.9× 慢**；全部**逐位相同** | `supports_plan` 对三条改 **false**；LASX i8 核待重写（已知因：quant 逐 8-lane 转标量存回、dot 拓宽累加指令多） |
-| `Capability::MatmulF64` 报 true ⇒ 引擎走"整块单次"单线程 f64 核、跳过行并行 | 64³/256³ 同速（引擎默认线程=1）；**512³ 慢 4.0×**、**1024×256×1024 慢 12.5×**；行并行结果**逐位** | `supports` 不再报 `MatmulF64`（引擎自行 `rows_in_parallel` 调同一核）；根治 = 给 `matmul_f64` 接 `pool::global()`，届时恢复 |
-| `GeluQuick` plan 路 | 审计探针称慢 1.25–1.43×（与 portable 非逐位，max_abs 1.89e-2）；**与比赛台架 0.97× 冲突** | **暂不切路由**（保留 true），待独立复测；若确认慢应重写核去 `xvfdiv`，而非静默切换 |
+| i8 三条 `supports_plan` | **假象**：前一次探针未带 `-C target-feature=+lasx`，LASX 核落标量回退。带 `+lasx` 复测（引擎入口 vs 直接 `exec_fused_plan`）**plan 快 2.5–5.2×**：quantize 4.4/3.6/2.6×、dot 5.2/3.2/2.4×、gemv 3.2/3.7/1.7×（逐位相同） | **保持 true**（推翻中间"改 false"结论） |
+| `Capability::MatmulF64` | **确认**：`matmul_f64` 单线程；报 true 会让引擎跳过行并行。`+lasx` 复测整块/引擎：512³ **3.28×**、1024×256×1024 **2.47×** 慢（64³/256³ 同速，引擎默认线程=1）；行并行**逐位** | 不再报 `MatmulF64`；根治 = 给 `matmul_f64` 接 `pool::global()`，届时恢复 |
+| `GeluQuick` | **假象**（同一 `+lasx` 原因）：带 `+lasx` 实测 plan 比 portable 快 **8.3–10.1×**（64K/1M/4M） | 保持 true |
 
-**教训（写进规则）**：`supports_plan`/`supports` 是**性能声明**，必须在目标后端上实测"声明路 ≥ 基线路"
-才可报 true；"有专用核"不等于"更快"（LASX i8 核与单线程 f64 matmul 都是反例）。
+**教训（写进方法学）**：
+1. **LASX 相关 A/B 必须带 `+lasx`**（`RUSTFLAGS`/`.cargo/config.toml`）；否则测的是"标量 LASX"，
+   结论会整体反向——i8 三条是实例，task-137 的 40× 异常也是。
+2. `supports_plan`/`supports` 是**性能声明**，必须在目标后端、目标 flags 下实测"声明路 ≥ 基线路"才可报
+   true；但在据此**改声明**之前，先确认基线测的是生产内核（否则会把测量装置问题写成代码问题）。
+
 
 
 
