@@ -748,6 +748,46 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `9de506a` / `7c40fc3` / `51b214c` | rev bump（HEAD 待 bump） | 欠账结清：入口计数剥离 `cfg(test)`（33/28/1）、`iso_kernel`/`kv_cache` 升级（真实优化 15/组合桥 3/未接线 0）、线程池实测不采纳；文档大清理（docs 2452→1570，AGENTS 835→97） |
 | 2026-10-20 | `e79308c` / `dc93583` / `0e89761` + 本仓 `a7b61a6` | rev bump（HEAD 待 bump） | 第二批积压：P4.2 三桶缓冲池（64× 内存，未接线）、f64 契约/geometry auto 核对闭环、LASX 行归约自动并行（8K 阈值，8K 2.71×/128K 8.68×，loadavg>3 趋势）；P4.1 判"已落地无剩余" |
 | 2026-10-20 | `4387c9c` / `f7b01a0` + 本仓 `354d3b8` | rev bump（HEAD 待 bump） | P4.2 接线 spectral（稳态 0 alloc/帧、逐位 12 摘要、A/B 0.89–0.97×；峰值未降）；`reduce_sum_rows_f32` override+并行（4M 阈值、逐位、4.2M 8.55×，grade A）⇒ 第二批积压全部闭环 |
+| 2026-10-20 | `0dff23b` | rev bump（HEAD 待 bump） | **引擎×后端双重并行修复**：后端报 `Capability::Threaded` 时引擎 matmul 不再外层切块（LASX 1024³：嵌套 21.4ms → 6.0ms） |
+| 2026-10-20 | `ee1619d` | rev bump（HEAD 待 bump） | **P4.2 峰值收尾**：分阶段早释放把 detect 同时存活峰值降到 **8.0156 MiB**（模型 8.02 MiB，差 0.012%）；resident 9.54 MiB、稳态 0 alloc |
+
+### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
+
+装置：`examples/dsl_vs_lasx_ab.rs` / `dsl_vs_lasx_ab2.rs` + `scripts/dsl_vs_lasx_ab.sh`
+（**进程级交替 A/B**：每个 arm 单独进程、逐轮对调顺序，6 轮丢首轮取中位+极差；进程内 3 次取中位；
+计时区外生成输入与做等价校验；两臂都预分配、无 prepare/打包；同线程数：
+LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 2.15→2.91（A 级窗口））。
+
+**A = `lasx_rs::api::*` 手写核；B = `ops_dsl::*` DSL 算子 + `LasxBackend`；比值 = B/A，>1 表示 DSL 更慢**
+
+| 算子 | 规模 | t=1 B/A | t=12 B/A | 等价类 |
+|---|---|---|---|---|
+| matmul NN | 1024³ | **1.000×** | **0.996×** | 逐位 |
+| dot | n≈8.4M | 0.989× | 0.945× | 逐位 |
+| sum | n≈16.8M | 0.990× | 1.014× | 逐位 |
+| softmax_rows | 512×2048 | 0.992× | 1.039× | 逐位 |
+| rms_norm | 512×2048 | 1.003× | 1.036× | 逐位 |
+| layer_norm | 512×2048 | 0.994× | 1.008× | 逐位 |
+| axpy | n≈4.2M | 0.934× | 0.998× | 逐位 |
+| cmatmul（均 Direct 路线） | 512³ 复数 | **0.869×** | **0.804×** | 逐位 |
+| **gelu_quick** | n≈4.2M | **10.655×** | **11.306×** | 容差（rel 7.606e-3） |
+| **absmax_rows** | 512×8192 | **7.981×** | **8.724×** | 逐位 |
+| geometry f64 `norm3` | n=1M | ≈0.96× | — | 逐位 |
+| geometry f64 `unitize3` | n=1M | ≈0.92× | — | 逐位 |
+
+**结论（如实）**
+1. **同内核路径，DSL 层几乎零税**（matmul/dot/sum/norm/axpy/cmatmul 全在 ±15% 内；t=12 matmul 0.996×）。
+   这是引擎路由（`Algorithm`→同一 `Backend` 核）+ 薄组合的直接结果。
+2. **两个真实性能缺口**：`gelu_quick` 慢 10.7–11.3×（DSL 走 portable 7 趟组合，LASX 是 1 趟融合核；
+   W3 按 ROI 删除了 LASX 的 GeluQuick plan 支持）、`absmax_rows` 慢 8.0–8.7×（DSL 3 趟组合 vs 1 趟融合核，
+   且轴 max 此前走标量默认——本轮已补 `reduce_max_rows` override，后续需重测该行）。
+3. **t=12 matmul 曾慢 3.9×**：根因是"引擎行切块 × 后端线程池"双重并行（嵌套 21.4ms vs 只后端 6.3ms）；
+   本轮用 `Capability::Threaded` 让引擎不再外层切块，修复后 **0.996×**。
+4. 缺口（如实跳过，不用近似臂）：`sum_cols`/`sum_rows`/`weighted_sum_cols`（LASX 无公开 `api::*` 入口）、
+   `spectral detect`/`stencil2d`（LASX 无对应库算子）、几何 f32（LASX 仅有 f64 版本）、FFT（两臂均无实现）。
+5. 公平性限制：LASX 臂是"库算子"，DSL 臂是"宏算子 + 同一后端"——两者都未含输入生成/校验/打包；
+   所有数字都是本机同窗口趋势，跨窗口不可比。
+
 
 
 ## 8. 已知边界与欠账
@@ -806,9 +846,11 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | P2/P3 数值融合 | **不采纳**（P2 上限 1.291×→向量后端 1.107× 且非逐位；P3 epilogue 占比 0–1%） | simd ROI 记录 |
 | 文档臃肿 | **已清理**：dev 7807→~870、ops 2705→1200、AGENTS 835→97；simd docs 2452→1570 | 本轮提交 |
 | P4.1 归约/epilogue 融合 | **已落地、无剩余**：spectral detect 已 2 趟（plan 复用 1 趟）⇒ 已到 1 读 1 写下限，无可再融趟数 | simd `ops_dsl/src/spectral.rs` :234/:287/:370/:390 |
-| P4.2 liveness 三桶池 | **已接线 spectral**：51 处中间缓冲换 `pool::take`（借出清零、逐位；12 组摘要接线前后逐字相同）；帧点接线前 **49 alloc / 21.12 MiB/帧** ⇒ 池化稳态 **0/0**；A/B 略快（Direct 0.89–0.91×、真实帧 0.955–0.971×，loadavg 1min>3 标趋势）；**峰值/常驻未降**（池只复用不归还，21.12 MiB 常驻；8.02 MiB 峰值需分阶段早释放，未做）；池外仍有 build_plan 17.86 MB + Escaped 0.54 MB/帧 | simd `4387c9c`；liveness 模型 21.61/8.02 MiB |
+| P4.2 liveness 三桶池 | **已接线 + 峰值收尾**：51 处中间缓冲换 `pool::take`（逐位，12 组摘要逐字相同）；帧点接线前 49 alloc/21.12 MiB ⇒ 稳态 0/0；**分阶段早释放后同时存活峰值 Direct 22.14 MB → 8.404992 MB（8.0156 MiB；模型 8.406016 MB，差 0.012%）**、Auto(FFT) 30.53 → 8.91 MB（结构下界：2×n×b+首个 p×b）；resident 21.12/29.12 → **9.54 MiB**；A/B Direct 0.9602×、FFT 0.9321×（loadavg 2.61/2.54/3.49）；`release_idle()` 帧间可回收（测试）；遗留：Escaped 12 个 Vec + `build_plan` 计划缓冲仍每帧分配 | simd `4387c9c`、`ee1619d` |
 | f64 逐元素/轴归约 + geometry auto | **已闭环**：6 方法默认委托 scalar（5 逐位 + 行和容差实测 rel ≤1e-14）；5 个 f64 几何入口经 `engine::execute`，引擎按 `supports_plan` 选融合/组合（cap 不参与）；两路与零向量语义已测 | simd `dc93583` |
-| LASX 行归约自动并行 | **已落地**：`reduce_rows_map_f32` 8K 阈值按行块并行（逐位）；8K 2.71×、128K 8.68×、67M 2.48×（loadavg≈5 ⇒ 趋势）；阈值以下走原串行不变慢；**`reduce_sum_rows_f32` 已补 override + 行块并行**（4M 阈值，与默认实现**逐位**；4.2M 8.55×、16.7M 2.65×、67M 2.17×，grade A loadavg 2.72/2.48/3.08） | 本仓 `a7b61a6`、`354d3b8` |
+| LASX 行归约自动并行 | **已落地**：`reduce_rows_map_f32` 8K 阈值按行块并行（逐位）；8K 2.71×、128K 8.68×、67M 2.48×（loadavg≈5 ⇒ 趋势）；**`reduce_sum_rows_f32` override + 行块并行**（4M 阈值、逐位；4.2M 8.55×、67M 2.17×，grade A）；**max/min 族 6 方法 override**：4 个轴方向 4M 阈值并行（行方向 4.2M 6.2–6.3×、67M 5.4–5.6×；列方向 ≤33.5M 中性、67M 6×），整片 max/min 保持顺序 fold（保 NaN payload/±0 逐位）；阈值以下 0.93–1.04× 无退化 | 本仓 `a7b61a6`、`354d3b8`、`be7f8f1` |
+| 引擎×后端双重并行（比赛发现） | **已修复**：LASX 报 `Capability::Threaded` ⇒ 引擎 matmul 不再外层行切块；1024³ 嵌套 21.4ms → 6.0ms，DSL/LASX 比值 3.9× → **0.996×**（比赛实测） | simd `0dff23b`；本仓 `9b92c24` 起 |
+| DSL vs LASX 性能比赛 | **已产出可复核台架与对照表**（§7.3）：同内核路径 DSL 税 ≈0（matmul 1.000×/0.996×、cmatmul DSL 更快 0.80–0.87×）；真实缺口：gelu_quick 10.7–11.3×、absmax_rows 8.0–8.7×；缺口 op（A 臂无公开入口）如实跳过 | 本仓 `9b92c24`；simd `ee1619d` |
 
 ---
 

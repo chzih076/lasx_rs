@@ -74,16 +74,21 @@ struct Args {
     op: String,
     arm: Arm,
     threads: usize,
+    /// DSL 臂的引擎线程数（默认 = `threads`）：用于诊断"引擎行切块 × 后端池"双重并行。
+    engine_threads: Option<usize>,
     iters: usize,
 }
 
 fn usage(msg: &str) -> ! {
-    eprintln!("{msg}\n\n用法：--op=<name> --arm=lasx|dsl --threads=N --iters=N [--list]");
+    eprintln!(
+        "{msg}\n\n用法：--op=<name> --arm=lasx|dsl --threads=N [--engine-threads=M] --iters=N [--list]"
+    );
     std::process::exit(2)
 }
 
 fn parse_args() -> Args {
     let (mut op, mut arm, mut threads, mut iters) = (String::new(), Arm::Lasx, 1usize, 5usize);
+    let mut engine_threads: Option<usize> = None;
     for a in std::env::args().skip(1) {
         if a == "--list" {
             for o in OPS {
@@ -105,6 +110,11 @@ fn parse_args() -> Args {
             threads = v.parse().unwrap_or_else(|_| usage("--threads 需为整数"));
         } else if let Some(v) = a.strip_prefix("--iters=") {
             iters = v.parse().unwrap_or_else(|_| usage("--iters 需为整数"));
+        } else if let Some(v) = a.strip_prefix("--engine-threads=") {
+            engine_threads = Some(
+                v.parse()
+                    .unwrap_or_else(|_| usage("--engine-threads 需为整数")),
+            );
         } else {
             usage(&format!("未知参数 {a}"));
         }
@@ -128,6 +138,7 @@ fn parse_args() -> Args {
         op,
         arm,
         threads,
+        engine_threads,
         iters,
     }
 }
@@ -243,14 +254,17 @@ fn print_result(
 fn main() {
     let args = parse_args();
     let threads = args.threads;
+    let engine_threads = args.engine_threads.unwrap_or(threads);
     let iters = args.iters;
+    // 诊断用：同时打印 pool 线程与引擎线程（RESULT 行格式不变，脚本仍按原格式解析）。
+    println!("META threads={threads} engine_threads={engine_threads}");
 
     // **引擎线程数（DSL 臂）**：`SIMD_DSL_ENGINE_THREADS` 只读一次 ⇒ 必须在**任何引擎调用之前**设置；
     // 本进程只跑一个 threads 值（脚本每轮/每臂各起一个进程）。
     if args.arm == Arm::Dsl {
         // SAFETY: 进程刚启动、尚未调用任何 simd_dsl 引擎入口（`OnceLock` 未初始化），也无线程并发读该环境变量。
         unsafe {
-            std::env::set_var("SIMD_DSL_ENGINE_THREADS", threads.to_string());
+            std::env::set_var("SIMD_DSL_ENGINE_THREADS", engine_threads.to_string());
         }
     }
     lasx_rs::pool::init_global(threads);

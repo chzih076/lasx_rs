@@ -1171,6 +1171,10 @@ impl Backend for LasxBackend {
                 | Capability::F64Elementwise
                 | Capability::FusedNorms
                 | Capability::FusedElementwise
+                // **Threaded（引擎×后端双重并行修复）**：LASX 的 matmul 在 work ≥ `PAR_MIN_WORK` 时
+                // 自己经 `pool::global()` 并行 ⇒ 引擎 `run_matmul_f32` 见到本能力位后**不再按行切块**，
+                // 避免"引擎行块 × 后端池"嵌套（实测 1024³：嵌套 21.4ms vs 只后端 6.3ms，3.4× 差）。
+                | Capability::Threaded
         )
     }
 
@@ -2146,7 +2150,9 @@ mod tests {
             "P1-4 后 map_*_f64 有 LASX 向量内核且逐位断言过 ⇒ 应为 true"
         );
         assert!(!be.supports(Capability::Transcendental));
-        assert!(!be.supports(Capability::Threaded));
+        // `Threaded` = "后端会在内部并行"：LASX matmul 在 work ≥ PAR_MIN_WORK 时走全局池 ⇒ 报真，
+        // 让引擎不再外层按行切块（避免双重并行）。见 `supports` 的注释。
+        assert!(be.supports(Capability::Threaded));
     }
 
     /// **P1-4：f64 逐元素 LASX 覆盖 vs `kernels::scalar` 参照**——多形状（含非 4 倍数/尾部/空）
