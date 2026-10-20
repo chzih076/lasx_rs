@@ -1,6 +1,6 @@
 //! **`simd_dsl::Backend` 的 `lasx_rs` 实现**（步骤 ③a；**feature 门控**：`dsl-backend`）。
 //!
-//! # 范围（**当前状态，阶段3 批1 之后**）
+//! # 范围（**当前状态，截至 B1b 组合原语补齐**）
 //! - **必需方法**（trait 无默认值）：`matmul_f32`、`dot_f32` ⇒ **接到现有 LASX 内核**
 //!   （`ops::matmul::matmul_f32` / `ops::dot::dot`）——**不绕开、不新写算法、不改语义**；
 //! - **已覆盖（本仓有内核可接的）**：`matmul_f32`/`dot_f32`、**`matmul_f64`/`dot_f64`（IS-2）**、
@@ -11,12 +11,14 @@
 //!   `reduce_{sum,weighted_sum,centered_sq_sum}_cols_f32`、`matmul_pair_psd_f32`、
 //!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
 //!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
-//!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`；
-//! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约、`max/min_{cols,rows}`、
-//!   `map_unary_f32`/`map_binary_scalar_f32`、banded/stencil、**f64 逐元素的其他族（如 f64 轴归约、
+//!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`、
+//!   **`map_unary_f32`/`reduce_rows_map_f32`/`axpy_inplace_f32`（B1b 组合原语；内核在 `ops/prims.rs` 与 `ops/axpy.rs`）**；
+//! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约（`reduce_sum_rows_f32`/
+//!   `reduce_max_f32` 等；`reduce_rows_map_f32` 已接）、`max/min_{cols,rows}`、
+//!   `map_binary_scalar_f32`、banded/stencil、**f64 逐元素的其他族（如 f64 轴归约、
 //!   `map_unary_f64`）** ⇒ **走 `simd_dsl` 标量默认**（**不 panic**；性能必然不如向量版，
 //!   迁移时按"无内核 ⇒ 不替换"如实记）；
-//! - **线程**：`CallOpts{threads}` **未接**（本后端不按 opts 派活，见文末 ③b-4 留档）；但 **GEMM 内核
+//! - **线程**：`CallOpts{threads}` **未接**（本后端不按 opts 派活，见上文 ③b-4 留档）；但 **GEMM 内核
 //!   自己**在 `work ≥ 32M` 时走**进程级全局池**（`ops::matmul::matmul_f32`，§7.28；`init_global(1)`
 //!   是逃生门）⇒ **大形状 A/B 的 `threads` 会 >1**，必须在表里打印（`examples/migrate_ab.rs` 已照做）。
 //!
@@ -25,7 +27,7 @@
 //! 与 `lasx_rs::api` **逐位一致**（同一内核；测试 `bitwise_same_as_api` 与
 //! `matmul_f64_and_dot_f64_bitwise_vs_api` 钉住）⇒ 声明为**逐位类**并**点名参照物** = `lasx_rs::api`。
 //!
-//! **IS-4 校正（audit §10 #2）**：`map_affine_f32` 与 `reduce_weighted_sum_cols_f32` 用 **FMA**
+//! **IS-4 校正（审计复核记录）**：`map_affine_f32` 与 `reduce_weighted_sum_cols_f32` 用 **FMA**
 //! （`ops/dsl_map.rs`）⇒ 它们是**容差类**（实测相对峰值 ≤ 1e-5），**不在上面那条逐位声明里**。
 //! 旧版本模块文档把这两条写成"逐位、map_affine 故意不融 FMA"，与代码事实相反 —— 已更正。
 //!
@@ -168,7 +170,8 @@ impl Backend for LasxBackend {
     /// * 对**标量默认**（接线前的路径）：**容差类**——LASX 侧 4-lane 累加/打包次序与顺序累加不同，
     ///   实测相对峰值 **≤ 3.4e-16**（形状 33×65×31 / 100×448×1024 / 512×512×512）。
     ///
-    /// **不接** `parallel::matmul_f64`（池版几何 = 批3 的事，本批只接线、不改线程口径）。
+    /// **未接** `parallel::matmul_f64`：当前 override 走单线程 `ops::matmul_f64`；池版 f64 GEMM
+    /// 未做，与 `CallOpts{threads}` 未接的状态一致（见上文 ③b-4 留档）。
     fn matmul_f64(
         &self,
         m: usize,
@@ -228,7 +231,7 @@ impl Backend for LasxBackend {
     ///   逐元素无归约。`Max`/`Min`：NaN 语义按 Rust（`f32::max`：另一侧是数就返回它），而 LASX
     ///   `xvfmax` 是 IEEE 语义（NaN 传播不同）⇒ **这两条委托标量参照**，不冒险。
     /// * `reduce_sum_cols_f32`：**逐位**——每列一条 lane、**按行序**累加（与参照同序）。
-    /// * **`map_affine_f32` / `reduce_weighted_sum_cols_f32`：容差类**（**IS-4 校正**，audit §10 #2）——
+    /// * **`map_affine_f32` / `reduce_weighted_sum_cols_f32`：容差类**（**IS-4 校正**，审计复核记录）——
     ///   两者都用 **FMA**（`a·x + b` / `v·w + acc`，见 `ops/dsl_map.rs` 的 `lasx_xvfmadd_s`），
     ///   舍入与"先乘后加"不同，**不是逐位**；实测相对峰值 ≤ 1e-5（`r19e_elementwise_and_axis_reduce_classes`
     ///   的 R19-G 断言，用非 2 的幂系数才测得出差）。旧注释写成"逐位、故意不融 FMA"，与代码事实相反。
@@ -700,7 +703,7 @@ impl Backend for LasxBackend {
                 // 回退：与引擎默认路径**同一式子**（f32 libm 逐元素）。
                 // ⚠️ **与引擎同式（本轮修）**：引擎在 R17 把相位改成**约减到 `[−π,π]`**
                 // （`ω` 峰值可达数千 rad/s，f32 直接算 `ω·t` 自带 ~1e-4 绝对误差，见 `simd_dsl`
-                // 的 `performance.md §14.5/§14.6`）⇒ 这里**转调同一份判据/本体**，否则两档不同式，
+                // 的 `docs/measurements/longson-batches.md` §14.6）⇒ 这里**转调同一份判据/本体**，否则两档不同式，
                 // 且本档在 `opt_in = false` 或某行超安全区时会把那个误差带进核表。
                 let reduce = simd_dsl::criteria::safety::phase_reduction_needed(om, dt, n);
                 for i in 0..n {
@@ -733,7 +736,7 @@ impl Backend for LasxBackend {
     /// 测试 `bitwise_same_as_api`、`matmul_f64_and_dot_f64_bitwise_vs_api` 钉住）⇒ **逐位类 + 点名参照物**。
     /// **注意（IS-4 校正）**：这条 `bit_exact` **不覆盖 FMA 族**——`map_affine_f32` 与
     /// `reduce_weighted_sum_cols_f32` 用 FMA ⇒ **容差类**（界见方法文档与 `r19e_*` 测试的 R19-G 断言）；
-    /// 旧版本把这两条也写成逐位，是 audit §10 #2 记的错误。
+    /// 旧版本把这两条也写成逐位，是 审计复核记录 记的错误。
     /// **其余路径（未覆盖的方法族、`FrontendForward` 等）一律 `None`** —— 未做未测 ⇒ 不声明。
     fn precision_claim(&self, path: EnginePath, scalar: ScalarKind) -> Option<PrecisionClaim> {
         match (path, scalar) {
@@ -929,7 +932,8 @@ impl Backend for LasxBackend {
     // 契约语义：`out_mapped = f(x, shift[r])`、`out_rowsum[r] = Σ_c out_mapped`（**一次扫描**）。
     // **等价类：容差**（契约文档自己也这么写）：映射值用 LASX `exp_vec`（与 `softmax_rows` 同串），
     // 与 portable 的 libm `exp` 非逐位；行和是 per-lane 累加 + 固定次序水平求和（portable 是单累加器）。
-    // 实测界见 `examples/map_rowsum_ab.rs`；**A/B <10% 就不保留此 override**（届时删掉本段）。
+    // 实测界与 A/B 见 `examples/map_rowsum_ab.rs`：portable/LASX = 4.745×/3.357×/3.087×/2.557×/2.293×
+    // （5 组全部 ≥1.10 门槛，loadavg≈7.5）⇒ **保留此 override**。
     fn map_rows_sum_f32(
         &self,
         x: &[f32],
@@ -1092,7 +1096,7 @@ impl Backend for LasxBackend {
 
     // ============ P3 Plan：`supports_plan` / `exec_fused_plan`（task-63 + P1 批1 task-66）============
     //
-    // **语义映射（契约 `9af59f7` 定死，不是猜；先读 backend.rs + tests/fused_plan.rs）**：
+    // **语义映射（契约 `9af59f7` 定死，不是猜；先读 `simd_dsl` 的 `backend.rs` + `tests/fused_plan.rs`）**：
     // * `Axpy { alpha }`：`y := alpha·x + y`（就地；`io.x` 只读、`io.y` 输出；`y.len()==x.len()`）；
     // * `SoftmaxRows { rows, cols }`：行 softmax（`io.x`/`io.out`，`len==rows·cols`）；
     // * `RmsNormRows { rows, cols, eps }`：`out = x/√(mean(x²)+eps)`（`io.x`/`io.out`）；
@@ -1505,7 +1509,7 @@ const fn strided_of(s: simd_dsl::Strides) -> crate::ops::strided::Strides {
 /// **A/B 用的"接之前"形态**（R19-E）：`matmul`/`dot`/建核/打包**照旧走 LASX**，但
 /// **逐元素与归约族用 `Backend` 的可移植默认实现** —— 这正是 `R19-E` 之前的 `LasxBackend` 行为。
 ///
-/// **为什么要有它**：要给出"接归约/逐元素族带来的收益"的**同进程**硬数（§5 口径），
+/// **为什么要有它**：要给出"接归约/逐元素族带来的收益"的**同进程**硬数（`docs/dev.md` §6.4 口径），
 /// 必须在**同一个进程内交替**跑"接之前"与"接之后"两种后端 ⇒ 用两个后端类型，而不是改全局开关。
 /// **不改任何数值口径**：它只是把 5 条方法落回默认实现，其余与 [`LasxBackend`] 完全一致。
 #[derive(Debug, Default, Clone, Copy)]

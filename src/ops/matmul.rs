@@ -221,7 +221,7 @@ pub(crate) fn matmul_f32(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: 
     // **scratch 说明（如实）**：池版入口要求 `a: &mut [f32]`（行内核就地整理），本轮用**内部
     // scratch** 消化这次 `&mut` ⇒ 调用方（含 DSL override）签名仍是 `&[f32]`、**不需要自己复制**。
     // 这次复制发生在后端内核内部，**不算 DSL 抽象税**（但真实成本存在，见 §7.28 的实测）。
-    const PAR_MIN_WORK: u128 = 32 * 1024 * 1024; // 阈值：work ≥ 32M ≈ 320³ 量级，待实测校准
+    const PAR_MIN_WORK: u128 = 32 * 1024 * 1024; // 阈值：work ≥ 32M ≈ 320³（实测来源 `docs/dev.md` §7.28.2：320³ 中性、56.6M 起 4.11× ⇒ 32M 是安全下界）
     let work = (m as u128) * (k as u128) * (n as u128);
     let pool = crate::pool::global();
     if work >= PAR_MIN_WORK && pool.threads() > 1 {

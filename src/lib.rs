@@ -4,7 +4,7 @@
 //!
 //! | 要求 | 说明 |
 //! |---|---|
-//! | **只在 `loongarch64` 上编译** | `src/` 里 **0 处** `target_arch` 门控、66 个文件直接用 LASX/LSX intrinsic ⇒ 其它架构**编译期**就过不去（这是**有意**的：不给 x86 加标量兜底，避免把"用错平台"从编译期错误退化成运行期错结果）。依赖方必须写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会直接红（Cargo 为所有目标解析依赖、不按平台跳过） |
+//! | **只在 `loongarch64` 上编译** | `src/` 里 **0 处** `target_arch` 门控、全部 84 个 `.rs` 文件直接用 LASX/LSX intrinsic ⇒ 其它架构**编译期**就过不去（这是**有意**的：不给 x86 加标量兜底，避免把"用错平台"从编译期错误退化成运行期错结果）。依赖方必须写成 `[target.'cfg(target_arch = "loongarch64")'.dependencies]`，否则他们的 x86 CI 会直接红（Cargo 为所有目标解析依赖、不按平台跳过） |
 //! | **需要 nightly 工具链** | 唯一的 feature 门是 `#![feature(stdarch_loongarch)]`（跟踪 **issue [#117427]**）——stable 上 `std::arch::loongarch64` 仍是 unstable（实测：stable **1.98.1** 与 nightly **1.100.0** 都仍要求该门）。**复查触发条件**：某个 stable 的 release note 宣布 `stdarch_loongarch` 稳定时，删掉 `src/lib.rs`/`cli/src/main.rs` 里的那两行 `#![feature(...)]` 并跑全套测试，然后本 crate 才能真正在 stable 上编译 |
 //! | **`-C target-feature=+lasx` 只影响性能** | 仓库的 `.cargo/config.toml` 里有它，但**依赖方的 cargo 不会读依赖自带的 config**。实测：**不带它也能编、数值也位精确**（intrinsic 自带 `#[target_feature(enable = "lasx")]`）；它对性能有意义（没有全局特性 ⇒ 那些 LASX 函数不能跨函数内联），所以想拿满性能请自行加 |
 //! | **LA664 勘误** | 3A6000/3C6000/3B6000 的原子操作丢失更新（`amadd` 等无屏障变体）会**静默错结果**；本库的生产路径已全部使用带屏障的序（`AcqRel`），并有"同输入跑两次逐位一致"的回归测试守着。详见 [`docs/platform.md`](https://github.com/chzih076/lasx_rs/blob/master/docs/platform.md) §1 |
@@ -26,7 +26,12 @@
 //! | [`parallel`] | 把内核铺到池上的多核调用策略层（`matmul_f32/f64`、`gemv_f16`、`rk4_j2_step_batch`） |
 //! | [`arch`] | 指令集能力探测（[`arch::SimdPath`]）与 LASX/LSX 的 load/store/splat 样板 |
 //! | `ops` | **算子层**：一个内核一个模块，入口按 `match SimdPath::detect()` 分派；接收切片 |
-//! | [`ffi`] | **C ABI 导出层**：41 个原始 `lasx_*` 符号 + 40 个 `_checked` 变体，只做裸指针 → 切片 |
+//! | [`cmatmul`] | 复数矩阵乘核心（分平面 `(Re,Im)`、f32/f64、直算 4 条 / Karatsuba 3 条），由 `ops` 重导出 |
+//! | [`laplace`]/[`ilaplace`] | 单边数值拉普拉斯变换 / 逆变换（批量矩阵乘，公式 DSL 表达） |
+//! | [`fast_trig`] | 超越函数递推快档 recon 原型（**opt-in**；默认仍走 `libm`） |
+//! | [`rewrite`] | 表达式级代数重写：模式识别 + 安全区分析（**原型，默认路径行为不变**） |
+//! | `dsl_backend` | `simd_dsl::Backend` 的 LASX 实现（**feature 门控** `dsl-backend`，默认关） |
+//! | [`ffi`] | **C ABI 导出层**：52 个原始 `lasx_*` 符号 + 46 个 `_checked` 变体，只做裸指针 → 切片 |
 //!
 //! 分层的目的是让"算法"与"ABI 约定"互不干扰：算子只处理安全的切片，指针有效性与
 //! 长度约定收敛在 [`ffi`] 一层；新增内核时只需在 `ops` 下加一个文件、在 [`ffi`]
@@ -62,8 +67,8 @@
 // 分层策略（全文见 docs/dev.md §17 —— 本仓库保留的唯一一份策略正本）：
 // - `src/pool`、`src/arch`、`src/aligned`、`src/api`、`src/parallel`、`src/scalar_ref.rs`
 //   这些**基础设施**里逐块写清楚（那里才是指针/生命周期/并发不变量的所在）；
-// - `src/ops/*`、`src/ffi/*` 里同一组前提下的 intrinsic 调用是重复的（406 个 unsafe 块里
-//   约 300 个是这种），逐块抄注释只会变噪声 —— 这些文件显式豁免，不变量在各自函数级 SAFETY
+// - `src/ops/*`、`src/ffi/*` 里同一组前提下的 intrinsic 调用是重复的（`src/` 现有 652 个
+//   `unsafe {` 块，其中多数属于这种），逐块抄注释只会变噪声 —— 这些文件显式豁免，不变量在各自函数级 SAFETY
 //   段里统一给出（模块头也写了豁免理由）。
 #![warn(clippy::undocumented_unsafe_blocks)]
 // SIMD intrinsics 固有：裸 i8 向量 ↔ 类型化向量（F32x8/F64x4 等）的 transmute，
@@ -111,7 +116,7 @@ pub mod aligned;
 pub mod api;
 pub mod arch;
 /// **`simd_dsl::Backend` 的 `lasx_rs` 实现**（**feature 门控** `dsl-backend`；默认关 ⇒ 无依赖、无编译）
-/// ——见 [`dsl_backend`] 模块文档（③a 只接必需方法 `matmul_f32`/`dot_f32`）。
+/// ——见 [`dsl_backend`] 模块文档（必需方法 + 热点内核 + 组合原语的当前覆盖清单）。
 #[cfg(feature = "dsl-backend")]
 pub mod dsl_backend;
 /// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。

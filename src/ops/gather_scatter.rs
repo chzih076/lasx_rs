@@ -15,9 +15,10 @@
 //! 行拷贝 f32 用 **8 lane 向量**（`load_f32x8`/`store_f32x8`）+ 尾部标量；i8 用 **32 B 块**
 //! （`copy_nonoverlapping`，memcpy 级） + 尾部标量。**整行一次处理**，不做 per-element 分支。
 //!
-//! # 门控（与 `dsl_map` 同因，另加 `test`，见 `mod.rs` 的交接单）
-//! `simd_dsl` 的 trait **尚未**声明这 3 个方法 ⇒ 本轮无生产调用方；只挂 feature 会被 `dead_code`
-//! （`-D warnings`）判死，又**禁止** `#[allow(dead_code)]`（AGENTS.md #49）。等 override 落地后删 `, test`。
+//! # 门控
+//! `simd_dsl` 的 trait 已声明这 3 个方法、`dsl_backend.rs` 已有 override 调用本模块 ⇒ 有生产调用方
+//! ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被 `dead_code` 判死，
+//! 且禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
 use simd_dsl::BackendError;
 

@@ -19,9 +19,9 @@
 //! - 3 个原语都**不做隐式广播**（二元要求两组源形状一致）。
 //!
 //! # 门控
-//! trait 尚未声明这 3 个方法 ⇒ 无生产调用方；只挂 feature 会被 `dead_code`（`-D warnings`）判死，
-//! 又禁止 `#[allow(dead_code)]`（AGENTS #49）⇒ `cfg(all(feature = "dsl-backend", test))`。
-//! **等 override 落地后删 `, test`**（交接单在 `ops/mod.rs`）。
+//! `simd_dsl` 的 trait 已声明这 3 个方法、`dsl_backend.rs` 已有 3 个 override 调用本模块 ⇒ 有生产
+//! 调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被 `clippy -D
+//! warnings` 的 `dead_code` 判死，又禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
 use simd_dsl::BackendError;
 

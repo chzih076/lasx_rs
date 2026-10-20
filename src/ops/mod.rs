@@ -62,7 +62,8 @@ pub mod f64_map;
 pub mod prims;
 
 /// **P4-b 融合内核**（`energy_dc` 单遍去均值能量、`psd_pair` 成对 epilogue）——
-/// **纯标量、与便携参照逐位**（`to_bits()` 相等）；LASX FMA 版留待拿到正确封装名后补（其容差界届时实测）。
+/// **纯标量、与便携参照逐位**（`to_bits()` 相等）；LASX FMA 版**未做**——FMA 一次舍入会破逐位，
+/// 若要做必须给容差界与实测（当前不做，保持逐位）。
 ///
 /// **门控已转为生产档**：`simd_dsl` 的 trait 已声明这两个原语、`dsl_backend.rs` 已有 LASX override
 /// ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控，见 AGENTS.md #49）。
@@ -73,9 +74,9 @@ pub mod fused;
 /// 统一 `Strides{row,col}`）。**内层连续（`col==1`）⇒ memcpy 行拷贝**（P5-a 实测手写 8-lane 更慢）；
 /// 跨步 ⇒ 标量按 `(r,c)`。空形状空操作、越界 ⇒ `Err`。
 ///
-/// **为什么带 `test` 门控**：trait 尚未声明这 3 个方法 ⇒ 本轮无生产调用方；只挂 feature 会被
-/// **门控已转正**（P5-b 收尾）：`dsl_backend.rs` 已有 3 个 override 调用本模块 ⇒ **有生产调用方**
-/// ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控，见 AGENTS.md #49）。
+/// **门控**：`simd_dsl` 的 trait 已声明这 3 个方法、`dsl_backend.rs` 已有 3 个 override 调用本模块
+/// ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控；否则触发
+/// `clippy -D warnings` 的 `dead_code`，见 AGENTS.md #49）。
 #[cfg(feature = "dsl-backend")]
 pub mod strided;
 

@@ -29,7 +29,7 @@ use super::matmul_f64 as rmath64;
 /// |---|---|---|---|
 /// | [`Route::Direct`] | 4 条实矩阵乘 + 组合 | **各乘积与对应实矩阵乘逐位一致** | `direct_matches_four_real_matmul_bitwise` |
 /// | [`Route::Karatsuba`]（默认） | 3 条实矩阵乘 + 组合 | **仅容差**（`k1` 多一次加法、组合次序不同） | `routes_agree_within_tolerance` |
-/// | `Fused`（**B1 规划中，尚未实现**） | 1 个交错微内核（Gauss 3 乘在 LASX 寄存器内） | **仅容差**（累加次序与上两条都不同） | 落地后 `fused_*` |
+/// | `Fused`（**规划中，尚未实现**；无 `fused_*` 入口） | 1 个交错微内核（Gauss 3 乘在 LASX 寄存器内） | **仅容差**（累加次序与上两条都不同） | 落地后 `fused_*` |
 ///
 /// # 边界矩阵（三条路线共用，缺一个都不许出货）
 /// `k=1`、`n=1`、`m/k/n` 不整除、**非 4 倍 rows**、**非 32 倍 n**、大方阵、零维（`m/n/k=0`）。

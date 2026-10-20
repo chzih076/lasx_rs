@@ -28,7 +28,7 @@ use std::ffi::c_char;
 /// # 语义（与算子完全一致）
 ///
 /// 直接返回 `SimdPath::detect().is_lasx()` 的结果——也就是**算子入口此刻会走的路径**。
-/// 所以它尊重 `lasx_force_lsx_thread`（该函数仅 Rust rlib 可见，见手册 §3.4）：
+/// 所以它尊重 `lasx_force_lsx_thread`（该函数仅 Rust rlib 可见，见 `docs/ops.md` §3.4）：
 /// 被强制降级时本函数返回 `0`，与算子的实际行为一致。调用方问的是"**现在能不能安全
 /// 调 `[LASX-only]` 符号**"，答案必须与算子走的路一致，否则这个查询就没有意义。
 ///

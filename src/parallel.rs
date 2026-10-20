@@ -732,7 +732,7 @@ pub fn rk4_j2_step_batch(
 // ============================================================================
 
 /// 列和并行版：按**列块**切（每列独立、按行序累加 ⇒ **逐位**）。`x` 只读、`out` 长度 `cols`。
-// `dsl_map` 本身挂在 `dsl-backend` feature 下（§7 的 feature 门控）⇒ 这里同门控。
+// `dsl_map` 本身挂在 `dsl-backend` feature 下 ⇒ 这里同门控（`parallel` 侧只被 `dsl_map` 调用）。
 #[cfg(feature = "dsl-backend")]
 pub fn reduce_sum_cols(
     pool: &crate::pool::WorkerPool,

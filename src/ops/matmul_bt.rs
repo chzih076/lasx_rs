@@ -8,16 +8,15 @@
 //! 累加**严格按 `t` 顺序**、**无多累加器、无重排、无 FMA 收缩** ⇒ 与"朴素三重循环（`i→j→t`）"
 //! **逐位一致**（单测用 `to_bits()` 钉住）。这是本轮硬约束。
 //!
-//! # 性能：本轮为什么是标量（**如实**）
-//! `src/arch/lasx.rs` 只导出 `load_f32x8`/`store_f32x8`/`splat_f32`/`zero_*`/`max_f32x8`，
-//! **没有**向量 `mul`/`add` 封装；`lasx_xvfmadd_s` 走 `core::arch` 且是 **FMA**（改舍入 ⇒ 破逐位）。
-//! 按"别凭记忆写 intrinsic"的规矩，本轮**先用标量保逐位**；8-lane 的 `mul`+`add`（非 FMA）
-//! 待确认封装名后再上——**性能结论等那之后再补**，本轮只报"少一次物化转置"的收益。
+//! # 性能：当前仍是标量（**如实**）
+//! 逐位要求"无重排、无 FMA 收缩"⇒ 只能用 8-lane `mul`+`add`（非 FMA）。当前内核**仍是标量**实现：
+//! 8-lane 非 FMA 版本**未做**（封装名已具备：`lasx_xvfmul_s`/`lasx_xvfadd_s`，见 `ops/axpy.rs`），
+//! 性能结论待后续补测；当前只兑现"少一次物化转置"的结构收益。
 //!
 //! # 门控
-//! trait 尚未声明该方法 ⇒ 无生产调用方；只挂 feature 会被 `dead_code`（`-D warnings`）判死，
-//! 又禁止 `#[allow(dead_code)]`（AGENTS #49）⇒ `cfg(all(feature = "dsl-backend", test))`。
-//! **等 override 落地后删 `, test`**（交接单在 `ops/mod.rs`）。
+//! `simd_dsl` 的 trait 已声明该方法、`dsl_backend.rs` 已有 `matmul_bt_f32` override 调用本模块
+//! ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被
+//! `clippy -D warnings` 的 `dead_code` 判死，且禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
 use simd_dsl::BackendError;
 

@@ -3,21 +3,23 @@
 //! 这一层只做三件事——把裸指针 + 长度转成切片、调用 `ops` 里的算子、
 //! 把结果原样返回。**不含任何计算逻辑**，这样 ABI 约定与算法演进互不干扰。
 //!
-//! 导出符号（94 个：50 个原始符号 + 44 个 `lasx_*_checked` 变体，名称与语义与历史版本保持兼容）：
+//! 导出符号（98 个：52 个原始符号 + 46 个 `lasx_*_checked` 变体，名称与语义与历史版本保持兼容）：
 //!
 //! | 模块 | 符号 |
 //! |---|---|
 //! | [`reduce`] | `lasx_dot`、`lasx_sum`、`lasx_dot_f64`、`lasx_axpy` |
-//! | [`matmul`] | `lasx_matmul`、`lasx_matmul_f64` |
-//! | [`quant`] | `lasx_dot_i8`、`lasx_dot_q4` |
+//! | [`matmul`] | `lasx_matmul`、`lasx_matmul_f64`、`lasx_matmul_scaled` |
+//! | [`quant`] | 10 个：`lasx_dot_i8`/`lasx_dot_q4`/`lasx_amax`/`lasx_absmax_rows`、`lasx_quantize_i8_{per_tensor,per_row}`、`lasx_dequantize_i8{,_rows}`、`lasx_gemv_i8`、`lasx_matmul_i8` |
 //! | [`batch`] | `lasx_norm3_batch`、`lasx_vec3_add_scaled_batch`、`lasx_batch_distance2d` |
 //! | [`physics`] | `lasx_ballistic_step`、`lasx_j2_accel_batch`、`lasx_rk4_j2_step_batch` |
-//! | [`memory`] | `lasx_alloc` |
+//! | [`memory`] | `lasx_alloc`、`lasx_free` |
+//! | [`cmatmul`] | 复数矩阵乘（分平面紧凑行主序）：`lasx_cmatmul_f32`/`lasx_cmatmul_f64`（+ `_checked`） |
+//! | [`meta`] | 运行时元信息：`lasx_has_lasx`、`lasx_version` |
 //! | [`matmul_plan`] | 矩阵乘**计划句柄** 7 个：`lasx_matmul_prepare{,_checked}`、`lasx_matmul_run{,_checked}`、`lasx_matmul_run_threaded{,_checked}`、`lasx_matmul_plan_destroy` |
 //! | [`attitude`] | 批量姿态/几何 7 个：叉积、单位化、3×3·向量、四元数四则/旋转/DCM |
 //! | [`nn`] | NN 侧 11 个：`lasx_softmax_rows`、`lasx_rms_norm`、`lasx_silu`、`lasx_gelu_quick`、`lasx_gelu_erf`、`lasx_rope`、`lasx_dot_f16`、`lasx_gemv_f16`、`lasx_layer_norm`、`lasx_gather_rows`、`lasx_gather_rows_i8` |
-//! | [`checked`] | 44 个 `lasx_*_checked`：带 `int *status` 出参的错误通道 |
-//! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助 |
+//! | [`checked`] | [`checked`] 模块内 41 个 `lasx_*_checked`（全库共 46 个，另 5 个随算子模块导出）：带 `int *status` 出参的错误通道 |
+//! | [`status`] | [`status::LasxStatus`]：错误码与校验辅助；`lasx_status_message` 取错误码文本 |
 //!
 //! # 安全约定
 //!
@@ -26,7 +28,7 @@
 //!
 //! # 两种用法
 //!
-//! - **原始 50 个符号**（本模块各子模块）：不做任何校验，误用即 UB——适合已经
+//! - **原始 52 个符号**（本模块各子模块）：不做任何校验，误用即 UB——适合已经
 //!   自己保证前置条件的调用方，零开销；
 //! - **[`checked`] 的 `lasx_*_checked` 变体**：多一个 `int *status` 出参，先校验
 //!   指针/长度/形状/物理常数，失败时写入 [`status::LasxStatus`] 并返回安全中性值。
@@ -46,7 +48,7 @@ pub mod matmul;
 /// 矩阵乘**计划句柄**：`lasx_matmul_prepare`/`_run`/`_run_threaded`/`_plan_destroy`（见 `docs/c-abi.md` 的"计划与句柄"一节）。
 pub mod matmul_plan;
 pub mod memory;
-/// 运行时元信息：`lasx_has_lasx` / `lasx_version`（§4.8）。
+/// 运行时元信息：`lasx_has_lasx` / `lasx_version`（`docs/ops.md` §4.8）。
 pub mod meta;
 pub mod nn;
 pub mod physics;
