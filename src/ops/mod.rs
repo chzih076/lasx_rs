@@ -43,10 +43,19 @@ pub mod dsl_fft;
 #[cfg(feature = "dsl-backend")]
 pub mod dsl_map;
 
-/// **f64 逐元素内核**（P1-4：`map_binary_f64`/`map_ternary_f64`/`map_affine_f64` 的 LASX 向量版）。
+/// **DSL 后端的广播/标量二元内核**（`map_binary_{rows,cols,scalar}_f32` 的 override 落点）：
+/// rows 广播每行一次标量 + SIMD 扫 `cols`、cols 广播每行 SIMD 连续 `w[c]`、标量整段 SIMD；
+/// `Add/Sub/Mul/Div` 与标量参照**逐位**，`Max/Min` 委托标量参照（NaN 语义）。
+///
+/// **同样挂在 `dsl-backend` 下**（唯一调用方 `src/dsl_backend.rs`）——理由同 [`dsl_map`]：
+/// 默认构建不能把它编成无人使用的模块（`clippy -D warnings` 的 `dead_code`）。
+#[cfg(feature = "dsl-backend")]
+pub mod broadcast;
+
+/// **f64 逐元素内核**（P1-4：`map_binary_f64`/`map_affine_f64` 的 LASX 向量版）。
 ///
 /// **4 f64/lane（LASX 256 位）+ 4 路展开 + 尾部标量兜底**；`Add`/`Sub`/`Mul`/`Div`、
-/// `SubSub`、`a·x+b`（**故意不融 FMA**）全部与 `simd_dsl::kernels::scalar` 参照 **逐位**
+/// `a·x+b`（**故意不融 FMA**）全部与 `simd_dsl::kernels::scalar` 参照 **逐位**
 /// （`Max`/`Min` 的 NaN 语义不同 ⇒ 仍委托标量，见 `dsl_backend.rs`）。
 /// **挂在 `dsl-backend` feature 下**：唯一调用方是 `src/dsl_backend.rs`（同 feature 门控）；
 /// 不门控会被 `dead_code` 判死（AGENTS #49 的教训）——**不要**用 `#[allow(dead_code)]` 掩盖。
@@ -70,11 +79,11 @@ pub mod prims;
 #[cfg(feature = "dsl-backend")]
 pub mod fused;
 
-/// **P5-b：跨步原语**（`copy_strided_f32` / `map_unary_strided_f32` / `map_binary_strided_f32`，
+/// **P5-b：跨步原语**（`copy_strided_f32` / `map_binary_strided_f32`，
 /// 统一 `Strides{row,col}`）。**内层连续（`col==1`）⇒ memcpy 行拷贝**（P5-a 实测手写 8-lane 更慢）；
 /// 跨步 ⇒ 标量按 `(r,c)`。空形状空操作、越界 ⇒ `Err`。
 ///
-/// **门控**：`simd_dsl` 的 trait 已声明这 3 个方法、`dsl_backend.rs` 已有 3 个 override 调用本模块
+/// **门控**：`simd_dsl` 的 trait 已声明这 2 个方法、`dsl_backend.rs` 已有 2 个 override 调用本模块
 /// ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不再需要 `test` 门控；否则触发
 /// `clippy -D warnings` 的 `dead_code`，见 AGENTS.md #49）。
 #[cfg(feature = "dsl-backend")]

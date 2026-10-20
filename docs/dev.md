@@ -752,6 +752,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `0dff23b` | rev bump（HEAD 待 bump） | **引擎×后端双重并行修复**：后端报 `Capability::Threaded` 时引擎 matmul 不再外层切块（LASX 1024³：嵌套 21.4ms → 6.0ms） |
 | 2026-10-20 | `ee1619d` | rev bump（HEAD 待 bump） | **P4.2 峰值收尾**：分阶段早释放把 detect 同时存活峰值降到 **8.0156 MiB**（模型 8.02 MiB，差 0.012%）；resident 9.54 MiB、稳态 0 alloc |
 | 2026-10-20 | `75b31dd` / `b497671` / `6abb2b3` | rev bump（HEAD 待 bump） | 比赛缺口清零：absmax_rows 单趟化（8×→1.0–1.12×）、gelu_quick 融合快路径（10.7×→0.97–0.99×）、FFT 峰值 8.02 MiB、stages/plan 复用（稳态 2 次/256 B） |
+| 2026-10-21 | `dc6a092` | rev bump（本仓同提交） | Backend 契约精简（删 6 条零消费方法；实测"减方法数不提速"）+ **广播/标量二元 override**（rows 4.63×/cols 4.27×，scalar 持平）；删 2 条 LASX 死 override/死内核 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -804,6 +805,23 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 **读数口径（重要）**：上表 `0.966×/0.985×` 与 `1.124×/1.045×` 是 **A 级窗口（loadavg 3.04→2.67）** 的台架读数。
 独立核验在 **C 级窗口（loadavg 4.2–8.8）** 复测 t=1 得到 gelu 0.886–1.155（中位 ≈0.978）、absmax 0.764–1.534（中位 ≈0.93、min ≈1.005）
 ⇒ **在 loadavg >4 时不要引用精确比值**；重测以 A 级窗口台架为准（`scripts/dsl_vs_lasx_ab.sh` 会在表头自动标"趋势"、并按 loadavg>3 提示）。
+
+#### 7.3.2 广播/标量二元 override（2026-10-21）
+
+背景：`Backend::map_binary_{rows,cols,scalar}_f32` 三个广播入口 LASX 之前**没有 override** ⇒ 落 portable
+标量默认（组合路径里的广播步全标量）。另一方案"把默认体转发到通用 `map_binary_strided_f32`"被实测否决
+（转发的 strided 循环无法向量化：Scalar 上 0.61–0.99×，标量最多 ~7× 慢）⇒ 改为 **LASX 直接 override**：
+
+| 入口 | 实现 | A/B（512×2048，8 对丢首对 min；loadavg 5.2–10 趋势） |
+|---|---|---|
+| `map_binary_rows_f32` | 每行 `w[r]` 一次 splat + 行内 SIMD 扫 cols（`Add/Sub/Mul/Div`；`Max/Min` 委托标量保 NaN 语义） | **4.63×** |
+| `map_binary_cols_f32` | 每行连续 `w[c]` 直接走 `dsl_map::map_binary` 内核 | **4.27×** |
+| `map_binary_scalar_f32` | 整段 splat + SIMD | **0.98×（持平）**——默认已被 LLVM 自动向量化，且 1M 档已带宽饱和；保留 override 以统一内核族 |
+
+逐位：10 组形状（0/1/奇数/非 8 倍）× 6 op × 含 NaN/±0/±inf/次正规数据，与 `kernels::scalar` 默认 **`to_bits` 全等**；
+错误面同口径（`ShapeOverflow`→`LengthMismatch`）。同时删除 2 条 LASX 死 override（`map_ternary_f64`/
+`map_unary_strided_f32`）与死内核，见 simd `docs/structure.md §7.2` 精简记录。
+
 
 
 

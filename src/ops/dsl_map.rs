@@ -94,6 +94,53 @@ pub(crate) fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
     }
 }
 
+/// **标量广播版**：`outᵢ = xᵢ op scalar`（`Add`/`Sub`/`Mul`/`Div`；**逐位**，同 `map_binary`）。
+///
+/// 与 [`map_binary`] 共用同一套 4 路展开 + 8-lane 尾 + 标量尾，只是第二操作数换成一个
+/// 提前 `splat` 好的向量；供 `Broadcast` 三入口（rows 广播/标量）复用，避免重复实现。
+///
+/// # Safety
+/// 调用方保证 `x.len() == out.len()` 且 `out` 不与 `x` 重叠。
+#[inline]
+pub(crate) fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: BinOp) {
+    let n = x.len();
+    let s = lasx::splat_f32(scalar);
+    macro_rules! vec_op_scalar {
+        ($a:expr, $s:expr, $op:expr) => {
+            match $op {
+                BinOp::Add => lasx_xvfadd_s($a, $s),
+                BinOp::Sub => lasx_xvfsub_s($a, $s),
+                BinOp::Mul => lasx_xvfmul_s($a, $s),
+                BinOp::Div => lasx_xvfdiv_s($a, $s),
+            }
+        };
+    }
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` ⇒ 四组 8 元素访存分别落在 [i,i+8)/…/[i+24,i+32)，全在切片内；
+        // 非别名由调用方保证。
+        unsafe {
+            let (px, po) = (x.as_ptr().add(i), out.as_mut_ptr().add(i));
+            for u in [0usize, 8, 16, 24] {
+                let a = lasx::load_f32x8(px.add(u));
+                lasx::store_f32x8(po.add(u), vec_op_scalar!(a, s, op));
+            }
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        // SAFETY: `i + 8 <= n` ⇒ 两次 8 元素访存都在切片内；非别名由调用方保证。
+        unsafe {
+            let a = lasx::load_f32x8(x.as_ptr().add(i));
+            lasx::store_f32x8(out.as_mut_ptr().add(i), vec_op_scalar!(a, s, op));
+        }
+        i += 8;
+    }
+    for j in i..n {
+        out[j] = bin_scalar(op, x[j], scalar);
+    }
+}
+
 /// `outᵢ = a·xᵢ + b`（**两步运算**，不融 FMA ⇒ 与标量参照逐位）。
 ///
 /// # Safety

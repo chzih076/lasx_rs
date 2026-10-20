@@ -1,10 +1,9 @@
-//! **P5-b：跨步（strided）原语** —— `copy_strided_f32` / `map_unary_strided_f32` /
-//! `map_binary_strided_f32`，统一用 [`Strides`] 描述**行/列步长**。
+//! **P5-b：跨步（strided）原语** —— `copy_strided_f32` / `map_binary_strided_f32`，
+//! 统一用 [`Strides`] 描述**行/列步长**。
 //!
 //! # 语义（与 `simd_dsl` 契约一致，不改）
 //! 逻辑形状 `rows×cols`；元素 `(r, c)` 在缓冲里的位置 = `r*row_stride + c*col_stride`。
 //! - [`copy_strided_f32`]：`dst(r,c) = src(r,c)`；
-//! - [`map_unary_strided_f32`]：`dst(r,c) = op(src(r,c))`；
 //! - [`map_binary_strided_f32`]：`dst(r,c) = op(x(r,c), y(r,c))`（**三组 stride 各自独立**）。
 //!
 //! # 快速路径（关键）
@@ -141,48 +140,6 @@ pub fn copy_strided_f32(
     Ok(())
 }
 
-/// **跨步一元映射**：`dst(r,c) = op(src(r,c))`（`op` 取 `UnaryOp` 语义子集：`Rcp`/`Sqrt`/`Neg`）。
-///
-/// # Errors
-/// 长度不足／溢出 ⇒ `LengthMismatch`。
-pub fn map_unary_strided_f32(
-    src: &[f32],
-    src_st: Strides,
-    dst: &mut [f32],
-    dst_st: Strides,
-    rows: usize,
-    cols: usize,
-    op: UnaryOpStrided,
-) -> Result<(), BackendError> {
-    if check(
-        "map_unary_strided_f32",
-        "src",
-        src.len(),
-        src_st,
-        rows,
-        cols,
-    )? {
-        return Ok(());
-    }
-    if check(
-        "map_unary_strided_f32",
-        "dst",
-        dst.len(),
-        dst_st,
-        rows,
-        cols,
-    )? {
-        return Ok(());
-    }
-    (0..rows).for_each(|r| {
-        (0..cols).for_each(|c| {
-            let v = src[r * src_st.row + c * src_st.col];
-            dst[r * dst_st.row + c * dst_st.col] = op.apply(v);
-        });
-    });
-    Ok(())
-}
-
 /// **跨步二元映射**：`dst(r,c) = op(x(r,c), y(r,c))`（**三组 stride 各自独立**，不做广播）。
 ///
 /// # Errors
@@ -222,30 +179,6 @@ pub fn map_binary_strided_f32(
         });
     });
     Ok(())
-}
-
-/// 跨步一元算子（**只列本轮要的**，避免与 `simd_dsl::UnaryOp` 抢语义）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnaryOpStrided {
-    /// `1/x`。
-    Rcp,
-    /// `√x`。
-    Sqrt,
-    /// `−x`（**只在测试里构造**，避免非测试构建 `dead_code`；不是生产变体）。
-    #[cfg(test)]
-    Neg,
-}
-
-impl UnaryOpStrided {
-    /// 应用。
-    pub fn apply(self, v: f32) -> f32 {
-        match self {
-            UnaryOpStrided::Rcp => 1.0 / v,
-            UnaryOpStrided::Sqrt => v.sqrt(),
-            #[cfg(test)]
-            UnaryOpStrided::Neg => -v,
-        }
-    }
 }
 
 /// 跨步二元算子。
@@ -301,27 +234,12 @@ mod tests {
         );
     }
 
-    /// 一元/二元映射与标量参照逐位（含跨步目标）。
+    /// 二元映射与标量参照逐位（含跨步目标）。
     #[test]
     fn strided_maps_match_scalar() {
         let (rows, cols) = (5usize, 7usize);
         let src = data(rows * cols * 2, 0.5);
         let st = Strides::new(cols * 2, 2); // 偶数列
-        let mut dst = vec![0.0f32; rows * cols * 2];
-        let dst_st = Strides::new(cols, 1);
-        map_unary_strided_f32(&src, st, &mut dst, dst_st, rows, cols, UnaryOpStrided::Sqrt)
-            .unwrap();
-        let want: Vec<f32> = (0..rows * cols)
-            .map(|i| src[(i / cols) * cols * 2 + (i % cols) * 2].sqrt())
-            .collect();
-        assert_eq!(
-            dst.iter()
-                .take(rows * cols)
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        // 二元
         let mut dst2 = vec![0.0f32; rows * cols];
         map_binary_strided_f32(
             &src,
@@ -359,13 +277,9 @@ mod tests {
         // 连续列布局：需要 4 个元素 ⇒ dst 只有 3 ⇒ Err（`st` 的 col=0 会退化到"只要 1 个"，故用 col=1）
         let dense = Strides::new(1, 1);
         assert!(copy_strided_f32(&src, dense, &mut dst, dense, 1, 4).is_err());
-        assert!(
-            map_unary_strided_f32(&src, dense, &mut dst, dense, 1, 4, UnaryOpStrided::Neg).is_err()
-        );
-        // 让全部算子变体与 `CONTIGUOUS` 都被构造到（否则 `-D warnings` 的 dead_code 会红）
+        // 让全部二元算子变体与 `CONTIGUOUS` 都被构造到（否则 `-D warnings` 的 dead_code 会红）
         let mut o2 = vec![0.0f32; 4];
         let cont = Strides::CONTIGUOUS;
-        map_unary_strided_f32(&src, cont, &mut o2, cont, 1, 4, UnaryOpStrided::Rcp).unwrap();
         map_binary_strided_f32(
             &src,
             cont,

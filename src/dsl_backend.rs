@@ -5,20 +5,21 @@
 //!   （`ops::matmul::matmul_f32` / `ops::dot::dot`）——**不绕开、不新写算法、不改语义**；
 //! - **已覆盖（本仓有内核可接的）**：`matmul_f32`/`dot_f32`、**`matmul_f64`/`dot_f64`（IS-2）**、
 //!   **`matmul_bt_f32`（IS-1）**、`reduce_sum_f32`、`map_affine_f32`、`map_binary_f32`、
-//!   **`map_binary_f64`/`map_ternary_f64`/`map_affine_f64`（P1-4，LASX f64 逐元素）**、
+//!   **`map_binary_{rows,cols,scalar}_f32`（P4.2 广播三入口：`ops/broadcast.rs`；`Add/Sub/Mul/Div`
+//!   逐位、`Max/Min` 委托标量）**、
+//!   **`map_binary_f64`/`map_affine_f64`（P1-4，LASX f64 逐元素）**、
 //!   **`quantize_i8_rows_f32`/`dot_i8`/`gemv_i8`（P1-5，LASX i8 内核；`dequantize_i8_rows_f32`
 //!   未接 ⇒ `Capability::Quant` 仍 `false`）**、
 //!   `reduce_{sum,weighted_sum,centered_sq_sum}_cols_f32`、`matmul_pair_psd_f32`、
 //!   `gather_rows_f32`/`gather_rows_i8`/`scatter_rows_f32`、`fft_strided_f32`、
 //!   `build_kernel_f32`（等距递推核）、`pack_f32`/`matmul_f32_packed`、
-//!   `copy_strided_f32`/`map_unary_strided_f32`/`map_binary_strided_f32`、
+//!   `copy_strided_f32`/`map_binary_strided_f32`、
 //!   **`map_unary_f32`/`reduce_rows_map_f32`/`axpy_inplace_f32`（B1b 组合原语；内核在 `ops/prims.rs` 与 `ops/axpy.rs`）**、
 //!   **`reduce_sum_rows_f32`（P4.2：LASX 8-lane 行和 + 行块自动并行；与默认实现**逐位**）**；
 //! - **仍未覆盖（**没有 LASX 内核**，或按分批计划不做）**：rows 方向归约的其余项
-//!   （`reduce_max_f32` 等）、`max/min_{cols,rows}`、
-//!   `map_binary_scalar_f32`、banded/stencil、**f64 逐元素的其他族（如 f64 轴归约、
-//!   `map_unary_f64`）** ⇒ **走 `simd_dsl` 标量默认**（**不 panic**；性能必然不如向量版，
-//!   迁移时按"无内核 ⇒ 不替换"如实记）；
+//!   （`reduce_max_f32` 等）、`max/min_{cols,rows}`、banded/stencil、
+//!   **f64 逐元素的其他族（如 f64 轴归约、`map_unary_f64`）** ⇒ **走 `simd_dsl` 标量默认**
+//!   （**不 panic**；性能必然不如向量版，迁移时按"无内核 ⇒ 不替换"如实记）；
 //! - **线程**：`CallOpts{threads}` **未接**（本后端不按 opts 派活，见上文 ③b-4 留档）；但 **GEMM 内核
 //!   自己**在 `work ≥ 32M` 时走**进程级全局池**（`ops::matmul::matmul_f32`，§7.28；`init_global(1)`
 //!   是逃生门）⇒ **大形状 A/B 的 `threads` 会 >1**，必须在表里打印（`examples/migrate_ab.rs` 已照做）。
@@ -62,7 +63,7 @@
 use simd_dsl::{
     Backend, BackendError, BinaryOp, CallOpts, Capability, EnginePath, ErrorBound, Fallback,
     FusedIo, FusedPlan, PackedB, PatternKind, PrecisionClaim, ReduceMapOp, RowFuse, ScalarKind,
-    TernaryOp, UnaryOp,
+    UnaryOp,
 };
 
 /// 用 LASX 现有内核的 `simd_dsl::Backend`。
@@ -114,6 +115,49 @@ fn axis_extreme_check(
             expected: 1,
             got: 0,
         });
+    }
+    Ok(())
+}
+
+/// `BinaryOp` → LASX 逐元素 `BinOp`（**只映射逐位安全的 4 条**；`Max/Min` 与 `#[non_exhaustive]`
+/// 的未来变体返回 `None` ⇒ 调用方委托 `simd_dsl::kernels::scalar`——Rust `f32::max/min` 的 NaN
+/// 语义 ≠ LASX `xvfmax/xvfmin` 的 IEEE 语义，不能向量化还声称逐位）。
+fn lasx_binop(op: BinaryOp) -> Option<crate::ops::dsl_map::BinOp> {
+    match op {
+        BinaryOp::Add => Some(crate::ops::dsl_map::BinOp::Add),
+        BinaryOp::Sub => Some(crate::ops::dsl_map::BinOp::Sub),
+        BinaryOp::Mul => Some(crate::ops::dsl_map::BinOp::Mul),
+        BinaryOp::Div => Some(crate::ops::dsl_map::BinOp::Div),
+        _ => None,
+    }
+}
+
+/// **广播二元的公共校验**（`map_binary_{rows,cols}_f32`；与 `simd_dsl::kernels::scalar` 的默认
+/// 实现**逐条同口径**）：先 `rows×cols` 溢出、再 `x`/`out` 等长、最后 `w` 长度（`w_what` 与默认
+/// 实现的措辞一致）。空形状不在这里早退——默认实现也是先校验再空循环，严格保持错误面不变。
+#[allow(clippy::too_many_arguments)] // 形状 4 个 + 三块缓冲 + 长度/措辞 = 与默认实现同口径的校验参数
+fn binary_broadcast_check(
+    op: &'static str,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    w: &[f32],
+    out: &[f32],
+    w_len: usize,
+    w_what: &'static str,
+) -> Result<(), BackendError> {
+    let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+        op,
+        what: "rows×cols",
+    })?;
+    if x.len() != total {
+        return Err(len_err(op, "x", total, x.len()));
+    }
+    if out.len() != total {
+        return Err(len_err(op, "out", total, out.len()));
+    }
+    if w.len() != w_len {
+        return Err(len_err(op, w_what, w_len, w.len()));
     }
     Ok(())
 }
@@ -331,6 +375,91 @@ impl Backend for LasxBackend {
         Ok(())
     }
 
+    /// **P4.2 广播入口（rows 方向）**：`out[r·cols+c] = op(x[r·cols+c], w[r])`（`w.len() == rows`）。
+    ///
+    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_rows`]：**每行 `w[r]` 只读一次**
+    /// 并 splat 进 SIMD、行内连续扫 `cols`（4 路展开 + 8-lane 尾 + 标量尾）——逐元素无重排
+    /// ⇒ 与 `kernels::scalar` 默认**逐位**。`Max`/`Min`/未来变体委托标量参照（NaN 语义不同）。
+    fn map_binary_rows_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        w: &[f32],
+        out: &mut [f32],
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        let name = "map_binary_rows_f32";
+        binary_broadcast_check(name, x, rows, cols, w, out, rows, "w（广播轴 = rows）")?;
+        match lasx_binop(op) {
+            Some(fop) => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+                    "map_binary_rows_f32: out 不得与 x 重叠（契约）"
+                );
+                crate::ops::broadcast::map_binary_rows(x, rows, cols, w, out, fop);
+                Ok(())
+            }
+            None => simd_dsl::kernels::scalar::map_binary_rows_f32(x, rows, cols, w, out, op),
+        }
+    }
+
+    /// **P4.2 广播入口（cols 方向）**：`out[r·cols+c] = op(x[r·cols+c], w[c])`（`w.len() == cols`）。
+    ///
+    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_cols`]：**每行**用连续 `w` 向量
+    /// 直接调用逐元素 SIMD 核（`ops::dsl_map::map_binary`）⇒ 与默认**逐位**；`Max/Min` 委托标量。
+    fn map_binary_cols_f32(
+        &self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        w: &[f32],
+        out: &mut [f32],
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        let name = "map_binary_cols_f32";
+        binary_broadcast_check(name, x, rows, cols, w, out, cols, "w（广播轴 = cols）")?;
+        match lasx_binop(op) {
+            Some(fop) => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+                    "map_binary_cols_f32: out 不得与 x 重叠（契约）"
+                );
+                crate::ops::broadcast::map_binary_cols(x, rows, cols, w, out, fop);
+                Ok(())
+            }
+            None => simd_dsl::kernels::scalar::map_binary_cols_f32(x, rows, cols, w, out, op),
+        }
+    }
+
+    /// **P4.2 标量二元入口**：`out[i] = op(x[i], scalar)`。
+    ///
+    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_scalar`]（整段 SIMD，标量提前
+    /// splat；与默认**逐位**）；`Max`/`Min` 委托标量参照（NaN 语义不同）。
+    fn map_binary_scalar_f32(
+        &self,
+        x: &[f32],
+        scalar: f32,
+        out: &mut [f32],
+        op: BinaryOp,
+    ) -> Result<(), BackendError> {
+        let name = "map_binary_scalar_f32";
+        if out.len() != x.len() {
+            return Err(len_err(name, "out", x.len(), out.len()));
+        }
+        match lasx_binop(op) {
+            Some(fop) => {
+                debug_assert!(
+                    !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+                    "map_binary_scalar_f32: out 不得与 x 重叠（契约）"
+                );
+                crate::ops::broadcast::map_binary_scalar(x, scalar, out, fop);
+                Ok(())
+            }
+            None => simd_dsl::kernels::scalar::map_binary_scalar_f32(x, scalar, out, op),
+        }
+    }
+
     /// **P1-4：f64 逐元素 LASX 覆盖**（4 f64/lane + 尾部标量；**逐位类**）。
     ///
     /// `Add`/`Sub`/`Mul`/`Div` 由 `ops::f64_map::map_binary` 向量化；**`Max`/`Min` 仍委托标量**：
@@ -372,42 +501,6 @@ impl Backend for LasxBackend {
             None => simd_dsl::kernels::scalar::map_binary_f64(x, y, out, op)?,
         }
         Ok(())
-    }
-
-    /// **P1-4：`map_ternary_f64` 的 LASX 覆盖**（`SubSub = x − y − z`，两次向量减法）。**逐位类**。
-    fn map_ternary_f64(
-        &self,
-        x: &[f64],
-        y: &[f64],
-        z: &[f64],
-        out: &mut [f64],
-        op: TernaryOp,
-    ) -> Result<(), BackendError> {
-        if y.len() != x.len() {
-            return Err(len_err("map_ternary_f64", "y", x.len(), y.len()));
-        }
-        if z.len() != x.len() {
-            return Err(len_err("map_ternary_f64", "z", x.len(), z.len()));
-        }
-        if out.len() != x.len() {
-            return Err(len_err("map_ternary_f64", "out", x.len(), out.len()));
-        }
-        match op {
-            // **逐位**：与标量参照同序 `(x − y) − z`，两次减法不重排。
-            TernaryOp::SubSub => {
-                debug_assert!(
-                    !std::ptr::eq(x.as_ptr(), out.as_ptr())
-                        && !std::ptr::eq(y.as_ptr(), out.as_ptr())
-                        && !std::ptr::eq(z.as_ptr(), out.as_ptr()),
-                    "map_ternary_f64: out 不得与输入重叠（契约）"
-                );
-                crate::ops::f64_map::map_ternary(x, y, z, out);
-                Ok(())
-            }
-            // `TernaryOp` 是 `#[non_exhaustive]`（外部 crate 视角）⇒ 将来新增变体一律**委托标量**
-            // （保守、正确优先；与 f32 的 `map_binary_f32` 对未知 `BinaryOp` 的口径一致）。
-            _ => simd_dsl::kernels::scalar::map_ternary_f64(x, y, z, out, op),
-        }
     }
 
     /// **P1-4：`map_affine_f64` 的 LASX 覆盖**（`a·x + b`，**故意不融 FMA** ⇒ **逐位类**）。
@@ -1128,7 +1221,7 @@ impl Backend for LasxBackend {
     /// * `Packing`：`pack_f32` + `matmul_f32_packed`（逐位断言已过，测试 `packed_bitwise_same_as_matmul`）；
     /// * `MatmulF64`：**IS-2 已接** `matmul_f64`/`dot_f64` → LASX f64 内核（与 `api::*` 逐位，
     ///   测试 `matmul_f64_and_dot_f64_bitwise_vs_api`）；
-    /// * **`F64Elementwise`（P1-4 新增）**：`map_binary_f64`/`map_ternary_f64`/`map_affine_f64`
+    /// * **`F64Elementwise`（P1-4 新增）**：`map_binary_f64`/`map_affine_f64`
     ///   已 override 到 `ops::f64_map`（LASX 4 f64/lane；与 `kernels::scalar` **逐位**，
     ///   测试 `f64_map_is_bitwise_vs_scalar`）。
     ///
@@ -1602,59 +1695,6 @@ impl Backend for LasxBackend {
             rows,
             cols,
         )
-    }
-
-    /// **P5-b：跨步一元映射** → `ops::strided` 内核；**未覆盖的变体委托标量**
-    /// （`simd_dsl::kernels::scalar::map_unary_f32` 走"跨步→连续物化 → 标量 → 写回"，逐位不变）。
-    fn map_unary_strided_f32(
-        &self,
-        src: &[f32],
-        src_st: simd_dsl::Strides,
-        dst: &mut [f32],
-        dst_st: simd_dsl::Strides,
-        rows: usize,
-        cols: usize,
-        op: UnaryOp,
-    ) -> Result<(), BackendError> {
-        let fast = match op {
-            UnaryOp::Sqrt => Some(crate::ops::strided::UnaryOpStrided::Sqrt),
-            UnaryOp::Rcp => Some(crate::ops::strided::UnaryOpStrided::Rcp),
-            // 其余（Exp/Sin/Cos/Ln/Erf/… 及 `#[non_exhaustive]` 将来变体）⇒ **委托标量**（保守、逐位）
-            _ => None,
-        };
-        match fast {
-            Some(o) => crate::ops::strided::map_unary_strided_f32(
-                src,
-                strided_of(src_st),
-                dst,
-                strided_of(dst_st),
-                rows,
-                cols,
-                o,
-            ),
-            None => {
-                // 物化 → 标量 → 写回（逐位；代价是多两次搬运，正确性优先）
-                let mut tmp = vec![0.0f32; rows * cols];
-                crate::ops::strided::copy_strided_f32(
-                    src,
-                    strided_of(src_st),
-                    &mut tmp,
-                    crate::ops::strided::Strides::new(cols, 1),
-                    rows,
-                    cols,
-                )?;
-                let mut out_tmp = vec![0.0f32; rows * cols];
-                simd_dsl::kernels::scalar::map_unary_f32(&tmp, &mut out_tmp, op)?;
-                crate::ops::strided::copy_strided_f32(
-                    &out_tmp,
-                    crate::ops::strided::Strides::new(cols, 1),
-                    dst,
-                    strided_of(dst_st),
-                    rows,
-                    cols,
-                )
-            }
-        }
     }
 
     /// **P5-b：跨步二元映射** → `ops::strided` 内核；**未覆盖的变体委托标量**（同上一律逐位）。
@@ -2221,7 +2261,6 @@ mod tests {
                 .map(|i| ((i * 37 % 101) as f64) * 0.1 - 5.05)
                 .collect();
             let y: Vec<f64> = (0..n).map(|i| ((i * 53 % 97) as f64) * 0.1 + 1.3).collect();
-            let z: Vec<f64> = (0..n).map(|i| ((i * 11 % 89) as f64) * 0.1 - 0.7).collect();
             for op in [
                 BinaryOp::Add,
                 BinaryOp::Sub,
@@ -2241,12 +2280,6 @@ mod tests {
                 );
             }
             let mut got = vec![f64::NAN; n];
-            be.map_ternary_f64(&x, &y, &z, &mut got, TernaryOp::SubSub)
-                .expect("backend");
-            let mut want = vec![f64::NAN; n];
-            scalar::map_ternary_f64(&x, &y, &z, &mut want, TernaryOp::SubSub).expect("scalar");
-            assert_eq!(bits(&got), bits(&want), "map_ternary_f64 n={n} 不逐位");
-            let mut got = vec![f64::NAN; n];
             be.map_affine_f64(&x, 0.3, -1.7, &mut got).expect("backend");
             let mut want = vec![f64::NAN; n];
             scalar::map_affine_f64(&x, 0.3, -1.7, &mut want).expect("scalar");
@@ -2261,10 +2294,6 @@ mod tests {
         );
         assert!(
             be.map_binary_f64(&v, &v, &mut o[..5], BinaryOp::Add)
-                .is_err()
-        );
-        assert!(
-            be.map_ternary_f64(&v, &v[..5], &v, &mut o, TernaryOp::SubSub)
                 .is_err()
         );
         assert!(be.map_affine_f64(&v, 1.0, 0.0, &mut o[..5]).is_err());

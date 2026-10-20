@@ -1,4 +1,4 @@
-//! **P1-4 A/B：LASX f64 逐元素 override vs portable 默认**（`map_binary/ternary/affine_f64`）。
+//! **P1-4 A/B：LASX f64 逐元素 override vs portable 默认**（`map_binary/affine_f64`）。
 //!
 //! A 臂 = `simd_dsl::kernels::scalar::*_f64`（契约的 portable 默认实现，即"没有 override 的后端"走的路）；
 //! B 臂 = `LasxBackend::*_f64`（本仓 `ops::f64_map` 的 LASX 4×f64 向量内核）。
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use lasx_rs::dsl_backend::LasxBackend;
 use simd_dsl::kernels::scalar;
-use simd_dsl::{Backend, BinaryOp, TernaryOp};
+use simd_dsl::{Backend, BinaryOp};
 
 const ROUNDS: usize = 6;
 
@@ -101,7 +101,6 @@ fn main() {
             .map(|i| ((i * 37 % 101) as f64) * 0.1 - 5.05)
             .collect();
         let y: Vec<f64> = (0..n).map(|i| ((i * 53 % 97) as f64) * 0.1 + 1.3).collect();
-        let z: Vec<f64> = (0..n).map(|i| ((i * 11 % 89) as f64) * 0.1 - 0.7).collect();
         let mut out_a = vec![0.0f64; n];
         let mut out_b = vec![0.0f64; n];
 
@@ -129,28 +128,6 @@ fn main() {
             row(name, n, a, b, &eq);
         }
 
-        // ---- map_ternary_f64（SubSub；读 3 块）----
-        {
-            scalar::map_ternary_f64(&x, &y, &z, &mut out_a, TernaryOp::SubSub).expect("scalar");
-            let want = out_a.clone();
-            be.map_ternary_f64(&x, &y, &z, &mut out_b, TernaryOp::SubSub)
-                .expect("backend");
-            let eq = class(&out_b, &want);
-            let (a, b) = ab(
-                || {
-                    scalar::map_ternary_f64(&x, &y, &z, &mut out_a, TernaryOp::SubSub)
-                        .expect("scalar");
-                    black_box(out_a[0]);
-                },
-                || {
-                    be.map_ternary_f64(&x, &y, &z, &mut out_b, TernaryOp::SubSub)
-                        .expect("backend");
-                    black_box(out_b[0]);
-                },
-            );
-            row("map_ternary_f64 SubSub", n, a, b, &eq);
-        }
-
         // ---- map_affine_f64（非 FMA ⇒ 逐位）----
         {
             scalar::map_affine_f64(&x, 0.3, -1.7, &mut out_a).expect("scalar");
@@ -175,7 +152,7 @@ fn main() {
     println!("\nloadavg（结束）= `{}`", loadavg());
     println!(
         "\n说明：A 臂 = `kernels::scalar::*_f64`（portable 默认）；B 臂 = `LasxBackend` 的 \
-         `map_binary_f64`/`map_ternary_f64`/`map_affine_f64`（LASX 4×f64 向量内核，4 路展开 + 尾部标量）。\
+         `map_binary_f64`/`map_affine_f64`（LASX 4×f64 向量内核，4 路展开 + 尾部标量）。\
          等价类全部**逐位**（affine 故意不融 FMA）。"
     );
 }

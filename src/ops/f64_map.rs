@@ -1,16 +1,15 @@
 //! `f64_map` —— 给 `simd_dsl::Backend` 的 **f64 逐元素族**提供 LASX 内核（P1-4）。
 //!
-//! # 覆盖（`Backend` 的三个 f64 逐元素方法）
+//! # 覆盖（`Backend` 的两个 f64 逐元素方法）
 //!
 //! | 方法 | 语义 | 本文件入口 |
 //! |---|---|---|
 //! | `map_binary_f64` | `outᵢ = xᵢ op yᵢ`（`Add`/`Sub`/`Mul`/`Div`） | [`map_binary`] |
-//! | `map_ternary_f64` | `outᵢ = xᵢ − yᵢ − zᵢ`（当前唯一变体 `SubSub`） | [`map_ternary`] |
 //! | `map_affine_f64` | `outᵢ = a·xᵢ + b` | [`map_affine`] |
 //!
 //! # 等价类（**逐条写死**，与 `simd_dsl::kernels::scalar` 参照比）
 //!
-//! * **全部逐位类**（`map_binary` 的 Add/Sub/Mul/Div、`map_ternary`、`map_affine`）：
+//! * **全部逐位类**（`map_binary` 的 Add/Sub/Mul/Div、`map_affine`）：
 //!   向量指令（`xvfadd_d`/`xvfsub_d`/`xvfmul_d`/`xvfdiv_d`）与标量 IEEE 运算**逐位同结果**；
 //!   **`map_affine` 故意不融 FMA**（先 `a·x` 再 `+b`，与标量参照 `a * v + b` 同序）⇒ 也是逐位，
 //!   不像 f32 的 `map_affine` 那样因 FMA 降为容差类（用两条向量指令换"逐位"，值得）。
@@ -113,57 +112,6 @@ pub(crate) fn map_binary(x: &[f64], y: &[f64], out: &mut [f64], op: BinOpF64) {
     }
 }
 
-/// `outᵢ = xᵢ − yᵢ − zᵢ`（`TernaryOp::SubSub`）。**逐位类**。
-///
-/// # Safety
-/// 调用方保证三输入与输出等长、且 `out` 不与任一输入重叠。
-#[inline]
-pub(crate) fn map_ternary(x: &[f64], y: &[f64], z: &[f64], out: &mut [f64]) {
-    let n = x.len();
-    debug_assert_eq!(y.len(), n, "map_ternary_f64：y 必须与 x 等长");
-    debug_assert_eq!(z.len(), n, "map_ternary_f64：z 必须与 x 等长");
-    debug_assert_eq!(out.len(), n, "map_ternary_f64：out 必须与 x 等长");
-    debug_assert!(
-        !std::ptr::eq(x.as_ptr(), out.as_ptr())
-            && !std::ptr::eq(y.as_ptr(), out.as_ptr())
-            && !std::ptr::eq(z.as_ptr(), out.as_ptr()),
-        "map_ternary_f64：out 不得与输入重叠（契约）"
-    );
-    let mut i = 0;
-    while i + 16 <= n {
-        // SAFETY: 同 `map_binary`（四组 4-lane 访存都在切片内）。
-        unsafe {
-            let px = x.as_ptr().add(i);
-            let py = y.as_ptr().add(i);
-            let pz = z.as_ptr().add(i);
-            let po = out.as_mut_ptr().add(i);
-            for u in [0usize, 4, 8, 12] {
-                let vx = lasx::load_f64x4(px.add(u));
-                let vy = lasx::load_f64x4(py.add(u));
-                let vz = lasx::load_f64x4(pz.add(u));
-                // 与标量参照同序：`(x − y) − z`（两次减法，不重排）。
-                let d = lasx_xvfsub_d(vx, vy);
-                lasx::store_f64x4(po.add(u), lasx_xvfsub_d(d, vz));
-            }
-        }
-        i += 16;
-    }
-    while i + 4 <= n {
-        // SAFETY: `i + 4 <= n`。
-        unsafe {
-            let vx = lasx::load_f64x4(x.as_ptr().add(i));
-            let vy = lasx::load_f64x4(y.as_ptr().add(i));
-            let vz = lasx::load_f64x4(z.as_ptr().add(i));
-            let d = lasx_xvfsub_d(vx, vy);
-            lasx::store_f64x4(out.as_mut_ptr().add(i), lasx_xvfsub_d(d, vz));
-        }
-        i += 4;
-    }
-    for j in i..n {
-        out[j] = (x[j] - y[j]) - z[j];
-    }
-}
-
 /// `outᵢ = a·xᵢ + b`。**逐位类**（**故意不融 FMA**：先乘后加，与标量参照同序）。
 ///
 /// # Safety
@@ -220,7 +168,6 @@ mod tests {
                 .map(|i| ((i * 37 % 101) as f64) * 0.1 - 5.05)
                 .collect();
             let y: Vec<f64> = (0..n).map(|i| ((i * 53 % 97) as f64) * 0.1 + 1.3).collect();
-            let z: Vec<f64> = (0..n).map(|i| ((i * 11 % 89) as f64) * 0.1 - 0.7).collect();
             let bits = |v: &[f64]| v.iter().map(|q| q.to_bits()).collect::<Vec<_>>();
             for op in [BinOpF64::Add, BinOpF64::Sub, BinOpF64::Mul, BinOpF64::Div] {
                 let mut got = vec![f64::NAN; n];
@@ -238,15 +185,6 @@ mod tests {
                     .collect();
                 assert_eq!(bits(&got), bits(&want), "n={n} op={op:?} 不逐位");
             }
-            let mut got = vec![f64::NAN; n];
-            map_ternary(&x, &y, &z, &mut got);
-            let want: Vec<f64> = x
-                .iter()
-                .zip(&y)
-                .zip(&z)
-                .map(|((a, b), c)| a - b - c)
-                .collect();
-            assert_eq!(bits(&got), bits(&want), "n={n} ternary 不逐位");
             let mut got = vec![f64::NAN; n];
             map_affine(0.3, -1.7, &x, &mut got);
             let want: Vec<f64> = x.iter().map(|v| 0.3 * v - 1.7).collect();
