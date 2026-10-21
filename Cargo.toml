@@ -37,11 +37,11 @@ lasx_rs_macros = { path = "macros", version = "0.1.0" }
 # （`git ls-remote <panel>` 取实值），否则本仓看到的是**旧快照**——③b-3b 就是因为 rev 钉在 `fc57fc7`
 # 而误判"`IdiomaticBackend` 未导出"（实际 `521e837` 已 `pub use idiomatic::IdiomaticBackend;`）。
 # 改完必须 `cargo update -p simd_dsl` 让 `Cargo.lock` 跟上。
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "b4a1db786cfd2df31ce7b5366885c34cac8abd0b", optional = true }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "a1ba57f7c88c8cea4c5e9cd1fff98b6aa5c8e561", optional = true }
 # **可选**：`ops_dsl`（算子库，含谱检测整帧 `detect`）——**只给"帧级 A/B"示例用**。
 # 依赖方向仍向下：`lasx_rs → ops_dsl → simd_dsl`；与 `simd_dsl` 同一个 rev（同一 git 仓的 workspace 成员）。
 # 仅在本 feature 下解析 ⇒ 默认构建不受影响（同上：一移动就 bump、并 `cargo update -p ops_dsl`）。
-ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "b4a1db786cfd2df31ce7b5366885c34cac8abd0b", optional = true }
+ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "a1ba57f7c88c8cea4c5e9cd1fff98b6aa5c8e561", optional = true }
 
 [features]
 # 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
@@ -52,7 +52,7 @@ dsl-backend = ["dep:simd_dsl", "dep:ops_dsl"]
 # （与上面的 `[dependencies]` 是同一个包、同一个 rev；dev-dependency 只是给测试 crate 打开 feature）。
 # 这样默认/生产构建不会把 harness 编进来。
 [dev-dependencies]
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "b4a1db786cfd2df31ce7b5366885c34cac8abd0b", features = ["conformance"] }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "a1ba57f7c88c8cea4c5e9cd1fff98b6aa5c8e561", features = ["conformance"] }
 
 # `tests/conformance.rs`：1 行 `backend_conformance!(LasxBackend)` ⇒ 16 个通用测试 / 15 组。
 # 依赖 `dsl-backend`（`LasxBackend` 在该 feature 下才编译）。
