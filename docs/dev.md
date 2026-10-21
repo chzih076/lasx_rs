@@ -755,6 +755,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `ee1619d` | rev bump（HEAD 待 bump） | **P4.2 峰值收尾**：分阶段早释放把 detect 同时存活峰值降到 **8.0156 MiB**（模型 8.02 MiB，差 0.012%）；resident 9.54 MiB、稳态 0 alloc |
 | 2026-10-20 | `75b31dd` / `b497671` / `6abb2b3` | rev bump（HEAD 待 bump） | 比赛缺口清零：absmax_rows 单趟化（8×→1.0–1.12×）、gelu_quick 融合快路径（10.7×→0.97–0.99×）、FFT 峰值 8.02 MiB、stages/plan 复用（稳态 2 次/256 B） |
 | 2026-10-21 | `dc6a092` | rev bump（本仓同提交） | Backend 契约精简（删 6 条零消费方法；实测"减方法数不提速"）+ **广播/标量二元 override**（rows 4.63×/cols 4.27×，scalar 持平）；删 2 条 LASX 死 override/死内核 |
+| 2026-10-21 | `31e5a6a` | rev bump（本仓同提交） | **引擎优化审计**：修短输入 panic + 轻逐元素并行阈值；`Capability::MatmulF64` 不再报（+lasx 实测 512³ 3.28×/1024×256×1024 2.47×）；i8/Gelu 的"负收益"经 +lasx 复测反转为 plan 更快 ⇒ 保持 plan 路由；审计结论见本文件 §7.3.3 与 simd 仓 `docs/engine_integration.md`「引擎优化审计」节 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 

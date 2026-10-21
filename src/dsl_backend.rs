@@ -377,7 +377,7 @@ impl Backend for LasxBackend {
 
     /// **P4.2 广播入口（rows 方向）**：`out[r·cols+c] = op(x[r·cols+c], w[r])`（`w.len() == rows`）。
     ///
-    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_rows`]：**每行 `w[r]` 只读一次**
+    /// `Add`/`Sub`/`Mul`/`Div` 走 `crate::ops::broadcast::map_binary_rows`（私有实现）：**每行 `w[r]` 只读一次**
     /// 并 splat 进 SIMD、行内连续扫 `cols`（4 路展开 + 8-lane 尾 + 标量尾）——逐元素无重排
     /// ⇒ 与 `kernels::scalar` 默认**逐位**。`Max`/`Min`/未来变体委托标量参照（NaN 语义不同）。
     fn map_binary_rows_f32(
@@ -406,7 +406,7 @@ impl Backend for LasxBackend {
 
     /// **P4.2 广播入口（cols 方向）**：`out[r·cols+c] = op(x[r·cols+c], w[c])`（`w.len() == cols`）。
     ///
-    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_cols`]：**每行**用连续 `w` 向量
+    /// `Add`/`Sub`/`Mul`/`Div` 走 `crate::ops::broadcast::map_binary_cols`（私有实现）：**每行**用连续 `w` 向量
     /// 直接调用逐元素 SIMD 核（`ops::dsl_map::map_binary`）⇒ 与默认**逐位**；`Max/Min` 委托标量。
     fn map_binary_cols_f32(
         &self,
@@ -434,7 +434,7 @@ impl Backend for LasxBackend {
 
     /// **P4.2 标量二元入口**：`out[i] = op(x[i], scalar)`。
     ///
-    /// `Add`/`Sub`/`Mul`/`Div` 走 [`crate::ops::broadcast::map_binary_scalar`]（整段 SIMD，标量提前
+    /// `Add`/`Sub`/`Mul`/`Div` 走 `crate::ops::broadcast::map_binary_scalar`（私有实现；整段 SIMD，标量提前
     /// splat；与默认**逐位**）；`Max`/`Min` 委托标量参照（NaN 语义不同）。
     fn map_binary_scalar_f32(
         &self,
