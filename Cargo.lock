@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "attention_block"
+version = "0.1.0"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=41f64abcebbfd9e1a333088187244022867279f3#41f64abcebbfd9e1a333088187244022867279f3"
+dependencies = [
+ "ops_dsl",
+ "simd_dsl",
+]
+
+[[package]]
 name = "lasx_bench"
 version = "0.1.0"
 dependencies = [
@@ -13,6 +22,7 @@ dependencies = [
 name = "lasx_rs"
 version = "0.1.0"
 dependencies = [
+ "attention_block",
  "lasx_rs_macros",
  "ops_dsl",
  "simd_dsl",
@@ -32,7 +42,7 @@ dependencies = [
 [[package]]
 name = "ops_dsl"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=9def672a8be74538c4fb95a119e35b832f68575d#9def672a8be74538c4fb95a119e35b832f68575d"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=41f64abcebbfd9e1a333088187244022867279f3#41f64abcebbfd9e1a333088187244022867279f3"
 dependencies = [
  "simd_dsl",
 ]
@@ -40,7 +50,7 @@ dependencies = [
 [[package]]
 name = "simd_dsl"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=9def672a8be74538c4fb95a119e35b832f68575d#9def672a8be74538c4fb95a119e35b832f68575d"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=41f64abcebbfd9e1a333088187244022867279f3#41f64abcebbfd9e1a333088187244022867279f3"
 dependencies = [
  "simd_dsl_macros",
 ]
@@ -48,4 +58,4 @@ dependencies = [
 [[package]]
 name = "simd_dsl_macros"
 version = "0.1.0"
-source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=9def672a8be74538c4fb95a119e35b832f68575d#9def672a8be74538c4fb95a119e35b832f68575d"
+source = "git+http://192.168.1.64/api/git/simd_dsl.git?rev=41f64abcebbfd9e1a333088187244022867279f3#41f64abcebbfd9e1a333088187244022867279f3"

@@ -37,22 +37,26 @@ lasx_rs_macros = { path = "macros", version = "0.1.0" }
 # （`git ls-remote <panel>` 取实值），否则本仓看到的是**旧快照**——③b-3b 就是因为 rev 钉在 `fc57fc7`
 # 而误判"`IdiomaticBackend` 未导出"（实际 `521e837` 已 `pub use idiomatic::IdiomaticBackend;`）。
 # 改完必须 `cargo update -p simd_dsl` 让 `Cargo.lock` 跟上。
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "9def672a8be74538c4fb95a119e35b832f68575d", optional = true }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "41f64abcebbfd9e1a333088187244022867279f3", optional = true }
 # **可选**：`ops_dsl`（算子库，含谱检测整帧 `detect`）——**只给"帧级 A/B"示例用**。
 # 依赖方向仍向下：`lasx_rs → ops_dsl → simd_dsl`；与 `simd_dsl` 同一个 rev（同一 git 仓的 workspace 成员）。
 # 仅在本 feature 下解析 ⇒ 默认构建不受影响（同上：一移动就 bump、并 `cargo update -p ops_dsl`）。
-ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "9def672a8be74538c4fb95a119e35b832f68575d", optional = true }
+ops_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "41f64abcebbfd9e1a333088187244022867279f3", optional = true }
+# **可选**：`attention_block`（DSL 仓的复杂算法示例库，后端泛型）——**只给复杂算法对照装置用**：
+# 同一份算法既跑可移植后端（simd 仓示例）也跑本仓 `LasxBackend`（`examples/algo_attention_lasx.rs`），
+# 零复制/零漂移。依赖方向仍向下（`lasx_rs → attention_block → ops_dsl → simd_dsl`），同一个 rev。
+attention_block = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "41f64abcebbfd9e1a333088187244022867279f3", optional = true }
 
 [features]
 # 把 `lasx_rs` 的 LASX 内核接成 `simd_dsl::Backend`（见 `src/dsl_backend.rs`）。
 # **默认关**：`cargo build` / `cargo test` / CI 十三步都不受影响。
-dsl-backend = ["dep:simd_dsl", "dep:ops_dsl"]
+dsl-backend = ["dep:simd_dsl", "dep:ops_dsl", "dep:attention_block"]
 
 # **conformance harness（task-80）**：`simd_dsl` 的 `conformance` feature 只在测试构建启用
 # （与上面的 `[dependencies]` 是同一个包、同一个 rev；dev-dependency 只是给测试 crate 打开 feature）。
 # 这样默认/生产构建不会把 harness 编进来。
 [dev-dependencies]
-simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "9def672a8be74538c4fb95a119e35b832f68575d", features = ["conformance"] }
+simd_dsl = { git = "http://192.168.1.64/api/git/simd_dsl.git", rev = "41f64abcebbfd9e1a333088187244022867279f3", features = ["conformance"] }
 
 # `tests/conformance.rs`：1 行 `backend_conformance!(LasxBackend)` ⇒ 16 个通用测试 / 15 组。
 # 依赖 `dsl-backend`（`LasxBackend` 在该 feature 下才编译）。
@@ -169,5 +173,13 @@ required-features = ["dsl-backend"]
 # 几何 f32（LASX 仅 f64 版本）均**如实跳过**（见 example 文件头）。
 [[example]]
 name = "dsl_vs_lasx_ab2"
+required-features = ["dsl-backend"]
+
+# `algo_attention_lasx`（2026-10-23）：**复杂算法三方对照的 LASX 测量入口**——跑 DSL 仓
+# `attention_block` 库里的同一份算法（512×512 单头注意力块）于 `LasxBackend`，输出
+# `ALGO impl=lasx …` 供 `simd_dsl/scripts/bench_algo_vs_openblas.sh` 与可移植/OpenBLAS 对照。
+# 算法与示例在 DSL 仓；本文件只做后端替换 + 计时（不复制算法）。
+[[example]]
+name = "algo_attention_lasx"
 required-features = ["dsl-backend"]
 
