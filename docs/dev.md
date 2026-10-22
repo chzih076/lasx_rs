@@ -173,7 +173,8 @@ lasx_rs/
   否则 `_strided`；`execute_composed(stages=5)`，无独立 5 抽头执行体）+ `direct_strided`/`red_black`/`rolling` 专用调度
   （跨步/多色/滚动三行缓冲，`rewrite` 无法表达、搬入会改数值/性能路径；`rolling` 的 stages 是**变量**）。
   **spectral + pool 已迁 simd `ops_dsl/examples/spectral/`（引擎算法感知/数据流验证台）**：不再属引擎白名单/门禁扫描面，
-  `ops_dsl` 公开面移除（原 53 步/58 处 `ops::pool` 引用/1069 行的用户层算法编排保留在示例；见 simd `structure.md §2` 分层判据）。
+  `ops_dsl` 公开面移除（原 53 步/58 处 `ops::pool` 引用/1069 行的用户层算法编排保留在示例；2026-10-23 死链清理后 **49 步**，
+  见 simd `structure.md §2` 分层判据）。
   实测归因（如实）：`Laplacian2dSeparable` 的 A/B **1.18–1.45× 不是路由收益**，主要来自**转置拷贝并行化**
   （新 helper `run_transpose_copy_f32`）；Gaussian helpers（`HALF_PAIRS`/`tap7_1d`/`add_sym_pair`/`zero_ring_3`）是
   **算子专用**、随迁移进引擎，非通用原语。
@@ -767,7 +768,8 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-21 | `a1ba57f`（含 `31e5a6a`/`b4a1db7`） | rev bump（本仓同提交） | **引擎优化审计**：修短输入 panic + 轻逐元素并行阈值；`Capability::MatmulF64` 不再报（+lasx 实测 512³ 3.28×/1024×256×1024 2.47×）；i8/Gelu 的"负收益"经 +lasx 复测反转为 plan 更快 ⇒ 保持 plan 路由；同批 `b4a1db7` rustdoc 链接修正、`a1ba57f` API 面基线更新（轻逐元素两项公开项有意新增）；审计结论见本文件 §7.3.3 与 simd 仓 `docs/engine_integration.md`「引擎优化审计」节 |
 | 2026-10-22 | `194bd77`（含 `c974aba`/`116eeaf`/`6d90d78`/`d2840e7`） | rev bump（本仓同提交） | **组合桥清零（业务算子）**：A7（matmul4+index2+embedding1）+ B8（reduce，含 amax 3 趟→1 趟，Scalar 2.75×/LASX 18.5×）+ C3（stencil：laplacian_separable 因转置拷贝并行化 1.18–1.45×、blur sep/direct）共 **18 个入口升级 `Algorithm`**；`enginecheck` 终态 **真实优化 16 模块/56 入口、业务组合桥 0、白名单 11 条（spectral 7 + stencil 4，逐条理由）+ 链入口 1**（**注：194bd77 当时快照；2026-10-22 晚 spectral/pool 迁 simd examples ⇒ 白名单缩为 4、真实 16/53，见 §2.6/§7.3.4**）；`hw_threads` 缓存（available_parallelism ≈66µs/次→一次）；独立复核 342/342 digest 0 差异；详见 simd 仓 `docs/engine_integration.md` 的「终态迁移闭环」节 |
 | 2026-10-22 | `e51bb9c`（本仓同提交） | rev bump（本仓同提交） | **spectral+pool 迁 simd `ops_dsl/examples/spectral/`（引擎算法感知/数据流验证台）**：`ops_dsl` 公共面删除 `spectral`/`pool` ⇒ 白名单 **4（stencil2d）**+ 链入口 1、真实优化 **16 模块/53 入口**（`build.rs` 计数修正：不再把注释/文档字样计入）；本仓删 `examples/spectral_frame_ab.rs`、`dsl_perf_report.rs` 去掉谱检测段（section 11→10），LASX 专属帧级 A/B 历史读数归档 §7.3.4；`cargo update` 三处 simd rev；门禁全绿 |
-| 2026-10-23 | `4886934`（本仓同提交） | rev bump（本仓同提交） | **引擎整算法感知 G2+G1**（simd 新增 `AlgoDecision`/`ComposedReport::decisions`（G2）与 `StageGraph`/`StageInfo`/`DataflowReport`/`execute_composed_graph`（G1），公开面 512→537）；spectral 验证台接入：A 段上报 `dft=direct|fft` 决策、B 段打印引擎 `DataflowReport`（53 阶段/61 缓冲/12 逃逸/max_live 6/**死写 d_ada@45**——G1 首个真实产出）；本仓 §7.3.4 补 G1/G2 API 说明；三个 simd rev 同步；门禁全绿 |
+| 2026-10-23 | `4886934`（本仓同提交） | rev bump（本仓同提交） | **引擎整算法感知 G2+G1**（simd 新增 `AlgoDecision`/`ComposedReport::decisions`（G2）与 `StageGraph`/`StageInfo`/`DataflowReport`/`execute_composed_graph`（G1），公开面 512→537）；spectral 验证台接入：A 段上报 `dft=direct|fft` 决策、B 段打印引擎 `DataflowReport`（53 阶段/61 缓冲/12 逃逸/max_live 6/**死写 d_ada@45**——G1 首个真实产出；**后于 `bff9bc9` 清理为 49 阶段/57 缓冲/`dead_writes` 空**）；本仓 §7.3.4 补 G1/G2 API 说明；三个 simd rev 同步；门禁全绿 |
+| 2026-10-23 | `58e665d`（本仓同提交） | rev bump（本仓同提交） | **spectral 死链清理闭环**（simd `bff9bc9` 删 ㊷–㊺ `cdb/ca/adth/d_ada` 死链，53→49 步；digest `0x4ad8d6d5753b6dd9` 不变、逐位等价；帧分配 49→43/帧、−6,144 B；detect 计时噪声内；`dead_writes` 清零、`max_live` 6→5）；本仓文档 49 阶段口径同步；三个 simd rev bump；门禁全绿 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -864,7 +866,7 @@ simd demo 的 `--mode frame-ab` 只保留**可移植档** rebuild vs reuse（同
 
 **后续（2026-10-23，不改变历史数字）**：simd 引擎已公开 **G1/G2 API**（`AlgoDecision`、
 `StageGraph`/`DataflowReport`、`execute_composed_decided(_with)`/`execute_composed_graph(_with)`）；
-simd `spectral_detect` 验证台现可上报 **53 阶段数据流**与 **DFT 决策**（`dft=direct|fft`），
+simd `spectral_detect` 验证台现可上报 **49 阶段数据流**（2026-10-23 死链清理后；原 53）与 **DFT 决策**（`dft=direct|fft`），
 即本目录旧台架要回答的"引擎能看见什么"已由 simd 侧 API/示例承接（历史读数仍以上表/归档为准）。
 
 **历史读数**（归档：`/home/lik/tmp_keep/results/spectral_frame_ab_lasx.txt`；lasx HEAD `3040aad` / ops_dsl@`194bd77`，
