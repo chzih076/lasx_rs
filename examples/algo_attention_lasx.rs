@@ -16,6 +16,7 @@
 use std::time::Instant;
 
 use attention_block::{DIM, EPS, Inputs, ROWS, digest, loadavg, run};
+use lasx_rs::arch::parallelism;
 use lasx_rs::dsl_backend::LasxBackend;
 
 fn bench(be: &LasxBackend, b: &Inputs, iters: usize) -> (f64, f64, Vec<f32>, f32) {
@@ -102,9 +103,14 @@ fn main() -> std::process::ExitCode {
         std::fs::write(path, bytes).expect("写 Z 失败");
     }
     let dg = digest(&z, amax);
+    let par = parallelism();
+    println!(
+        "BACKEND lasx logical={} physical={} policy=smt-avoid+physical-core-pool+cpuset-capped+dynamic-chunk",
+        par.logical, par.physical
+    );
     println!(
         "ALGO impl=lasx threads={} rows={ROWS} dim={DIM} eps={EPS:e} iters={iters} ms_min={min:.6} ms_med={med:.6} digest=0x{dg:016x} amax={amax:.6e} loadavg={}",
-        std::thread::available_parallelism().map_or(1, |n| n.get()),
+        par.logical,
         loadavg()
     );
     std::process::ExitCode::SUCCESS

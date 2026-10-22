@@ -895,6 +895,39 @@ loadavg 4.93/3.52/2.29，6 对丢首对中位+极差）：
 
 > 归档文件是**唯一**可复核来源（示例已删）；引用时写"历史读数（归档）"，不得写成当前可复现结论。
 
+#### 7.3.5 复杂算法三方对照：DSL 可移植 / DSL-LASX / OpenBLAS（2026-10-23）
+
+**装置（可复现）**：算法/示例在 DSL 仓 `attention_block`（后端泛型 `run<B: Backend>`；512×512 单头
+注意力块 = 5 GEMM + softmax + 残差 + LayerNorm + amax）；本仓 `examples/algo_attention_lasx.rs`
+注入 `LasxBackend`（**零复制**同一算法）；OpenBLAS 侧 `simd_dsl/scripts/bench_algo_openblas.c`
+（cblas_sgemm + 标量组合）；runner `simd_dsl/scripts/bench_algo_vs_openblas.sh`（先验一致性 →
+交替轮次 → 中位/极差/比值）。复现：
+`cargo run --release --features dsl-backend --example algo_attention_lasx -- --bench`
+（或 sibling 两仓存在时跑 runner；`SKIP_LASX=1` 跳过 LASX 档）。
+
+**LASX 自动硬件策略（本仓提供，用户无需手写）**：`arch::parallelism()`（cpuset 感知 `logical` +
+sysfs 拓扑 `physical`，SMT 兄弟算一核）、`pool::WorkerPool::auto()`（池大小 = min(物理核, 可用逻辑核)，
+本机 24 逻辑 = 12 物理 ×2 SMT ⇒ 取 12）、动态取块（大 `m` 不固定等分）、池化；
+`algo_attention_lasx` 实测打印 `BACKEND lasx logical=24 physical=12 policy=smt-avoid+physical-core-pool+
+cpuset-capped+dynamic-chunk`；`taskset -c 0` 时打印 `logical=1 physical=1`（cpuset 感知、不超订）。
+依据：`src/pool/mod.rs` 的 256³ 三臂实测（12t **101.7/100.8 µs** vs 24t **163.9/135.1 µs**，
+SMT 兄弟互抢 L1/L2 ⇒ 超线程更差）与 `src/arch/mod.rs`；**不自动绑核**（绑核只在 1t 对照档由 runner
+手动 `taskset` 施加以保证单核公平）。
+
+**实测**（loadavg 3.6–3.9，window=ok；ITERS=3、ROUNDS=4 丢首轮；先验一致性：LASX-vs-可移植
+`max_rel=3.3e-7`、OpenBLAS-vs-可移植 `1.0e-6`，均 `ok=yes`）：
+
+| 档位 | DSL 可移植 | **DSL-LASX** | OpenBLAS | `C/LASX`（>1=DSL 更快） | LASX/可移植 |
+|---|---|---|---|---|---|
+| 1t（单核；C 单线程） | 177.1 ms | **32.5 ms** | 31.7 ms | **0.974**（基本持平） | 5.45× |
+| auto（24 线程） | 57.0 ms | **10.0 ms** | 16.5 ms（波动 12.7–27.4） | **1.648**（LASX 快 ~1.65×） | 5.69× |
+
+**引擎层"白得"（同一次实验可见）**：同一份 `attention_block::run` 上空引擎自动提供类型化 `Algorithm`
+分派、可选编译期形状入口（`matmul_const`）、`pipeline!` 编译期链展开、`engine::perceive` 的
+`const _: () = assert!(…)` 编译期自证、`build.rs`/enginecheck 编译期入口矩阵、`StageGraph` 数据流分析、
+rustc 风格诊断与 `fix` 建议、按规模自动的并行规模（本机 `default_threads(262144)=4`）——C/OpenBLAS 侧
+没有这些，且对照时不按 DSL 建议改 C 代码。详见 simd `docs/measurements/complex-algorithm-openblas.md`。
+
 ## 8. 已知边界与欠账
 
 ### 8.1 缺口与待办（按"要不要做"排）
