@@ -772,6 +772,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-23 | `58e665d`（本仓同提交） | rev bump（本仓同提交） | **spectral 死链清理闭环**（simd `bff9bc9` 删 ㊷–㊺ `cdb/ca/adth/d_ada` 死链，53→49 步；digest `0x4ad8d6d5753b6dd9` 不变、逐位等价；帧分配 49→43/帧、−6,144 B；detect 计时噪声内；`dead_writes` 清零、`max_live` 6→5）；本仓文档 49 阶段口径同步；三个 simd rev bump；门禁全绿 |
 | 2026-10-23 | `d5bd872`（本仓同提交） | rev bump（本仓同提交） | **引擎诊断组件（rustc 风格，中/英）**：simd 新增 `engine::diag`（`Lang/Level/Label/SourceLine/Diagnostic/Diagnostics`，rustc 形态 `警告[…]:`/`-->`/片段+`^^^^`/`= 注意/帮助`，正文全量双语）并接入 G1 数据流（`analyze_diagnostics(lang)`/`summary(lang)`/`diagnostic(_lang)`）；spectral 验证台提供 `--lang zh|en` 与 `--mode bad-graph`（错误形态演示）；公开面 578；本仓 §7.3.4 补说明、rev 同步；门禁全绿 |
 | 2026-10-23 | `966b61c`（本仓同提交） | rev bump（本仓同提交） | **诊断支持 fix（机器可应用修复建议，cargo-fix 风格）**：`Fix`/`Applicability` + `GraphFix`（死写⇒删除+重编号 MachineApplicable；use-before-def⇒前移 MaybeIncorrect；重复号⇒重编号 MachineApplicable；**非单调号⇒MaybeIncorrect**，迭代收敛）+ `fixes`/`verify`/`render_source`/`analyze_stages`；spectral 验证台 `--fix`/`--mode bad-graph --fix`（补丁 + `= 应用后` 验证）；§7.3.4 补说明；公开面 597；门禁全绿 |
+| 2026-10-23 | `9def672`（本仓同提交） | rev bump（本仓同提交） | **复杂算法示例放回 DSL 仓**：`ops_dsl/examples/algo_attention.rs`（512×512 单头注意力块，ops_dsl 拼装 + 引擎分析/诊断/fix 展示）+ OpenBLAS C 对照装置（`simd_dsl/scripts/bench_algo_*`，先验一致性 `max_rel=1.0e-6`；可移植后端 1t C/DSL=0.18、auto=0.28；参照：本仓已入库 `512³` 单 GEMM LASX vs OpenBLAS=0.936）；fix 安全边界（多写阶段死写 ⇒ Manual）同步；三处 simd rev bump；门禁全绿 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
