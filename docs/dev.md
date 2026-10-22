@@ -165,19 +165,19 @@ lasx_rs/
   → 编译期报告加入"链入口"（`94c376f`）。
 * 引擎把组合路径**并行化**（`a57412e`）、真实优化扩面（8 模块 + 13 入口，`e88c6c4`→`c69f08e`）、
   matmul/transpose 并行（`fe2e191`）、complex/laplace/diff 优化（`fffbf4a`）、决策可见性（编译期打印 + 运行时零成本，`f65bed1`）。
-* **2026-10-22 终态**：18 个 `ops_dsl` 模块全部有引擎入口；**业务算子执行入口 100% `Algorithm`（业务算子组合桥 0）**，
-  真实优化 **16 模块 / 56 入口**（A7+B8+C3=18 条组合桥已迁移）；`enginecheck --matrix` 未接线 0。
-  **白名单 11 条 + 链入口 1 条（单列）**：spectral 7（plan/stages 管理、诊断、零分配/plan 复用形态、用户层算法编排——
-  53 步 + 58 处 `ops::pool` 引用/1069 行，搬进通用引擎属**分层违规**，见 simd `structure.md §2` 分层判据小节）、
-  stencil 4（`laplacian_2d_direct` **薄校验 + P2-7 分派决策**（`rows>=5 && cols>=512 && ud.len()>=3*(cols-2)` ⇒ `rolling`，
+* **2026-10-22 终态**：`ops_dsl/src` 现 **17 个算子模块**（18 个 `.rs` 含 `lib.rs`；`spectral`/`pool` 已迁 `ops_dsl/examples/spectral/`）
+  全部有引擎入口；**业务算子执行入口 100% `Algorithm`（业务算子组合桥 0）**，
+  真实优化 **16 模块 / 53 入口**（A7+B8+C3=18 条组合桥已迁移；引擎矩阵实测）；`enginecheck --matrix` 未接线 0。
+  **白名单 4 条（stencil2d）+ 链入口 1 条（单列，pipeline）**：
+  stencil 4 = `laplacian_2d_direct` **薄校验 + P2-7 分派决策**（`rows>=5 && cols>=512 && ud.len()>=3*(cols-2)` ⇒ `rolling`，
   否则 `_strided`；`execute_composed(stages=5)`，无独立 5 抽头执行体）+ `direct_strided`/`red_black`/`rolling` 专用调度
-  （跨步/多色/滚动三行缓冲，`rewrite` 无法表达、搬入会改数值/性能路径；`rolling` 的 stages 是**变量**））、
-  `pipeline` 链入口 1（`execute_map_chain`，引擎持整条链）。
+  （跨步/多色/滚动三行缓冲，`rewrite` 无法表达、搬入会改数值/性能路径；`rolling` 的 stages 是**变量**）。
+  **spectral + pool 已迁 simd `ops_dsl/examples/spectral/`（引擎算法感知/数据流验证台）**：不再属引擎白名单/门禁扫描面，
+  `ops_dsl` 公开面移除（原 53 步/58 处 `ops::pool` 引用/1069 行的用户层算法编排保留在示例；见 simd `structure.md §2` 分层判据）。
   实测归因（如实）：`Laplacian2dSeparable` 的 A/B **1.18–1.45× 不是路由收益**，主要来自**转置拷贝并行化**
   （新 helper `run_transpose_copy_f32`）；Gaussian helpers（`HALF_PAIRS`/`tap7_1d`/`add_sym_pair`/`zero_ring_3`）是
   **算子专用**、随迁移进引擎，非通用原语。
-  此前"后两者不升级有硬证据"的结论由本次分层裁决取代（原委保留：阶段数作为 `Algorithm` 参数由引擎入口校验，
-  不再由算子层自行解释）。
+  此前"后两者不升级有硬证据"的结论由本次分层裁决取代（spectral 迁示例区；stencil 3 迁移 + 4 白名单）。
 * **ROI 判定（如实）**：`axpy→rms` 融合、matmul epilogue 融合均**暂不采纳**（向量化后端下收益只剩 1.107×，见 §7 表）；
   **线程池亦不采纳**（`forbid(unsafe_code)` 下 std 无作用域池；实测空 scope 12 线程 267µs，
   axpy n=262144 并行仅 0.35×、1M 0.98×、4M 1.63×）。
@@ -765,7 +765,8 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-20 | `75b31dd` / `b497671` / `6abb2b3` | rev bump（HEAD 待 bump） | 比赛缺口清零：absmax_rows 单趟化（8×→1.0–1.12×）、gelu_quick 融合快路径（10.7×→0.97–0.99×）、FFT 峰值 8.02 MiB、stages/plan 复用（稳态 2 次/256 B） |
 | 2026-10-21 | `dc6a092` | rev bump（本仓同提交） | Backend 契约精简（删 6 条零消费方法；实测"减方法数不提速"）+ **广播/标量二元 override**（rows 4.63×/cols 4.27×，scalar 持平）；删 2 条 LASX 死 override/死内核 |
 | 2026-10-21 | `a1ba57f`（含 `31e5a6a`/`b4a1db7`） | rev bump（本仓同提交） | **引擎优化审计**：修短输入 panic + 轻逐元素并行阈值；`Capability::MatmulF64` 不再报（+lasx 实测 512³ 3.28×/1024×256×1024 2.47×）；i8/Gelu 的"负收益"经 +lasx 复测反转为 plan 更快 ⇒ 保持 plan 路由；同批 `b4a1db7` rustdoc 链接修正、`a1ba57f` API 面基线更新（轻逐元素两项公开项有意新增）；审计结论见本文件 §7.3.3 与 simd 仓 `docs/engine_integration.md`「引擎优化审计」节 |
-| 2026-10-22 | `194bd77`（含 `c974aba`/`116eeaf`/`6d90d78`/`d2840e7`） | rev bump（本仓同提交） | **组合桥清零（业务算子）**：A7（matmul4+index2+embedding1）+ B8（reduce，含 amax 3 趟→1 趟，Scalar 2.75×/LASX 18.5×）+ C3（stencil：laplacian_separable 因转置拷贝并行化 1.18–1.45×、blur sep/direct）共 **18 个入口升级 `Algorithm`**；`enginecheck` 终态 **真实优化 16 模块/56 入口、业务组合桥 0、白名单 11 条（spectral 7 + stencil 4，逐条理由）+ 链入口 1**；`hw_threads` 缓存（available_parallelism ≈66µs/次→一次）；独立复核 342/342 digest 0 差异；详见 simd 仓 `docs/engine_integration.md` 的「终态迁移闭环」节 |
+| 2026-10-22 | `194bd77`（含 `c974aba`/`116eeaf`/`6d90d78`/`d2840e7`） | rev bump（本仓同提交） | **组合桥清零（业务算子）**：A7（matmul4+index2+embedding1）+ B8（reduce，含 amax 3 趟→1 趟，Scalar 2.75×/LASX 18.5×）+ C3（stencil：laplacian_separable 因转置拷贝并行化 1.18–1.45×、blur sep/direct）共 **18 个入口升级 `Algorithm`**；`enginecheck` 终态 **真实优化 16 模块/56 入口、业务组合桥 0、白名单 11 条（spectral 7 + stencil 4，逐条理由）+ 链入口 1**（**注：194bd77 当时快照；2026-10-22 晚 spectral/pool 迁 simd examples ⇒ 白名单缩为 4、真实 16/53，见 §2.6/§7.3.4**）；`hw_threads` 缓存（available_parallelism ≈66µs/次→一次）；独立复核 342/342 digest 0 差异；详见 simd 仓 `docs/engine_integration.md` 的「终态迁移闭环」节 |
+| 2026-10-22 | `e51bb9c`（本仓同提交） | rev bump（本仓同提交） | **spectral+pool 迁 simd `ops_dsl/examples/spectral/`（引擎算法感知/数据流验证台）**：`ops_dsl` 公共面删除 `spectral`/`pool` ⇒ 白名单 **4（stencil2d）**+ 链入口 1、真实优化 **16 模块/53 入口**（`build.rs` 计数修正：不再把注释/文档字样计入）；本仓删 `examples/spectral_frame_ab.rs`、`dsl_perf_report.rs` 去掉谱检测段（section 11→10），LASX 专属帧级 A/B 历史读数归档 §7.3.4；`cargo update` 三处 simd rev；门禁全绿 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -800,7 +801,8 @@ LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 
 3. **t=12 matmul 曾慢 3.9×**：根因是"引擎行切块 × 后端线程池"双重并行（嵌套 21.4ms vs 只后端 6.3ms）；
    本轮用 `Capability::Threaded` 让引擎不再外层切块，修复后 **0.996×**。
 4. 缺口（如实跳过，不用近似臂）：`sum_cols`/`sum_rows`/`weighted_sum_cols`（LASX 无公开 `api::*` 入口）、
-   `spectral detect`/`stencil2d`（LASX 无对应库算子）、几何 f32（LASX 仅有 f64 版本）、FFT（两臂均无实现）。
+   `spectral detect`（**现迁 simd `ops_dsl/examples/spectral` 验证台**）/`stencil2d`（LASX 无对应库算子）、
+   几何 f32（LASX 仅有 f64 版本）、FFT（两臂均无实现）。
 5. 公平性限制：LASX 臂是"库算子"，DSL 臂是"宏算子 + 同一后端"——两者都未含输入生成/校验/打包；
    所有数字都是本机同窗口趋势，跨窗口不可比。
 
@@ -852,12 +854,29 @@ simd 引擎审计（见 simd 仓 `docs/engine_integration.md` 的「引擎优化
 2. `supports_plan`/`supports` 是**性能声明**，必须在目标后端、目标 flags 下实测"声明路 ≥ 基线路"才可报
    true；但在据此**改声明**之前，先确认基线测的是生产内核（否则会把测量装置问题写成代码问题）。
 
+#### 7.3.4 LASX 专属帧级 A/B（`spectral_frame_ab`）下线（2026-10-22）
 
+**状态：已删除、不再可复现。** spectral 已于 2026-10-22 迁 simd `ops_dsl/examples/spectral/`（引擎算法感知/
+数据流验证台）；`lasx_rs/examples/spectral_frame_ab.rs`（LASX 专属帧级 A/B 台架）随之删除——
+simd demo 的 `--mode frame-ab` 只保留**可移植档** rebuild vs reuse（同进程交替 8 对丢首对、min+中位、逐位断言），
+**不再包含 LASX 专属 ④–⑦ 对比**。`examples/dsl_perf_report.rs` 也已去掉 W10（section 11→10）并改用 simd demo。
 
+**历史读数**（归档：`/home/lik/tmp_keep/results/spectral_frame_ab_lasx.txt`；lasx HEAD `3040aad` / ops_dsl@`194bd77`，
+loadavg 4.93/3.52/2.29，6 对丢首对中位+极差）：
 
+| # | 对比 | 数字 |
+|---|---|---|
+| 正确性 | LASX 档 FFT vs Direct | out masked_rel **5.075e-7**；psd masked_rel **8.915e-5** |
+| ① | `build_plan` Direct / FFT | 15.229 / 0.331 ms ⇒ **46.00×** |
+| ② | 帧体（预建）Direct / FFT | 18.181 / 14.269 ms ⇒ **1.274×** |
+| ③ | 一次性 detect Direct / FFT | 37.876 / 15.048 ms ⇒ **2.517×** |
+| ④ | 一次性 detect Auto(FFT) 可移植 / LASX | 57.666 / 14.914 ms ⇒ **3.867×** |
+| ⑤ | 一次性 detect Direct 可移植 / LASX | 347.011 / 36.304 ms ⇒ **9.558×** |
+| ⑥ | 帧体（FFT，预建）接族前 / 接族后 | 40.284 / 14.322 ms ⇒ **2.813×** |
+| ⑦ | 一次性 detect（FFT）接族前 / 接族后 | 39.948 / 13.939 ms ⇒ **2.866×** |
+| 正确性 | ⑥⑦ 接族前后 | out masked_rel **3.625e-7** |
 
-
-
+> 归档文件是**唯一**可复核来源（示例已删）；引用时写"历史读数（归档）"，不得写成当前可复现结论。
 
 ## 8. 已知边界与欠账
 
@@ -909,12 +928,12 @@ simd 引擎审计（见 simd 仓 `docs/engine_integration.md` 的「引擎优化
 | 欠账 | 结论 | 依据 |
 |---|---|---|
 | 组合桥升级（`iso_kernel`/`kv_cache`） | **已结清**：升级为 `Algorithm::IsoKernelBuild`/`KvCacheWrite`，入口改走 `engine::execute`；新路径与旧宏展开的等价物 `to_bits()` 全等 | simd `7c40fc3`；enginecheck 15/3/0 |
-| `spectral`/`stencil2d` 升级 | **不升级**：阶段数是运行期变量、`gaussian_blur` 最大 97 阶段、变体字段会爆炸，且算法知识属算子层（分层倒挂） | simd 侧评估（task-115 notes） |
+| `spectral`/`stencil2d` 升级 | **部分结清（2026-10-22 终态）**：stencil2d = 3 条迁移 `Algorithm` + 4 条白名单（专用调度/薄校验分派）；**spectral 已迁 simd `ops_dsl/examples/spectral` 验证台**（用户层算法编排不搬通用引擎，见 simd `structure.md §2` 分层判据；原"不升级"结论被取代） | simd `d2840e7`、task-160；enginecheck 16/4/1 |
 | 引擎线程池 | **不采纳**：`#![forbid(unsafe_code)]` 下 std 无作用域池；空 scope 12 线程 267µs，axpy n=262144 并行 0.35×、1M 0.98×、4M 1.63×（跨算子调度收益已由 chain 的"整链一次 spawn"拿到） | simd `9de506a` |
 | 入口计数含测试代码 | **已结清**：`enginecheck`/`build.rs` 剥离 `#[cfg(test)]`；编译期打印 33/28/1（旧 41 虚增 8 次） | simd `9de506a` |
 | P2/P3 数值融合 | **不采纳**（P2 上限 1.291×→向量后端 1.107× 且非逐位；P3 epilogue 占比 0–1%） | simd ROI 记录 |
 | 文档臃肿 | **已清理**：dev 7807→~870、ops 2705→1200、AGENTS 835→97；simd docs 2452→1570 | 本轮提交 |
-| P4.1 归约/epilogue 融合 | **已落地、无剩余**：spectral detect 已 2 趟（plan 复用 1 趟）⇒ 已到 1 读 1 写下限，无可再融趟数 | simd `ops_dsl/src/spectral.rs` :234/:287/:370/:390 |
+| P4.1 归约/epilogue 融合 | **已落地、无剩余**：spectral detect 已 2 趟（plan 复用 1 趟）⇒ 已到 1 读 1 写下限，无可再融趟数 | simd `ops_dsl/examples/spectral/mod.rs`（原 `src/spectral.rs`，2026-10-22 迁出）:234/:287/:370/:390 |
 | P4.2 liveness 三桶池 | **已接线 + 峰值收尾**：51 处中间缓冲换 `pool::take`（逐位，12 组摘要逐字相同）；帧点接线前 49 alloc/21.12 MiB ⇒ 稳态 0/0；**分阶段早释放后同时存活峰值 Direct 22.14 MB → 8.404992 MB（8.0156 MiB；模型 8.406016 MB，差 0.012%）**、Auto(FFT) 30.53 → 8.91 MB（结构下界：2×n×b+首个 p×b）；resident 21.12/29.12 → **9.54 MiB**；A/B Direct 0.9602×、FFT 0.9321×（loadavg 2.61/2.54/3.49）；`release_idle()` 帧间可回收（测试）；遗留：Escaped 12 个 Vec + `build_plan` 计划缓冲仍每帧分配 | simd `4387c9c`、`ee1619d` |
 | f64 逐元素/轴归约 + geometry auto | **已闭环**：6 方法默认委托 scalar（5 逐位 + 行和容差实测 rel ≤1e-14）；5 个 f64 几何入口经 `engine::execute`，引擎按 `supports_plan` 选融合/组合（cap 不参与）；两路与零向量语义已测 | simd `dc93583` |
 | LASX 行归约自动并行 | **已落地**：`reduce_rows_map_f32` 8K 阈值按行块并行（逐位）；8K 2.71×、128K 8.68×、67M 2.48×（loadavg≈5 ⇒ 趋势）；**`reduce_sum_rows_f32` override + 行块并行**（4M 阈值、逐位；4.2M 8.55×、67M 2.17×，grade A）；**max/min 族 6 方法 override**：4 个轴方向 4M 阈值并行（行方向 4.2M 6.2–6.3×、67M 5.4–5.6×；列方向 ≤33.5M 中性、67M 6×），整片 max/min 保持顺序 fold（保 NaN payload/±0 逐位）；阈值以下 0.93–1.04× 无退化 | 本仓 `a7b61a6`、`354d3b8`、`be7f8f1` |

@@ -10,8 +10,11 @@
 //! * **DSL**＝`matmul!`/`dot!`/`sum!`/`wsum!`/`affine!`/`combine!`/`kernel!` → 引擎 → 后端；
 //! * **抽象层损失** ＝ `DSL 臂 / 同后端 L0 臂`（>1 的部分＝宏解析+引擎编排+分派的代价）。
 //!
-//! **无 L0 的行**：轴归约/加权归约/整帧 `detect` 在本仓没有手写公开入口（LASX 内核只经 `Backend`
-//! 暴露）⇒ 只给档位差，**不编造 L0**。
+//! **无 L0 的行**：轴归约/加权归约在本仓没有手写公开入口（LASX 内核只经 `Backend`
+//! 暴露）⇒ 只给档位差，**不编造 L0**。整帧谱检测已迁 `simd_dsl` 的
+//! `ops_dsl` 示例 `spectral_detect`：
+//! `cargo run --release -p ops_dsl --example spectral_detect`（`--mode frame-ab` = 可移植档
+//! rebuild vs reuse 跨帧 A/B + 逐位；`--check` = digest/池峰值/入口 stages 自检）。
 //!
 //! 复现：`cargo run --release --features dsl-backend --example dsl_perf_report`
 #![cfg(feature = "dsl-backend")]
@@ -19,11 +22,10 @@
 use std::cell::RefCell;
 use std::time::Instant;
 
-use lasx_rs::dsl_backend::{LasxBackend, LasxBackendHybrid};
-use ops_dsl::spectral::{DftMode, SpectralCfg, detect_stages};
+use lasx_rs::dsl_backend::LasxBackend;
 use simd_dsl::{
-    Backend, BinaryOp, IdiomaticBackend, KernelSpec, ScalarBackend, affine, combine, dot, kernel,
-    matmul, sum, wsum,
+    Backend, BinaryOp, IdiomaticBackend, KernelSpec, affine, combine, dot, kernel, matmul, sum,
+    wsum,
 };
 
 fn loadavg() -> String {
@@ -116,12 +118,7 @@ fn run<'a>(tag: &str, title: &str, mut arms: Vec<Arm<'a>>) {
 fn main() {
     println!("# DSL 完整性能报表（R19-F）\n");
     println!("loadavg = {}\n", loadavg());
-    let (lasx, hyb, port, scalar) = (
-        LasxBackend,
-        LasxBackendHybrid,
-        IdiomaticBackend,
-        ScalarBackend,
-    );
+    let (lasx, port) = (LasxBackend, IdiomaticBackend);
 
     // ---- W1: 方阵 matmul 512³（计算密集）----
     {
@@ -386,40 +383,6 @@ fn main() {
             }),
         ];
         run("W9", &format!("等距核构造 {rows}×{n}"), arms);
-    }
-
-    // ---- W10: 谱检测整帧 detect（真实工作点；无 L0）----
-    {
-        let (n, p, b) = (4096usize, 513usize, 256usize);
-        let cfg = SpectralCfg {
-            n,
-            p,
-            b,
-            dt: 1.0 / n as f32,
-            eps: 1.0e-12,
-            k_soft: 6.0,
-            dft: DftMode::Auto,
-        };
-        let x: Vec<f32> = (0..n * b)
-            .map(|i| ((i * 37 % 101) as f32) * 0.05 - 2.5)
-            .collect();
-        let threshold = vec![-40.0f32; b];
-        let fw = cfg.normalized_fw();
-        let arms = vec![
-            Arm::new("DSL+LASX", || {
-                let _ = detect_stages(&lasx, &cfg, &x, &threshold, &fw).unwrap();
-            }),
-            Arm::new("DSL+可移植", || {
-                let _ = detect_stages(&port, &cfg, &x, &threshold, &fw).unwrap();
-            }),
-            Arm::new("DSL+LASX(hybrid)", || {
-                let _ = detect_stages(&hyb, &cfg, &x, &threshold, &fw).unwrap();
-            }),
-            Arm::new("DSL+Scalar", || {
-                let _ = detect_stages(&scalar, &cfg, &x, &threshold, &fw).unwrap();
-            }),
-        ];
-        run("W10", &format!("谱检测整帧 detect n={n} p={p} b={b}"), arms);
     }
 
     // ---- W11: 原地按列 FFT 本体（4096×256，帧里 DFT 的核心；R19-H 接 LASX）----
