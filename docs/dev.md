@@ -771,6 +771,7 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-23 | `4886934`（本仓同提交） | rev bump（本仓同提交） | **引擎整算法感知 G2+G1**（simd 新增 `AlgoDecision`/`ComposedReport::decisions`（G2）与 `StageGraph`/`StageInfo`/`DataflowReport`/`execute_composed_graph`（G1），公开面 512→537）；spectral 验证台接入：A 段上报 `dft=direct|fft` 决策、B 段打印引擎 `DataflowReport`（53 阶段/61 缓冲/12 逃逸/max_live 6/**死写 d_ada@45**——G1 首个真实产出；**后于 `bff9bc9` 清理为 49 阶段/57 缓冲/`dead_writes` 空**）；本仓 §7.3.4 补 G1/G2 API 说明；三个 simd rev 同步；门禁全绿 |
 | 2026-10-23 | `58e665d`（本仓同提交） | rev bump（本仓同提交） | **spectral 死链清理闭环**（simd `bff9bc9` 删 ㊷–㊺ `cdb/ca/adth/d_ada` 死链，53→49 步；digest `0x4ad8d6d5753b6dd9` 不变、逐位等价；帧分配 49→43/帧、−6,144 B；detect 计时噪声内；`dead_writes` 清零、`max_live` 6→5）；本仓文档 49 阶段口径同步；三个 simd rev bump；门禁全绿 |
 | 2026-10-23 | `d5bd872`（本仓同提交） | rev bump（本仓同提交） | **引擎诊断组件（rustc 风格，中/英）**：simd 新增 `engine::diag`（`Lang/Level/Label/SourceLine/Diagnostic/Diagnostics`，rustc 形态 `警告[…]:`/`-->`/片段+`^^^^`/`= 注意/帮助`，正文全量双语）并接入 G1 数据流（`analyze_diagnostics(lang)`/`summary(lang)`/`diagnostic(_lang)`）；spectral 验证台提供 `--lang zh|en` 与 `--mode bad-graph`（错误形态演示）；公开面 578；本仓 §7.3.4 补说明、rev 同步；门禁全绿 |
+| 2026-10-23 | `966b61c`（本仓同提交） | rev bump（本仓同提交） | **诊断支持 fix（机器可应用修复建议，cargo-fix 风格）**：`Fix`/`Applicability` + `GraphFix`（死写⇒删除+重编号 MachineApplicable；use-before-def⇒前移 MaybeIncorrect；重复号⇒重编号 MachineApplicable；**非单调号⇒MaybeIncorrect**，迭代收敛）+ `fixes`/`verify`/`render_source`/`analyze_stages`；spectral 验证台 `--fix`/`--mode bad-graph --fix`（补丁 + `= 应用后` 验证）；§7.3.4 补说明；公开面 597；门禁全绿 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -869,6 +870,8 @@ simd demo 的 `--mode frame-ab` 只保留**可移植档** rebuild vs reuse（同
 `StageGraph`/`DataflowReport`、`execute_composed_decided(_with)`/`execute_composed_graph(_with)`）；
 并已提供 **rustc 风格中/英诊断（`engine::diag`：`Diagnostics`/`Diagnostic`，`analyze_diagnostics(lang)`/
 `summary(lang)`/`diagnostic(_lang)`）**，simd 验证台用 `--lang zh|en`（默认 zh）与 `--mode bad-graph` 演示错误形态；
+**诊断还支持 fix（机器可应用修复建议）**：`Fix`/`Applicability`/`GraphFix` + `StageGraph::fixes(lang)`/
+`fix_remove_stage`/`fix_move_before`/`fix_renumber`，验证台用 `--fix` / `--mode bad-graph --fix` 演示（patch + `= 应用后` 验证）；
 simd `spectral_detect` 验证台现可上报 **49 阶段数据流**（2026-10-23 死链清理后；原 53）与 **DFT 决策**（`dft=direct|fft`），
 即本目录旧台架要回答的"引擎能看见什么"已由 simd 侧 API/示例承接（历史读数仍以上表/归档为准）。
 
