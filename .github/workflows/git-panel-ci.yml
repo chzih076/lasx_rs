@@ -120,13 +120,14 @@ jobs:
           # （`rows` 那个 1.08× 扩展比就是静默退化的典型）。
           ./examples/c/matmul_mt_caller
           ./examples/c/matmul_mt_convenience
-      # **DSL 后端集成**（2026-10-16 加）：`lasx_rs` 实现 `simd_dsl::Backend` 的 **feature 门控**集成。
-      # 依赖从 panel 的 git 端点取（`rev` 已钉住），**默认构建完全不受影响**（无 feature 时
-      # `cargo tree` 里没有 `simd_dsl`）。这一步是**纯新增**：取不到依赖、或该 feature 下构建/测试
-      # 出问题，**都不许让前十三步变红** ⇒ `continue-on-error`。判据：日志里 `Finished` 与
-      # `test result: ok` 同时出现。
-      - name: DSL backend integration (feature-gated, additive)
-        continue-on-error: true
+      # **纯化守卫（2026-10-28，替代原 DSL 后端集成步）**：`lasx_rs` 已去掉全部 DSL 依赖
+      # （适配器迁到 DSL 仓 `backends/lasx`，方向 DSL 仓 → lasx）。此步钉住"纯化"承诺：
+      # manifest / lock 里不得再出现 `simd_dsl`/`ops_dsl`/`attention_block`，也不得有
+      # `dsl-backend` feature；本仓默认构建/测试就是全部内容。
+      - name: Purity guard (no DSL dependencies)
         run: |
-          cargo build --release --features dsl-backend
-          cargo test --release --features dsl-backend
+          if grep -nE 'simd_dsl|ops_dsl|attention_block|dsl-backend' Cargo.toml Cargo.lock; then
+            echo "::error::lasx_rs 已纯化：不得再出现 DSL 依赖/feature（适配器在 DSL 仓 backends/lasx）"
+            exit 1
+          fi
+          echo "OK：lasx_rs manifest/lock 零 DSL 依赖"
