@@ -126,8 +126,13 @@ jobs:
       # `dsl-backend` feature；本仓默认构建/测试就是全部内容。
       - name: Purity guard (no DSL dependencies)
         run: |
-          if grep -nE 'simd_dsl|ops_dsl|attention_block|dsl-backend' Cargo.toml Cargo.lock; then
+          # 只查**实际依赖行**（Cargo.toml 的注释里会解释"已删除 dsl-backend/simd_dsl…"，不算依赖）。
+          if grep -vE '^[[:space:]]*#' Cargo.toml | grep -nE 'simd_dsl|ops_dsl|attention_block|dsl-backend'; then
             echo "::error::lasx_rs 已纯化：不得再出现 DSL 依赖/feature（适配器在 DSL 仓 backends/lasx）"
+            exit 1
+          fi
+          if grep -nE 'simd_dsl|ops_dsl|attention_block' Cargo.lock; then
+            echo "::error::Cargo.lock 里出现 DSL crate（lasx_rs 应为零 DSL 依赖）"
             exit 1
           fi
           echo "OK：lasx_rs manifest/lock 零 DSL 依赖"
