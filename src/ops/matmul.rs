@@ -142,7 +142,7 @@ use std::arch::loongarch64::*;
 /// 所以口径按**表达式**定义（参考实现同样写成 `beta.mul_add(old, alpha * acc)`），不按
 /// "数学值"定义；NaN 的 payload 不在逐位承诺内。
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Epi {
+pub enum Epi {
     /// `C = acc`：不读 `C`，store 与既有内核逐字节相同。
     Plain,
     /// `C = alpha·acc`：不读 `C`。
@@ -589,7 +589,7 @@ pub(crate) fn matmul_f32_packed_at(
 /// 顺序版的 [`matmul_f32_packed`] 走的是同一个函数（`m4` 之后的行尾由调用方补），
 /// 所以并行与单线程**逐位一致**（每个输出元素沿 k 的升序累加不变）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn matmul_f32_packed_rows(
+pub fn matmul_f32_packed_rows(
     k: usize,
     n: usize,
     jb: usize,
@@ -1017,7 +1017,7 @@ pub(crate) fn matmul_f32_packed_rows_gen<G: FnMut(usize, &mut [f32])>(
 /// 18–46 GB/s（探针与端到端都测过）。循环顺序本身不是瓶颈（两种都实测过）。
 /// 一次处理 4 条带（读侧每行 512 B 连续）是端到端选的：宽 B 形状比单条带快 2%，其余打平。
 #[inline]
-pub(crate) fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
+pub fn pack_b(k: usize, n: usize, jb: usize, nc: usize, b: &[f32], packed: &mut [f32]) {
     let strips = nc / 32;
     let mut s0 = 0;
     while s0 < strips {
@@ -1220,7 +1220,7 @@ fn row_tail_packed(
 /// "16 累加器 + 4 载入 + 4 广播" 已经是寄存器可容纳的最优 ops/FMA 组合——
 /// `cRxC` 扫描里 `c8x16` 实测同样是 2.00 FMA/周期；改 f64 内核形状的同类尝试也实测否掉了。
 #[inline]
-pub(crate) fn pack_strips(k: usize) -> usize {
+pub fn pack_strips(k: usize) -> usize {
     const L2_BUDGET: usize = 2 * 1024 * 1024;
     let per_strip = (k * 32 * 4).max(1);
     (L2_BUDGET / per_strip).clamp(1, 256)
@@ -1464,7 +1464,7 @@ fn row_tail_f32(a_row: &[f32], c_row: &mut [f32], b: &[f32], k: usize, n: usize,
 /// `epi` 的标量段走 [`Epi::scalar`]（与参考实现同一个表达式）；`beta == 0` 时**不读**
 /// `c_row`。
 #[inline]
-pub(crate) fn row_tail_range_f32(
+pub fn row_tail_range_f32(
     a_row: &[f32],
     c_row: &mut [f32],
     b: &[f32],
