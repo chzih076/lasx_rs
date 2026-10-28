@@ -75,6 +75,12 @@
 #![allow(clippy::missing_transmute_annotations)]
 // extern "C" FFI 函数按约定解引用传入裸指针（调用方保证有效），非 unsafe fn 语义
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// **纯化（2026-10-28）**：`ops` 从私有内核层变为公开层（供 DSL 仓 `backends/lasx` 适配器调用），
+// 其文档注释里按私有时代写法用短链接互相引用（`map_*`/`Epi::scalar`/`SMALL_N` 等），且部分被
+// 引用的项仍是私有。**不改内核语义**，先允许 rustdoc 的这两类链接告警；清理归 docs 任务
+// （task-176）。注意：这是**文档链接**告警，不影响 `--document-private-items` 之外的 API。
+#![allow(rustdoc::broken_intra_doc_links)]
+#![allow(rustdoc::private_intra_doc_links)]
 
 // ---------------------------------------------------------------------------
 // 架构防呆：错架构要"错得明显"
