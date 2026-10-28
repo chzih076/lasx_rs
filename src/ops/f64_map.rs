@@ -33,7 +33,7 @@ use std::arch::loongarch64::*;
 ///
 /// `Max`/`Min` **不在此枚举里**：NaN 语义不同 ⇒ 由 `LasxBackend` 委托标量（见模块文档）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BinOpF64 {
+pub enum BinOpF64 {
     /// `x + y`
     Add,
     /// `x − y`
@@ -74,12 +74,13 @@ fn bin_vec(op: BinOpF64, a: lasx::F64x4, b: lasx::F64x4) -> lasx::F64x4 {
 /// # Safety
 /// 调用方保证 `x.len() == y.len() == out.len()` 且 `out` 不与 `x`/`y` 重叠。
 #[inline]
-pub(crate) fn map_binary(x: &[f64], y: &[f64], out: &mut [f64], op: BinOpF64) {
+pub fn map_binary(x: &[f64], y: &[f64], out: &mut [f64], op: BinOpF64) {
     let n = x.len();
     debug_assert_eq!(y.len(), n, "map_binary_f64：y 必须与 x 等长");
     debug_assert_eq!(out.len(), n, "map_binary_f64：out 必须与 x 等长");
     debug_assert!(
-        !std::ptr::eq(x.as_ptr(), out.as_ptr()) && !std::ptr::eq(y.as_ptr(), out.as_ptr()),
+        n == 0
+            || (!std::ptr::eq(x.as_ptr(), out.as_ptr()) && !std::ptr::eq(y.as_ptr(), out.as_ptr())),
         "map_binary_f64：out 不得与输入重叠（契约）"
     );
     let mut i = 0;
@@ -117,11 +118,11 @@ pub(crate) fn map_binary(x: &[f64], y: &[f64], out: &mut [f64], op: BinOpF64) {
 /// # Safety
 /// 调用方保证 `x.len() == out.len()` 且 `out` 不与 `x` 重叠。
 #[inline]
-pub(crate) fn map_affine(a: f64, b: f64, x: &[f64], out: &mut [f64]) {
+pub fn map_affine(a: f64, b: f64, x: &[f64], out: &mut [f64]) {
     let n = x.len();
     debug_assert_eq!(out.len(), n, "map_affine_f64：out 必须与 x 等长");
     debug_assert!(
-        !std::ptr::eq(x.as_ptr(), out.as_ptr()),
+        n == 0 || !std::ptr::eq(x.as_ptr(), out.as_ptr()),
         "map_affine_f64：out 不得与输入重叠（契约）"
     );
     let va = lasx::splat_f64(a);

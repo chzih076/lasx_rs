@@ -22,7 +22,7 @@
 //! 调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被 `clippy -D
 //! warnings` 的 `dead_code` 判死，又禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
-use simd_dsl::BackendError;
+use crate::api::Error;
 
 /// **行/列步长**（元素单位；不是字节）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +76,8 @@ impl Strides {
     }
 }
 
-fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) -> BackendError {
-    BackendError::LengthMismatch {
+fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) -> Error {
+    Error::Shape {
         op,
         what,
         expected,
@@ -93,19 +93,22 @@ fn check(
     st: Strides,
     rows: usize,
     cols: usize,
-) -> Result<bool, BackendError> {
+) -> Result<bool, Error> {
     match st.needed(rows, cols) {
         Some(0) => Ok(true),
         Some(need) if buf_len >= need => Ok(false),
         Some(need) => Err(len_err(op, what, need, buf_len)),
-        None => Err(len_err(op, what, usize::MAX, buf_len)),
+        None => Err(Error::Overflow {
+            op,
+            what: "视图所需长度",
+        }),
     }
 }
 
 /// **跨步拷贝**：`dst(r,c) = src(r,c)`。
 ///
 /// # Errors
-/// 任一侧按步长所需长度不足／乘法溢出 ⇒ `BackendError::LengthMismatch`。
+/// 任一侧按步长所需长度不足／乘法溢出 ⇒ [`Error::Shape`] / [`Error::Overflow`]。
 pub fn copy_strided_f32(
     src: &[f32],
     src_st: Strides,
@@ -113,7 +116,7 @@ pub fn copy_strided_f32(
     dst_st: Strides,
     rows: usize,
     cols: usize,
-) -> Result<(), BackendError> {
+) -> Result<(), Error> {
     if check("copy_strided_f32", "src", src.len(), src_st, rows, cols)? {
         return Ok(());
     }
@@ -154,7 +157,7 @@ pub fn map_binary_strided_f32(
     rows: usize,
     cols: usize,
     op: BinaryOpStrided,
-) -> Result<(), BackendError> {
+) -> Result<(), Error> {
     if check("map_binary_strided_f32", "x", x.len(), x_st, rows, cols)? {
         return Ok(());
     }

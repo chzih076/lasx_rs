@@ -88,7 +88,7 @@ fn butterfly(re: &mut [f32], im: &mut [f32], b: usize, i0: usize, i1: usize, wr:
 }
 
 /// 原地按列 radix-2 复数 FFT（正变换）。**前提**：`n` 是 2 的幂、`re/im` 长度都是 `n*b`。
-pub(crate) fn fft_strided(re: &mut [f32], im: &mut [f32], n: usize, b: usize) {
+pub fn fft_strided(re: &mut [f32], im: &mut [f32], n: usize, b: usize) {
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert!(re.len() == n * b && im.len() == n * b);
     let levels = n.trailing_zeros() as usize;

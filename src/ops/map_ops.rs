@@ -19,7 +19,7 @@ use std::arch::loongarch64::*;
 
 /// 本地产物：逐元素二元运算种类（与 `simd_dsl::BinaryOp` 的 `Add/Sub/Mul/Div` 一一对应）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BinOp {
+pub enum BinOp {
     /// `x + y`
     Add,
     /// `x − y`
@@ -45,7 +45,7 @@ fn bin_scalar(op: BinOp, a: f32, b: f32) -> f32 {
 /// # Safety
 /// 调用方保证 `x.len() == y.len() == out.len()` 且 `out` 不与 `x`/`y` 重叠。
 #[inline]
-pub(crate) fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
+pub fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
     let n = x.len();
     // **4 路展开（32 元素/迭代）**：逐元素运算没有归约 ⇒ 展开**不改变任何数值**（按构造逐位安全），
     // 只为摊薄循环开销、给访存更多并行度。动机是实测：单路版本在 1 MiB 档比 LLVM 自动向量化的
@@ -102,7 +102,7 @@ pub(crate) fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
 /// # Safety
 /// 调用方保证 `x.len() == out.len()` 且 `out` 不与 `x` 重叠。
 #[inline]
-pub(crate) fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: BinOp) {
+pub fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: BinOp) {
     let n = x.len();
     let s = lasx::splat_f32(scalar);
     macro_rules! vec_op_scalar {
@@ -146,7 +146,7 @@ pub(crate) fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: Bin
 /// # Safety
 /// 调用方保证 `x.len() == out.len()` 且 `out` 不与 `x` 重叠。
 #[inline]
-pub(crate) fn map_affine(a: f32, b: f32, x: &[f32], out: &mut [f32]) {
+pub fn map_affine(a: f32, b: f32, x: &[f32], out: &mut [f32]) {
     let n = x.len();
     let va = lasx::splat_f32(a);
     let vb = lasx::splat_f32(b);
@@ -188,7 +188,7 @@ pub(crate) fn map_affine(a: f32, b: f32, x: &[f32], out: &mut [f32]) {
 /// # Safety
 /// 调用方保证 `x.len() == rows·cols`、`out.len() == cols`、`out` 不与 `x` 重叠。
 #[inline]
-pub(crate) fn reduce_sum_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_sum_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     let work = (rows as u128) * (cols as u128);
     let pool = crate::pool::global();
     if work >= PAR_MIN_REDUCE_ELEMS && pool.threads() > 1 && cols >= 8 {
@@ -203,12 +203,12 @@ pub(crate) fn reduce_sum_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f3
 /// 实测（12 线程、loadavg≈1.3）：33.5M 元素 **1.007×（中性、无退化）**，67M **4.04×/5.17×**；
 /// 4.2M 及以下 0.98–1.04×（无效）⇒ 阈值取 33.5M：**33.5M 以下回退 1t（不许变慢）**，
 /// 大矩阵（列足够多）才并行。
-pub(crate) const PAR_MIN_REDUCE_ELEMS: u128 = 1 << 25; // 33.5M 元素
+pub const PAR_MIN_REDUCE_ELEMS: u128 = 1 << 25; // 33.5M 元素
 
 /// 列和的**列区间**版本：只算列 `[c0, c1)`，写入 `out_chunk`（长度 `c1-c0`）。
 ///
 /// 每列仍按行序累加 ⇒ 与整段调用**逐位一致**（并行切分的基础）。
-pub(crate) fn reduce_sum_cols_range(
+pub fn reduce_sum_cols_range(
     x: &[f32],
     rows: usize,
     cols: usize,
@@ -247,13 +247,7 @@ pub(crate) fn reduce_sum_cols_range(
 /// # Safety
 /// 调用方保证 `x.len() == rows·cols`、`w.len() >= rows`、`out.len() == cols`、`out` 不与 `x` 重叠。
 #[inline]
-pub(crate) fn reduce_weighted_sum_cols(
-    x: &[f32],
-    w: &[f32],
-    rows: usize,
-    cols: usize,
-    out: &mut [f32],
-) {
+pub fn reduce_weighted_sum_cols(x: &[f32], w: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     let work = (rows as u128) * (cols as u128);
     let pool = crate::pool::global();
     if work >= PAR_MIN_REDUCE_ELEMS && pool.threads() > 1 && cols >= 8 {
@@ -264,7 +258,7 @@ pub(crate) fn reduce_weighted_sum_cols(
 }
 
 /// 带权列和的**列区间**版本（逐位切分基础）。
-pub(crate) fn reduce_weighted_sum_cols_range(
+pub fn reduce_weighted_sum_cols_range(
     x: &[f32],
     w: &[f32],
     rows: usize,
@@ -300,7 +294,7 @@ pub(crate) fn reduce_weighted_sum_cols_range(
 
 /// `Σ x[i]`：直接复用本仓既有的 LASX 归约（`ops::sum`）。
 #[inline]
-pub(crate) fn reduce_sum(x: &[f32]) -> f32 {
+pub fn reduce_sum(x: &[f32]) -> f32 {
     crate::ops::sum::sum(x)
 }
 
@@ -315,7 +309,7 @@ pub(crate) fn reduce_sum(x: &[f32]) -> f32 {
 // **并行**：行与行之间独立（每行的归约次序不变）⇒ 行块切分仍是**逐位类**；只改"哪一行先算"。
 
 /// 行和的**逐行 kernel**：`out[r] = Σ_c x[r·cols + c]`（**逐位**，见本段文档）。
-pub(crate) fn reduce_sum_rows_rows(x: &[f32], cols: usize, out: &mut [f32], rows_local: usize) {
+pub fn reduce_sum_rows_rows(x: &[f32], cols: usize, out: &mut [f32], rows_local: usize) {
     for r in 0..rows_local {
         out[r] = row_sum_bitwise(&x[r * cols..(r + 1) * cols]);
     }
@@ -353,14 +347,14 @@ fn row_sum_bitwise(row: &[f32]) -> f32 {
 /// 67M 2.17×。拐点在"数据超出 L3（≈16 MB）"：3.1M 元素 = 12.6 MB 仍在 L3，串行已打满带宽；
 /// 4.2M = 16.8 MB 起并行才有效 ⇒ 阈值取 **4M 元素**（`1<<22`）。阈值以下原地串行
 /// （**不许变慢**：8K–3.1M 实测 0.99–1.01× 是与 1t 同一路径/或并行无收益）。
-pub(crate) const PAR_MIN_SUM_ROWS_ELEMS: u128 = 1 << 22; // 4M 元素
+pub const PAR_MIN_SUM_ROWS_ELEMS: u128 = 1 << 22; // 4M 元素
 
 /// 行和入口（`LasxBackend::reduce_sum_rows_f32` 的落点；**自动并行**）。
 ///
 /// `work = rows·cols ≥ PAR_MIN_SUM_ROWS_ELEMS` 且池线程 > 1 时按**行块**并行
 /// （`parallel::reduce_sum_rows`）；否则串行。线程数由 `pool::global()` 决定
 /// （`init_global(n)` 可控；默认 `WorkerPool::auto()`）。
-pub(crate) fn reduce_sum_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_sum_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     let work = (rows as u128) * (cols as u128);
     let pool = crate::pool::global();
     if work >= PAR_MIN_SUM_ROWS_ELEMS && pool.threads() > 1 && rows >= 2 {
@@ -382,22 +376,22 @@ pub(crate) fn reduce_sum_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f3
 // ±0 的符号也依赖实现细节 ⇒ 想保**逐位**就不能换结合次序。并行（切独立轴）是零风险的加速点。
 
 /// 轴 `max`：沿 `rows` 归约、保留 `cols`（`out[c] = max_r x[r·cols + c]`）。
-pub(crate) fn reduce_max_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_max_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     reduce_extreme_cols(x, rows, cols, out, f32::max);
 }
 
 /// 轴 `min`：沿 `rows` 归约、保留 `cols`。
-pub(crate) fn reduce_min_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_min_cols(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     reduce_extreme_cols(x, rows, cols, out, f32::min);
 }
 
 /// 轴 `max`：沿 `cols` 归约、保留 `rows`（`out[r] = max_c x[r·cols + c]`）。
-pub(crate) fn reduce_max_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_max_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     reduce_extreme_rows(x, rows, cols, out, f32::max);
 }
 
 /// 轴 `min`：沿 `cols` 归约、保留 `rows`。
-pub(crate) fn reduce_min_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+pub fn reduce_min_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     reduce_extreme_rows(x, rows, cols, out, f32::min);
 }
 
@@ -412,7 +406,7 @@ pub(crate) fn reduce_min_rows(x: &[f32], rows: usize, cols: usize, out: &mut [f3
 ///
 /// ⇒ 阈值取 **4M 元素**（`1<<22`，与行和同口径）：阈值以下走串行（**不许变慢**）；
 /// 4.2M 起行方向稳定 ≥5×，列方向中性（0.98–1.04）到 67M 才 6×（如实记：列方向收益在超大矩阵）。
-pub(crate) const PAR_MIN_EXTREME_ELEMS: u128 = 1 << 22; // 4M 元素
+pub const PAR_MIN_EXTREME_ELEMS: u128 = 1 << 22; // 4M 元素
 
 /// 沿 `rows` 归约（列方向）的入口：按**列块**并行（每列的行序不变 ⇒ 逐位）。
 fn reduce_extreme_cols(
@@ -449,7 +443,7 @@ fn reduce_extreme_rows(
 }
 
 /// 列区间 `[c0, c1)` 的 max/min（每列：初值 = 第 0 行，之后按 `r` 升序 fold）。
-pub(crate) fn reduce_extreme_cols_range(
+pub fn reduce_extreme_cols_range(
     x: &[f32],
     rows: usize,
     cols: usize,
@@ -469,7 +463,7 @@ pub(crate) fn reduce_extreme_cols_range(
 }
 
 /// 行区间 `[r0, r1)` 的 max/min（每行：初值 = 本行第 0 列，之后按 `c` 升序 fold）。
-pub(crate) fn reduce_extreme_rows_range(
+pub fn reduce_extreme_rows_range(
     x: &[f32],
     cols: usize,
     out: &mut [f32],
@@ -487,7 +481,7 @@ pub(crate) fn reduce_extreme_rows_range(
 }
 
 /// 整片 `max`（**逐位**：与默认实现同一 fold；空输入 = 幺元 `NEG_INFINITY`）。
-pub(crate) fn max_global(x: &[f32]) -> f32 {
+pub fn max_global(x: &[f32]) -> f32 {
     let mut it = x.iter().copied();
     let Some(mut acc) = it.next() else {
         return f32::NEG_INFINITY;
@@ -499,7 +493,7 @@ pub(crate) fn max_global(x: &[f32]) -> f32 {
 }
 
 /// 整片 `min`（**逐位**：空输入 = 幺元 `POSITIVE_INFINITY`）。
-pub(crate) fn min_global(x: &[f32]) -> f32 {
+pub fn min_global(x: &[f32]) -> f32 {
     let mut it = x.iter().copied();
     let Some(mut acc) = it.next() else {
         return f32::INFINITY;

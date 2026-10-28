@@ -18,10 +18,10 @@
 //! ⇒ 有生产调用方 ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被
 //! `clippy -D warnings` 的 `dead_code` 判死，且禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
-use simd_dsl::BackendError;
+use crate::api::Error;
 
-fn mismatch(op: &'static str, what: &'static str, expected: usize, got: usize) -> BackendError {
-    BackendError::LengthMismatch {
+fn mismatch(op: &'static str, what: &'static str, expected: usize, got: usize) -> Error {
+    Error::Shape {
         op,
         what,
         expected,
@@ -40,16 +40,19 @@ pub fn matmul_bt_f32(
     a: &[f32],
     b: &[f32],
     out: &mut [f32],
-) -> Result<(), BackendError> {
-    let need_a = m
-        .checked_mul(k)
-        .ok_or_else(|| mismatch("matmul_bt_f32", "m*k（溢出）", usize::MAX, m))?;
-    let need_b = n
-        .checked_mul(k)
-        .ok_or_else(|| mismatch("matmul_bt_f32", "n*k（溢出）", usize::MAX, n))?;
-    let need_o = m
-        .checked_mul(n)
-        .ok_or_else(|| mismatch("matmul_bt_f32", "m*n（溢出）", usize::MAX, m))?;
+) -> Result<(), Error> {
+    let need_a = m.checked_mul(k).ok_or(Error::Overflow {
+        op: "matmul_bt_f32",
+        what: "m*k",
+    })?;
+    let need_b = n.checked_mul(k).ok_or(Error::Overflow {
+        op: "matmul_bt_f32",
+        what: "n*k",
+    })?;
+    let need_o = m.checked_mul(n).ok_or(Error::Overflow {
+        op: "matmul_bt_f32",
+        what: "m*n",
+    })?;
     if a.len() != need_a {
         return Err(mismatch("matmul_bt_f32", "a", need_a, a.len()));
     }

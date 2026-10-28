@@ -16,7 +16,7 @@
 
 use crate::arch::lasx;
 use crate::ops::nn_math::exp_vec;
-use simd_dsl::ReduceMapOp;
+use crate::ops::types::ReduceMapKind;
 use std::arch::loongarch64::*;
 
 /// 8 lane 水平求和（与 `ops::softmax_rows::hsum` **同一固定折叠次序**，保证 LASX 内部一致）。
@@ -30,15 +30,15 @@ fn hsum(v: lasx::F32x8) -> f32 {
 
 /// `out_mapped[r·cols+c] = f(x[r·cols+c], shift[r])`、`out_rowsum[r] = Σ_c out_mapped[…]`。
 ///
-/// # Panics（调用方 `dsl_backend` 已校验，这里是 debug 断言）
+/// # Panics（调用方适配器已校验，这里是 debug 断言）
 /// `x.len() == rows·cols`、`out_mapped.len() == rows·cols`、`out_rowsum.len() == rows`；
 /// `ExpShiftedRow` 要求 `shift.len() == rows`；`Exp` 要求 `shift` 为空。
-pub(crate) fn map_rows_sum_f32(
+pub fn map_rows_sum_f32(
     x: &[f32],
     rows: usize,
     cols: usize,
     shift: &[f32],
-    map: ReduceMapOp,
+    map: ReduceMapKind,
     out_mapped: &mut [f32],
     out_rowsum: &mut [f32],
 ) {
@@ -47,7 +47,7 @@ pub(crate) fn map_rows_sum_f32(
     debug_assert_eq!(out_rowsum.len(), rows);
     debug_assert!(shift.is_empty() || shift.len() == rows);
 
-    let shifted = matches!(map, ReduceMapOp::ExpShiftedRow);
+    let shifted = matches!(map, ReduceMapKind::ExpShiftedRow);
     for r in 0..rows {
         let x_row = &x[r * cols..(r + 1) * cols];
         let out_row = &mut out_mapped[r * cols..(r + 1) * cols];

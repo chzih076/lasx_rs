@@ -20,15 +20,24 @@
 //! ⇒ 只挂 `#[cfg(feature = "dsl-backend")]`（不需要 `test` 门控；否则会被 `dead_code` 判死，
 //! 且禁止 `#[allow(dead_code)]`，见 AGENTS.md #49）。
 
-use simd_dsl::BackendError;
+use crate::api::Error;
 
-/// 长度/越界错误构造（与 `dsl_backend.rs` 的 `len_err` 同形）。
-fn mismatch(op: &'static str, what: &'static str, expected: usize, got: usize) -> BackendError {
-    BackendError::LengthMismatch {
+/// 长度错误构造（中性 `api::Error`；`id` 越界用 [`bad_id`]）。
+fn mismatch(op: &'static str, what: &'static str, expected: usize, got: usize) -> Error {
+    Error::Shape {
         op,
         what,
         expected,
         got,
+    }
+}
+
+/// `id` 越界/乘法溢出 ⇒ [`Error::BadValue`]（由调用方回退或报错，不糊成"长度不符"）。
+fn bad_id(op: &'static str, what: &'static str) -> Error {
+    Error::BadValue {
+        op,
+        what,
+        requirement: "指向 table/out 范围内的一整行（且乘加不溢出）",
     }
 }
 
@@ -68,7 +77,7 @@ pub fn gather_rows_f32(
     ids: &[u32],
     out: &mut [f32],
     out_stride: usize,
-) -> Result<(), BackendError> {
+) -> Result<(), Error> {
     if row_len == 0 {
         return Ok(());
     }
@@ -77,7 +86,10 @@ pub fn gather_rows_f32(
         .checked_sub(1)
         .and_then(|v| v.checked_mul(out_stride))
         .and_then(|v| v.checked_add(row_len))
-        .ok_or_else(|| mismatch("gather_rows_f32", "out（溢出）", usize::MAX, out.len()))?;
+        .ok_or(Error::Overflow {
+            op: "gather_rows_f32",
+            what: "out 所需长度",
+        })?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -90,9 +102,9 @@ pub fn gather_rows_f32(
     let max_end = max_id
         .checked_mul(table_stride)
         .and_then(|b| b.checked_add(row_len))
-        .ok_or_else(|| mismatch("gather_rows_f32", "id 越界（溢出）", usize::MAX, max_id))?;
+        .ok_or_else(|| bad_id("gather_rows_f32", "id"))?;
     if max_end > table.len() {
-        return Err(mismatch("gather_rows_f32", "table", max_end, table.len()));
+        return Err(bad_id("gather_rows_f32", "id 对应的 table 行"));
     }
     ids.iter().enumerate().for_each(|(t, &id)| {
         let base = id as usize * table_stride;
@@ -115,7 +127,7 @@ pub fn gather_rows_i8(
     ids: &[u32],
     out: &mut [i8],
     out_stride: usize,
-) -> Result<(), BackendError> {
+) -> Result<(), Error> {
     if row_len == 0 {
         return Ok(());
     }
@@ -124,7 +136,10 @@ pub fn gather_rows_i8(
         .checked_sub(1)
         .and_then(|v| v.checked_mul(out_stride))
         .and_then(|v| v.checked_add(row_len))
-        .ok_or_else(|| mismatch("gather_rows_i8", "out（溢出）", usize::MAX, out.len()))?;
+        .ok_or(Error::Overflow {
+            op: "gather_rows_i8",
+            what: "out 所需长度",
+        })?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -132,19 +147,14 @@ pub fn gather_rows_i8(
         return Err(mismatch("gather_rows_i8", "out", need, out.len()));
     }
     ids.iter().enumerate().try_for_each(|(t, &id)| {
-        let base = (id as usize).checked_mul(table_stride).ok_or_else(|| {
-            mismatch(
-                "gather_rows_i8",
-                "id*table_stride（溢出）",
-                usize::MAX,
-                id as usize,
-            )
-        })?;
+        let base = (id as usize)
+            .checked_mul(table_stride)
+            .ok_or_else(|| bad_id("gather_rows_i8", "id"))?;
         let end = base
             .checked_add(row_len)
-            .ok_or_else(|| mismatch("gather_rows_i8", "id 越界", usize::MAX, base))?;
+            .ok_or_else(|| bad_id("gather_rows_i8", "id 对应的 table 行"))?;
         if end > table.len() {
-            return Err(mismatch("gather_rows_i8", "table", end, table.len()));
+            return Err(bad_id("gather_rows_i8", "id 对应的 table 行"));
         }
         let dst = t * out_stride;
         // SAFETY: 同 f32 版本。
@@ -164,7 +174,7 @@ pub fn scatter_rows_f32(
     row_len: usize,
     out: &mut [f32],
     out_stride: usize,
-) -> Result<(), BackendError> {
+) -> Result<(), Error> {
     if row_len == 0 {
         return Ok(());
     }
@@ -173,7 +183,10 @@ pub fn scatter_rows_f32(
         .checked_sub(1)
         .and_then(|v| v.checked_mul(src_stride))
         .and_then(|v| v.checked_add(row_len))
-        .ok_or_else(|| mismatch("scatter_rows_f32", "src（溢出）", usize::MAX, src.len()))?;
+        .ok_or(Error::Overflow {
+            op: "scatter_rows_f32",
+            what: "src 所需长度",
+        })?;
     if ids.is_empty() {
         return Ok(());
     }
@@ -181,17 +194,12 @@ pub fn scatter_rows_f32(
         return Err(mismatch("scatter_rows_f32", "src", need_src, src.len()));
     }
     ids.iter().enumerate().try_for_each(|(t, &id)| {
-        let base = (id as usize).checked_mul(out_stride).ok_or_else(|| {
-            mismatch(
-                "scatter_rows_f32",
-                "id*out_stride（溢出）",
-                usize::MAX,
-                id as usize,
-            )
-        })?;
+        let base = (id as usize)
+            .checked_mul(out_stride)
+            .ok_or_else(|| bad_id("scatter_rows_f32", "id"))?;
         let end = base
             .checked_add(row_len)
-            .ok_or_else(|| mismatch("scatter_rows_f32", "id 越界", usize::MAX, base))?;
+            .ok_or_else(|| bad_id("scatter_rows_f32", "id 对应的 out 行"))?;
         if end > out.len() {
             return Err(mismatch("scatter_rows_f32", "out", end, out.len()));
         }

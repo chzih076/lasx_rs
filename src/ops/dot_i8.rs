@@ -131,9 +131,8 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
 
 /// **P1-5 契约入口**：`Σ a·b` 的 **i64 精确累加 → 末端一次饱和到 i32**（与
 /// `simd_dsl::kernels::scalar::dot_i8` **逐位**；与 N3 入口的差别只在"回绕 vs 饱和"）。
-#[cfg(feature = "dsl-backend")]
 #[inline]
-pub(crate) fn dot_i8_saturating(a: &[i8], b: &[i8]) -> i32 {
+pub fn dot_i8_saturating(a: &[i8], b: &[i8]) -> i32 {
     dot_i8_i64(a, b).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
@@ -210,7 +209,6 @@ mod tests {
 
     /// **P1-5 契约入口 `dot_i8_saturating`**：i64 精确和 → 末端**一次饱和**到 i32
     /// （与"回绕"入口 N3 的差别只在末端；覆盖正/负饱和与不饱和的多形状）。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn test_dot_i8_saturating_matches_clamped_exact_reference() {
         use super::dot_i8_saturating;

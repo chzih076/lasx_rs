@@ -14,18 +14,11 @@
 //! **校验在调用方**：`dsl_backend` 的 override 先按默认实现同口径校验 `rows×cols` 溢出、
 //! `x/out/w` 长度与空形状，再进本模块；这里只做"已校验切片"上的 SIMD 运算。
 
-use crate::ops::dsl_map::{self, BinOp};
+use crate::ops::map_ops::{self, BinOp};
 
 /// `out[r·cols+c] = op(x[r·cols+c], w[r])`（`w.len() == rows`；调用方已校验）。
 #[inline]
-pub(crate) fn map_binary_rows(
-    x: &[f32],
-    rows: usize,
-    cols: usize,
-    w: &[f32],
-    out: &mut [f32],
-    op: BinOp,
-) {
+pub fn map_binary_rows(x: &[f32], rows: usize, cols: usize, w: &[f32], out: &mut [f32], op: BinOp) {
     if rows == 0 || cols == 0 {
         return; // 空视图（调用方已校验长度/溢出）⇒ 无事可做
     }
@@ -35,31 +28,24 @@ pub(crate) fn map_binary_rows(
         .zip(out.chunks_exact_mut(cols))
         .enumerate()
     {
-        dsl_map::map_binary_scalar(x_row, w[r], out_row, op);
+        map_ops::map_binary_scalar(x_row, w[r], out_row, op);
     }
 }
 
 /// `out[r·cols+c] = op(x[r·cols+c], w[c])`（`w.len() == cols`；调用方已校验）。
 #[inline]
-pub(crate) fn map_binary_cols(
-    x: &[f32],
-    rows: usize,
-    cols: usize,
-    w: &[f32],
-    out: &mut [f32],
-    op: BinOp,
-) {
+pub fn map_binary_cols(x: &[f32], rows: usize, cols: usize, w: &[f32], out: &mut [f32], op: BinOp) {
     if rows == 0 || cols == 0 {
         return;
     }
     // 每行：`w` 是连续向量 ⇒ 直接走逐元素 `map_binary` 的 SIMD 核（无需重复实现）。
     x.chunks_exact(cols)
         .zip(out.chunks_exact_mut(cols))
-        .for_each(|(x_row, out_row)| dsl_map::map_binary(x_row, w, out_row, op));
+        .for_each(|(x_row, out_row)| map_ops::map_binary(x_row, w, out_row, op));
 }
 
 /// `out[i] = op(x[i], scalar)`（调用方已校验等长）。
 #[inline]
-pub(crate) fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: BinOp) {
-    dsl_map::map_binary_scalar(x, scalar, out, op);
+pub fn map_binary_scalar(x: &[f32], scalar: f32, out: &mut [f32], op: BinOp) {
+    map_ops::map_binary_scalar(x, scalar, out, op);
 }

@@ -54,8 +54,7 @@ pub(crate) fn gemv_i8(
 /// **溢出语义同 [`Backend::dot_i8`]**：逐行复用 [`crate::ops::dot_i8::dot_i8_saturating`]
 /// （**i64 精确累加 + 末端一次饱和**），而不是每次乘法后 `saturating_add`（后者与累加顺序相关，
 /// 会违反契约"结果与顺序无关"的要求）。`k = 0` ⇒ `out` 全 0；`j = 0` ⇒ 空操作。
-#[cfg(feature = "dsl-backend")]
-pub(crate) fn gemv_i8_i32(j: usize, k: usize, a: &[i8], x: &[i8], out: &mut [i32]) {
+pub fn gemv_i8_i32(j: usize, k: usize, a: &[i8], x: &[i8], out: &mut [i32]) {
     for r in 0..j {
         out[r] = crate::ops::dot_i8::dot_i8_saturating(&a[r * k..(r + 1) * k], x);
     }
@@ -149,7 +148,6 @@ mod tests {
 
     /// **P1-5 契约入口 `gemv_i8_i32`**：`out[o] = Σ a[o·k+t]·x[t]`（i64 精确 + 末端饱和），
     /// 与独立参考逐位；覆盖 k=0/j=0/非对齐/饱和。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn test_gemv_i8_i32_matches_exact_reference() {
         use super::gemv_i8_i32;

@@ -234,8 +234,7 @@ pub(crate) fn dequantize_i8_per_row(
 ///
 /// # Safety
 /// 调用方保证 `x.len() >= rows*cols`、`out.len() >= rows*cols`、`scale.len() >= rows`。
-#[cfg(feature = "dsl-backend")]
-pub(crate) unsafe fn quantize_i8_rows_contract(
+pub unsafe fn quantize_i8_rows_contract(
     x: &[f32],
     rows: usize,
     cols: usize,
@@ -503,7 +502,6 @@ mod tests {
     // ===== P1-5 契约函数（每行给定 scale）的逐位验收 =====
 
     /// P1-5 契约的独立参考实现（照契约写：除法 → ties-even → clamp；NaN ⇒ 0）。
-    #[cfg(feature = "dsl-backend")]
     fn ref_quantize(x: &[f32], rows: usize, cols: usize, scale: &[f32]) -> Vec<i8> {
         let mut out = vec![0i8; rows * cols];
         for r in 0..rows {
@@ -518,7 +516,6 @@ mod tests {
 
     /// **边界样本**（±0.5/±1.5/±2.5/127.5/128.5/-128.5/-129.5/NaN/±inf/极小值）× 多 scale：
     /// 与契约参考**逐位一致**（含 scale=0/负/inf 的 IEEE 除法语义）。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn contract_quantize_matches_reference_on_boundaries() {
         let x: Vec<f32> = vec![
@@ -570,7 +567,6 @@ mod tests {
     }
 
     /// 多行 + 非 8 倍数 `cols`（覆盖尾部标量）× 每行不同 scale：逐位。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn contract_quantize_matches_reference_for_ragged_rows() {
         for &(rows, cols) in &[(3usize, 21usize), (4, 32), (5, 33), (2, 1), (1, 8)] {

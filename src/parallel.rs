@@ -733,7 +733,6 @@ pub fn rk4_j2_step_batch(
 
 /// 列和并行版：按**列块**切（每列独立、按行序累加 ⇒ **逐位**）。`x` 只读、`out` 长度 `cols`。
 // `dsl_map` 本身挂在 `dsl-backend` feature 下 ⇒ 这里同门控（`parallel` 侧只被 `dsl_map` 调用）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_sum_cols(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
@@ -746,12 +745,11 @@ pub fn reduce_sum_cols(
     }
     // 闭包第二参是**块行数**（不是结束下标）——`pool` 的约定与 `_start, rows` 一致。
     pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
-        crate::ops::dsl_map::reduce_sum_cols_range(x, rows, cols, c0, c0 + clen, o);
+        crate::ops::map_ops::reduce_sum_cols_range(x, rows, cols, c0, c0 + clen, o);
     });
 }
 
 /// 带权列和并行版（按列块切；**逐位**，同 `reduce_sum_cols`）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_weighted_sum_cols(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
@@ -765,7 +763,7 @@ pub fn reduce_weighted_sum_cols(
     }
     // 同 `reduce_sum_cols`：闭包第二参是块行数。
     pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
-        crate::ops::dsl_map::reduce_weighted_sum_cols_range(x, w, rows, cols, c0, c0 + clen, o);
+        crate::ops::map_ops::reduce_weighted_sum_cols_range(x, w, rows, cols, c0, c0 + clen, o);
     });
 }
 
@@ -863,14 +861,13 @@ pub fn layer_norm(
 /// 并行只改变"哪一行先算"（输出行互不重叠）。
 ///
 /// **门控**：`dsl-backend`（`RowFuse` 与 `ops::prims` 都在该 feature 下；默认构建无 `simd_dsl` 依赖）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_rows_map(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
     rows: usize,
     cols: usize,
     out: &mut [f32],
-    plan: simd_dsl::RowFuse,
+    plan: crate::ops::types::RowFuseSpec,
 ) {
     if rows == 0 || cols == 0 {
         return;
@@ -888,7 +885,6 @@ pub fn reduce_rows_map(
 /// 并行只改变"哪一行先算"（每行只写自己的 `out[r]`，互不重叠）。
 ///
 /// **门控**：`dsl-backend`（`ops::dsl_map` 在该 feature 下；默认构建无 `simd_dsl` 依赖）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_sum_rows(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
@@ -902,14 +898,13 @@ pub fn reduce_sum_rows(
     // 本 helper 每次只写 `out[r0..r1]`（一行一个标量 ⇒ 数组宽度 1）。
     pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, 1)], |r0, rlen, [o]| {
         let r1 = r0 + rlen;
-        crate::ops::dsl_map::reduce_sum_rows_rows(&x[r0 * cols..r1 * cols], cols, o, rlen);
+        crate::ops::map_ops::reduce_sum_rows_rows(&x[r0 * cols..r1 * cols], cols, o, rlen);
     });
 }
 
 /// **轴 `max/min` 列方向并行版**：按**列块**切（每列的行序不变 ⇒ **逐位**）。
 ///
 /// `op` 必须是 `f32::max` 或 `f32::min`（调用方 `dsl_map` 的两个入口各传一个）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_extreme_cols(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
@@ -922,12 +917,11 @@ pub fn reduce_extreme_cols(
         return;
     }
     pool.for_each_row_block_mut::<f32, 1, _>(cols, 8, [(out, 1)], |c0, clen, [o]| {
-        crate::ops::dsl_map::reduce_extreme_cols_range(x, rows, cols, c0, c0 + clen, o, op);
+        crate::ops::map_ops::reduce_extreme_cols_range(x, rows, cols, c0, c0 + clen, o, op);
     });
 }
 
 /// **轴 `max/min` 行方向并行版**：按**行块**切（每行的列序不变 ⇒ **逐位**）。
-#[cfg(feature = "dsl-backend")]
 pub fn reduce_extreme_rows(
     pool: &crate::pool::WorkerPool,
     x: &[f32],
@@ -941,7 +935,7 @@ pub fn reduce_extreme_rows(
     }
     pool.for_each_row_block_mut::<f32, 1, _>(rows, 1, [(out, 1)], |r0, rlen, [o]| {
         let r1 = r0 + rlen;
-        crate::ops::dsl_map::reduce_extreme_rows_range(&x[r0 * cols..r1 * cols], cols, o, rlen, op);
+        crate::ops::map_ops::reduce_extreme_rows_range(&x[r0 * cols..r1 * cols], cols, o, rlen, op);
     });
 }
 
@@ -978,7 +972,6 @@ mod tests {
         assert_eq!(bits(&o1), bits(&on), "layer_norm 并行不逐位");
 
         // 列归约：按列块切（helpers 挂在 dsl-backend feature 下）
-        #[cfg(feature = "dsl-backend")]
         {
             let (mut c1, mut cn) = (vec![0.0f32; cols], vec![0.0f32; cols]);
             reduce_sum_cols(&p1, &x, rows, cols, &mut c1);
@@ -998,10 +991,9 @@ mod tests {
 
     /// **task-120**：`reduce_rows_map` 的行块并行与单线程**逐位一致**
     /// （行内统计量/epilogue/map 的次序不变，并行只改"哪一行先算"）。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn test_reduce_rows_map_parallel_bit_for_bit() {
-        use simd_dsl::{BinaryOp, RowEpilogue, RowFuse, RowReduce};
+        use crate::ops::types::{RowEpilogueKind, RowFuseSpec, RowMapKind, RowReduceKind};
         let p1 = crate::pool::WorkerPool::new(1);
         let p4 = crate::pool::WorkerPool::new(4);
         // 奇数行 + 非 8 倍数行宽 ⇒ 覆盖行尾块与列尾。
@@ -1011,22 +1003,22 @@ mod tests {
             .map(|i| ((i * 37 % 101) as f32) * 0.1 - 6.07)
             .collect();
         let plans = [
-            RowFuse {
-                reduce: RowReduce::Sum,
-                epilogue: RowEpilogue::InvSqrtMeanPlusEps,
-                map: BinaryOp::Mul,
+            RowFuseSpec {
+                reduce: RowReduceKind::Sum,
+                epilogue: RowEpilogueKind::InvSqrtMeanPlusEps,
+                map: RowMapKind::Mul,
                 eps: 1e-5,
             },
-            RowFuse {
-                reduce: RowReduce::SumSq,
-                epilogue: RowEpilogue::Mean,
-                map: BinaryOp::Sub,
+            RowFuseSpec {
+                reduce: RowReduceKind::SumSq,
+                epilogue: RowEpilogueKind::Mean,
+                map: RowMapKind::Sub,
                 eps: 0.0,
             },
-            RowFuse {
-                reduce: RowReduce::Sum,
-                epilogue: RowEpilogue::Inv,
-                map: BinaryOp::Div,
+            RowFuseSpec {
+                reduce: RowReduceKind::Sum,
+                epilogue: RowEpilogueKind::Inv,
+                map: RowMapKind::Div,
                 eps: 0.0,
             },
         ];
@@ -1040,7 +1032,6 @@ mod tests {
 
     /// **task-123**：`reduce_sum_rows` 的行块并行与单线程**逐位一致**
     /// （每行内部 8-lane 累加 + 顺序 fold 的次序不变，并行只改"哪一行先算"）。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn test_reduce_sum_rows_parallel_bit_for_bit() {
         let p1 = crate::pool::WorkerPool::new(1);
@@ -1066,7 +1057,6 @@ mod tests {
     /// （列/行方向都只切"与归约轴无关"的另一维 ⇒ 每输出的元素次序不变）。
     ///
     /// 数据含 `NaN`/`±0`/`±inf`（切分不改变每轴 fold 次序 ⇒ 连 NaN/±0 的位模式也要相等）。
-    #[cfg(feature = "dsl-backend")]
     #[test]
     fn test_axis_extreme_parallel_bit_for_bit() {
         let p1 = crate::pool::WorkerPool::new(1);

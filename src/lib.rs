@@ -30,7 +30,6 @@
 //! | [`laplace`]/[`ilaplace`] | 单边数值拉普拉斯变换 / 逆变换（批量矩阵乘，公式 DSL 表达） |
 //! | [`fast_trig`] | 超越函数递推快档 recon 原型（**opt-in**；默认仍走 `libm`） |
 //! | [`rewrite`] | 表达式级代数重写：模式识别 + 安全区分析（**原型，默认路径行为不变**） |
-//! | `dsl_backend` | `simd_dsl::Backend` 的 LASX 实现（**feature 门控** `dsl-backend`，默认关） |
 //! | [`ffi`] | **C ABI 导出层**：52 个原始 `lasx_*` 符号 + 46 个 `_checked` 变体，只做裸指针 → 切片 |
 //!
 //! 分层的目的是让"算法"与"ABI 约定"互不干扰：算子只处理安全的切片，指针有效性与
@@ -115,10 +114,6 @@ extern crate self as lasx_rs;
 pub mod aligned;
 pub mod api;
 pub mod arch;
-/// **`simd_dsl::Backend` 的 `lasx_rs` 实现**（**feature 门控** `dsl-backend`；默认关 ⇒ 无依赖、无编译）
-/// ——见 [`dsl_backend`] 模块文档（必需方法 + 热点内核 + 组合原语的当前覆盖清单）。
-#[cfg(feature = "dsl-backend")]
-pub mod dsl_backend;
 /// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。
 pub mod fast_trig;
 pub mod ffi;
@@ -131,7 +126,7 @@ pub mod rewrite;
 /// **复数矩阵乘核心**（A 阶：分平面 `(Re, Im)`、f32/f64、直算 4 条 / Karatsuba 3 条）——
 /// 见 [`cmatmul`] 模块文档（默认路线与位精确契约差异）。
 pub use ops::cmatmul;
-mod ops;
+pub mod ops;
 pub mod parallel;
 pub mod plan;
 pub mod pool;

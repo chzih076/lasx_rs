@@ -1,40 +1,33 @@
-//! **B1b（M5 续）：组合原语 override 的 LASX 向量内核**。
+//! **组合原语的内核实现（中性 API，无 DSL 依赖）**。
 //!
-//! 两个入口（`dsl-backend` feature 下唯一调用方是 `src/dsl_backend.rs`）：
+//! 两个入口：
 //!
-//! * [`map_unary`]：逐元素一元。**`Exp` 走 `nn_math::exp_vec`（8 lane 多项式）、`Sqrt` 走
-//!   `lasx_xvfsqrt_s`（IEEE 正确舍入 ⇒ 逐位）；其余变体整片委托
-//!   `simd_dsl::kernels::scalar::map_unary_f32`**（逐位不变，不做未经验证的向量化）。
-//! * [`reduce_rows_map`]：窄三元组融合（`RowFuse`）。**`Sum`/`SumSq` 行内 8-lane 累加 + 同序
-//!   hsum，`Add/Sub/Mul/Div` 的 map 用向量写回**；`Max` 归约与 `Max/Min` map 等**未验证的组合
-//!   整片委托标量参照**（契约完整性优先，`NaN`/`±0` 语义不为优化让路）。
+//! * [`map_unary_exp`] / [`map_unary_sqrt`]：逐元素一元，**只向量化这两个**。
+//!   `Sqrt` 走 `lasx_xvfsqrt_s`（IEEE 正确舍入 ⇒ 逐位）；`Exp` 走本仓 `nn_math::exp_vec`
+//!   （容差类，实测界登记在 `docs/dev.md`）。其余一元变体**不在本仓实现**——由 DSL 适配器
+//!   回退到 simd 侧标量（本库不猜语义）。
+//! * [`reduce_rows_map`]：窄三元组融合（[`RowFuseSpec`]）。**`Sum`/`SumSq` + `Add/Sub/Mul/Div`**
+//!   走向量路径；**不支持的组合返回 [`Error::BadValue`]**，由适配器回退（本库不静默换语义）。
 //!
-//! # 等价类（实测，见 `tests/prims_override.rs`）
+//! # 等价类（与纯化前的契约口径一致）
 //!
-//! * `map_unary`：`Sqrt` **逐位**（同一 IEEE sqrt）；`Exp` **容差类**（LASX 多项式 vs libm，
-//!   实测 rel 界写在测试消息里/`docs/dev.md §7.52`）；其余变体委托标量 ⇒ **逐位**。
-//! * `reduce_rows_map`：**`Sum`/`SumSq` 的累加次序与标量多累加器版逐 lane 同序**（每个 chunk 加到
-//!   对应 lane，末尾按 `acc[0]+…+acc[7]` 顺序 hsum、再逐元素补尾）⇒ 与
-//!   `kernels::scalar::reduce_rows_map_f32` **逐位**；`epilogue`/`map` 的标量运算次序逐字复制 ⇒
-//!   整个支持组合 **`to_bits` 全等**。委托组合自然逐位。
-//!
-//! **门控**：挂 `#[cfg(feature = "dsl-backend")]`（无 feature 时 `dsl_backend.rs` 不编译 ⇒ 本模块
-//! 无人使用会被 `clippy -D warnings` 的 `dead_code` 判死，见 AGENTS.md #49；**不要**用
-//! `#[allow(dead_code)]` 掩盖）。
+//! * `map_unary_sqrt` **逐位**（同一 IEEE sqrt）；`map_unary_exp` **容差类**（LASX 多项式 vs libm）。
+//! * `reduce_rows_map` 的**受支持组合**：行内 8-lane 累加 + 固定次序 hsum、epilogue/map 逐字照旧
+//!   标量次序 ⇒ 与 DSL 侧标量参照 **`to_bits` 全等**（纯化前由 `tests/prims_override.rs` 钉住；
+//!   该等价性现在归 DSL 侧 conformance/适配器测试）。
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::arch::loongarch64::*;
 
-use simd_dsl::kernels::scalar;
-use simd_dsl::{BackendError, BinaryOp, RowEpilogue, RowFuse, RowReduce, UnaryOp};
-
+use crate::api::Error;
 use crate::arch::lasx;
 use crate::ops::nn_math::{exp_seq, exp_vec};
+use crate::ops::types::{RowEpilogueKind, RowFuseSpec, RowMapKind, RowReduceKind};
 
-/// 长度不符 ⇒ 与 portable 默认同错误码同字段。
+/// 长度不符 ⇒ `Error::Shape`（字段口径同 `api` 层）。
 #[inline]
-fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) -> BackendError {
-    BackendError::LengthMismatch {
+fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) -> Error {
+    Error::Shape {
         op,
         what,
         expected,
@@ -42,74 +35,81 @@ fn len_err(op: &'static str, what: &'static str, expected: usize, got: usize) ->
     }
 }
 
-/// 逐元素一元运算（`Backend::map_unary_f32` 的 LASX 实现）。
+/// 逐元素 `out = exp(x)`（LASX 向量近似；容差类）。
 ///
-/// `Exp`/`Sqrt` 向量化；其余变体（`Sin/Cos/Ln/Erf/Sigmoid/Rcp/Abs`）**整片委托**
-/// `scalar::map_unary_f32`——这是**有意**的：它们的 libm/近似语义没有 LASX 逐位对应物，
-/// 自造近似会改变等价类，而本函数的第一职责是"让组合路径不再走标量"时**不破坏契约**。
-pub(crate) fn map_unary(x: &[f32], out: &mut [f32], op: UnaryOp) -> Result<(), BackendError> {
-    match op {
-        UnaryOp::Exp => {
-            expect_same_len(x, out)?;
-            debug_assert_ne!(x.as_ptr(), out.as_ptr(), "map_unary_f32：out 不得与 x 重叠");
-            // 主循环 8 lane；尾部用 `exp_seq`（与 `exp_vec` 同一串操作的标量版 ⇒ 尾块与向量块同一近似）。
-            let (xc, xt) = x.as_chunks::<8>();
-            let (oc, ot) = out.as_chunks_mut::<8>();
-            for (xi, oi) in xc.iter().zip(oc.iter_mut()) {
-                // SAFETY: `xi`/`oi` 都是 8 个 f32 的引用，load/store 的 8 lane 前提成立。
-                unsafe {
-                    let v = lasx::load_f32x8(xi.as_ptr());
-                    lasx::store_f32x8(oi.as_mut_ptr(), exp_vec(v));
-                }
-            }
-            for (o, v) in ot.iter_mut().zip(xt) {
-                *o = exp_seq(*v);
-            }
-            Ok(())
+/// # Errors
+/// `x.len() != out.len()` ⇒ [`Error::Shape`]。
+pub fn map_unary_exp(x: &[f32], out: &mut [f32]) -> Result<(), Error> {
+    expect_same_len("map_unary_exp", x, out)?;
+    debug_assert_ne!(x.as_ptr(), out.as_ptr(), "map_unary_exp：out 不得与 x 重叠");
+    // 主循环 8 lane；尾部用 `exp_seq`（与 `exp_vec` 同一串操作的标量版 ⇒ 尾块与向量块同一近似）。
+    let (xc, xt) = x.as_chunks::<8>();
+    let (oc, ot) = out.as_chunks_mut::<8>();
+    for (xi, oi) in xc.iter().zip(oc.iter_mut()) {
+        // SAFETY: `xi`/`oi` 都是 8 个 f32 的引用，load/store 的 8 lane 前提成立。
+        unsafe {
+            let v = lasx::load_f32x8(xi.as_ptr());
+            lasx::store_f32x8(oi.as_mut_ptr(), exp_vec(v));
         }
-        UnaryOp::Sqrt => {
-            expect_same_len(x, out)?;
-            debug_assert_ne!(x.as_ptr(), out.as_ptr(), "map_unary_f32：out 不得与 x 重叠");
-            let (xc, xt) = x.as_chunks::<8>();
-            let (oc, ot) = out.as_chunks_mut::<8>();
-            for (xi, oi) in xc.iter().zip(oc.iter_mut()) {
-                // SAFETY: 同 `Exp` 分支（8 lane 读写）。
-                unsafe {
-                    let v = lasx::load_f32x8(xi.as_ptr());
-                    // `xvfsqrt_s` 为 IEEE 正确舍入平方根 ⇒ 与标量 `f32::sqrt` 逐位。
-                    lasx::store_f32x8(oi.as_mut_ptr(), lasx_xvfsqrt_s(v));
-                }
-            }
-            for (o, v) in ot.iter_mut().zip(xt) {
-                *o = v.sqrt();
-            }
-            Ok(())
-        }
-        _ => scalar::map_unary_f32(x, out, op),
     }
-}
-
-#[inline]
-fn expect_same_len(x: &[f32], out: &[f32]) -> Result<(), BackendError> {
-    if x.len() != out.len() {
-        return Err(len_err("map_unary_f32", "out", x.len(), out.len()));
+    for (o, v) in ot.iter_mut().zip(xt) {
+        *o = exp_seq(*v);
     }
     Ok(())
 }
 
-/// 窄三元组融合（`Backend::reduce_rows_map_f32` 的 LASX 实现）。
+/// 逐元素 `out = sqrt(x)`（LASX `xvfsqrt_s`，IEEE 正确舍入 ⇒ 逐位）。
+///
+/// # Errors
+/// `x.len() != out.len()` ⇒ [`Error::Shape`]。
+pub fn map_unary_sqrt(x: &[f32], out: &mut [f32]) -> Result<(), Error> {
+    expect_same_len("map_unary_sqrt", x, out)?;
+    debug_assert_ne!(
+        x.as_ptr(),
+        out.as_ptr(),
+        "map_unary_sqrt：out 不得与 x 重叠"
+    );
+    let (xc, xt) = x.as_chunks::<8>();
+    let (oc, ot) = out.as_chunks_mut::<8>();
+    for (xi, oi) in xc.iter().zip(oc.iter_mut()) {
+        // SAFETY: 同 `map_unary_exp`（8 lane 读写）。
+        unsafe {
+            let v = lasx::load_f32x8(xi.as_ptr());
+            // `xvfsqrt_s` 为 IEEE 正确舍入平方根 ⇒ 与标量 `f32::sqrt` 逐位。
+            lasx::store_f32x8(oi.as_mut_ptr(), lasx_xvfsqrt_s(v));
+        }
+    }
+    for (o, v) in ot.iter_mut().zip(xt) {
+        *o = v.sqrt();
+    }
+    Ok(())
+}
+
+#[inline]
+fn expect_same_len(op: &'static str, x: &[f32], out: &[f32]) -> Result<(), Error> {
+    if x.len() != out.len() {
+        return Err(len_err(op, "out", x.len(), out.len()));
+    }
+    Ok(())
+}
+
+/// 窄三元组融合：行统计 + epilogue + 行内 map（[`RowFuseSpec`]）。
 ///
 /// 支持 `reduce ∈ {Sum, SumSq}` 且 `map ∈ {Add, Sub, Mul, Div}` 的向量路径；
-/// **`Max` 归约与 `Max/Min` map 整片委托标量**（见模块头"等价类"）。
-pub(crate) fn reduce_rows_map(
+/// 其余组合（含任何未来变体）返回 [`Error::BadValue`]（**不静默降级**，由适配器回退）。
+///
+/// # Errors
+/// * 长度/溢出不符 ⇒ [`Error::Shape`] / [`Error::Overflow`]；
+/// * 不受支持的 `plan` ⇒ [`Error::BadValue`]（`what = "plan"`）。
+pub fn reduce_rows_map(
     x: &[f32],
     rows: usize,
     cols: usize,
     out: &mut [f32],
-    plan: RowFuse,
-) -> Result<(), BackendError> {
+    plan: RowFuseSpec,
+) -> Result<(), Error> {
     let op = "reduce_rows_map_f32";
-    let total = rows.checked_mul(cols).ok_or(BackendError::ShapeOverflow {
+    let total = rows.checked_mul(cols).ok_or(Error::Overflow {
         op,
         what: "rows×cols",
     })?;
@@ -128,20 +128,23 @@ pub(crate) fn reduce_rows_map(
         return Ok(());
     }
 
-    let vectorizable = matches!(plan.reduce, RowReduce::Sum | RowReduce::SumSq)
+    let vectorizable = matches!(plan.reduce, RowReduceKind::Sum | RowReduceKind::SumSq)
         && matches!(
             plan.map,
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            RowMapKind::Add | RowMapKind::Sub | RowMapKind::Mul | RowMapKind::Div
         );
     if !vectorizable {
-        // 未验证的组合（`Max` 的 `f32::max` NaN/±0 语义、`Max/Min` map）⇒ 契约优先，整片委托。
-        return scalar::reduce_rows_map_f32(x, rows, cols, out, plan);
+        return Err(Error::BadValue {
+            op,
+            what: "plan",
+            requirement: "受支持的组合（reduce ∈ {Sum,SumSq} 且 map ∈ {Add,Sub,Mul,Div}）；其余由适配器回退",
+        });
     }
 
     // **自动并行分派（P0-3 推广）**：`reduce_rows_map` 的每一行都是**独立**的
     // （行内统计量 → epilogue → 行内 map），并行只改"哪一行先算"，**任何元素的运算次序不变**
     // ⇒ **逐位类**（与 `rms/layer/softmax` 的行块切分同一论证）。
-    // 阈值 `PAR_MIN_ROWS_MAP_ELEMS` 由 `examples/row_par_ab.rs` 实测定；阈值以下原地串行。
+    // 阈值由纯化前 `examples/row_par_ab.rs` 实测定；阈值以下原地串行。
     let work = (rows as u128) * (cols as u128);
     let pool = crate::pool::global();
     if work >= PAR_MIN_ROWS_MAP_ELEMS && pool.threads() > 1 && rows >= 2 {
@@ -157,14 +160,14 @@ pub(crate) fn reduce_rows_map(
 ///
 /// 串行主体（整段）与并行分块（`parallel::reduce_rows_map` 的每块）**共用本函数** ⇒ 两条路径
 /// 对同一行执行完全相同的指令序列（**逐位**）。
-pub(crate) fn reduce_rows_map_rows(
+pub fn reduce_rows_map_rows(
     x: &[f32],
     out: &mut [f32],
     cols: usize,
     rows_local: usize,
-    plan: RowFuse,
+    plan: RowFuseSpec,
 ) {
-    let square = matches!(plan.reduce, RowReduce::SumSq);
+    let square = matches!(plan.reduce, RowReduceKind::SumSq);
     let inv_cols = 1.0f32 / cols as f32;
     let map = plan.map;
     for r in 0..rows_local {
@@ -172,7 +175,7 @@ pub(crate) fn reduce_rows_map_rows(
         let stat = row_stat_vec(row, square);
         let k = epilogue(stat, inv_cols, plan.eps, plan.epilogue);
         let dst = &mut out[r * cols..r * cols + cols];
-        // map 主体 8 lane + 尾部标量（与标量 `apply_scalar_op` 逐位：都是 IEEE 单条运算）。
+        // map 主体 8 lane + 尾部标量（与标量参照逐位：都是 IEEE 单条运算）。
         let (rc, rt) = row.as_chunks::<8>();
         let (dc, dt) = dst.as_chunks_mut::<8>();
         let vk = lasx::splat_f32(k);
@@ -181,38 +184,33 @@ pub(crate) fn reduce_rows_map_rows(
             unsafe {
                 let v = lasx::load_f32x8(ri.as_ptr());
                 let res = match map {
-                    BinaryOp::Add => lasx_xvfadd_s(v, vk),
-                    BinaryOp::Sub => lasx_xvfsub_s(v, vk),
-                    BinaryOp::Mul => lasx_xvfmul_s(v, vk),
-                    BinaryOp::Div => lasx_xvfdiv_s(v, vk),
-                    // 上面 `vectorizable` 已排除；这里给出保持 `match` 穷尽的安全分支。
-                    _ => unreachable!("vectorizable 已限制 map 集合"),
+                    RowMapKind::Add => lasx_xvfadd_s(v, vk),
+                    RowMapKind::Sub => lasx_xvfsub_s(v, vk),
+                    RowMapKind::Mul => lasx_xvfmul_s(v, vk),
+                    RowMapKind::Div => lasx_xvfdiv_s(v, vk),
                 };
                 lasx::store_f32x8(di.as_mut_ptr(), res);
             }
         }
         for (d, v) in dt.iter_mut().zip(rt) {
             *d = match map {
-                BinaryOp::Add => v + k,
-                BinaryOp::Sub => v - k,
-                BinaryOp::Mul => v * k,
-                BinaryOp::Div => v / k,
-                _ => unreachable!("vectorizable 已限制 map 集合"),
+                RowMapKind::Add => v + k,
+                RowMapKind::Sub => v - k,
+                RowMapKind::Mul => v * k,
+                RowMapKind::Div => v / k,
             };
         }
     }
 }
 
-/// `reduce_rows_map_f32` 的自动并行阈值（元素数；按 `examples/row_par_ab.rs` 校准）。
+/// `reduce_rows_map_f32` 的自动并行阈值（元素数；按纯化前 `examples/row_par_ab.rs` 校准）。
 ///
 /// **实测**（12 线程、loadavg≈5、同进程 1t vs auto、6 对丢首对取中位；判据 1t/auto ≥1.10）：
 /// 8K **2.72×**、16K 4.62×、32K 5.73×、64K 8.27×、128K 7.54×、256K 8.32×、512K 7.71×、
 /// 786K 7.49×、4.2M 2.11×、16.7M 2.29×；**8K 以下走串行**（不触发分派 ⇒ 与 1t 同一路径）。
 /// 阈值取 8K 与 `rms_norm`/`softmax`/`layer_norm`（P0-3 同口径）一致；等价类 = **逐位**
-/// （并行只改行序，行内次序不变）；
-/// 方差如实记：同一二进制另一次运行（loadavg≈3.9、池首次唤醒）在 8K–32K 曾出现 0.06–0.31×
-/// ⇒ 小规模收益对"冷池 + 高负载"敏感，但**阈值以下不启用**，生产小调用不会变慢。
-pub(crate) const PAR_MIN_ROWS_MAP_ELEMS: u128 = 1 << 13; // 8K 元素
+/// （并行只改行序，行内次序不变）。
+pub const PAR_MIN_ROWS_MAP_ELEMS: u128 = 1 << 13; // 8K 元素
 
 /// 行统计量：**与标量多累加器版同序**——每个 8-lane chunk 加到对应 lane 的向量累加器，
 /// 末尾按 `acc[0]+acc[1]+…+acc[7]`（自 0 起）顺序归约，再按 c 递增补尾。
@@ -242,13 +240,13 @@ fn row_stat_vec(row: &[f32], square: bool) -> f32 {
 
 /// 每行一次的标量收尾——**逐字复制标量参照的运算次序**（含乘法口径的 `Mean`）。
 #[inline]
-fn epilogue(stat: f32, inv_cols: f32, eps: f32, kind: RowEpilogue) -> f32 {
+fn epilogue(stat: f32, inv_cols: f32, eps: f32, kind: RowEpilogueKind) -> f32 {
     match kind {
-        RowEpilogue::Raw => stat,
-        RowEpilogue::Mean => stat * inv_cols,
-        RowEpilogue::MeanPlusEps => stat * inv_cols + eps,
-        RowEpilogue::SqrtMeanPlusEps => (stat * inv_cols + eps).sqrt(),
-        RowEpilogue::InvSqrtMeanPlusEps => 1.0f32 / (stat * inv_cols + eps).sqrt(),
-        RowEpilogue::Inv => 1.0f32 / stat,
+        RowEpilogueKind::Raw => stat,
+        RowEpilogueKind::Mean => stat * inv_cols,
+        RowEpilogueKind::MeanPlusEps => stat * inv_cols + eps,
+        RowEpilogueKind::SqrtMeanPlusEps => (stat * inv_cols + eps).sqrt(),
+        RowEpilogueKind::InvSqrtMeanPlusEps => 1.0f32 / (stat * inv_cols + eps).sqrt(),
+        RowEpilogueKind::Inv => 1.0f32 / stat,
     }
 }
