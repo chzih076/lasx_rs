@@ -784,6 +784,8 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-28 | —（方向翻转：DSL 仓 `backends/lasx` 适配器钉 lasx rev） | **`508d953` lasx 纯化**：删除 `dsl-backend` feature 与 `simd_dsl`/`ops_dsl` 依赖；`src/dsl_backend.rs` + 相关 examples/tests 迁 **DSL 仓 `backends/lasx`**（`lasx_backend`，workspace-excluded） | lasx 零 DSL 依赖；依赖方向 = 适配器 → lasx(git rev) |
 | 2026-10-28 | —（同上） | **`026b372`**：matmul 打包内核 5 个入口改 `pub`（供 DSL 仓适配器调用） | 适配器可直接用内核，无需复制 |
 | 2026-10-28 | —（同上） | **`ad412ba`**：`ops` 公开后 rustdoc 两类文档链接告警 `allow`（修 CI rustdoc 档） | 纯化后 CI 保持绿 |
+| 2026-11-05 | —（DSL 仓 `backends/lasx` 适配器 rev 同上；适配器 `Cargo.toml` → `3e374cd`） | **`3e374cd`（本仓）**：新增 `ops::norm2_batch`（`Norm2BatchF64`）与 `ops::dequantize_i8_rows`（`DequantizeI8Rows`）+ `api::norm2_batch_into` | 适配器两个融合 plan 由回退 portable → 走 LASX 核；逐位（见 §7.4） |
+| 2026-11-05 | `8a7ee2f`（DSL 仓适配器：**16/16 plan 全真** + 能力位口径） | 本仓 rev 被适配器钉到 `3e374cd`（cargo update） | 覆盖矩阵收窄：62 方法 / 45 override / 16 PatternKind 全真；能力位“刻意低估”注释 + conformance 断言（见 §7.4） |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
 
@@ -947,6 +949,84 @@ SMT 兄弟互抢 L1/L2 ⇒ 超线程更差）与 `src/arch/mod.rs`；**不自动
 `const _: () = assert!(…)` 编译期自证、`build.rs`/enginecheck 编译期入口矩阵、`StageGraph` 数据流分析、
 rustc 风格诊断与 `fix` 建议、按规模自动的并行规模（本机 `default_threads(262144)=4`）——C/OpenBLAS 侧
 没有这些，且对照时不按 DSL 建议改 C 代码。详见 simd `docs/measurements/complex-algorithm-openblas.md`。
+
+### 7.4 缺口收窄沉淀：覆盖矩阵 / 能力位口径 / 新算子 / GEMM 研究（2026-11-05）
+
+> 原始记录：`/home/lik/tmp_keep/results/lasx-gap-audit-178.md`（缺口审计）、`gemm_gap_179.md`（GEMM 假设）、
+> `gemm_gap_181_k2.md`（k2 展开）。代码：本仓 `3e374cd`、DSL 仓适配器 `8a7ee2f`。
+> **所有 LASX 测量必须带 `-C target-feature=+lasx`**（见 §7.3.5 的 P1：缺标志会静默回退标量、慢 26–46×）；
+> loadavg/grade 按 §4.1 口径标注。
+
+#### 7.4.1 覆盖矩阵摘要
+
+- `Backend`：**62 个方法**（`simd_dsl/src/contract/backend.rs`）；适配器 **45 个具名 override**，其余走 trait 默认。
+- **16 个 `PatternKind` 全部 `supports_plan = true`**（f32 5：Axpy/Softmax/Rms/Layer/Rope；**f64 几何 6**：
+  Vec3AddScaled/Norm3/**Norm2（本次新增）**/Unitize3/Cross3/Mat3MulVec3；**i8 4**：
+  Quantize/**Dequantize（本次新增）**/Dot/Gemv；+ GeluQuick ⇒ 5+6+4+1 = **16**）。
+- **16 个功能性默认方法**（无 LASX 核或收益低，保持 portable）：
+  `map_unary_f64`、`reduce_sum_f64`、`reduce_weighted_sum_f32/f64`、`reduce_cols_map_f32`、
+  `map_ternary_f32`、`map_nary_f32/f64`、`map_unary_masked_f32`、`build_banded_kernel_f32`、`stencil_rows_f32`、
+  `exec_fused_plan_portable` + 4 个 display/helper（`backend_tag`/`error_*`）。
+- **为何不接**：stencil_rows / build_banded_kernel / nary / masked / cols_map **无对应 LASX 核**；
+  `reduce_weighted_sum_f32/f64 → dot` 薄 override 会**更慢**（实测比现有默认慢 **2.3–15.6×**，默认已被
+  LLVM 自动向量化）⇒ 不做；f64 unary 需新增核、收益未证。
+
+#### 7.4.2 能力位语义口径（**刻意低估，勿"修正诚实性"**）
+
+`supports(cap)` 是**路由/性能声明**（`decide_composed`：true ⇒ 后端单次调用、引擎**不做行并行**），
+**不是"有没有实现"**。本仓因此刻意低估；`tests/conformance.rs` 有断言钉住这些返回值，防止后人误改。
+
+| 变体 | 实际实现 | 上报 | 理由（关键实测） |
+|---|---|---|---|
+| `MatmulF64` | `matmul_f64` 有核（单线程） | **false** | true ⇒ 引擎跳过行并行；实测整块/引擎 **512³ 3.28×、1024×256×1024 2.47× 慢** |
+| `Elementwise` | map_binary/affine/scalar/rows/cols 专用；unary 仅 Exp/Sqrt | false | true ⇒ 丢行并行、且多数 unary 仍走标量 |
+| `Reduction` | 12 个 reduce override 专用 | false | 同上：定义应 true、路由应 false |
+| `Transcendental` | 仅 Exp/Sqrt 有核 | false | 核不全 |
+| `ComplexRoutes` | binary ✓、`map_ternary_f32` 走默认 | false | true 需补 ternary（无通用 3 输入指令） |
+| `F64Elementwise` | affine/binary f64 ✓、`map_unary_f64` 标量 | true | **族级近似**；引擎 0 消费 ⇒ 无行为影响，已在适配器注释标注 |
+| `Threaded` | matmul 内部 `pool::global` 自动并行 | true | 语义 = "内核自动并行"；**不兑现 `CallOpts.threads` 逐次意图**（引擎据此不嵌套线程） |
+| `FusedGeometry`/`Quant` | 语义已转 `supports_plan` | 不报（保留枚举） | `backend.rs` 已注明，避免双口径 |
+
+#### 7.4.3 新算子（均为**逐位**，已接 `supports_plan`/`exec_fused_plan`）
+
+- **`Norm2BatchF64`**（`src/ops/norm2_batch.rs`；`api::norm2_batch_into`）：`out[i]=√(x²+y²)`，f64 SOA；
+  LASX 4 f64/lane + 2 路展开，LSX 2/lane，标量尾同式；硬件 sqrt 与标量同为 IEEE 正确舍入 ⇒ `to_bits` 全等
+  （NaN 按 `is_nan` 对拍）。A/B（plan vs portable，6 对丢首对中位，**loadavg 7.4–7.5 ⇒ grade A**）：
+  **1M 3.96× / 8M 3.64×**。测试 `tests/norm2_batch.rs`（适配器侧；含 n=0/1/3/4/8/33/1024 与错误面）。
+- **`DequantizeI8Rows`**（`src/ops/dequantize_i8_rows.rs`；`api::dequantize_i8_rows{,_into}`）：
+  `out[r,c]=(q as f32)·scale[r]`；i8→i32 两级拓宽 + `xvpermi_d/q` lane 重排（无 i8→f32 直转指令；
+  原"lane 乱序"担忧已被两次重叠 load + permute 解决）→ `ffint` + 行标量乘。逐位（含 ±127/−128/±0/次正规/
+  NaN/±inf scale）。A/B：**1M 2.11×**（grade A）、**8M 1.09–1.52×（中位 ~1.29，带宽受限、抖动大）**。
+  **风险（如实）**：8M 未稳定越过 1.2× 门槛；若后续窗口复测不支持，可**一行 revert**（`supports_plan`
+  回 false 即回退 portable）；LSX-only CPU 不接（128-bit lane 更窄、重排占比更高，走同式标量）。
+  测试 `tests/dequantize_i8_rows.rs`（适配器侧；行尾 cols 非 16 倍数、全 i8 值域、scale 特殊值）。
+
+#### 7.4.4 GEMM 研究：源码级已到头（1t f32 vs OpenBLAS 0.3.34 la464）
+
+基线（`taskset -c 4`、进程级交替、6 轮丢首轮取上中位，**B 级窗口 loadavg 3.4–3.8**）：
+**512³ 0.929× / 1024³ 0.961× / 1536³ 0.956×**（OB/LASX；512³ 历史 0.936/0.911 复现，先验一致 `max_rel≈9e-7`）。
+
+**perf 归因修正（重要）**：512³ 每次调用 LASX 多 ~8.3% cycles、+4.9% 指令、IPC 低 3.2%、L1D miss **1.8×**、
+分支指令 **5.5×**（1.17M vs 0.21M）；FMA/cycle **1.67 vs 1.80**（远未到 2.0 墙）⇒ 剩余 ~6% 主因是
+**k 内层循环取指/分支/指针开销 + 部分 L1 miss，不是 FMA 端口吞吐**。微内核主循环 **31 条/k 步 =
+4×`xvld`(B) + 4×`xvldrepl.w`(A) + 16×`xvfmadd.s` + 6 addi + 1 bnez**（FMA 密度 51.6%）。
+1024³ cycles 基本持平（LASX 略少 1.2%）、1t 已实质打平。
+
+**已否决假设**（均**逐位**不变、生产默认未改）：`pack_b` 分组 gmax（pack 仅占 512³ **1.78%** ⇒ 上限 <0.1%，
+端到端 g2 0.949 在 C 级窗口噪声内）；`pipe_b` 软件流水（**−7.5%/−8.5%**，寄存器 24→28+、编译器调度变差）；
+既有旋钮重评：prefetch **+1.7%**（唯一正项、仍远低门槛）、cbuf −0.2%、legacy −1.9%、l1=64K −10.3%、
+k_chunk=512 −13.6%、k_chunk=128 −2.6%、panel3M −2.5%；**k2 展开**：instructions **−9.9%**、branches **−46%**，
+但 IPC **3.35→2.92（−12.8%）**、cycles **+3.4%**、ms **+2.4%** ⇒ 更慢（根因：16 acc+8 B+8 A=32 regs 无调度余量，
+FMA issue/load 延迟覆盖不足；端到端 512³ 0.934、1024³ 0.958，1536³ 窗口受载不可用）。
+**结论**：源码级优化已到头；跨过 0.98× 只剩 **asm 微内核**（历史已否决）或接受 **512³≈0.93–0.95**、
+1024³ 已≈1.0× 的现状。
+
+#### 7.4.5 不做清单（写理由，防重复投入）
+
+- `DequantizeI8Rows` 8M 风险档：**保留但标注**（见 7.4.3；可一行 revert）。
+- spectral / stencil2d / 几何 f32 手写 LASX 核：**不做**（无对应核/带宽级收益/已由通用 map+reduce+f64 plan 覆盖）。
+- `reduce_weighted_sum_f32/f64 → api::dot`：**不做**（比默认慢 2.3–15.6×）。
+- `map_ternary_f32`（为 `ComplexRoutes` 补）：**不做**（无通用 3 输入指令；cmatmul 热核已是 `matmul_f32`）。
 
 ## 8. 已知边界与欠账
 
