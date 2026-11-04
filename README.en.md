@@ -185,6 +185,26 @@ C signatures and the C-side calling contract (memory, safety model, capability p
 (32 `pub fn`), alongside `lasx_rs::view`, `lasx_rs::plan`, `lasx_rs::shape`, `lasx_rs::pool`,
 and `lasx_rs::parallel`.
 
+## Relation to the DSL repository (after the dependency flip, 2026-10-28)
+
+This library **no longer depends on any DSL crate** (purified in `508d953`: the `dsl-backend` feature and the
+`simd_dsl`/`ops_dsl` dependencies were removed). The former `src/dsl_backend.rs` plus its `examples/`/`tests/`
+moved to the **`backends/lasx` adapter crate in the DSL repository** (`lasx_backend`, workspace-excluded,
+`loongarch64` + nightly only). Dependency direction:
+
+```text
+lasx_rs (this library: pure ISA kernels, zero third-party deps)
+   ↑ git rev (pinned by the DSL-side adapter's Cargo.toml)
+backends/lasx (DSL-repo adapter: implements simd_dsl::Backend)
+   ↓ path
+simd_dsl / ops_dsl / attention_block (DSL repository)
+```
+
+**History (moved away)**: `lasx_rs::dsl_backend::LasxBackend` → `lasx_backend::LasxBackend`; the old
+`--features dsl-backend` commands were removed — build the adapter with
+`--manifest-path <dsl-repo>/backends/lasx/Cargo.toml` instead. This README and `docs/dev.md`/`docs/ops.md`/
+`docs/c-abi.md` describe only the pure ISA-kernel surface; DSL adapters/operators/diagnostics live in the DSL repo.
+
 ## Documentation
 
 | Document | Contents |

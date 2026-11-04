@@ -178,6 +178,25 @@ A/B/C 分级）与 [`scripts/benchvar.rs`](scripts/benchvar.rs)（按行对齐�
 （32 个 `pub fn`），另有 `lasx_rs::view` / `lasx_rs::plan` / `lasx_rs::shape` / `lasx_rs::pool` /
 `lasx_rs::parallel`。
 
+## 与 DSL 仓的关系（依赖链翻转后，2026-10-28）
+
+本库**不再依赖任何 DSL crate**（纯化 `508d953`：删除 `dsl-backend` feature 与 `simd_dsl`/`ops_dsl` 依赖）。
+原 `src/dsl_backend.rs` + 相关 `examples/`/`tests/` 已整体迁到 **DSL 仓 `backends/lasx` 适配器 crate**
+（`lasx_backend`，workspace-excluded，仅 `loongarch64`+nightly 构建）。依赖方向：
+
+```text
+lasx_rs（本库：纯 ISA 内核，零第三方依赖）
+   ↑ git rev（钉在 DSL 仓适配器的 Cargo.toml）
+backends/lasx（DSL 仓适配器：实现 simd_dsl::Backend）
+   ↓ path
+simd_dsl / ops_dsl / attention_block（DSL 仓）
+```
+
+**历史（已迁走）**：`lasx_rs::dsl_backend::LasxBackend` → `lasx_backend::LasxBackend`；
+旧 `--features dsl-backend` 命令已删除，改用 `--manifest-path <DSL仓>/backends/lasx/Cargo.toml` 构建。
+本库 CI/文档（本 README、`docs/dev.md`、`docs/ops.md`、`docs/c-abi.md`）只描述纯 ISA 内核面；
+DSL 适配/算子/诊断相关内容归 DSL 仓。
+
 ## 文档
 
 | 文档 | 内容 |

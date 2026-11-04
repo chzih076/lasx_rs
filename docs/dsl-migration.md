@@ -1,5 +1,10 @@
 # `lasx_rs` DSL 面「退化/删除」分析（目标：`lasx_rs` = **纯后端**）
 
+> **历史文档（2026-10-28 更新）**：本文是**纯化前**的迁移分析，路径/结论均为当时状态。**2026-10-28 已执行纯化**：
+> `lasx_rs` **零 DSL 依赖**（`508d953`）；`src/dsl_backend.rs` + 相关 `examples/`/`tests/` 已迁 **DSL 仓
+> `backends/lasx`**（`lasx_backend`，workspace-excluded）；文中 `dsl_backend.rs`、`--features dsl-backend`、
+> `ops_dsl` 依赖等均为**历史引用**（已迁走）。
+
 > **口径（用户更正）**：迁移**不是换壳**。目标形态 = `simd_dsl`（引擎+宏+trait）→ **后端 `lasx_rs`**
 > （trait 实现 + LASX 内核 + 原语 + C ABI）→ **算子库 `ops_dsl`**。
 > ⇒ `lasx_rs` 里**任何 DSL 面都不该留**（宏 crate、`rewrite.rs`、DSL 规划、`shape::Prepared` 生成路径）。
@@ -12,7 +17,7 @@
 | `macros/`（整 crate）：`matmul!`(`macros/src/lib.rs:970`)、`dot!`(:981)、`gemv!`(:987)、`#[fast_trig]`(:1000) | 旧 DSL 宏入口 | `src/{laplace,rewrite,shape}.rs`、`src/shape/{f16,vec}.rs`、`examples/{formula_dsl,formula_vec,laplace}.rs` | ① 所有调用点改走 `simd_dsl` 宏或**直接调后端方法**；② `ops_dsl` 补出缺口能力（§4）；③ `shape::Prepared` 生成路径已摘除（§2） |
 | `src/rewrite.rs`（`TrigOp`:31、`StepKind`:42、`KernelPattern`:53、`Rewrite`:70、`plan`:84、`safe`:110、`safe_zone`:115） | 旧「核形态判据」层 | `src/laplace.rs`、`examples/formula_dsl.rs`、`src/lib.rs` | 判据**下沉引擎**（`simd_dsl::equivalence::guard_of` + `simd_dsl::safety::recurrence_safe`）；**安全区阈值逐值核对**（两套判据 ⇒ 数值路径不一致） |
 | `src/plan.rs` 的 DSL 部分 | DSL 侧规划（与 `rewrite.rs` 配套） | `src/{laplace,rewrite}.rs` | 同 `rewrite.rs`；**只删 DSL 部分**，文件里若有非 DSL 规划工具则逐项判定 |
-| `src/dsl_backend.rs`（`LasxBackend`，feature 门控） | **不是删除项**：它是"纯后端"形态的第一步（`impl simd_dsl::Backend`） | 自身 feature 门控 example | **保留，作为目标形态的落点**（见 §3） |
+| `src/dsl_backend.rs`（`LasxBackend`，feature 门控） | **不是删除项**：它是"纯后端"形态的第一步（`impl simd_dsl::Backend`） | 自身 feature 门控 example | **保留，作为目标形态的落点**（见 §3）；**已迁走**：2026-10-28 落到 DSL 仓 `backends/lasx`（`lasx_backend`） |
 
 ## 2. 降级清单（核心：`shape::Prepared` 与 `apply*`）
 
@@ -42,7 +47,7 @@
 
 | 项 | 为什么属于后端 |
 |---|---|
-| `impl simd_dsl::Backend`（`src/dsl_backend.rs`） | 纯后端的**定义**：trait 实现是 `lasx_rs` 在新形态里的唯一身份 |
+| `impl simd_dsl::Backend`（`src/dsl_backend.rs`；**历史，已迁 DSL 仓 `backends/lasx/src/lib.rs`**） | 纯后端的**定义**：trait 实现是 `lasx_rs` 在新形态里的唯一身份 |
 | LASX 内核（`src/arch/**`） | 手写 ISA 特化**只能在具体后端**（引擎/算子库一律架构中立） |
 | `src/ops/**` 的**内核/原语**部分（37 个文件，含 `dot_i8`/`matmul_i8`/`dot_q4`/`gemv_i8`） | "该后端有能力做"的原语实现；**算子语义**搬 `ops_dsl`，**内核**留后端 |
 | **C ABI 98 符号**（`src/ffi/*.rs`，`#[unsafe(no_mangle)] pub extern "C"`） | 外部消费者的**稳定契约** ⇒ 必须留；实现改为**内部直接实现、不经 DSL** |

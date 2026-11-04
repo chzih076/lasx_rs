@@ -158,7 +158,9 @@ lasx_rs/
 
 ### 2.6 跨算子链与编译期报告（引擎接管，2026-10-19/20）
 
-`simd_dsl` 侧把优化从"算子内部"推进到"算子之间"；lasx_rs 侧只做 rev bump + 覆盖验证：
+**历史记录（依赖链翻转前，2026-10-28 已迁走）**：`simd_dsl` 侧把优化从"算子内部"推进到"算子之间"；
+lasx_rs 侧只做 rev bump + 覆盖验证。**2026-10-28 起**：DSL 侧适配器迁 **DSL 仓 `backends/lasx`**，
+本库**零 DSL 依赖**、不再钉任何 DSL rev（方向翻转：适配器 → lasx git rev）。以下为当时的跨仓协作记录：
 
 * `engine::chain::execute_map_chain`（simd `7f5b9be`）→ 链 + RMS 终止步（`8492b35`）→ 算子层"整条算法"入口（`5235d33`）
   → 链 + 行 LayerNorm 终止步（`00e15ac`）→ `pipeline!` 宏把整条链在编译期展开给引擎（`d3b97c2`）
@@ -739,7 +741,11 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-19 | B1/B1b 组合原语 override | `axpy_inplace_f32` 落地（逐位）+ 5 个缺口如实报；`map_unary`/`reduce_rows_map` 去标量化 **2.6–4.1×** | lasx `fd0af50` 等 |
 | 2026-10-19/20 | 引擎接管 7.52.2–7.52.19 | 见 §2.6；`axpy→rms`、matmul epilogue 融合 ROI **暂不采纳**（1.107×） | 见 §7.2 |
 
-### 7.2 跨仓 rev bump 表（`lasx_rs` → `simd_dsl`）
+### 7.2 跨仓 rev 表（2026-10-28 翻转后：DSL 适配器钉 lasx rev；此前为 `lasx_rs` → `simd_dsl`）
+
+> **2026-10-28 依赖链翻转**：旧方向 = 本仓在 `Cargo.toml` 钉 `simd_dsl` rev（下列 2026-10-28 前的行，**历史**）；
+> 新方向 = **DSL 仓 `backends/lasx` 适配器在 `Cargo.toml` 钉本仓 git rev**，本库零 DSL 依赖、不再钉 DSL rev
+> （纯化 `508d953`）。此后升级由 DSL 仓 bump 适配器 rev 并重跑其门禁/A-B。
 
 | 日期 | simd_dsl rev / 关键提交 | lasx_rs 动作 | 目的 |
 |---|---|---|---|
@@ -773,17 +779,24 @@ DYN `Exact<8>` × 三种行数，与 `api::matmul` 逐位）、`test_policy_sema
 | 2026-10-23 | `d5bd872`（本仓同提交） | rev bump（本仓同提交） | **引擎诊断组件（rustc 风格，中/英）**：simd 新增 `engine::diag`（`Lang/Level/Label/SourceLine/Diagnostic/Diagnostics`，rustc 形态 `警告[…]:`/`-->`/片段+`^^^^`/`= 注意/帮助`，正文全量双语）并接入 G1 数据流（`analyze_diagnostics(lang)`/`summary(lang)`/`diagnostic(_lang)`）；spectral 验证台提供 `--lang zh|en` 与 `--mode bad-graph`（错误形态演示）；公开面 578；本仓 §7.3.4 补说明、rev 同步；门禁全绿 |
 | 2026-10-23 | `966b61c`（本仓同提交） | rev bump（本仓同提交） | **诊断支持 fix（机器可应用修复建议，cargo-fix 风格）**：`Fix`/`Applicability` + `GraphFix`（死写⇒删除+重编号 MachineApplicable；use-before-def⇒前移 MaybeIncorrect；重复号⇒重编号 MachineApplicable；**非单调号⇒MaybeIncorrect**，迭代收敛）+ `fixes`/`verify`/`render_source`/`analyze_stages`；spectral 验证台 `--fix`/`--mode bad-graph --fix`（补丁 + `= 应用后` 验证）；§7.3.4 补说明；公开面 597；门禁全绿 |
 | 2026-10-23 | `9def672`（本仓同提交） | rev bump（本仓同提交） | **复杂算法示例放回 DSL 仓**：`ops_dsl/examples/algo_attention.rs`（512×512 单头注意力块，ops_dsl 拼装 + 引擎分析/诊断/fix 展示）+ OpenBLAS C 对照装置（`simd_dsl/scripts/bench_algo_*`，先验一致性 `max_rel=1.0e-6`；可移植后端 1t C/DSL=0.18、auto=0.28；参照：本仓已入库 `512³` 单 GEMM LASX vs OpenBLAS=0.936）；fix 安全边界（多写阶段死写 ⇒ Manual）同步；三处 simd rev bump；门禁全绿 |
-| 2026-10-23 | `41f64ab`（本仓同提交） | rev bump（本仓同提交） | **算法示例库（后端泛型）**：DSL 仓新增 `attention_block` crate（`run<B: Backend>` 同一份 512×512 注意力块 + 阶段声明），示例迁入 DSL 仓；本仓为三方对照加 `attention_block` git 依赖（同 rev），依赖方向仍 `lasx_rs → attention_block → ops_dsl → simd_dsl`；三处 simd rev bump；门禁全绿 |
+| 2026-10-23 | `41f64ab`（本仓同提交） | rev bump（本仓同提交） | **算法示例库（后端泛型）**：DSL 仓新增 `attention_block` crate（`run<B: Backend>` 同一份 512×512 注意力块 + 阶段声明），示例迁入 DSL 仓；本仓为三方对照加 `attention_block` git 依赖（同 rev），依赖方向仍 `lasx_rs → attention_block → ops_dsl → simd_dsl`（**历史**；2026-10-28 已翻转为 DSL 仓 `backends/lasx` → lasx）；三处 simd rev bump；门禁全绿 |
 | 2026-10-23 | `0e23256`（本仓同提交） | rev bump（本仓同提交） | **LASX 后端测量入口**：`examples/algo_attention_lasx.rs`（同一份 `attention_block` 跑 `LasxBackend`，零复制）供 `simd_dsl/scripts/bench_algo_vs_openblas.sh` 三方对照；实测（loadavg 3.6–3.9 window=ok，先验一致性 LASX-vs-可移植 `max_rel=3.3e-7`）：**1t LASX 32.5 ms vs OpenBLAS 31.7 ms（C/LASX=0.974，基本持平）**、**24t LASX 10.0 ms vs OpenBLAS 16.5 ms（C/LASX=1.648，LASX 快 1.65×；OB 波动 12.7–27.4 ms）**、LASX 比可移植后端快 5.45×/5.69×；门禁全绿 |
+| 2026-10-28 | —（方向翻转：DSL 仓 `backends/lasx` 适配器钉 lasx rev） | **`508d953` lasx 纯化**：删除 `dsl-backend` feature 与 `simd_dsl`/`ops_dsl` 依赖；`src/dsl_backend.rs` + 相关 examples/tests 迁 **DSL 仓 `backends/lasx`**（`lasx_backend`，workspace-excluded） | lasx 零 DSL 依赖；依赖方向 = 适配器 → lasx(git rev) |
+| 2026-10-28 | —（同上） | **`026b372`**：matmul 打包内核 5 个入口改 `pub`（供 DSL 仓适配器调用） | 适配器可直接用内核，无需复制 |
+| 2026-10-28 | —（同上） | **`ad412ba`**：`ops` 公开后 rustdoc 两类文档链接告警 `allow`（修 CI rustdoc 档） | 纯化后 CI 保持绿 |
 
 ### 7.3 DSL 算子 vs LASX 库算子性能比赛（2026-10-20，可复核台架）
+
+> **历史（2026-10-28 已迁走）**：本节 A/B 装置与 `LasxBackend` 现位于 **DSL 仓 `backends/lasx`**
+> （`examples/dsl_vs_lasx_ab*.rs`、`src/lib.rs`）；下列数字为当时 lasx 仓内测量口径，装置已不在本仓。
 
 装置：`examples/dsl_vs_lasx_ab.rs` / `dsl_vs_lasx_ab2.rs` + `scripts/dsl_vs_lasx_ab.sh`
 （**进程级交替 A/B**：每个 arm 单独进程、逐轮对调顺序，6 轮丢首轮取中位+极差；进程内 3 次取中位；
 计时区外生成输入与做等价校验；两臂都预分配、无 prepare/打包；同线程数：
 LASX 臂 `pool::init_global(N)`，DSL 臂 `SIMD_DSL_ENGINE_THREADS=N`。loadavg 2.15→2.91（A 级窗口））。
 
-**A = `lasx_rs::api::*` 手写核；B = `ops_dsl::*` DSL 算子 + `LasxBackend`；比值 = B/A，>1 表示 DSL 更慢**
+**A = `lasx_rs::api::*` 手写核；B = DSL 算子 + `LasxBackend`（历史：`ops_dsl::*` + 原 `lasx_rs::dsl_backend`；
+现适配器在 DSL 仓 `backends/lasx`）；比值 = B/A，>1 表示 DSL 更慢**
 
 | 算子 | 规模 | t=1 B/A | t=12 B/A | 等价类 |
 |---|---|---|---|---|
@@ -897,13 +910,17 @@ loadavg 4.93/3.52/2.29，6 对丢首对中位+极差）：
 
 #### 7.3.5 复杂算法三方对照：DSL 可移植 / DSL-LASX / OpenBLAS（2026-10-23）
 
-**装置（可复现）**：算法/示例在 DSL 仓 `attention_block`（后端泛型 `run<B: Backend>`；512×512 单头
-注意力块 = 5 GEMM + softmax + 残差 + LayerNorm + amax）；本仓 `examples/algo_attention_lasx.rs`
-注入 `LasxBackend`（**零复制**同一算法）；OpenBLAS 侧 `simd_dsl/scripts/bench_algo_openblas.c`
-（cblas_sgemm + 标量组合）；runner `simd_dsl/scripts/bench_algo_vs_openblas.sh`（先验一致性 →
-交替轮次 → 中位/极差/比值）。复现：
-`cargo run --release --features dsl-backend --example algo_attention_lasx -- --bench`
-（或 sibling 两仓存在时跑 runner；`SKIP_LASX=1` 跳过 LASX 档）。
+**装置（可复现；依赖链翻转后装置已迁 DSL 仓）**：算法/示例在 DSL 仓 `attention_block`（后端泛型
+`run<B: Backend>`；512×512 单头注意力块 = 5 GEMM + softmax + 残差 + LayerNorm + amax）；
+**LASX 测量入口现位于 DSL 仓 `backends/lasx/examples/algo_attention_lasx.rs`**（注入 `LasxBackend`，
+**零复制**同一算法）；OpenBLAS/runner 在 DSL 仓 `scripts/bench_algo_*`。复现（在 DSL 仓根）：
+`cargo run --release --manifest-path backends/lasx/Cargo.toml --example algo_attention_lasx -- --bench`
+（runner `bash scripts/bench_algo_vs_openblas.sh` **自包含**：`LASX_DIR=backends/lasx` 默认、**不再需要
+sibling lasx 仓**，适配器 `Cargo.toml` 钉本仓 git rev；`SKIP_LASX=1` 跳过 LASX 档）。
+**LASX 档必须带 `+lasx`**（2026-10-28 P1 修复）：runner 脚本已 export `RUSTFLAGS='-C target-feature=+lasx'`；
+手工 `--manifest-path` 构建需自己加，或 `cd backends/lasx && cargo build` 走该目录 `.cargo/config.toml`——
+否则**静默回退标量**（digest 不变但慢 26–46×）。**2026-11-05 已按修复后 runner 在低载窗口
+（loadavg 2.4–2.5）重测，下表为新数字**；旧 32.5/10.0 ms 属缺 flag 的错误口径，已废弃。
 
 **LASX 自动硬件策略（本仓提供，用户无需手写）**：`arch::parallelism()`（cpuset 感知 `logical` +
 sysfs 拓扑 `physical`，SMT 兄弟算一核）、`pool::WorkerPool::auto()`（池大小 = min(物理核, 可用逻辑核)，
@@ -914,13 +931,13 @@ cpuset-capped+dynamic-chunk`；`taskset -c 0` 时打印 `logical=1 physical=1`�
 SMT 兄弟互抢 L1/L2 ⇒ 超线程更差）与 `src/arch/mod.rs`；**不自动绑核**（绑核只在 1t 对照档由 runner
 手动 `taskset` 施加以保证单核公平）。
 
-**实测**（loadavg 3.6–3.9，window=ok；ITERS=3、ROUNDS=4 丢首轮；先验一致性：LASX-vs-可移植
-`max_rel=3.3e-7`、OpenBLAS-vs-可移植 `1.0e-6`，均 `ok=yes`）：
+**实测（2026-11-05 修复 `+lasx` 后重测；loadavg 2.4–2.5，window=ok；ITERS=3、ROUNDS=4 丢首轮；
+先验一致性：LASX-vs-可移植 `max_rel=3.3e-7`、OpenBLAS-vs-可移植 `1.0e-6`，均 `ok=yes`）**：
 
 | 档位 | DSL 可移植 | **DSL-LASX** | OpenBLAS | `C/LASX`（>1=DSL 更快） | LASX/可移植 |
 |---|---|---|---|---|---|
-| 1t（单核；C 单线程） | 177.1 ms | **32.5 ms** | 31.7 ms | **0.974**（基本持平） | 5.45× |
-| auto（24 线程） | 57.0 ms | **10.0 ms** | 16.5 ms（波动 12.7–27.4） | **1.648**（LASX 快 ~1.65×） | 5.69× |
+| 1t（单核；C 单线程） | 160.9 ms | **27.2 ms** | 28.1 ms | **1.034**（LASX 快 ~3.4%） | 5.92× |
+| auto（24 线程） | 48.9 ms | **5.53 ms** | 14.5 ms（波动 0.7 ms） | **2.616**（LASX 快 ~2.6×） | 8.84× |
 
 **引擎层"白得"（同一次实验可见）**：同一份 `attention_block::run` 上空引擎自动提供类型化 `Algorithm`
 分派、可选编译期形状入口（`matmul_const`）、`pipeline!` 编译期链展开、`engine::perceive` 的
@@ -960,7 +977,9 @@ rustc 风格诊断与 `fix` 建议、按规模自动的并行规模（本机 `de
 
 * **LA664 勘误与内核生命周期**：由 `docs/platform.md` 记录；由外部契约派生的待补项也在那里（不在本文重复）。
 * **工具链**：本库依赖 nightly feature（`stdarch_loongarch`）；稳定工具链不可用是**已知且接受**的边界。
-* **跨仓 rev**：`simd_dsl` 的 rev 由 `Cargo.toml` 钉死；升级必须重跑本仓门禁与 A/B（见 §7.2 表）。
+* **跨仓 rev（2026-10-28 依赖链翻转）**：**DSL 仓 `backends/lasx` 适配器在 `Cargo.toml` 钉本库 git rev**；
+  本库**不再依赖/钉任何 DSL rev**（lasx 纯化后零 DSL 依赖）。升级本库时由 DSL 仓 bump 适配器 rev 并重跑
+  其适配器门禁/A-B（见 §7.2 表；2026-10-28 前的"本仓钉 simd_dsl rev"行为历史）。
 
 ### 8.4 测量环境限制（结论的适用范围）
 
