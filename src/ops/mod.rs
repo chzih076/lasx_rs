@@ -29,6 +29,8 @@ pub mod batch_distance2d;
 pub mod broadcast;
 pub mod cmatmul;
 pub mod cross3_batch;
+/// **i8 行反量化**（`out = q as f32 · scale[r]`）：LASX 两级拓宽 + lane 重排（逐位）。
+pub mod dequantize_i8_rows;
 pub mod dot;
 pub mod dot_f16;
 pub mod dot_f64;
@@ -60,6 +62,8 @@ pub mod matmul_bt;
 pub mod matmul_f64;
 pub mod matmul_i8;
 pub mod nn_math;
+/// **f64 二分量模长融合核**（`out = √(x²+y²)`；LASX 4 lane + LSX 2 lane，逐位）。
+pub mod norm2_batch;
 pub mod norm3_batch;
 /// **组合原语内核**（`map_unary_exp`/`map_unary_sqrt` + `reduce_rows_map`）。
 pub mod prims;

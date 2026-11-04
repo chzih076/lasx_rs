@@ -1228,6 +1228,23 @@ pub fn norm3_batch_into(xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f64]) -> 
     Ok(())
 }
 
+/// 每个样本的二分量模长 `√(x²+y²)`（f64；写入调用方缓冲，task-180 / DSL `Norm2BatchF64`）。
+///
+/// 与 [`norm3_batch_into`] 同形（少一个分量）：LASX 4 f64/lane / LSX 2/lane，标量尾同式。
+/// **等价类 = 逐位**：硬件 sqrt 与标量 `f64::sqrt` 同为 IEEE 正确舍入，乘/加同序。
+///
+/// # Errors
+/// `xs`/`ys` 长度不一致、或 `out.len()` 不等于它，返回 [`Error::Shape`]。
+pub fn norm2_batch_into(xs: &[f64], ys: &[f64], out: &mut [f64]) -> Result<()> {
+    let n = expect_same_len("norm2_batch", &[("xs", xs.len()), ("ys", ys.len())])?;
+    expect_len("norm2_batch", "out", out.len(), n)?;
+    if n == 0 {
+        return Ok(());
+    }
+    crate::ops::norm2_batch::norm2_batch(xs, ys, out);
+    Ok(())
+}
+
 /// 每个点到 `(px, py)` 的距离（f32）。
 ///
 /// # Errors
