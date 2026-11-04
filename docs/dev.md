@@ -939,6 +939,9 @@ SMT 兄弟互抢 L1/L2 ⇒ 超线程更差）与 `src/arch/mod.rs`；**不自动
 | 1t（单核；C 单线程） | 160.9 ms | **27.2 ms** | 28.1 ms | **1.034**（LASX 快 ~3.4%） | 5.92× |
 | auto（24 线程） | 48.9 ms | **5.53 ms** | 14.5 ms（波动 0.7 ms） | **2.616**（LASX 快 ~2.6×） | 8.84× |
 
+**独立复核**（2026-11-05，另一人 loadavg 4.29–4.40）：1t **28.1 ms**（与上表 27.2 差 3.4%）、
+24t **7.0 ms**（C 侧极差 6.74 ms ⇒ 24t 比值在 2.6–3.6 间浮动，正式口径以 1t 为主）。
+
 **引擎层"白得"（同一次实验可见）**：同一份 `attention_block::run` 上空引擎自动提供类型化 `Algorithm`
 分派、可选编译期形状入口（`matmul_const`）、`pipeline!` 编译期链展开、`engine::perceive` 的
 `const _: () = assert!(…)` 编译期自证、`build.rs`/enginecheck 编译期入口矩阵、`StageGraph` 数据流分析、
