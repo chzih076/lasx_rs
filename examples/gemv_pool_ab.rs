@@ -3,7 +3,7 @@
 //!
 //! `cargo run --release --example gemv_pool_ab -- <m> <k> <serial|pool> [线程数]`
 //!
-//! 例（3 轮交替，`docs/dev.md` §6.4 的口径）：
+//! 例（3 轮交替，`docs/dev.md` §4.1 的口径）：
 //!
 //! ```text
 //! for i in 1 2 3; do

@@ -19,7 +19,7 @@
 //! LSX-only CPU **不接**（128 位 lane 更窄，重排成本占比更高）：走同式标量循环。
 
 // 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，
-// 不逐块重复；策略全文见 `docs/dev.md` §17）：
+// 不逐块重复；策略全文见 `docs/dev.md` §2.1）：
 #![allow(clippy::undocumented_unsafe_blocks)]
 use crate::arch::SimdPath;
 use std::arch::loongarch64::*;

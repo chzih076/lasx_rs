@@ -36,12 +36,12 @@ pub struct LasxMatmulPlan {
     plan: MatmulPlan<f32>,
     /// **按线程数缓存的池**（2026-10-15）：键 = 建池时的线程数，值与句柄同生命周期。
     ///
-    /// 为什么这样设计（`docs/dev.md` §7.10 ⑫）：
+    /// 为什么这样设计（`docs/dev.md` §6.3）：
     /// - **生命周期与 plan 绑定**、显式所有权（`plan_destroy` 一并析构）⇒ 不引入任何进程级状态；
     /// - **并发安全**：`Mutex` 只保护"查/换缓存"这一小步（纳秒级），工作负载在池里跑；
     ///   多个线程并发 `run_threaded` 同一 plan 时**共用同一个池**——池本身的契约是
     ///   "同一时刻一个派活者"（`DispatchToken`），所以并发调用会**串行派活**（**契约已写进
-    ///   `docs/c-abi.md` §11.2.1**）；要真正并行请用**不同的 plan** 或 `parallel::*` + 自管池。
+    ///   `docs/c-abi.md` §6**）；要真正并行请用**不同的 plan** 或 `parallel::*` + 自管池。
     /// - `threads` 与缓存不符 ⇒ **重建**（`threads` 语义是"这次用多少"，不能悄悄改）。
     pool: std::sync::Mutex<Option<(usize, std::sync::Arc<crate::pool::WorkerPool>)>>,
 }
@@ -360,7 +360,7 @@ fn run_threaded(
             ns_min: dt,
         });
     }
-    // 便利层：**池缓存进句柄**（2026-10-15；见 `docs/c-abi.md` §11.2.1 与 `docs/dev.md` §7.10 ⑫）。
+    // 便利层：**池缓存进句柄**（2026-10-15；见 `docs/c-abi.md` §6 与 `docs/dev.md` §6.3）。
     // 每次调用现建现拆池要付 12 线程的创建/回收（实测 2.15× 慢）；这里按**线程数**缓存一个池，
     // 挂在 plan 句柄里 ⇒ **生命周期与 plan 绑定**（`plan_destroy` 一并析构）、无进程级状态；
     // `threads` 与缓存不符时**重建**（理由：缓存多份会让每个句柄的线程数/内存膨胀，

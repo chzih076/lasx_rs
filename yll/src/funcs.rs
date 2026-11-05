@@ -24,7 +24,7 @@ use crate::yll::{YllContextC, YllValueWrapper, arg_f64, arg_int, error, yll_floa
 /// 进程内唯一的常驻线程池：建一次，跨调用/跨步复用。
 ///
 /// 多步传播的收益几乎全在"池复用"上（每次新建线程要付约 0.5 ms/步，见
-/// `docs/dev.md` §7.6）。解释器不提供 GIL、可能并发调用本扩展——池的派活接口取
+/// `docs/dev.md` §4.3）。解释器不提供 GIL、可能并发调用本扩展——池的派活接口取
 /// `&self` 并在内部把派活者串行化，所以这里**不需要再套一层 `Mutex`**：直接拿全局池。
 fn pool() -> &'static lasx_rs::pool::WorkerPool {
     lasx_rs::pool::global()
@@ -380,7 +380,7 @@ pub extern "C" fn fn_rk4_step(
 /// 多星 × 多步 RK4 J2 传播（多核）。
 ///
 /// 与 [`fn_rk4_step`] 的区别只在**调用策略**：这里是常驻线程池跑 `steps` 步、池跨步复用，
-/// 而 `rk4_step` 是单线程单步。同样的内核与线程数，端到端快约 2.1–2.3×（dev.md §7.6）。
+/// 而 `rk4_step` 是单线程单步。同样的内核与线程数，端到端快约 2.1–2.3×（dev.md §4.3）。
 ///
 /// 多步传播是**原地推进**的，脚本侧拿到的是终态；要逐步观察请用循环里的 `rk4_step`。
 #[unsafe(no_mangle)]

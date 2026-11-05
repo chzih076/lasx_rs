@@ -461,7 +461,7 @@ impl<T: PackedKernel> MatmulPlan<T> {
 
     /// **列瓦片内核（crate 内部，H1/H2 实验用）**：只算列区间 `[col0, col1)` 覆盖的整条带。
     ///
-    /// **不是公开 API**（`pub(crate)`）：只为 `docs/dev.md §7.10 ⑨/⑩` 的实验服务——让实验能
+    /// **不是公开 API**（`pub(crate)`）：只为 `docs/dev.md` §6.3 的实验服务——让实验能
     /// "每个线程只算自己那段列"，从而量出"worker↔列瓦片绑定"到底能不能降片上流量。
     /// 位精确性由 `src/parallel.rs` 的实验测试逐位断言（与 `api::matmul`、整块跑比对）。
     ///

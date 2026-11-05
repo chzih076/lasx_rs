@@ -48,7 +48,7 @@ pub mod matmul;
 /// 矩阵乘**计划句柄**：`lasx_matmul_prepare`/`_run`/`_run_threaded`/`_plan_destroy`（见 `docs/c-abi.md` 的"计划与句柄"一节）。
 pub mod matmul_plan;
 pub mod memory;
-/// 运行时元信息：`lasx_has_lasx` / `lasx_version`（`docs/ops.md` §4.8）。
+/// 运行时元信息：`lasx_has_lasx` / `lasx_version`（`docs/ops.md` §7）。
 pub mod meta;
 pub mod nn;
 pub mod physics;

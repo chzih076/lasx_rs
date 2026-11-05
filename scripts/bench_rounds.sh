@@ -13,7 +13,7 @@
 #   /tmp/bench_<label>_log.txt    逐轮 before/after 的 uptime 原文 + A/B/C 分级 + 并发数
 #   /tmp/bench_<label>_r<i>.txt   第 i 轮各组的原始输出（按组顺序拼接）
 #
-# 分级（见 docs/dev.md §6.4）：
+# 分级（见 docs/dev.md §4.1）：
 #   A = 轮前 1min<=3 且 5min<=3 且无并发 bench/编译（桌面常驻负载下通常不可达）
 #   B = 轮前 1min<=4.5 且无并发 bench/编译 ⇒ 可作正式数
 #   C = 其余 ⇒ 只作趋势

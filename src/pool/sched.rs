@@ -196,7 +196,7 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
     if gran >= 4 {
         // 行结构内核（矩阵乘）：块需对齐行粒度，让块边界落在微块边界上。
         //
-        // 静态 vs 动态**这次是可信的实测**（`docs/dev.md` §7.10 ⑩ 的阈值表，2026-10-15）：
+        // 静态 vs 动态**这次是可信的实测**（`docs/dev.md` §6.3 ⑩ 的阈值表，2026-10-15）：
         // **同进程交替**（静态 `RowBlock` 与动态 `Dynamic{block_rows=per/4}` 在同一进程里交替
         // 跑、各取 ≥5 次中位数）⇒ **没有旧那套"顺序效应 / 同代码摆动 65%"的问题**，所以这次的
         // 百分比可以引用。数据（k=768、n=2048、粒度 4）：
@@ -206,7 +206,7 @@ pub fn pick_rows(rows: usize, threads: usize, gran: usize) -> Pick {
         //   threads=6  per=64：静态 3.6658 → 动态 3.9342（**−7%**：线程太少，抢不到均衡）
         //   per ≤ 16（threads 12/24）与 per=8 全部：静态明显更好（动态慢 5–40%）
         //
-        // **2026-10-15 晚：补扫 + 聚焦复验（`docs/dev.md` §7.10 ⑬）**：
+        // **2026-10-15 晚：补扫 + 聚焦复验（`docs/dev.md` §6.3 ⑬）**：
         // - **复现、保留**：`threads=16` **两窗口 15/15 格全部静态**（含 per=64：粗扫 0.91、复验
         //   0.949；其余格 0.72–0.97）⇒ 这一档**即使 per ≥ 32 也不走动态**。
         // - **不复现、已回退**：`threads=20` 粗扫说静态（per=48/64 → 0.935/0.958），聚焦复验却说
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn pick_is_sane() {
         assert_eq!(pick_rows(1024, 1, 4), Pick::RowBlock);
-        // 2026-10-15 实测交叉点（§7.10 ⑩ 阈值表）：per_thread ≥ 32 且 threads ≥ 12 才动态
+        // 2026-10-15 实测交叉点（§6.3 ⑩ 阈值表）：per_thread ≥ 32 且 threads ≥ 12 才动态
         assert_eq!(pick_rows(1024, 24, 4), Pick::Dynamic { block_rows: 12 }); // per=43
         assert_eq!(pick_rows(1024, 16, 4), Pick::RowBlock); // 16 线程：两窗口 15/15 格全静态（保留）
         assert_eq!(pick_rows(1024, 20, 4), Pick::Dynamic { block_rows: 16 }); // 20：复验不复现 ⇒ 回退

@@ -11,7 +11,7 @@
 //! LASX 缺失时走 LSX 128 位路径（2 f64/向量），再缺走标量尾同式。
 
 // 本文件豁免 `clippy::undocumented_unsafe_blocks`（分层策略：内核模块在函数级统一写 SAFETY，
-// 不逐块重复；策略全文见 `docs/dev.md` §17）：
+// 不逐块重复；策略全文见 `docs/dev.md` §2.1）：
 #![allow(clippy::undocumented_unsafe_blocks)]
 use crate::arch::SimdPath;
 use crate::arch::{lasx, lsx};

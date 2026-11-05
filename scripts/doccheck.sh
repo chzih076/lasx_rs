@@ -33,7 +33,6 @@ doc_key() {
     docs/ops.md) echo ops ;;
     docs/c-abi.md) echo cabi ;;
     docs/platform.md) echo platform ;;
-    docs/dsl.md) echo dsl ;;
     README.md) echo root ;;
     README.en.md) echo rooten ;;
     AGENTS.md) echo agents ;;
@@ -42,7 +41,7 @@ doc_key() {
 
 # ---- 收集各文档的编号集合 ----
 sections() { grep -oE '^#{1,4} [0-9]+(\.[0-9]+)*' "$1" 2>/dev/null | sed 's/^#* //' | sort -u; }
-for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/c-abi.md cabi" "docs/platform.md platform" "docs/dsl.md dsl" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
+for pair in "docs/dev.md dev" "docs/ops.md ops" "docs/c-abi.md cabi" "docs/platform.md platform" "README.md root" "README.en.md rooten" "AGENTS.md agents"; do
   f="${pair%% *}"; k="${pair##* }"
   [ -f "$f" ] && sections "$f" > "$T/$k"
 done
@@ -52,7 +51,7 @@ check_refs() {
   local f="$1" line ref num prefix target ln=0
   while IFS= read -r line; do
     ln=$((ln + 1))
-    # `manual §9.6` 这类是**外部手册**的编号，不是本文档体系（docs/dev.md §16 有说明）
+    # `manual §9.6` 这类是**外部手册**的编号，不是本文档体系（文档规范见 docs/dev.md §1.2）
     case "$line" in *'manual §'*) continue ;; esac
     for ref in $(printf '%s' "$line" | grep -oE '§[0-9]+(\.[0-9]+)*'); do
       num="${ref#§}"
@@ -60,13 +59,12 @@ check_refs() {
       target=""
       # 取**前缀里最后一次**出现的文档名（"就近"语义：一句里可以先提 dev 再提 ops）
       last_doc=$(printf '%s' "$prefix" |
-        grep -oE 'docs/c-abi\.md|docs/dev\.md|docs/ops\.md|docs/platform\.md|docs/dsl\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
+        grep -oE 'docs/c-abi\.md|docs/dev\.md|docs/ops\.md|docs/platform\.md|README\.en\.md|README\.md|AGENTS\.md' | tail -1)
       case "$last_doc" in
         docs/c-abi.md) target=cabi ;;
         docs/dev.md) target=dev ;;
         docs/ops.md) target=ops ;;
         docs/platform.md) target=platform ;;
-        docs/dsl.md) target=dsl ;;
         README.en.md) target=rooten ;;
         README.md) target=root ;;
         AGENTS.md) target=agents ;;
@@ -75,7 +73,7 @@ check_refs() {
       # 反例"判据不在本节（在 `docs/ops.md` §5.15）"里 §5.15 属于 ops（就近是 ops）。
       # 用字节偏移比较"最后一次出现"的位置。
       doc_off=$(printf '%s' "$prefix" |
-        grep -bo 'docs/c-abi\.md\|docs/dev\.md\|docs/ops\.md\|docs/dsl\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
+        grep -bo 'docs/c-abi\.md\|docs/dev\.md\|docs/ops\.md\|docs/platform\.md\|README\.en\.md\|README\.md\|AGENTS\.md' | tail -1 | cut -d: -f1)
       self_off=$(printf '%s' "$prefix" | grep -bo '本文\|本节' | tail -1 | cut -d: -f1)
       if [ -n "${self_off:-}" ] && { [ -z "${doc_off:-}" ] || [ "$self_off" -gt "$doc_off" ]; }; then
         target=$(doc_key "$f")
@@ -91,7 +89,7 @@ check_refs() {
     done
   done < "$f"
 }
-for f in docs/dev.md docs/ops.md docs/c-abi.md docs/platform.md docs/dsl.md README.md README.en.md AGENTS.md; do
+for f in docs/dev.md docs/ops.md docs/c-abi.md docs/platform.md README.md README.en.md AGENTS.md; do
   [ -f "$f" ] && check_refs "$f"
 done
 
@@ -150,9 +148,9 @@ fi
 
 # ---- ⑤ 引用噪音：同一文档里同一 `§X` 被引用 >12 次 ----
 # 本次系统性整理的目标是"别到处引用"（用户要求）。实测：同文档内同一目标的重复指向会滚到
-# 20+ 次（`docs/dev.md §7.9` 曾 **24** 次、`docs/ops.md §7.9` 17 次），修掉后再加门禁——
+# 20+ 次（历史上单文档同一目标曾被引用 **24** 次），修掉后再加门禁——
 # 本仓库的既有教训是"**没有门禁的规范会复发**"（`doccheck` 抓过 4 次结构性破坏）。
-# 阈值 12：整理后当前最高为 `docs/dev.md §6.3` 的 10 次，留 2 次余量。
+# 阈值 12：整理后当前最高为 10 次，留 2 次余量。
 for f in docs/dev.md docs/ops.md docs/c-abi.md docs/platform.md README.md README.en.md AGENTS.md; do
   [ -f "$f" ] || continue
   while IFS= read -r hit; do

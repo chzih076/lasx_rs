@@ -1,7 +1,7 @@
 /*
  * bench_openblas.c — **可复现的跨库对照装置**：同一个二进制里跑两条矩阵乘实现。
  *
- * 为什么要有它（`docs/dev.md` §7.10 的历史问题）：那一节的 OpenBLAS 数字来自 `/tmp` 里的
+ * 为什么要有它（`docs/dev.md` §4.1 的历史问题）：那一节的 OpenBLAS 数字来自 `/tmp` 里的
  * 一次性探针，探针不进仓库 ⇒ 数字永远只是"历史记录"、不可复现。这个文件把**装置**入库，
  * 于是"本库 vs OpenBLAS"随时可以重测。
  *
@@ -23,7 +23,7 @@
  *     OB impl=lasx dtype=f32 m=256 k=256 n=256 threads=1 iters=9 ms_med=… ms_min=… ms_max=… gflops=…
  *     OBCHECK dtype=f32 m=256 k=256 n=256 threads=1 max_diff=… max_ref=… max_rel=… tol=… ok=yes
  *
- * ---- 公平性约定（每条都能在下面的代码里对上；`docs/dev.md` §6.4 引用同一份清单）----
+ * ---- 公平性约定（每条都能在下面的代码里对上；`docs/dev.md` §4.1 引用同一份清单）----
  *
  * 1. **同一形状、同一确定性数据、同一预热**：数据由固定种子的 LCG 生成（`fill_rand_*`，
  *    范围 `[-1,1)`），两个实现读**同一份** `a`/`b`；计时前各自热身 1 次，再按同一迭代数取样。
@@ -73,7 +73,7 @@
 
 /* 本机 `cblas.h` 没声明它（只有 Fortran 侧 `f77blas.h` 有），但符号在 libopenblas 里。 */
 extern void openblas_set_num_threads(int);
-/* **对手身份**（2026-10-15 审计加）：`docs/dev.md §6.4` 要求"每次对照第一行就声明对手的
+/* **对手身份**（2026-10-15 审计加）：`docs/dev.md §4.1` 要求"每次对照第一行就声明对手的
  * 构建与内核"。这三个查询函数本机头文件同样没声明 ⇒ 显式 extern（与上面同法）。 */
 extern char *openblas_get_config(void);
 extern char *openblas_get_corename(void);
@@ -101,23 +101,23 @@ static int G_split_plan, G_split_threaded;
 static lasx_matmul_plan *G_plan;
 static int G_plan_threads;
 /* `--split=omp`：**用 OpenMP 驱动**（C 消费者的正规用法：并行区常驻 + `omp for` 派活）。
- * 与 pthread 档的差别主要在**每次调用的握手成本**（futex 屏障 vs 自旋+分块），见 §7.10 ⑦。
+ * 与 pthread 档的差别主要在**每次调用的握手成本**（futex 屏障 vs 自旋+分块），见 §4.3 ⑦。
  * 没编 `-fopenmp` 时这一档直接报错退出（不静默降级）。 */
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 static int G_split_omp;
 /* `--split=plan-tight`：常驻 worker + **原子自旋握手**（不用 futex 屏障）。
- * 用途见 `docs/dev.md` §7.10 ⑦：把"C 调用方驱动的 plan 路径"从"每次调用一次屏障"的
+ * 用途见 `docs/dev.md` §4.1 ⑦：把"C 调用方驱动的 plan 路径"从"每次调用一次屏障"的
  * 台架成本里解放出来，量出真实可得的每调用时间。 */
 static int G_split_tight;
 /* **实验 B（H2）**：`--split=plan-tight-dyn` —— 在 tight 握手上换成"**动态认领小行块 +
- * 主线程也认领**"。目的（`docs/dev.md` §7.10 ⑩）：压掉 `worker_fn` 里那 40–48% 的自旋/空转
+ * 主线程也认领**"。目的（`docs/dev.md` §4.1 ⑩）：压掉 `worker_fn` 里那 40–48% 的自旋/空转
  * （静态等分时先做完的工人只能干等最慢的那个）。**只改 driver，不动库**。 */
 static int G_split_tight_dyn;
 static atomic_int G_tight_next; /* 动态认领：下一个待领的行块号 */
-static int G_tight_blk = 12;    /* 动态认领的块大小（行）；`--dyn-blk=N` 可扫（§7.10 ⑩ 扫描的胜者） */
-static int G_spin_limit = 200;  /* 等握手时"先转多少圈再让出"；`--spin=N` 可扫（§7.10 ⑩ 混合等待胜者） */
+static int G_tight_blk = 12;    /* 动态认领的块大小（行）；`--dyn-blk=N` 可扫（§4.3 ⑩ 扫描的胜者） */
+static int G_spin_limit = 200;  /* 等握手时"先转多少圈再让出"；`--spin=N` 可扫（§4.3 ⑩ 混合等待胜者） */
 static int G_wait_yield;        /* `--wait=yield`：完全不让转，每圈直接 sched_yield */
 /* 本装置是否真的起了 worker（只有起了才允许去等屏障——`omp` 档不起 worker，
  * 早期版本让 JOIN_WORKERS 去等**未初始化**的 `pthread_barrier_t`，整进程挂死过一次）。 */
@@ -197,7 +197,7 @@ static void run_lasx(void *c) {
     } else if (G_split_omp && G_plan != NULL) {
 #ifdef _OPENMP
         /* OpenMP 驱动：调用一次就开一个并行区，`omp for` 把行块派给线程——这就是给 C 消费者
-         * 的推荐用法（`docs/c-abi.md` §11.2 的 `#pragma omp parallel for` 样板）。 */
+         * 的推荐用法（`docs/c-abi.md` §6 的 `#pragma omp parallel for` 样板）。 */
         const int kk = G_k, nn = G_n, blk = G_rows_per_thread > 0 ? G_rows_per_thread : 1;
         const float *a = (const float *)G_a;
         float *cc = (float *)c;
@@ -525,7 +525,7 @@ static void usage(const char *argv0) {
 
 /* **`--impl=alt`：同进程调用级交替 A/B（2026-10-15 口径变更后的"正式对照"）**
  *
- * 口径理由（`docs/dev.md §6.4`）：SIMD 库的性能是"同一进程、同一份数据上，调它它干多久"；
+ * 口径理由（`docs/dev.md §4.1`）：SIMD 库的性能是"同一进程、同一份数据上，调它它干多久"；
  * 跨进程（分次运行）会把进程启动、每进程建池、调度、他人干扰都掺进来 ⇒ 那不是库的性能。
  *
  * 本模式：三臂（`plan` = 调用方常驻线程；`threaded` = 库自管、池缓存在 plan 内；`openblas`）
@@ -679,7 +679,7 @@ int main(int argc, char **argv) {
     const int do_lasx = impl && (!strcmp(impl, "lasx") || !strcmp(impl, "both"));
     const int do_ob = impl && (!strcmp(impl, "openblas") || !strcmp(impl, "both"));
     const int do_check = impl && !strcmp(impl, "both");
-    /* **`--impl=alt`**：同进程调用级交替（正式对照，见 `docs/dev.md §6.4`） */
+    /* **`--impl=alt`**：同进程调用级交替（正式对照，见 `docs/dev.md §4.1`） */
     const int do_alt = impl && !strcmp(impl, "alt");
     /* 测试模式（scan/verify）不需要 --impl，按各自的必填项校验 */
     if (G_mode_scan) {
@@ -731,7 +731,7 @@ int main(int argc, char **argv) {
     G_b = B;
 
     /* **对照口径第一行（2026-10-15 审计加）**：打印对手身份 + 两边共享缓冲的地址对齐。
-     * `docs/dev.md §6.4`：以后任何对外数字都要带这一行（build / core / 线程后端 / 实际线程数），
+     * `docs/dev.md §4.1`：以后任何对外数字都要带这一行（build / core / 线程后端 / 实际线程数），
      * 以及"同一批缓冲"的地址（两边读写的是**同一块内存**，布局与对齐天然一致）。 */
     printf("OBIDENT openblas_config=\"%s\" core=%s nthreads_set=%d nthreads_get=%d "
            "a_mod64=%zu b_mod64=%zu ptrs_a=%p b=%p\n",

@@ -2,7 +2,7 @@
 # 跨库对照 runner（lasx_rs vs OpenBLAS 0.3.34）——**可复现**：进程级交替 + 丢首轮 + 中位数/极差
 # + 逐轮 loadavg + A/B/C 分级。
 #
-# 口径见 `docs/dev.md` §6.4；**跨库对照的公平性清单**（同一形状/同一确定性数据/同一预热、
+# 口径见 `docs/dev.md` §4.1；**跨库对照的公平性清单**（同一形状/同一确定性数据/同一预热、
 # CBLAS 布局映射、先验一致性、线程对齐）写在 `scripts/bench_openblas.c` 头部注释里——那里是
 # 权威，本脚本只负责"多轮 + 分级 + 汇总"。
 #
@@ -14,13 +14,13 @@
 # 环境变量：
 #   BIN      对照二进制（默认 /tmp/bench_openblas；不存在时本脚本按下面那条 gcc 命令构建）
 #   SETTLE   轮间等待秒数（默认 60：让上一轮 bench 自身的 1min loadavg 衰减）
-#   PIN_CPU  单线程档绑的核（默认 4；**只有单线程内核该绑核**，见 §6.4）
+#   PIN_CPU  单线程档绑的核（默认 4；**只有单线程内核该绑核**，见 §4.1）
 #
 # 产物（**故意写 /tmp**，原始日志不进仓库）：
 #   /tmp/bench_openblas_<label>_log.txt      逐轮 before/after loadavg + 分级 + 原始 OB 行
 #   /tmp/bench_openblas_<label>_summary.txt  丢首轮后各 case 的中位数/极差/GFLOP/s/比值
 #
-# 分级（docs/dev.md §6.4）：A = 轮前 1min 且 5min ≤3 且无并发 bench/编译（本机通常不可达）；
+# 分级（docs/dev.md §4.1）：A = 轮前 1min 且 5min ≤3 且无并发 bench/编译（本机通常不可达）；
 #   B = 轮前 1min ≤4.5 且无并发 ⇒ 可作正式数；C = 其余 ⇒ 只作趋势。
 set -u
 label="${1:?用法: bench_openblas.sh <label> [rounds] [case-filter]}"
@@ -138,7 +138,7 @@ for i in $(seq 1 "$rounds"); do
     # 每条实现各起一个进程；两个进程的先后顺序逐轮翻转 ⇒ 同窗口成对交替
     if [ $((i % 2)) -eq 1 ]; then order="lasx openblas"; else order="openblas lasx"; fi
     for impl in $order; do
-      # 保留 `OBIDENT`（对手身份，每次对照的第一行）与 `OB`（结果）——口径要求见 §6.4
+      # 保留 `OBIDENT`（对手身份，每次对照的第一行）与 `OB`（结果）——口径要求见 §4.1
       out=$(OPENBLAS_NUM_THREADS=$threads $pre "$bin" --impl="$impl" "${args[@]}" 2>&1)
       line=$(printf '%s' "$out" | grep '^OB ')
       echo "r$i case=$name $line" >> "$log"

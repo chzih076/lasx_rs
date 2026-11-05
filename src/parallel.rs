@@ -26,7 +26,7 @@ use crate::ops::matmul_f64 as matmul64;
 use crate::plan::MatmulPlan;
 use crate::pool::sched::Pick;
 
-/// 一次并行执行的观测量（**执行自检**用；`docs/dev.md` §7.10 ⑤ 那种"静默退化"就靠它发现）。
+/// 一次并行执行的观测量（**执行自检**用；`docs/dev.md` §4.3 那种"静默退化"就靠它发现）。
 ///
 /// 典型用法：`threads > 1` 时若 `chunks <= 1`，或"总耗时 ≈ 各块耗时之和"，说明这次并没有
 /// 真的并行起来（`lasx_matmul` 按行切那个 1.08× 扩展比就是这类退化的实例）。
@@ -1534,7 +1534,7 @@ mod plan_threaded_tests {
 ///
 /// 跑法：`cargo test --release -p lasx_rs --lib diag_pool_vs_plan -- --ignored --nocapture`
 ///
-/// 起因（`docs/dev.md` §7.10 ⑦）：跨台架比较曾给出"池比计划快 1.35×"，于是先怀疑"面板/行的
+/// 起因（`docs/dev.md` §4.3）：跨台架比较曾给出"池比计划快 1.35×"，于是先怀疑"面板/行的
 /// 循环次序"。结果同进程交替测下来**计划反而略快**（≈2.55 ms / 355 G vs 池 ≈3.02 ms / 300 G）
 /// ⇒ 差异来自台架的**每次调用握手**（futex 屏障 vs 自旋）与窗口噪声，不是库内结构。
 /// 留下这个测试是为了下次不要再从"跨台架差 1.4×"直接推结论。

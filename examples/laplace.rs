@@ -125,7 +125,7 @@ fn perf_part() {
     let sigs: Vec<f64> = (0..M).map(|j| 0.5 + 0.01 * j as f64).collect();
     let oms: Vec<f64> = (0..M).map(|j| (j % 16) as f64 * 0.25).collect();
     let f = vec![1.0f32; N * NB];
-    println!("\n== ③ 性能演示（同进程交替，口径见 docs/dev.md §6.4）==");
+    println!("\n== ③ 性能演示（同进程交替，口径见 docs/dev.md §4.1）==");
     let threads = lasx_rs::arch::parallelism().physical.max(1);
     println!("    形状 M×N×NB = {M}×{N}×{NB}（f32），线程数 = {threads}（物理核）");
     println!(
@@ -341,7 +341,7 @@ fn derivative_part() {
     }
     println!("   逆变换最大相对误差 {worst_inv:.2e}（跳变扣除已开）");
     println!(
-        "   限制：**阶跃/含 δ 不适用**（f≡1 时 f″=δ′，定理给 0 —— 反例见 docs/ops.md §9.05）；\
+        "   限制：**阶跃/含 δ 不适用**（f≡1 时 f″=δ′，定理给 0 —— 反例见 docs/ops.md 的 laplace 章节）；\
          初值须给**右极限**，给错会残留 s^{{n−1−k}}·ε 项。"
     );
 }

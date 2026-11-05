@@ -310,7 +310,7 @@ mod tests {
     }
 
     /// **A/B 实测（硬门限）**：`rows=1024, cols=768`；臂①物化连续副本+连续 op vs 臂②跨步直接做
-    /// （`src_st.col = 2` padding）。§5 口径：同进程交替、5 轮丢首轮、中位。
+    /// （`src_st.col = 2` padding）。性能口径：同进程交替、5 轮丢首轮、中位。
     #[test]
     fn ab_materialize_vs_strided() {
         let (rows, cols) = (1024usize, 768usize);

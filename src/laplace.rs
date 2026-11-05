@@ -110,8 +110,8 @@ fn kernels64(
 ///   `Im z = e^{−σt}[Im(s^k)cos(ωt) − Re(s^k)sin(ωt)]`；
 /// - **`k = 0` 时直接委派 [`kernels64`]** ⇒ 与旧核**逐位一致**（回归锚点，测试 `weighted_k0_bitwise_same_as_plain`）；
 /// - **分工**：**核只管 `s^k·F`**（在积分里）；**导数定理的初值项 `Σ s^{n−1−k}f⁽ᵏ⁾(0⁺)` 不在积分里
-///   ⇒ 仍由 `derivative*_spectrum_*` 逐节点减**（见 `docs/ops.md` §9.08）。
-/// - **限制**：核元素量级随 `|s|^k` 放大 ⇒ **核自身的动态范围变大**（见 §9.08 的经验界）。
+///   ⇒ 仍由 `derivative*_spectrum_*` 逐节点减**（见 `laplace` 模块 rustdoc）。
+/// - **限制**：核元素量级随 `|s|^k` 放大 ⇒ **核自身的动态范围变大**（见 本模块 rustdoc 的经验界）。
 fn kernels64_weighted(
     sig: &[f64],
     om: &[f64],
@@ -151,7 +151,7 @@ fn kernels64_weighted(
 /// [`laplace_batch_f32_with`] 完全相同（同一分平面复数路径、同两条 `matmul!`、同批量 `[K,N]`）。
 ///
 /// **契约**：`k = 0` 与 [`laplace_batch_f32`] **逐位一致**；`k ≥ 1` 与"算完 `F` 再逐节点乘
-/// `s^k`"**不逐位一致**（舍入次序不同）——后者见 `derivative*_spectrum_*`/文档 §9.08。
+/// `s^k`"**不逐位一致**（舍入次序不同）——后者见 `derivative*_spectrum_*`/文档 本模块 rustdoc。
 pub fn laplace_batch_f32_weighted<const M: usize, const N: usize, const NB: usize>(
     sig: &[f64],
     om: &[f64],
@@ -241,7 +241,7 @@ fn kernels64_recurrence(
 
 /// **`f32` 批量正变换（等距递推核，opt-in）**：接口与 [`laplace_batch_f32`] 一致（同一 `s`
 /// 节点、同一分平面、同一批量）。**契约：仅容差**（与 libm 核**不逐位一致**；最大误差界见
-/// `docs/ops.md` §9.10，安全区见 [`recurrence_safe`]）；**默认路线仍是 libm**。
+/// `laplace` 模块 rustdoc，安全区见 [`recurrence_safe`]）；**默认路线仍是 libm**。
 pub fn laplace_batch_f32_recurrence<const M: usize, const N: usize, const NB: usize>(
     sig: &[f64],
     om: &[f64],
@@ -270,7 +270,7 @@ pub fn laplace_batch_f32_recurrence<const M: usize, const N: usize, const NB: us
 pub enum FusedMode {
     /// 现场用 **libm** 表达式生成（**与物化版逐字相同** ⇒ 期望**逐位一致**）。
     Libm,
-    /// 现场用**等距递推**生成（**容差类**：与物化 libm 差见 §9.10.1 的 5.5e-14 界）。
+    /// 现场用**等距递推**生成（**容差类**：与物化 libm 差见 本模块 rustdoc 的 5.5e-14 界）。
     Recurrence,
 }
 
@@ -1603,7 +1603,7 @@ mod c_perf {
 /// - **首选：调用方给**（解析式或已知量）；**本函数不做任何数值估计、没有静默回退**；
 /// - `init` 必须是 **右极限 `f⁽ᵏ⁾(0⁺)`**（单边拉普拉斯的约定）；
 /// - **取错的后果**：残留 `s^{n−1−k}·ε_k` 项 ⇒ 在**大 `|s|`** 处误差按 `|s|^{n−1−k}` 放大
-///   （实测见 `docs/ops.md` §9.08 的表）。
+///   （实测见 `laplace` 模块 rustdoc 的表）。
 ///
 /// # 适用范围（**不满足就别用**）
 /// - 要求 `f` 在 `[0,∞)` 上**足够次可微**、且**指数阶**（否则 `F` 本身不存在）；
@@ -2001,7 +2001,7 @@ mod derivative_tests {
     /// **③ 端到端往返（最值钱）**：`F` → **导数定理**（得到 `L{f″}`）→ **库内逆变换** → `f″`。
     ///
     /// 这里把 `G(s) = s²F(s) − s·f(0⁺) − f′(0⁺)` 直接作为 [`ComplexFn`] 交给 `invert_batch_f64`，
-    /// **并且用 `DubnerAbate::f0 = f″(0⁺) = a²` 做跳变扣除**（否则会退回 1/N 收敛，见 §9.05 的 `f₀` 契约）。
+    /// **并且用 `DubnerAbate::f0 = f″(0⁺) = a²` 做跳变扣除**（否则会退回 1/N 收敛，见 本模块 rustdoc 的 `f₀` 契约）。
     #[test]
     fn derivative_theorem_round_trip_through_inverse() {
         use crate::ilaplace::{ComplexFn, DubnerAbate, OneOverSPlus, invert_batch_f64};
@@ -2102,10 +2102,10 @@ mod derivative_tests {
             assert!(gre[j].abs() < 1e-12 && gim[j].abs() < 1e-12);
         }
         // 定理给 0，但真值是 δ′（分布）⇒ **不适用**。这里不做"修正"，只把"定理的输出是 0、
-        // 而真值不是 0"这件事**钉成断言**（如实记录不适用；反例的说明见 `docs/ops.md` §9.08）。
+        // 而真值不是 0"这件事**钉成断言**（如实记录不适用；反例的说明见 `laplace` 模块 rustdoc）。
         assert_eq!(
             gre[0], 0.0,
-            "阶跃情形定理输出 0（而真值 f″=δ′ ⇒ 不适用，见 §9.08）"
+            "阶跃情形定理输出 0（而真值 f″=δ′ ⇒ 不适用，见 本模块 rustdoc）"
         );
         assert_eq!(gim[0], 0.0);
     }

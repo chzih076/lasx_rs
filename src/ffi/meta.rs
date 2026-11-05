@@ -28,7 +28,7 @@ use std::ffi::c_char;
 /// # 语义（与算子完全一致）
 ///
 /// 直接返回 `SimdPath::detect().is_lasx()` 的结果——也就是**算子入口此刻会走的路径**。
-/// 所以它尊重 `lasx_force_lsx_thread`（该函数仅 Rust rlib 可见，见 `docs/ops.md` §3.4）：
+/// 所以它尊重 `lasx_force_lsx_thread`（该函数仅 Rust rlib 可见，见 `docs/ops.md` §3.3）：
 /// 被强制降级时本函数返回 `0`，与算子的实际行为一致。调用方问的是"**现在能不能安全
 /// 调 `[LASX-only]` 符号**"，答案必须与算子走的路一致，否则这个查询就没有意义。
 ///
@@ -37,7 +37,7 @@ use std::ffi::c_char;
 /// **调用任何标了 `[LASX-only]` 的符号之前**（如 `lasx_dot`、`lasx_sum`、`lasx_matmul`、
 /// `lasx_dot_i8`）。标了 `LASX+LSX` 的符号在两种机型上都安全，不需要问。
 ///
-/// 代价：一次进程级原子读 + 一次线程局部读（实测边际 0.2–0.6 ns，见 `docs/dev.md` §7.14），
+/// 代价：一次进程级原子读 + 一次线程局部读（实测边际 0.2–0.6 ns，见 `docs/dev.md` §4.3），
 /// 所以放在"每个批次调一次"的位置即可，不必每个元素都问。
 #[unsafe(no_mangle)]
 pub extern "C" fn lasx_has_lasx() -> i32 {

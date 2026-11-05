@@ -49,7 +49,7 @@ pub extern "C" fn lasx_matmul_f64(
 /// - `beta == 0` 时**不读 `c`**（CBLAS 语义：`C` 无需在入参里有效）；
 /// - 与"先算 `A·B` 再整体做 `beta·C_old + alpha·acc`"**逐位一致**；
 /// - `beta != 0` 且 `k > 384`（打包路径要 k 分块、部分和会覆盖 `C_old`）退回与朴素二遍法
-///   同构的实现——不假装更快。口径与实测见 `docs/dev.md` §19.15。
+///   同构的实现——不假装更快。口径与实测见 `docs/dev.md` §4.4。
 ///
 /// 需要错误通道时用 `crate::ffi::checked::lasx_matmul_scaled_checked`。
 #[unsafe(no_mangle)]

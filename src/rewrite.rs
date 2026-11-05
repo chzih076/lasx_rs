@@ -22,7 +22,7 @@
 //!
 //! # 契约
 //! 重写路径**与 libm 逐元素路径不逐位一致** ⇒ **必须显式 opt-in**（宏级属性草案 `#[fast_trig]`）；
-//! **默认仍 libm/位精确**。误差界与安全区见 `docs/ops.md` §9.10.1。
+//! **默认仍 libm/位精确**。误差界与安全区见 `docs/ops.md`。
 
 use crate::laplace::{RECURRENCE_MAX_PHASE, RECURRENCE_MAX_PHASE_STEP, recurrence_safe};
 
@@ -120,7 +120,7 @@ pub fn safe_zone() -> (f64, f64) {
 /// ① 调 [`plan`] 拿判定；② 走 `Rewrite::Recurrence` 时调用**库内已落地的**
 /// `laplace_batch_{f32,f64}_recurrence`（它内部就是**同源守卫 + 逐行回退 libm**）。
 /// 因此"生成 + 守卫 + 逐行回退"这条链路的**行为**已由库内入口 + 下面的测试覆盖；
-/// **尚未落地**的是"宏 crate 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]`"（见 `docs/dev.md` §9.5.2）。
+/// **尚未落地**的是"宏 crate 里把 AST 降成 `KernelPattern` 并挂 `#[fast_trig]`"（见 `docs/dev.md`）。
 pub const GENERATION_VIA_LIBRARY_ENTRY: &str =
     "recurrence 生成走 laplace_batch_*_recurrence（同源守卫 + 逐行回退）";
 

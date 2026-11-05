@@ -63,7 +63,7 @@
 //! 测试/验证用的线程级降级钩子见 [`lasx_force_lsx_thread`]。
 #![feature(stdarch_loongarch)]
 // **unsafe 审查**：`undocumented_unsafe_blocks` 要求每个 `unsafe` 块都紧邻一条 SAFETY 说明。
-// 分层策略（全文见 docs/dev.md §17 —— 本仓库保留的唯一一份策略正本）：
+// 分层策略（全文见 docs/dev.md §2.1 —— 本仓库保留的唯一一份策略正本）：
 // - `src/pool`、`src/arch`、`src/aligned`、`src/api`、`src/parallel`、`src/scalar_ref.rs`
 //   这些**基础设施**里逐块写清楚（那里才是指针/生命周期/并发不变量的所在）；
 // - `src/ops/*`、`src/ffi/*` 里同一组前提下的 intrinsic 调用是重复的（`src/` 现有 652 个
@@ -120,7 +120,7 @@ extern crate self as lasx_rs;
 pub mod aligned;
 pub mod api;
 pub mod arch;
-/// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md` §9.10。
+/// **超越函数 recon 原型**（opt-in；默认仍走 `libm`）——见 [`fast_trig`] 与 `docs/ops.md`。
 pub mod fast_trig;
 pub mod ffi;
 /// **逆拉普拉斯变换**（Dubner–Abate + 跳变扣除；指数和仍用公式 DSL 表达）——见 [`ilaplace`]。

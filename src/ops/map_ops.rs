@@ -49,7 +49,7 @@ pub fn map_binary(x: &[f32], y: &[f32], out: &mut [f32], op: BinOp) {
     let n = x.len();
     // **4 路展开（32 元素/迭代）**：逐元素运算没有归约 ⇒ 展开**不改变任何数值**（按构造逐位安全），
     // 只为摊薄循环开销、给访存更多并行度。动机是实测：单路版本在 1 MiB 档比 LLVM 自动向量化的
-    // 可移植档慢约 10%（见 `ops/axpy.rs` 的同款教训）；本文件 W5/W6 的 §5 复测确认了这一点。
+    // 可移植档慢约 10%（见 `ops/axpy.rs` 的同款教训）；本文件 W5/W6 的 性能复测确认了这一点。
     // 展开成宏而不是 `unsafe fn`：edition 2024 下 `unsafe fn` 体内不再隐式 unsafe（会触发
     // `unsafe_op_in_unsafe_fn` 告警），而宏展开进已有的 `unsafe { }` 块里就够了。
     macro_rules! vec_op {

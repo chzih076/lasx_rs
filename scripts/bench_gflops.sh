@@ -1,5 +1,5 @@
 #!/bin/bash
-# **GFLOPS 薄封装**（`docs/dev.md §7.27` 的产数入口）。
+# **GFLOPS 薄封装**（`docs/dev.md §4.4` 的产数入口）。
 #
 # **底层复用 `scripts/bench_openblas.sh`**（它的 `gflops` 模式已输出 `ms_med(min-max)` 与
 # `gflops(med)` 列、逐轮 loadavg、A/B/C 分级）—— 本脚本**只做三件事**，**不实现第二套口径**：
@@ -14,9 +14,9 @@
 #
 # 口径要点（沿用 `bench_openblas.sh` / `bench_openblas.c` 头部注释）：
 #   - **同一时刻只跑一个实现**（绝不同进程混跑 OpenBLAS + LASX）；
-#   - `nice -n 10`；`SETTLE` 默认 60s（本机 GUI 基线噪声下可降到 30，见 §7.27）；
+#   - `nice -n 10`；`SETTLE` 默认 60s（本机 GUI 基线噪声下可降到 30，见 §4.4）；
 #   - GFLOPS = 2·m·n·k / t / 1e9（由底层脚本计算，本脚本不再重算）；
-#   - 多线程档由底层脚本的 case 定义决定（`openblas_set_num_threads(12)` 档见 §7.27）。
+#   - 多线程档由底层脚本的 case 定义决定（`openblas_set_num_threads(12)` 档见 §4.4）。
 set -u
 label="${1:?用法: bench_gflops.sh <label> [rounds] [case-filter]}"
 rounds="${2:-5}"
@@ -33,4 +33,4 @@ nice -n 10 bash "$(dirname "$0")/bench_openblas.sh" "$label" "$rounds" "$filter"
 echo "[bench_gflops] loadavg(after)  = $(cat /proc/loadavg)"
 echo "[bench_gflops] 原始日志: $log"
 echo "[bench_gflops] 汇总(底层脚本产物): /tmp/bench_openblas_${label}_log.txt（逐轮 loadavg）"
-echo "[bench_gflops] 提示：把 loadavg(before/after) 范围与 GUI 基线说明一并写进 §7.27。" > "$sum"
+echo "[bench_gflops] 提示：把 loadavg(before/after) 范围与 GUI 基线说明一并写进 §4.4。" > "$sum"

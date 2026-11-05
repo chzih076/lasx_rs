@@ -1,4 +1,4 @@
-//! **P5-a：gather / scatter 的 LASX 高性能内核**（签名与 `simd_dsl/docs/structure.md §7` 的
+//! **P5-a：gather / scatter 的 LASX 高性能内核**（签名与 `（DSL 仓）docs/structure.md §7` 的
 //! **解冻最终契约**逐字一致；**stride 从第一天就在签名里**，ids 用 `u32`，越界 ⇒ `Err`）。
 //!
 //! # 三个内核
@@ -314,7 +314,7 @@ mod tests {
         assert!(scatter_rows_f32(&[0.0; 8], 8, &[4], 8, &mut o2, 8).is_err());
     }
 
-    /// **A/B 实测（§5 口径：同进程交替、≥5 对丢首对、中位）**：新内核 vs 朴素逐行 `copy_from_slice`。
+    /// **A/B 实测（性能口径：同进程交替、≥5 对丢首对、中位）**：新内核 vs 朴素逐行 `copy_from_slice`。
     ///
     /// **口径说明（如实）**：不与 `api::gather_rows` 比 —— 它**每次调用都分配新 Vec**，
     /// 与本内核（写进调用方缓冲）不同口径，比出来的是"分配开销"而不是"内核快慢"。

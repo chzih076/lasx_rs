@@ -1,7 +1,7 @@
 #!/bin/bash
 # lasx_rs 性能剖析 runner（perf stat 计数 + 用户态调用图）。
 #
-# 目标（`docs/dev.md` §7.10 ⑧）：把"C 侧 245.8 G 与结构上界 346–355 G 之间的差距"查清——
+# 目标（`docs/dev.md` §4.1 ⑧）：把"C 侧 245.8 G 与结构上界 346–355 G 之间的差距"查清——
 # 到底是**带宽（DRAM/L3）**、**同步/调度抖动**、**TLB**，还是**窗口**？
 #
 # 环境约束（本机实测，**perf_event_paranoid = 2**）：
@@ -11,7 +11,7 @@
 #     并且**先跑事件自检**（每个分批单独 `perf stat … -- true`）把"哪些真能计数"打出来。
 #
 # **降 `perf_event_paranoid` 不解锁 uncore/内核帧**（2026-10-15 用户授权后实测，见
-# `docs/dev.md` §7.10 ⑧-权限）：本机 **PMU 没有 uncore/内存控制器事件**（`perf list` 命中 0）、
+# `docs/dev.md` §4.1 ⑧-权限）：本机 **PMU 没有 uncore/内存控制器事件**（`perf list` 命中 0）、
 # **`kptr_restrict = 2`**、**无 vmlinux 调试符号** ⇒ 权限降到 1 也拿不到"L3/DRAM 实测字节"与
 # 内核帧；那条路要继续走得先满足"`kptr_restrict=0` + 内核 DWARF + 支持 uncore 的 PMU"。
 # 本脚本**只读**系统状态（记录 paranoid 值用于留痕），**不改任何系统设置**——系统设置不进仓库；
@@ -27,7 +27,7 @@
 #   /tmp/profile_lasx_<label>_perf.data    `perf record` 的样本（plan-tight 档）
 #   /tmp/profile_lasx_<label>_top.txt      `perf report` 的用户态热点（前若干函数）
 #
-# 口径（`docs/dev.md` §6.4）：每档每个分批 **≥3 次重复**；报**中位数 + 极差**；
+# 口径（`docs/dev.md` §4.1）：每档每个分批 **≥3 次重复**；报**中位数 + 极差**；
 #   逐次记录轮前 `loadavg`；并同时报装置自己的 `iters`/`ms_max`（窗口质量）。
 #   容器里没有 `perf` 时脚本会明确说"本机不可用"并退出（**不编数据**）。
 set -u

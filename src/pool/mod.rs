@@ -354,7 +354,7 @@ impl WorkerPool {
     /// **更差**（SMT 兄弟互抢 L1/L2）。这与本函数旧注释"没有额外收益，**也不会更差**"相反——
     /// 旧说法来自早期较宽松的扫描，已被本次更严格的三臂对照推翻。
     /// **影响面（2026-10-18 审计复核更正）**：`global()` = 本函数，**当前实际调用点只有**
-    /// `ops::matmul::matmul_f32`（`work ≥ 32M` 时，§7.28）与 `shape::Prepared` 的默认策略（`Auto`
+    /// `ops::matmul::matmul_f32`（`work ≥ 32M` 时，§4.4）与 `shape::Prepared` 的默认策略（`Auto`
     /// 且 `threads > 1`）。经前者受益的是 `api::matmul`/`api::matmul_into`/`api::matmul_scaled_into`
     /// 的融合分支、以及公式 DSL `matmul!`。**不走它**：`api::gemv*`、各 `_batch`、
     /// `api::matmul_f64`（f64 GEMM 尚无池版接线）、`parallel::*`（那些用调用方显式传入的池）。
@@ -365,7 +365,7 @@ impl WorkerPool {
         // **按可用 CPU 数封顶**：`available_parallelism()` 尊重 `sched_getaffinity`/cgroup，
         // 而 `physical_cores()` 读 sysfs 拓扑、**不看进程的亲和性**。进程被 `taskset` 绑到
         // 1 个核时，只按物理核建池会在 1 个核上跑 12 个线程——实测 1t GEMM 用例因此
-        // 多付 **+8.2%（1024³）/ +6.6%（1536³）** 的派发与争用开销（`§7.44` 的 0.878/0.825
+        // 多付 **+8.2%（1024³）/ +6.6%（1536³）** 的派发与争用开销（`§4.4` 的 0.878/0.825
         // 口径就带了这个伪影）。空闲全机时两者都=12，行为不变。
         let avail = std::thread::available_parallelism()
             .map(|v| v.get())
@@ -1032,7 +1032,7 @@ impl std::fmt::Debug for WorkerPool {
 
 /// 本轮的自旋上限：生产 = [`SPIN_LIMIT`]；`#[cfg(test)]` 下可被
 /// [`set_spin_limit_for_test`] 覆盖，供"H2 等待策略扫描"在同一进程里交替对照
-/// （`docs/dev.md` §7.10 ⑩）。
+/// （`docs/dev.md` §6.3 ⑩）。
 fn spin_limit() -> u32 {
     #[cfg(test)]
     {
